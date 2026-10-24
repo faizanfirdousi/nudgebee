@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"time"
 
 	"nudgebee/services/internal/database"
 	kgmodels "nudgebee/services/knowledge_graph/models"
@@ -647,6 +646,11 @@ type UpsertResult struct {
 	FilterID           uuid.UUID
 	RemovedAccounts    []string
 	RemovedFlowSources []string
+	// Filter contents before this save, as stored (the "empty == all" sentinel
+	// is NOT expanded). Carried out so the caller can audit prev -> new without
+	// re-reading the row it just overwrote.
+	PreviousAccountIDs  []string
+	PreviousFlowSources []string
 }
 
 // toggleableFlowSources is the set of flow sources a tenant can turn on/off from the
@@ -701,8 +705,11 @@ func (r *FilterRepository) UpsertDefaultFilterForTenant(
 	}
 
 	var removedAccounts, removedFlowSources []string
+	var previousAccountIDs, previousFlowSources []string
 
 	if existing != nil {
+		previousAccountIDs = existing.AccountIDs
+		previousFlowSources = existing.FlowSources
 		// An empty account_ids / flow_sources list means "all" (that's how the
 		// build path resolves it), so a plain set-difference is wrong here: the
 		// nightly cron pre-creates the default row with empty arrays, so for almost
@@ -754,9 +761,11 @@ func (r *FilterRepository) UpsertDefaultFilterForTenant(
 	}
 
 	return &UpsertResult{
-		FilterID:           existing.ID,
-		RemovedAccounts:    removedAccounts,
-		RemovedFlowSources: removedFlowSources,
+		FilterID:            existing.ID,
+		RemovedAccounts:     removedAccounts,
+		RemovedFlowSources:  removedFlowSources,
+		PreviousAccountIDs:  previousAccountIDs,
+		PreviousFlowSources: previousFlowSources,
 	}, nil
 }
 
@@ -889,88 +898,4 @@ func isNoRowsError(err error) bool {
 	}
 	// GetFilterForTenant wraps ErrNoRows in fmt.Errorf with "no filter found"
 	return strings.Contains(err.Error(), "no filter found")
-}
-
-// TryClaimTenantProcessing atomically checks whether KG processing for this tenant
-// started within lockDuration and, if not, stamps last_process_started_at = NOW().
-//
-// It uses SELECT ... FOR UPDATE so that concurrent callers (same or different replicas)
-// are serialized: the second caller blocks until the first commits, then reads the fresh
-// timestamp and returns false — preventing concurrent same-tenant graph builds that
-// cause PostgreSQL deadlocks on knowledge_graph_node upserts.
-//
-// Returns true if the caller should proceed with processing, false if it should skip.
-func (r *FilterRepository) TryClaimTenantProcessing(tenantID string, lockDuration time.Duration) (bool, error) {
-	tx, err := r.dbManager.BeginTx()
-	if err != nil {
-		return false, fmt.Errorf("failed to begin transaction for tenant claim: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	// Lock all enabled filter rows for this tenant. FOR UPDATE ensures a concurrent
-	// caller blocks here until we commit, then re-reads the fresh last_process_started_at.
-	rows, err := tx.Queryx(`
-		SELECT id, last_process_started_at
-		FROM knowledge_graph_tenant_filters
-		WHERE tenant_id = $1 AND enabled = true
-		FOR UPDATE
-	`, tenantID)
-	if err != nil {
-		return false, fmt.Errorf("failed to select tenant filters for update: %w", err)
-	}
-
-	defer func() { _ = rows.Close() }()
-	maxStartedAt, err := scanMaxProcessStartedAt(rows)
-	if err != nil {
-		return false, err
-	}
-
-	// If the most recent process start is within lockDuration, skip.
-	if maxStartedAt != nil && time.Since(*maxStartedAt) < lockDuration {
-		return false, nil
-	}
-
-	// Stamp the start time on all enabled filters for this tenant.
-	_, err = tx.Exec(`
-		UPDATE knowledge_graph_tenant_filters
-		SET last_process_started_at = NOW()
-		WHERE tenant_id = $1 AND enabled = true
-	`, tenantID)
-	if err != nil {
-		return false, fmt.Errorf("failed to stamp last_process_started_at: %w", err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return false, fmt.Errorf("failed to commit tenant claim: %w", err)
-	}
-
-	return true, nil
-}
-
-// scanMaxProcessStartedAt iterates rows from a SELECT on knowledge_graph_tenant_filters
-// and returns the most recent last_process_started_at value across all rows.
-func scanMaxProcessStartedAt(rows interface {
-	Next() bool
-	StructScan(dest interface{}) error
-	Err() error
-}) (*time.Time, error) {
-	type filterRow struct {
-		ID                   string     `db:"id"`
-		LastProcessStartedAt *time.Time `db:"last_process_started_at"`
-	}
-
-	var maxStartedAt *time.Time
-	for rows.Next() {
-		var fr filterRow
-		if err := rows.StructScan(&fr); err != nil {
-			return nil, fmt.Errorf("failed to scan tenant filter row: %w", err)
-		}
-		if fr.LastProcessStartedAt != nil && (maxStartedAt == nil || fr.LastProcessStartedAt.After(*maxStartedAt)) {
-			maxStartedAt = fr.LastProcessStartedAt
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to iterate tenant filter rows: %w", err)
-	}
-	return maxStartedAt, nil
 }

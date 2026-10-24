@@ -11,26 +11,87 @@ import { getBrandTitle } from '@hooks/useTenantBranding';
 import { getUpstreamStatus, mapUpstreamError } from '@lib/errorMessages';
 
 const NULL_AGENT_ID = '00000000-0000-0000-0000-000000000000';
+const MAX_LEGACY_FORWARDED_RESPONSE_LENGTH = 16 * 1024;
+const asText = (value) => (value == null ? '' : String(value));
 
 const parseReferences = (raw) => {
   const parsed = typeof raw === 'string' ? safeJSONParse(raw) : raw;
   return Array.isArray(parsed) ? parsed : [];
 };
-const buildDrawerTasks = (agents, message) => {
+export const buildDrawerTasks = (agents, message) => {
   const list = (agents || []).filter((agent) => agent.agent_name !== 'router');
+  const agentIds = new Set(list.map((agent) => String(agent.id)));
 
-  // child agent id -> the tool call that spawned it, so a sub-agent nests under its invocation.
+  // child agent id -> its planner tool call, whose thought and execution metadata
+  // are rendered on the actual agent row instead of a duplicate wrapper row.
   const spawnerToolByChildAgent = new Map();
   list.forEach((agent) => {
     (agent.llm_conversation_tool_calls || []).forEach((t) => {
-      if (t.child_agent_id) {
-        spawnerToolByChildAgent.set(String(t.child_agent_id), String(t.id));
+      if (t.child_agent_id && agentIds.has(String(t.child_agent_id))) {
+        spawnerToolByChildAgent.set(String(t.child_agent_id), { toolCall: t, parentAgentId: String(agent.id) });
       }
     });
   });
 
+  // Older and partially-persisted agent-as-tool calls may omit child_agent_id.
+  // Fall back only when the child has exactly one same-name tool call on its
+  // recorded parent agent; ambiguous matches remain as separate rows.
+  list.forEach((agent) => {
+    const agentId = String(agent.id);
+    if (spawnerToolByChildAgent.has(agentId)) {
+      return;
+    }
+    const parentAgentId = agent.parent_agent_id && agent.parent_agent_id !== NULL_AGENT_ID ? String(agent.parent_agent_id) : null;
+    if (!parentAgentId) {
+      return;
+    }
+    const parentAgent = list.find((candidate) => String(candidate.id) === parentAgentId);
+    const matches = (parentAgent?.llm_conversation_tool_calls || []).filter(
+      (toolCall) => !toolCall.child_agent_id && toolCall.tool_name === agent.agent_name
+    );
+    if (matches.length === 1) {
+      spawnerToolByChildAgent.set(agentId, { toolCall: matches[0], parentAgentId });
+    }
+  });
+  const spawnerToolIds = new Set([...spawnerToolByChildAgent.values()].map((spawner) => String(spawner.toolCall.id)));
+
+  // Some legacy nested agents were persisted with the orchestrator as parent
+  // even though a direct child agent forwarded their response unchanged. New
+  // calls carry explicit backend links; keep this fallback bounded and apply it
+  // only for one unique, small, byte-identical response match.
+  const forwardedParentByAgent = new Map();
+  list.forEach((agent) => {
+    const agentId = String(agent.id);
+    if (
+      spawnerToolByChildAgent.has(agentId) ||
+      !agent.response ||
+      typeof agent.response !== 'string' ||
+      agent.response.length > MAX_LEGACY_FORWARDED_RESPONSE_LENGTH
+    ) {
+      return;
+    }
+    const storedParentId = agent.parent_agent_id && agent.parent_agent_id !== NULL_AGENT_ID ? String(agent.parent_agent_id) : null;
+    if (!storedParentId) {
+      return;
+    }
+    const forwardingParents = list.filter((candidate) => {
+      const candidateSpawner = spawnerToolByChildAgent.get(String(candidate.id));
+      return (
+        candidateSpawner?.parentAgentId === storedParentId &&
+        typeof candidate.response === 'string' &&
+        candidate.response.length <= MAX_LEGACY_FORWARDED_RESPONSE_LENGTH &&
+        candidate.response === agent.response &&
+        String(candidate.id) !== agentId
+      );
+    });
+    if (forwardingParents.length === 1) {
+      forwardedParentByAgent.set(agentId, String(forwardingParents[0].id));
+    }
+  });
+
   const tasks = [];
 
+  // Turn record, not a task -> chip/drawer filter it via `actionableTasks`. Never count unfiltered.
   if (message?.ack_message?.trim()) {
     tasks.push({
       id: message.id + '-acknowledgment',
@@ -47,10 +108,15 @@ const buildDrawerTasks = (agents, message) => {
 
   list.forEach((agent) => {
     const toolCalls = agent.llm_conversation_tool_calls || [];
-    const agentReferences = toolCalls.flatMap((t) => parseReferences(t.references)).concat(parseReferences(agent.references));
+    const spawner = spawnerToolByChildAgent.get(String(agent.id));
+    const spawnerTool = spawner?.toolCall;
+    const agentReferences = toolCalls
+      .flatMap((t) => parseReferences(t.references))
+      .concat(parseReferences(agent.references), parseReferences(spawnerTool?.references));
     const parentAgentId = agent.parent_agent_id && agent.parent_agent_id !== NULL_AGENT_ID ? String(agent.parent_agent_id) : null;
-    const parentId = spawnerToolByChildAgent.get(String(agent.id)) || parentAgentId;
+    const parentId = spawner?.parentAgentId || forwardedParentByAgent.get(String(agent.id)) || parentAgentId;
     const isRootAgent = !parentId; // the top-level orchestrator — the drawer renders it as a container header
+    const thought = asText(agent.thought || spawnerTool?.thought);
     tasks.push({
       id: agent.id,
       tool_id: agent.id,
@@ -62,11 +128,13 @@ const buildDrawerTasks = (agents, message) => {
       text: isRootAgent ? agent.agent_name : undefined,
       response_status: agent.status,
       response_summary: agent.response_summary,
-      log: (agent.thought || '').split('\n\nAction:')[0],
-      thought: agent.thought,
+      log: thought.split('\n\nAction:')[0],
+      thought,
       query: agent.query,
       response: { type: 'tool_call_response', text: agent.response },
       references: agentReferences.length > 0 ? agentReferences : undefined,
+      metadata: spawnerTool?.metadata,
+      isPlannerAction: Boolean(spawnerTool),
       created_at: agent.created_at,
       updated_at: agent.updated_at,
     });
@@ -98,7 +166,7 @@ const buildDrawerTasks = (agents, message) => {
     });
 
     toolCalls.forEach((t) => {
-      if (!t.id || parentToolCallId(t)) {
+      if (!t.id || parentToolCallId(t) || spawnerToolIds.has(String(t.id))) {
         return; // sub-steps render under their parent, not as their own task
       }
       const toolRefs = parseReferences(t.references);
@@ -111,8 +179,8 @@ const buildDrawerTasks = (agents, message) => {
         type: 'tool_call',
         tool: t.tool_name,
         response_status: t.status,
-        log: (t.thought || '').split('\n\nAction:')[0],
-        thought: t.thought,
+        log: asText(t.thought).split('\n\nAction:')[0],
+        thought: asText(t.thought),
         text: t.parameters,
         toolParameters: safeJSONParse(t.parameters) || {},
         references: toolRefs.length > 0 ? toolRefs : undefined,
@@ -130,10 +198,11 @@ const buildDrawerTasks = (agents, message) => {
 
 const parseConversationMessages = (conversationMessages, accountId) => {
   const allMessages = [];
+  const queuedMessages = [];
   const collapsedIndexes = {}; // To track which items should be auto-collapsed
 
   if (!conversationMessages || conversationMessages.length === 0) {
-    return { allMessages, collapsedIndexes };
+    return { allMessages, queuedMessages, collapsedIndexes };
   }
 
   const agentIdMap = {};
@@ -167,6 +236,7 @@ const parseConversationMessages = (conversationMessages, accountId) => {
   const sortedByCreated = [...conversationMessages].sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
   let currentGenId = null;
   sortedByCreated.forEach((cm) => {
+    if (cm.status === 'QUEUED') return;
     if (cm.message_type !== 'followup') {
       currentGenId = cm.id;
       return;
@@ -200,6 +270,20 @@ const parseConversationMessages = (conversationMessages, accountId) => {
 
   conversationMessages.forEach((conversationMessage) => {
     if (conversationMessage.message_type === 'followup') {
+      return;
+    }
+
+    if (conversationMessage.status === 'QUEUED') {
+      queuedMessages.push({
+        id: conversationMessage.id,
+        text: conversationMessage.message,
+        images: conversationMessage.attachments || [],
+        config: conversationMessage.message_config,
+        createdAt: new Date(conversationMessage.created_at).getTime(),
+        user: conversationMessage?.user?.display_name || conversationMessage?.user_display_name || 'Workspace member',
+        userId: conversationMessage.user_id,
+        isServer: true,
+      });
       return;
     }
 
@@ -330,8 +414,8 @@ const parseConversationMessages = (conversationMessages, accountId) => {
                 // Carry the tool call's own reasoning so the card title and the
                 // Tool Details "Thought" box show the thought — not the parameters
                 // (those live in `toolParameters` and render as the "Query" box).
-                log: (t.thought || '').split('\n\nAction:')[0],
-                thought: t.thought,
+                log: asText(t.thought).split('\n\nAction:')[0],
+                thought: asText(t.thought),
                 // getCardTitle's in_progress branch reads `query`, not `text` — without
                 // this, the row renders an empty title (just "-") for every poll between
                 // this tool_call being created and its `child_agent_id` getting linked to
@@ -418,13 +502,13 @@ const parseConversationMessages = (conversationMessages, accountId) => {
           response_text: agent.response,
           response_status: agent.status,
           response_summary: agent.response_summary,
-          log: (activeTool.thought || agent.thought || '').split('\n\nAction:')[0],
+          log: asText(activeTool.thought || agent.thought).split('\n\nAction:')[0],
           tool: activeTool.tool_name ?? agent.agent_name,
           tool_id: agent.id,
           created_at: agent.created_at,
           updated_at: agent.updated_at,
           agentName: agent.agent_name,
-          thought: agent.thought,
+          thought: asText(agent.thought),
           query: agent.query,
           parentAgents: parentAgentsList,
           plannerId: plannerIdChildMapping[agent.id],
@@ -483,6 +567,10 @@ const parseConversationMessages = (conversationMessages, accountId) => {
           references: responseReferences,
           ack_message: conversationMessage.ack_message,
           status: conversationMessage.status,
+          // Seconds this turn spent parked on a followup waiting for a human
+          // answer — already inside [created_at, updated_at]. ResponseMetaRail
+          // subtracts it so the duration chip shows the model's own time.
+          followup_wait_seconds: conversationMessage.followup_wait_seconds || 0,
           // Carry the raw `metadata` jsonb through to the UI response object —
           // MessageItem parses it and threads the per-message egressfilter
           // (and future per-subsystem) events into ResponseMetaRail. Without
@@ -501,7 +589,7 @@ const parseConversationMessages = (conversationMessages, accountId) => {
     }
   });
 
-  return { allMessages };
+  return { allMessages, queuedMessages };
 };
 
 // Each task pick is a complete (credential, model) choice, so the credential
@@ -552,10 +640,12 @@ const initialState = {
   isProcessing: false,
   currentlyProcessingQuestion: null,
   messages: [],
+  queuedMessages: [],
   conversationStatus: '',
   conversationTitle: '',
   conversationIdAtDb: '',
   isLoading: false,
+  needsConversationRefresh: false,
   availableCredentials: [],
   // Flat (config, model) rows straight from the server. Unlike
   // availableCredentials this keeps every config's own name, so the picker can
@@ -575,6 +665,7 @@ const initialState = {
   configCleared: false,
   // Server-advertised image capability (from ai_list_models). Defaults to
   // disabled so the attach UI stays hidden until the backend confirms support.
+  queueSupport: { enabled: false, maxMessages: 5 },
   imageSupport: { enabled: false, maxPerMessage: 0, maxSizeMb: 0, allowedMimeTypes: [] },
 };
 
@@ -584,6 +675,11 @@ function investigationReducer(state, action) {
       return {
         ...state,
         messages: typeof action.payload === 'function' ? action.payload(state.messages) : action.payload,
+      };
+    case 'SET_QUEUED_MESSAGES':
+      return {
+        ...state,
+        queuedMessages: typeof action.payload === 'function' ? action.payload(state.queuedMessages) : action.payload,
       };
     case 'SET_CONVERSATION_STATUS':
       return { ...state, conversationStatus: action.payload };
@@ -633,6 +729,7 @@ function investigationReducer(state, action) {
           availableModels: action.availableModels ?? state.availableModels,
           defaultModel: action.defaultModel,
           imageSupport: action.imageSupport ?? state.imageSupport,
+          queueSupport: action.queueSupport ?? state.queueSupport,
         },
         action.availableModels
       );
@@ -649,13 +746,14 @@ function investigationReducer(state, action) {
         availableModels: state.availableModels,
         defaultModel: state.defaultModel,
         imageSupport: state.imageSupport,
+        queueSupport: state.queueSupport,
       };
     default:
       return state;
   }
 }
 
-export const useLLMInvestigationControl = (accountId) => {
+export const useLLMInvestigationControl = (accountId, eventId) => {
   const [state, dispatch] = useReducer(investigationReducer, initialState);
 
   const {
@@ -678,6 +776,7 @@ export const useLLMInvestigationControl = (accountId) => {
   } = state;
 
   const currentSessionRef = useRef('');
+  const investigationGenerationRef = useRef(0);
   const isMountedRef = useRef(true);
   const fetchIdRef = useRef(0);
   const abortControllerRef = useRef(null);
@@ -719,55 +818,77 @@ export const useLLMInvestigationControl = (accountId) => {
       return;
     }
     let cancelled = false;
+    let retryTimer;
 
-    apiAskNudgebee
-      .listModels(accountId)
-      .then((res) => {
-        if (!isMountedRef.current || cancelled) return;
-        // credentials[] is the server's collapsed view: one entry per distinct
-        // destination (provider + endpoint + key + type + version + region +
-        // aws creds + adapter), each carrying the models reachable through it.
-        // Only the server can compute this — endpoints and api keys are never
-        // serialized — so no grouping happens here.
-        //
-        // sources[] is not for display. It maps every configured slot that
-        // resolves to this credential, so a conversation pinned to e.g.
-        // '…:tier:summary' still resolves to the credential that now
-        // represents it.
-        const availableCredentials = (res?.data?.credentials || []).map((c) => ({
-          id: c.id,
-          name: c.name,
-          provider: c.provider,
-          configSource: c.llm_config_source,
-          sources: (c.sources || []).map((s) => s.llm_config_source),
-          models: (c.models || []).map((m) => ({ model: m.model })),
-        }));
-        // models[] is the ungrouped view: one row per configured slot, each
-        // naming its own config. credentials[] folds these together by
-        // destination, which loses the per-config names the picker lists.
-        const availableModels = (res?.data?.models || []).map((m) => ({
-          model: m.model,
-          provider: m.provider,
-          configSource: m.llm_config_source,
-          configName: m.config_name,
-          isFallback: !!m.is_fallback,
-        }));
-        const defaultModel = res?.data?.default || null;
-        const rawImageSupport = res?.data?.image_support;
-        const imageSupport = rawImageSupport
-          ? {
-              enabled: !!rawImageSupport.enabled,
-              maxPerMessage: rawImageSupport.max_per_message || 0,
-              maxSizeMb: rawImageSupport.max_size_mb || 0,
-              allowedMimeTypes: rawImageSupport.allowed_mime_types || [],
-            }
-          : undefined;
-        dispatch({ type: 'SET_MODELS', availableCredentials, availableModels, defaultModel, imageSupport });
-      })
-      .catch((err) => console.error('Failed to fetch models', err));
+    const loadModels = () =>
+      apiAskNudgebee
+        .listModels(accountId)
+        .then((res) => {
+          if (!isMountedRef.current || cancelled) return;
+          if (res?.errors?.length || !res?.data) {
+            throw new Error('Unable to load model capabilities');
+          }
+          // credentials[] is the server's collapsed view: one entry per distinct
+          // destination (provider + endpoint + key + type + version + region +
+          // aws creds + adapter), each carrying the models reachable through it.
+          // Only the server can compute this — endpoints and api keys are never
+          // serialized — so no grouping happens here.
+          //
+          // sources[] is not for display. It maps every configured slot that
+          // resolves to this credential, so a conversation pinned to e.g.
+          // '…:tier:summary' still resolves to the credential that now
+          // represents it.
+          const availableCredentials = (res?.data?.credentials || []).map((c) => ({
+            id: c.id,
+            name: c.name,
+            provider: c.provider,
+            configSource: c.llm_config_source,
+            sources: (c.sources || []).map((s) => s.llm_config_source),
+            models: (c.models || []).map((m) => ({ model: m.model })),
+          }));
+          // models[] is the ungrouped view: one row per configured slot, each
+          // naming its own config. credentials[] folds these together by
+          // destination, which loses the per-config names the picker lists.
+          const availableModels = (res?.data?.models || []).map((m) => ({
+            model: m.model,
+            provider: m.provider,
+            configSource: m.llm_config_source,
+            configName: m.config_name,
+            isFallback: !!m.is_fallback,
+          }));
+          const defaultModel = res?.data?.default || null;
+          const rawImageSupport = res?.data?.image_support;
+          const imageSupport = rawImageSupport
+            ? {
+                enabled: !!rawImageSupport.enabled,
+                maxPerMessage: rawImageSupport.max_per_message || 0,
+                maxSizeMb: rawImageSupport.max_size_mb || 0,
+                allowedMimeTypes: rawImageSupport.allowed_mime_types || [],
+              }
+            : undefined;
+          dispatch({
+            type: 'SET_MODELS',
+            availableCredentials,
+            availableModels,
+            defaultModel,
+            imageSupport,
+            queueSupport: {
+              enabled: !!res?.data?.queue_support?.enabled,
+              maxMessages: res?.data?.queue_support?.max_messages > 0 ? res.data.queue_support.max_messages : 5,
+            },
+          });
+        })
+        .catch((err) => {
+          if (cancelled) return;
+          console.error('Failed to fetch models', err);
+          // A server restart must not leave queuing disabled until a page reload.
+          retryTimer = setTimeout(loadModels, 5000);
+        });
+    loadModels();
 
     return () => {
       cancelled = true;
+      clearTimeout(retryTimer);
     };
   }, [accountId]);
 
@@ -788,6 +909,7 @@ export const useLLMInvestigationControl = (accountId) => {
       }
 
       const sessionKey = currentSessionRef.current;
+      let investigationGeneration = investigationGenerationRef.current;
       try {
         dispatch({ type: 'SET_IS_PROCESSING', payload: true });
 
@@ -796,12 +918,26 @@ export const useLLMInvestigationControl = (accountId) => {
           conversationId: conversationId,
         });
 
-        if (!isMountedRef.current || currentSessionRef.current !== sessionKey) return;
+        if (!isMountedRef.current || currentSessionRef.current !== sessionKey || investigationGenerationRef.current !== investigationGeneration)
+          return;
 
         const response = res?.data?.data?.ai_cancel_investigation || {};
 
         if (response?.data?.status === 'terminated') {
-          dispatch({ type: 'SET_ALLOW_STOP', payload: false });
+          // The cancellation response confirms the transaction committed. Retire
+          // older polls so they cannot restore an in-progress snapshot afterward.
+          fetchIdRef.current++;
+          investigationGeneration = ++investigationGenerationRef.current;
+          dispatch({
+            type: 'UPDATE_CONVERSATION_META',
+            fields: {
+              conversationStatus: 'TERMINATED',
+              currentlyProcessingQuestion: null,
+              allowStop: false,
+              isProcessing: false,
+              needsConversationRefresh: true,
+            },
+          });
           snackbar.success('Investigation terminated successfully');
           if (onStopSuccess) {
             onStopSuccess();
@@ -811,11 +947,11 @@ export const useLLMInvestigationControl = (accountId) => {
         }
       } catch (error) {
         console.error('Error stopping investigation:', error);
-        if (isMountedRef.current && currentSessionRef.current === sessionKey) {
+        if (isMountedRef.current && currentSessionRef.current === sessionKey && investigationGenerationRef.current === investigationGeneration) {
           snackbar.error('An error occurred while stopping the investigation');
         }
       } finally {
-        if (isMountedRef.current && currentSessionRef.current === sessionKey) {
+        if (isMountedRef.current && currentSessionRef.current === sessionKey && investigationGenerationRef.current === investigationGeneration) {
           dispatch({ type: 'SET_IS_PROCESSING', payload: false });
         }
       }
@@ -826,6 +962,7 @@ export const useLLMInvestigationControl = (accountId) => {
   const handleWorkflowGeneration = useCallback(
     async (finalQuery, llmSessionId, workflowId, workflowDefinition, currentCluster, onSuccess) => {
       const sessionKey = currentSessionRef.current;
+      const investigationGeneration = investigationGenerationRef.current;
       const userSession = getUserSession();
       const config = {
         ...(selectedModel && {
@@ -859,9 +996,10 @@ export const useLLMInvestigationControl = (accountId) => {
         true
       );
 
-      if (!isMountedRef.current || currentSessionRef.current !== sessionKey) return;
-
       const response = res?.data?.ai_generate_workflow?.data ?? {};
+      // Settle this submission independently of whether it still owns the conversation UI.
+      if (!isMountedRef.current || currentSessionRef.current !== sessionKey || investigationGenerationRef.current !== investigationGeneration)
+        return Boolean(response.query || response.response);
 
       if (!response?.query && !response?.response) {
         const errorMessage = res?.errors?.[0]?.message;
@@ -898,32 +1036,45 @@ export const useLLMInvestigationControl = (accountId) => {
   );
 
   const handleInvestigationGeneration = useCallback(
-    async (finalQuery, llmSessionId, onSuccess, categorySource, images) => {
+    async (finalQuery, llmSessionId, onSuccess, categorySource, images, optimisticMessageId) => {
       const sessionKey = currentSessionRef.current;
+      const investigationGeneration = investigationGenerationRef.current;
       const requestPayload = {
         account_id: accountId,
         query: finalQuery,
         session_id: llmSessionId,
+        ...(conversationIdAtDb && { conversation_id: conversationIdAtDb }),
       };
 
-      if (selectedModel) {
-        requestPayload.config = {
+      // selectedTierModels is null or non-empty in practice (both the reducer's
+      // own cleanup and the picker normalize an empty selection to null), but
+      // checking key count directly rather than truthiness means that stays
+      // true even if a future producer doesn't — {} is truthy in JS, so a bare
+      // `!selectedTierModels` would silently skip the selectedConfig/
+      // configCleared branches below for an empty-but-non-null value.
+      const hasTierModels = selectedTierModels && Object.keys(selectedTierModels).length > 0;
+      const config = {
+        ...(selectedModel && {
           llm_provider: selectedModel.provider,
           llm_model_name: selectedModel.model,
           ...(selectedModel.configSource && { llm_config_source: selectedModel.configSource }),
-        };
-      } else if (selectedTierModels && Object.keys(selectedTierModels).length > 0) {
-        requestPayload.config = {
-          llm_tier_models: serializeTierModels(selectedTierModels),
-        };
-      } else if (selectedConfig) {
+        }),
+        ...(!selectedModel &&
+          hasTierModels && {
+            llm_tier_models: serializeTierModels(selectedTierModels),
+          }),
         // No provider/model: the config's own per-task models decide, and the
         // server rejects a model sent alongside a whole-config pin.
-        requestPayload.config = { llm_config_source: selectedConfig.configSource };
-      } else if (configCleared) {
+        ...(!selectedModel && !hasTierModels && selectedConfig && { llm_config_source: selectedConfig.configSource }),
         // Carries the picker's "Clear all" to the server. Sending nothing would
         // leave the conversation's stored config in force.
-        requestPayload.config = { llm_config_reset: true };
+        ...(configCleared && !selectedModel && !hasTierModels && !selectedConfig && { llm_config_reset: true }),
+        // Scopes the turn to the event under investigation, so an automation the
+        // model triggers gets tagged back to it (see tool_workflow_automation.go).
+        ...(eventId && { event_id: eventId }),
+      };
+      if (Object.keys(config).length > 0) {
+        requestPayload.config = config;
       }
 
       if (categorySource) {
@@ -936,9 +1087,10 @@ export const useLLMInvestigationControl = (accountId) => {
 
       const res = await apiAskNudgebee.aiGenerateInvestigate(requestPayload);
 
-      if (!isMountedRef.current || currentSessionRef.current !== sessionKey) return;
-
       const response = res?.data?.data?.ai_execute_investigation ?? {};
+      // Settle this submission independently of whether it still owns the conversation UI.
+      if (!isMountedRef.current || currentSessionRef.current !== sessionKey || investigationGenerationRef.current !== investigationGeneration)
+        return Boolean(response.data?.query);
 
       if (!response?.data?.query) {
         const status = getUpstreamStatus(res?.data);
@@ -947,6 +1099,31 @@ export const useLLMInvestigationControl = (accountId) => {
         throw new Error('Investigation generation failed');
       }
 
+      if (response.data.status === 'QUEUED' && response.data.message_id) {
+        // This request raced with active work on the server. Retire only its
+        // optimistic bubble; the persisted message belongs in the waiting list.
+        if (optimisticMessageId) {
+          dispatch({ type: 'SET_MESSAGES', payload: (previous) => previous.filter((m) => m.id !== optimisticMessageId) });
+        }
+        dispatch({
+          type: 'SET_QUEUED_MESSAGES',
+          payload: (previous) =>
+            previous.some((m) => m.id === response.data.message_id)
+              ? previous
+              : [
+                  ...previous,
+                  {
+                    id: response.data.message_id,
+                    text: finalQuery,
+                    images: images || [],
+                    createdAt: Date.now(),
+                    user: 'You',
+                    isServer: true,
+                  },
+                ],
+        });
+        dispatch({ type: 'UPDATE_CONVERSATION_META', fields: { currentlyProcessingQuestion: null, isProcessing: false } });
+      }
       dispatch({ type: 'SET_CONVERSATION_STATUS', payload: 'IN_PROGRESS' });
       // The reset is one-shot: it has reached the server, and re-sending it on
       // every later turn would keep clearing a config the user may have since
@@ -958,12 +1135,13 @@ export const useLLMInvestigationControl = (accountId) => {
         onSuccess(llmSessionId);
       }
     },
-    [accountId, selectedModel, selectedTierModels, selectedConfig, configCleared]
+    [accountId, conversationIdAtDb, eventId, selectedModel, selectedTierModels, selectedConfig, configCleared]
   );
 
   const startInvestigation = useCallback(
     async ({
       text,
+      optimisticMessageId,
       queryPrefix: _queryPrefix,
       querySuffix,
       selectedSessionId,
@@ -980,18 +1158,25 @@ export const useLLMInvestigationControl = (accountId) => {
         return;
       }
 
+      investigationGenerationRef.current += 1;
+      const sessionKey = currentSessionRef.current;
+      const investigationGeneration = investigationGenerationRef.current;
       const finalQuery = querySuffix ? `${text} ${querySuffix}` : text;
-      const llmSessionId = selectedSessionId || uuidv4();
+      const llmSessionId = selectedSessionId || (apiMode === 'investigate' && conversationIdAtDb ? undefined : uuidv4());
 
       dispatch({ type: 'UPDATE_CONVERSATION_META', fields: { currentlyProcessingQuestion: finalQuery, isProcessing: true } });
 
       try {
         if (apiMode === 'workflow') {
-          await handleWorkflowGeneration(finalQuery, llmSessionId, workflowId, workflowDefinition, currentCluster, onSuccess);
+          return (await handleWorkflowGeneration(finalQuery, llmSessionId, workflowId, workflowDefinition, currentCluster, onSuccess)) !== false;
         } else {
-          await handleInvestigationGeneration(finalQuery, llmSessionId, onSuccess, categorySource, images);
+          return (await handleInvestigationGeneration(finalQuery, llmSessionId, onSuccess, categorySource, images, optimisticMessageId)) !== false;
         }
       } catch (error) {
+        // A late failure belongs to the submitted conversation, not whichever
+        // conversation/account the user has opened while the request was pending.
+        if (!isMountedRef.current || currentSessionRef.current !== sessionKey || investigationGenerationRef.current !== investigationGeneration)
+          return false;
         console.error(error);
         dispatch({ type: 'INVESTIGATION_FAILED' });
 
@@ -1003,12 +1188,14 @@ export const useLLMInvestigationControl = (accountId) => {
         if (onFailure) {
           onFailure();
         }
+        return false;
       }
     },
-    [accountId, handleWorkflowGeneration, handleInvestigationGeneration]
+    [accountId, conversationIdAtDb, handleWorkflowGeneration, handleInvestigationGeneration]
   );
 
   const resetInvestigationState = useCallback(() => {
+    investigationGenerationRef.current += 1;
     // Abort any in-flight requests and invalidate pending fetches
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
@@ -1022,10 +1209,12 @@ export const useLLMInvestigationControl = (accountId) => {
   }, []);
 
   const fetchConversation = useCallback(
-    async (sessionId, conversationId, source, isNewChat) => {
+    async (sessionId, conversationId, source, isNewChat, forceFull = false) => {
       if ((!sessionId && !conversationId) || (isNewChat && source === 'poll')) {
         return;
       }
+
+      if (forceFull) conversationFetcherRef.current?.reset();
 
       // Abort previous in-flight request when starting a new non-poll fetch
       if (source !== 'poll' && abortControllerRef.current) {
@@ -1103,11 +1292,15 @@ export const useLLMInvestigationControl = (accountId) => {
           if (['COMPLETED', 'FAILED', 'KILLED', 'TERMINATED'].includes(response.status)) {
             const msgs = response.llm_conversation_messages || [];
             const hasWaitingMessages = msgs.some((m) => m.message_type !== 'followup' && m.status === 'WAITING');
-            const hasActiveMessages = msgs.some((m) => m.message_type !== 'followup' && ['IN_PROGRESS', 'WAITING'].includes(m.status));
+            const hasActiveMessages = msgs.some(
+              (m) => m.message_type !== 'followup' && ['IN_PROGRESS', 'WAITING', 'WAITING_FOR_CLIENT_TOOL'].includes(m.status)
+            );
             if (hasWaitingMessages) {
               effectiveStatus = 'WAITING';
             } else if (hasActiveMessages) {
-              effectiveStatus = 'IN_PROGRESS';
+              effectiveStatus = msgs.some((m) => m.message_type !== 'followup' && m.status === 'WAITING_FOR_CLIENT_TOOL')
+                ? 'WAITING_FOR_CLIENT_TOOL'
+                : 'IN_PROGRESS';
             }
           }
           if (!isStale()) {
@@ -1117,6 +1310,7 @@ export const useLLMInvestigationControl = (accountId) => {
                 conversationTitle: conversationResponses[0].title,
                 conversationIdAtDb: conversationResponses[0].id,
                 conversationStatus: effectiveStatus,
+                needsConversationRefresh: false,
               },
             });
           }
@@ -1184,8 +1378,9 @@ export const useLLMInvestigationControl = (accountId) => {
             dispatch({ type: 'SET_ALLOW_STOP', payload: true });
           }
 
-          const { allMessages } = parseConversationMessages(response.llm_conversation_messages, accountId);
+          const { allMessages, queuedMessages } = parseConversationMessages(response.llm_conversation_messages, accountId);
           if (!isNewChat && !isStale()) {
+            dispatch({ type: 'SET_QUEUED_MESSAGES', payload: queuedMessages });
             dispatch({
               type: 'SET_MESSAGES',
               payload: (prev) => {
@@ -1233,7 +1428,7 @@ export const useLLMInvestigationControl = (accountId) => {
             const isTerminalStatus = ['COMPLETED', 'FAILED', 'KILLED', 'TERMINATED'].includes(effectiveStatus);
             const isWaitingStatus = effectiveStatus === 'WAITING';
             if (isTerminalStatus || isWaitingStatus) {
-              dispatch({ type: 'SET_CURRENTLY_PROCESSING_QUESTION', payload: null });
+              dispatch({ type: 'UPDATE_CONVERSATION_META', fields: { currentlyProcessingQuestion: null, isProcessing: false } });
             }
           }
         } else if (!isStale() && source !== 'poll') {
@@ -1283,9 +1478,84 @@ export const useLLMInvestigationControl = (accountId) => {
     [accountId]
   );
 
+  const queueInvestigationMessage = useCallback(
+    async ({ text, images }) => {
+      if (!text || !text.trim()) return null;
+      const sessionKey = currentSessionRef.current;
+      const requestPayload = {
+        account_id: accountId,
+        query: text.trim(),
+        queue_only: true,
+        session_id: currentSessionRef.current || undefined,
+      };
+      if (conversationIdAtDb) {
+        requestPayload.conversation_id = conversationIdAtDb;
+      }
+      if (selectedModel) {
+        requestPayload.config = {
+          llm_provider: selectedModel.provider,
+          llm_model_name: selectedModel.model,
+          ...(selectedModel.configSource && { llm_config_source: selectedModel.configSource }),
+        };
+      } else if (selectedTierModels && Object.keys(selectedTierModels).length > 0) {
+        requestPayload.config = {
+          llm_tier_models: serializeTierModels(selectedTierModels),
+        };
+      } else if (selectedConfig) {
+        requestPayload.config = { llm_config_source: selectedConfig.configSource };
+      }
+      if (images?.length) {
+        requestPayload.images = images;
+      }
+      const res = await apiAskNudgebee.aiGenerateInvestigate(requestPayload);
+      const result = res?.data?.data?.ai_execute_investigation;
+      const errors = res?.data?.errors?.length ? res.data.errors : result?.errors;
+      if ((Array.isArray(errors) && errors.length > 0) || result?.data?.status !== 'QUEUED' || !result?.data?.message_id) {
+        const error = new Error(errors?.[0]?.message || 'Unable to queue message. Please try again.');
+        error.queueNotReady =
+          getUpstreamStatus(res?.data) === 409 && error.message === 'Conversation is not ready to queue a message. Please retry your message.';
+        // Only explicit queue-admission rejections prove nothing was saved.
+        error.notAdmitted =
+          getUpstreamStatus(res?.data) === 409 &&
+          [
+            'Conversation is not ready to queue a message. Please retry your message.',
+            'history: conversation is no longer running; retry your message',
+            'history: queued message capacity reached',
+          ].includes(error.message);
+        throw error;
+      }
+      if (isMountedRef.current && currentSessionRef.current === sessionKey && result.data.status === 'QUEUED' && result.data.message_id) {
+        dispatch({
+          type: 'SET_QUEUED_MESSAGES',
+          payload: (previous) =>
+            previous.some((m) => m.id === result.data.message_id)
+              ? previous
+              : [
+                  ...previous,
+                  {
+                    id: result.data.message_id,
+                    text: text.trim(),
+                    images: images || [],
+                    createdAt: Date.now(),
+                    user: 'You',
+                    isServer: true,
+                  },
+                ],
+        });
+      }
+      return result.data;
+    },
+    [accountId, conversationIdAtDb, selectedModel, selectedTierModels, selectedConfig]
+  );
+
   return {
     messages,
     setMessages,
+    queuedMessages: state.queuedMessages,
+    queueSupport: state.queueSupport,
+    needsConversationRefresh: state.needsConversationRefresh,
+    setQueuedMessages: (msgs) => dispatch({ type: 'SET_QUEUED_MESSAGES', payload: msgs }),
+    queueInvestigationMessage,
     conversationStatus,
     setConversationStatus,
     conversationTitle,

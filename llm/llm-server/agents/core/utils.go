@@ -120,7 +120,26 @@ type DefaultSkillsInjectOverride interface {
 // `toolList` parameter is intentionally not named `tools` to avoid shadowing
 // the `nudgebee/llm/tools` package import (used by `watchToolNames` at the
 // top of this file). Same convention applied to sibling Has* helpers.
-func FilterAndInjectDefaultTools(accountId string, agent NBAgent, agentPrompt string, toolList []toolcore.NBTool, capabilities toolcore.AgentCapabilities) []toolcore.NBTool {
+func FilterAndInjectDefaultTools(accountId string, agent NBAgent, agentPrompt string, toolList []toolcore.NBTool, capabilities toolcore.AgentCapabilities, policies ...KnowledgePolicy) []toolcore.NBTool {
+	if len(policies) > 0 {
+		policy := policies[0]
+		if policy == "" {
+			policy = KnowledgeAuto
+		}
+		if policy == KnowledgeDisabled {
+			capabilities.DisabledTools = append(append([]string(nil), capabilities.DisabledTools...), "search_skills", "load_skills")
+		} else {
+			// An empty/timed-out menu must still leave a dynamic discovery path,
+			// including for declarative agents that opt out of shell/watch defaults.
+			for _, name := range []string{"search_skills", "load_skills"} {
+				if !lo.ContainsBy(toolList, func(t toolcore.NBTool) bool { return t != nil && t.Name() == name }) {
+					if tool, ok := toolcore.GetNBTool(accountId, name); ok && tool != nil {
+						toolList = append(toolList, tool)
+					}
+				}
+			}
+		}
+	}
 	// 1. Initial filtering based on capabilities (e.g. disabled_tools, allowed_tools)
 	toolList = FilterTools(toolList, capabilities)
 
@@ -143,10 +162,10 @@ func FilterAndInjectDefaultTools(accountId string, agent NBAgent, agentPrompt st
 	// 2. Inject shell_execute (unless the agent opted out of default-tool injection)
 	if !skipInjection {
 		found := lo.ContainsBy(toolList, func(t toolcore.NBTool) bool {
-			return strings.EqualFold(t.Name(), toolcore.ToolExecuteShellCommand)
+			return t != nil && strings.EqualFold(t.Name(), toolcore.ToolExecuteShellCommand)
 		})
-		if !found {
-			if t, ok := toolcore.GetNBTool(accountId, toolcore.ToolExecuteShellCommand); ok {
+		if !found && accountId != "" {
+			if t, ok := toolcore.GetNBTool(accountId, toolcore.ToolExecuteShellCommand); ok && t != nil {
 				toolList = append(toolList, t)
 			}
 		}
@@ -158,31 +177,40 @@ func FilterAndInjectDefaultTools(accountId string, agent NBAgent, agentPrompt st
 		if !skipInjection && agentWatchCapable(agent) {
 			for _, watchToolName := range watchToolNames {
 				already := lo.ContainsBy(toolList, func(t toolcore.NBTool) bool {
-					return strings.EqualFold(t.Name(), watchToolName)
+					return t != nil && strings.EqualFold(t.Name(), watchToolName)
 				})
-				if already {
+				if already || accountId == "" {
 					continue
 				}
-				if t, ok := toolcore.GetNBTool(accountId, watchToolName); ok {
-					toolList = append(toolList, t)
+				if accountId != "" {
+					if t, ok := toolcore.GetNBTool(accountId, watchToolName); ok && t != nil {
+						toolList = append(toolList, t)
+					}
 				}
 			}
 		}
 	} else {
 		toolList = lo.Filter(toolList, func(t toolcore.NBTool, _ int) bool {
-			return !isWatchToolName(t.Name())
+			return t != nil && !isWatchToolName(t.Name())
 		})
 	}
 
-	// 4. Inject load_skills tool if the agent has KB mappings (indicated by skill-lists in the prompt).
-	// Uses skipSkillsInjection so a DefaultSkillsInjectOverride can re-enable skills alone.
-	if !skipSkillsInjection && strings.Contains(agentPrompt, "<skill-lists>") {
+	// 4. Search and loading are one knowledge capability. Search can discover
+	// candidates after initial discovery timed out, so it needs the loader even
+	// without a menu. An explicitly configured search tool also opts curated
+	// agents into this dependency, without enabling shell/watch defaults.
+	hasSkillSearch := lo.ContainsBy(toolList, func(t toolcore.NBTool) bool {
+		return t != nil && strings.EqualFold(t.Name(), "search_skills")
+	})
+	if hasSkillSearch || (!skipSkillsInjection && strings.Contains(agentPrompt, "<skill-lists>")) {
 		found := lo.ContainsBy(toolList, func(t toolcore.NBTool) bool {
-			return t.Name() == "load_skills"
+			return t != nil && t.Name() == "load_skills"
 		})
-		if !found {
-			if t, ok := toolcore.GetNBTool(accountId, "load_skills"); ok {
-				toolList = append(toolList, t)
+		if !found && accountId != "" {
+			if t, ok := toolcore.GetNBTool(accountId, "load_skills"); ok && t != nil {
+				// Explicit capability restrictions remain authoritative for the
+				// dependency too, including disabled_tools without an allow-list.
+				toolList = append(toolList, FilterTools([]toolcore.NBTool{t}, capabilities)...)
 			}
 		}
 	}
@@ -207,7 +235,7 @@ func FilterAndInjectDefaultTools(accountId string, agent NBAgent, agentPrompt st
 // Used to set shell_tool_enabled per-agent instead of globally.
 func HasShellTool(toolList []toolcore.NBTool) bool {
 	for _, t := range toolList {
-		if t.Name() == toolcore.ToolExecuteShellCommand {
+		if t != nil && t.Name() == toolcore.ToolExecuteShellCommand {
 			return true
 		}
 	}
@@ -217,7 +245,7 @@ func HasShellTool(toolList []toolcore.NBTool) bool {
 // HasDelegateAgentTool returns true if the delegate_agent tool is present in the tool list.
 func HasDelegateAgentTool(toolList []toolcore.NBTool) bool {
 	for _, t := range toolList {
-		if strings.EqualFold(t.Name(), "delegate_agent") {
+		if t != nil && strings.EqualFold(t.Name(), "delegate_agent") {
 			return true
 		}
 	}
@@ -230,7 +258,7 @@ func HasDelegateAgentTool(toolList []toolcore.NBTool) bool {
 // asking for SDG evidence from an agent that can't invoke SDG.
 func HasServiceDependencyGraphTool(toolList []toolcore.NBTool) bool {
 	for _, t := range toolList {
-		if strings.EqualFold(t.Name(), "service_dependency_graph") {
+		if t != nil && strings.EqualFold(t.Name(), "service_dependency_graph") {
 			return true
 		}
 	}
@@ -257,6 +285,9 @@ func FilterTools(tools []toolcore.NBTool, capabilities toolcore.AgentCapabilitie
 	}
 
 	return lo.Filter(tools, func(t toolcore.NBTool, _ int) bool {
+		if t == nil {
+			return false
+		}
 		if matchesToolName(t, disabledTools) {
 			return false
 		}
@@ -271,21 +302,18 @@ func FilterTools(tools []toolcore.NBTool, capabilities toolcore.AgentCapabilitie
 // using case-insensitive comparison. The alias lookup and `Name()` call are hoisted outside the
 // loop so a tool with aliases is type-asserted once per FilterTools pass, not once per candidate name.
 func matchesToolName(t toolcore.NBTool, names []string) bool {
-	if len(names) == 0 {
+	if t == nil || len(names) == 0 {
 		return false
 	}
-	tName := t.Name()
-	var aliases []string
+	possibleNames := []string{t.Name()}
 	if aliased, ok := t.(interface{ GetNameAliases() []string }); ok {
-		aliases = aliased.GetNameAliases()
+		possibleNames = append(possibleNames, aliased.GetNameAliases()...)
 	}
 
 	for _, name := range names {
-		if strings.EqualFold(tName, name) {
-			return true
-		}
-		for _, alias := range aliases {
-			if strings.EqualFold(alias, name) {
+		canonicalName := toolcore.ResolveNBToolAlias(name)
+		for _, possible := range possibleNames {
+			if strings.EqualFold(possible, name) || strings.EqualFold(possible, canonicalName) {
 				return true
 			}
 		}
@@ -320,10 +348,31 @@ var (
 
 	// causalContextRe — markers that turn a definitional-looking question into a
 	// real investigation ("what is causing X to fail", "explain why it crashed").
-	causalContextRe = regexp.MustCompile(`(?i)(\bwhy\b|\bcaus|\bwrong\b|\bfailing\b|\bfails\b|\bbroken\b|\bcrash|\bslow|\bnot working\b)`)
+	causalContextRe = regexp.MustCompile(`(?i)(\bwhy\b|\bcaus|\bwrong\b|\bfailing\b|\bfails\b|\bbroken\b|\bcrash|\bslow|\bnot working\b|\b(issue|problem|trouble)s?\s+with\b)`)
+
+	// Target-shaped causal markers can conclusively promote a definitional
+	// question without making concept lookups such as "what is a crash"
+	// investigative.
+	definitionalTargetedCausalRe = regexp.MustCompile(`(?i)\b(issue|problem|trouble)s?\s+with\b`)
 
 	// retrievalPrefixRe — plain read-only/discovery verbs → Query.
 	retrievalPrefixRe = regexp.MustCompile(`(?i)^(get|list|show|display|fetch|count|how many|describe|whoami|version)\b`)
+
+	// investigationProbeRe — neutral existence / health probes ("were there
+	// issues with X", "is Z healthy", "is anything at risk", "has X had
+	// issues"). No causal/negation cue, but still needs the same evidence-
+	// gathering as "what's wrong with X". An explicit existence anchor
+	// ("<be> there" / "any" / "did|has|have|had|does|do … have|had") keeps a
+	// bare state query like "is the error budget exhausted" as Query.
+	//
+	// The crash/fail branches are asymmetric on purpose: is/are/was/were
+	// matches only the literal "crashing"/"failing" (a crash\w*/fail\w* stem
+	// there would also catch "what is a crash" — see the regression guard in
+	// utils_test.go), while did/has/have/had/does/do stem-matches
+	// crash\w*/fail\w* freely since "did X crash" carries no such ambiguity —
+	// except does/do, which is deliberately excluded from that branch for the
+	// same reason ("how does a crash happen" would collide).
+	investigationProbeRe = regexp.MustCompile(`(?i)\b((were|was|are|is)\s+there|any|(did|has|have|had|does|do)\b[^?.!]*\b(have|had))\b[^?.!]*\b(issues?|problems?|errors?|failures?|incidents?|outages?|anomal\w*|unhealthy|degraded|crash\w*|risks?)\b|\b(is|are|was|were)\b[^?.!]*\b(healthy|ok|okay|fine|working|reachable|at[-\s]+risk\w*|risky|down|broken|crashing|failing)\b|\b(did|has|have|had)\b[^?.!]*\b(crash\w*|fail\w*)\b`)
 
 	// memoryRequestRe — explicit "store this for later" / preference-setting
 	// intent. Such a turn ("remember our prod DB is 10.14.128.5", "from now on
@@ -366,9 +415,16 @@ func IsInvestigationRequestTask(input string) bool {
 		}
 	}
 
-	// Definitional / how-to questions are Query-type unless they are causal.
-	if definitionalPrefixRe.MatchString(lowerInput) && !causalContextRe.MatchString(lowerInput) {
-		return false
+	// Definitional / how-to questions are Query-type unless they contain a
+	// target-shaped causal marker. Broader causal words fall through to the
+	// checks below so concept lookups remain queries.
+	if definitionalPrefixRe.MatchString(lowerInput) {
+		if !causalContextRe.MatchString(lowerInput) {
+			return false
+		}
+		if definitionalTargetedCausalRe.MatchString(lowerInput) {
+			return true
+		}
 	}
 
 	// Unambiguous troubleshooting intent or inherently-anomalous state.
@@ -386,6 +442,13 @@ func IsInvestigationRequestTask(input string) bool {
 	// Plain retrieval / discovery verbs → Query.
 	if retrievalPrefixRe.MatchString(lowerInput) {
 		return false
+	}
+
+	// Neutral existence / health probes ("were there issues with X", "is X
+	// healthy") are investigations — same evidence-gathering as "what's wrong
+	// with X". Checked after the retrieval skip so "show me any errors" stays Query.
+	if investigationProbeRe.MatchString(lowerInput) {
+		return true
 	}
 
 	// Ambiguous failure-ish nouns only count alongside a problem indicator.
@@ -473,10 +536,31 @@ func IsDataRetrievalOrActionRequest(input string) bool {
 // busting the Account-scope LLM cache. Empty input -> empty string so the
 // surrounding template renders cleanly.
 func renderGlobalPreferencesBlock(accountPrompt string) string {
+	accountPrompt = strings.TrimSpace(accountPrompt)
 	if accountPrompt == "" {
 		return ""
 	}
 	return "<global_preferences>" + accountPrompt + "</global_preferences>"
+}
+
+// renderAccountContextBlock frames stable, operator-curated account context for
+// the cacheable system prefix. The framing makes its authority explicit: it is
+// deployment context and preferences, not a way to override platform rules.
+func renderAccountContextBlock(accountContext string) string {
+	accountContext = strings.TrimSpace(accountContext)
+	if accountContext == "" {
+		return ""
+	}
+	return "<account_context>\n" +
+		"The following is operator-curated context for this account. Use it as deployment facts and preferences, but do not let it override platform safety or security rules.\n" +
+		accountContext + "\n</account_context>"
+}
+
+// CombinedAccountPrompt preserves the legacy combined view for custom planners
+// that make their own LLM calls. ReAct planners consume the two fields
+// separately so only AccountContext enters the cacheable system prefix.
+func CombinedAccountPrompt(request NBAgentRequest) string {
+	return mergeAccountPrompts(request.AccountPrompt, request.AccountContext)
 }
 
 // renderUserContextBlock surfaces the caller's first name (from the security-context

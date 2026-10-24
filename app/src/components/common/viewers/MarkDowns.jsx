@@ -2,7 +2,7 @@ import { Box } from '@mui/material';
 import { useRef, useEffect, useState, useMemo } from 'react';
 import PropTypes from 'prop-types';
 import dynamic from 'next/dynamic';
-import { marked } from 'marked';
+import { marked, Marked } from 'marked';
 import DOMPurify from 'dompurify';
 import { withErrorBoundary, reportHandledError } from '@shared/ErrorBoundary';
 import { ds } from 'src/utils/colors';
@@ -96,6 +96,35 @@ const createMarkdownRenderer = (chartCodes) => {
   return renderer;
 };
 
+// GFM strikethrough in marked also matches a SINGLE tilde pair, so an LLM writing
+// "~5.67 cores (peak ~40.97)" for approximate values gets everything between the two
+// tildes struck through (seen on the Investigation tab of the Investigation Analysis
+// card, and on Ask Nudgebee answers).
+//
+// This is handled in the tokenizer rather than by escaping the source text, because
+// escaping is not idempotent: callers that pre-escaped as well ("~" -> "\~") produced
+// "\\~", which marked renders as a literal backslash followed by a LIVE tilde — the
+// strikethrough came back and a stray "\" appeared with it. A tokenizer rule cannot
+// double-apply, and it leaves code spans and fenced blocks alone for free.
+const doubleTildeOnlyStrikethrough = {
+  tokenizer: {
+    del(src) {
+      const strike = /^~~(?=\S)([\s\S]*?\S)~~/.exec(src);
+      if (strike) {
+        return { type: 'del', raw: strike[0], text: strike[1], tokens: this.lexer.inlineTokens(strike[1]) };
+      }
+      // A lone tilde is the character the author meant: emit it as text so the
+      // built-in single-tilde `del` rule never gets to look at it.
+      return src.startsWith('~') ? { type: 'text', raw: '~', text: '~' } : false;
+    },
+  },
+};
+
+// A private parser instance: `marked.use()` on the module-level singleton would
+// change markdown parsing for any other importer too.
+const markedParser = new Marked();
+markedParser.use(doubleTildeOnlyStrikethrough);
+
 const MARKED_OPTIONS = {
   breaks: true,
   gfm: true,
@@ -161,7 +190,7 @@ const defaultStyles = {
       margin: '0 var(--ds-space-1)',
       fontSize: 'var(--ds-text-caption)',
       color: ds.gray[700],
-      fontFamily: '"Roboto Mono", monospace',
+      fontFamily: ds.font.mono,
       border: `1px solid ${ds.gray[200]}`,
     },
     '& strong, & b': {
@@ -213,7 +242,7 @@ const defaultStyles = {
         margin: '0 var(--ds-space-1)',
         fontSize: 'var(--ds-text-caption)',
         color: ds.gray[700],
-        fontFamily: '"Roboto Mono", monospace',
+        fontFamily: ds.font.mono,
         border: `1px solid ${ds.gray[200]}`,
       },
     },
@@ -247,7 +276,7 @@ const defaultStyles = {
     '& code': {
       color: 'inherit !important',
       fontSize: 'var(--ds-text-body)',
-      fontFamily: '"Roboto Mono", monospace',
+      fontFamily: ds.font.mono,
       lineHeight: 1.6,
       backgroundColor: 'transparent !important',
       padding: 0,
@@ -348,7 +377,7 @@ const defaultStyles = {
     borderRadius: 'var(--ds-radius-sm)',
     padding: 'var(--ds-space-1) var(--ds-space-1)',
     fontSize: 'var(--ds-text-caption)',
-    fontFamily: '"Roboto Mono", monospace',
+    fontFamily: ds.font.mono,
   },
   '& details': {
     marginBottom: 'var(--ds-space-3)',
@@ -387,7 +416,7 @@ function MarkDowns({ data, sx, allowExecutable, canRunCode = true, onLinkClick }
       .split('\n')
       .map((line) => line.trim()) // Removes leading spaces/tabs from every line
       .join('\n');
-    const convertedData = marked(cleanedData, { ...MARKED_OPTIONS, renderer: createMarkdownRenderer(codes) });
+    const convertedData = markedParser.parse(cleanedData, { ...MARKED_OPTIONS, renderer: createMarkdownRenderer(codes) });
     const sanitized = DOMPurify.sanitize(convertedData, {
       ADD_TAGS: ['div', 'svg', 'path', 'g', 'defs', 'marker', 'img'],
       ADD_ATTR: [

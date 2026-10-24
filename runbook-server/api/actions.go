@@ -79,6 +79,8 @@ func (s *Server) handleAction(c *gin.Context) {
 		s.handleValidateWorkflow(c, sc, args)
 	case "workflow_trigger_dryrun", "workflow_dryrun_execute":
 		s.handleDryRunWorkflow(c, sc, args)
+	case "workflow_check_trigger_match":
+		s.handleCheckTriggerMatch(c, sc, args)
 	case "workflow_list_taskdefinitions":
 		s.handleListTasks(c, sc)
 	case "workflow_trigger_task", "workflow_execute_task":
@@ -293,6 +295,30 @@ func parseAccountFilter(args map[string]any) []string {
 	return nil
 }
 
+// mergeEventIntoInputs tags a trigger's inputs with the event it was run
+// against, using the same "event" input key the Nubi automation tool sets
+// (llm/llm-server/tools/tool_workflow_automation.go). executor.go's
+// initial-pass tagging reads inputs["event"]["id"] and upserts it as the
+// nb_event_id search attribute, which is what listExecutionsForEvent queries
+// — so this is the one place a trigger request needs to touch to show up in
+// an event's automation history.
+//
+// A caller-supplied "event" input always wins: an automation the model or
+// user explicitly points at a different event should not be silently
+// re-pointed at the triggering page's event.
+func mergeEventIntoInputs(inputs map[string]any, eventID string) map[string]any {
+	if eventID == "" {
+		return inputs
+	}
+	if inputs == nil {
+		inputs = map[string]any{}
+	}
+	if _, exists := inputs["event"]; !exists {
+		inputs["event"] = map[string]any{"id": eventID}
+	}
+	return inputs
+}
+
 func (s *Server) handleGetWorkflow(c *gin.Context, sc *security.RequestContext, args map[string]any) {
 	accountID, ok := args["account_id"].(string)
 	if !ok || accountID == "" {
@@ -431,6 +457,13 @@ func (s *Server) handleTriggerWorkflow(c *gin.Context, sc *security.RequestConte
 		inputs = i
 	}
 
+	// Tags the run with the event under investigation so it surfaces in that
+	// event's automation history — read here, ahead of the trigger call, so
+	// the tag is in place before the workflow's first search-attribute pass
+	// runs (see mergeEventIntoInputs).
+	eventID, hasEventID := args["event_id"].(string)
+	inputs = mergeEventIntoInputs(inputs, eventID)
+
 	// use_draft_definition routes the trigger to the draft-snapshot path
 	// (canvas "Run current" button) instead of the live version. Event-
 	// resolution callers below never set this flag.
@@ -454,7 +487,7 @@ func (s *Server) handleTriggerWorkflow(c *gin.Context, sc *security.RequestConte
 	}
 
 	// If triggered from an event context, create an event_resolution record to track this execution
-	if eventID, ok := args["event_id"].(string); ok && eventID != "" {
+	if hasEventID && eventID != "" {
 		s.createWorkflowEventResolution(sc, eventID, workflowID, we)
 	}
 
@@ -731,6 +764,33 @@ func (s *Server) handleDryRunWorkflow(c *gin.Context, sc *security.RequestContex
 		"dryrun_id":    dryRunID,
 		"execution_id": executionID,
 	})
+}
+
+// handleCheckTriggerMatch answers "would this event fire this trigger?" for the
+// automation builder's trigger simulator. Read-only, and the trigger comes from
+// the request because the user is usually still editing it.
+func (s *Server) handleCheckTriggerMatch(c *gin.Context, sc *security.RequestContext, args map[string]any) {
+	accountID, ok := args["account_id"].(string)
+	if !ok || accountID == "" {
+		c.JSON(http.StatusBadRequest, buildApiResponse(nil, []error{fmt.Errorf("account_id is required")}))
+		return
+	}
+
+	var req model.CheckTriggerMatchRequest
+	if err := common.DecodeMapToStruct(args, &req); err != nil {
+		s.logger.Warn("invalid trigger-match request from RPC", "error", err)
+		c.JSON(http.StatusBadRequest, buildApiResponse(nil, []error{errors.New("invalid trigger match request payload")}))
+		return
+	}
+
+	resp, err := s.workflowService.CheckTriggerMatch(sc, accountID, req)
+	if err != nil {
+		s.logger.Warn("trigger match check failed from RPC", "error", err)
+		c.JSON(http.StatusBadRequest, buildApiResponse(nil, []error{err}))
+		return
+	}
+
+	c.JSON(http.StatusOK, resp)
 }
 
 func (s *Server) handleListTasks(c *gin.Context, sc *security.RequestContext) {

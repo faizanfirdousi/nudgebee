@@ -1,18 +1,17 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Box, Alert, Typography } from '@mui/material';
-import CodeMirror from '@uiw/react-codemirror';
-import { json } from '@codemirror/lang-json';
-import { yaml } from '@codemirror/lang-yaml';
+import { Box, Typography } from '@mui/material';
 import * as jsYaml from 'js-yaml';
 import { useRouter } from 'next/router';
-import { Modal } from '@shared/modal';
+import { CodeEditor } from '@ui/CodeEditor';
+import { Modal } from '@ui/Modal';
+import { Banner } from '@ui/Banner';
 import { Button } from '@ui/Button';
 import { snackbar } from '@shared/snackbarService';
 import apiWorkflow from '@api1/workflow';
 import type { WorkflowCreateRequest } from '@api1/workflow/types';
 import { parseHttpResponseBodyMessage } from 'src/utils/common';
-import { colors } from 'src/utils/colors';
-import NewToggleButtons from '../NewToggleButtons';
+import { ds } from 'src/utils/colors';
+import { Toggle } from '@ui/Toggle';
 
 type CodeFormat = 'json' | 'yaml';
 
@@ -172,7 +171,6 @@ const CreateWorkflowFromCodeModal: React.FC<CreateWorkflowFromCodeModalProps> = 
     }
   };
 
-  const extensions = useMemo(() => (format === 'json' ? [json()] : [yaml()]), [format]);
   const isValid = !parseError && currentText.trim().length > 0;
   const formatLabel = format.toUpperCase();
   const containerWord = format === 'json' ? 'object' : 'mapping';
@@ -198,45 +196,29 @@ const CreateWorkflowFromCodeModal: React.FC<CreateWorkflowFromCodeModalProps> = 
     >
       <Box sx={{ display: 'flex', flexDirection: 'column', gap: 'var(--ds-space-3)', padding: 'var(--ds-space-4) 0' }}>
         <Box id='wf-code-format-tabs' sx={{ display: 'flex', justifyContent: 'flex-start' }}>
-          <NewToggleButtons options={formatOptions} activeValue={format} onChange={handleFormatChange} size='sm' width='180px' />
+          <Toggle options={formatOptions} activeValue={format} onChange={handleFormatChange} size='sm' width='180px' />
         </Box>
 
         {parseError && (
-          <Alert severity='error'>
-            <Typography variant='body2' sx={{ fontSize: 'var(--ds-text-body)' }}>
-              <strong>{formatLabel} Parse Error:</strong> {parseError}
-            </Typography>
-          </Alert>
-        )}
-        <Box
-          sx={{
-            border: parseError ? `2px solid ${colors.border.error}` : `1px solid ${colors.border.primary}`,
-            borderRadius: 'var(--ds-radius-lg)',
-            height: '480px',
-            overflow: 'auto',
-            backgroundColor: 'var(--ds-background-100)',
-          }}
-        >
-          <CodeMirror
-            value={currentText}
-            height='480px'
-            extensions={extensions}
-            onChange={handleChange}
-            basicSetup={{
-              lineNumbers: true,
-              foldGutter: true,
-              dropCursor: false,
-              allowMultipleSelections: false,
-              indentOnInput: true,
-              bracketMatching: true,
-              closeBrackets: true,
-              autocompletion: true,
-              highlightActiveLine: true,
-              highlightSelectionMatches: true,
-            }}
+          <Banner
+            tone='critical'
+            surface='section'
+            message={
+              <>
+                <strong>{formatLabel} Parse Error:</strong> {parseError}
+              </>
+            }
           />
-        </Box>
-        <Typography sx={{ fontSize: 'var(--ds-text-small)', color: colors.text.secondaryDark }}>
+        )}
+        <CodeEditor
+          value={currentText}
+          onChange={handleChange}
+          language={format}
+          height='480px'
+          showLanguageLabel={false}
+          error={Boolean(parseError)}
+        />
+        <Typography sx={{ fontSize: 'var(--ds-text-small)', color: ds.gray[400] }}>
           The {formatLabel} must include a <strong>name</strong> string and a <strong>definition</strong> {containerWord}. <strong>tags</strong> and{' '}
           <strong>status</strong> are optional.
         </Typography>

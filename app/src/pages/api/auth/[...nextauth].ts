@@ -36,6 +36,7 @@ import {
 import { adapterUserUpdateDataOnUserRoles, groupBelongsToTenant } from '@lib/userPermissionMapper';
 import { pickDefaultTenant } from '@lib/defaultTenant';
 import { findTenantByDomain } from '@lib/tenantLookup';
+import { dummyCredsAdminEmail } from '@lib/dummyCredsAdmin';
 import { getLicenseDetails, SERVICES_SERVER_UNREACHABLE_MSG, type LicenseTier } from '@lib/license';
 import { enrichAuthToken, enrichSession, onReturningOAuthSignIn, onUnknownOAuthSignIn, resolveLicensedTenantUser } from '@lib/authHooks';
 
@@ -126,6 +127,21 @@ export async function adapterUser(user: any): Promise<NudgebeeUser> {
   const selectedTenant = pickDefaultTenant(user);
   if (selectedTenant) {
     tenant = selectedTenant;
+  }
+  // pickDefaultTenant is synchronous and only sees built-in role rows
+  // (user_roles / group tenant roles). Dynamic-RBAC custom-role grants live on a
+  // separate async path (resolveUserCustomPermissions), so a user whose ONLY
+  // access to their explicit default tenant is a custom role reads as "no access"
+  // there and gets skipped into whichever tenant carries a built-in role (issue
+  // #36117). When the marked default was skipped for exactly that reason, resolve
+  // its custom grants and honor the default if the user holds any — one extra
+  // resolve, only on the path that would otherwise discard the explicit default.
+  const markedDefault = (user.tenants ?? []).find((t: any) => t.is_default);
+  if (markedDefault && selectedTenant && markedDefault.id !== selectedTenant.id) {
+    const resolved = await resolveUserCustomPermissions(user.id, markedDefault.id);
+    if (resolved.permissions.length > 0) {
+      tenant = markedDefault;
+    }
   }
   //filter roles based on tenant
   user.user_roles = user.user_roles ?? [];
@@ -259,7 +275,7 @@ export function GQLAdapter() {
         throw new Error('User Account is suspended');
       } else if (accountsData.user.status === 'inactive') {
         //first time login flow
-        console.log(`getUserByAccount: user ${accountsData.user.id} is inactive, first time login`);
+        console.log('getUserByAccount: user is inactive, first time login', { userId: accountsData.user.id });
         return null;
       }
       const transformedUser = await adapterUser(accountsData.user);
@@ -705,7 +721,7 @@ export async function ensureAllowedDomainsSet(email: string, tenantId?: string) 
         tenantId
       );
       await getTenantAttributes(true); // refresh cache
-      console.log(`Set allowed_domains for tenant ${tenantId}: [${domain}]`);
+      console.log('Set allowed_domains for tenant', { tenantId, domain });
     }
   } catch (e) {
     console.log('Failed to set allowed_domains for tenant', e);
@@ -795,7 +811,7 @@ if (process.env.NEXTAUTH_DUMMY_CREDS_ENABLED == 'true') {
         if (!credentials?.username) {
           throw Error('Invalid Username');
         }
-        const normalizedUsername = credentials.username.toLowerCase();
+        const normalizedUsername = credentials.username.trim().toLowerCase();
         // Refuse to authenticate when the configured password is empty or
         // still the .env.example placeholder — otherwise a fresh `cp
         // .env.example .env` would silently authenticate anyone typing the
@@ -813,10 +829,26 @@ if (process.env.NEXTAUTH_DUMMY_CREDS_ENABLED == 'true') {
         if (pwdBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(pwdBuf, expectedBuf)) {
           throw Error('Invalid Passsword');
         }
+        // Pin the provider to the deployment's admin when it names one. Checked
+        // after the password so a wrong guess cannot probe for the address.
+        // Fail closed when the licence is unreadable: its fallback carries no
+        // address, which would leave the provider unpinned or pinned to the
+        // wrong one.
+        const license = await getLicenseDetails();
+        if (license.error) {
+          throw Error('Unable to verify the admin address: services-server is unreachable. Try again shortly.');
+        }
+        const adminEmail = dummyCredsAdminEmail(license.email);
+        if (adminEmail && normalizedUsername !== adminEmail) {
+          console.warn('[Security] dummy-creds login refused for', normalizedUsername, '— only the configured admin address may use this provider.');
+          throw Error('NO_TENANT_ACCESS');
+        }
         console.warn(
           '[Security] dummy-creds login succeeded for',
           normalizedUsername,
-          '— this provider accepts ANY email with the configured password and bypasses OAuth / LDAP / SSO. Disable NEXTAUTH_DUMMY_CREDS_ENABLED if this is a production deployment.'
+          adminEmail
+            ? '— this provider is pinned to the admin address and bypasses OAuth / LDAP / SSO.'
+            : '— this provider accepts ANY email with the configured password and bypasses OAuth / LDAP / SSO. Set admin.email (ADMIN_EMAIL) to pin it, or disable NEXTAUTH_DUMMY_CREDS_ENABLED if this is a production deployment.'
         );
         return await getOrCreateBootstrapAdminUser(normalizedUsername);
       },
@@ -1582,7 +1614,7 @@ export const authOptions: NextAuthOptions = {
                 return false;
               }
               user.id = newUser.data.id;
-              console.log(`Successfully onboarded and linked saas account for ${user.email}`);
+              console.log('Successfully onboarded and linked saas account', { email: user.email });
               return true; // Successfully onboarded and linked
             }
             console.error('Failed to get new user ID or account details after saas onboarding.');
@@ -1592,7 +1624,7 @@ export const authOptions: NextAuthOptions = {
             return false;
           }
         } else {
-          console.log(`User with email ${user.email} not found and no tenant routing matched. Self-onboarding via OAuth is disabled.`);
+          console.log('User not found and no tenant routing matched. Self-onboarding via OAuth is disabled.', { email: user.email });
           return false;
         }
       }

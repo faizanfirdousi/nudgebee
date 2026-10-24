@@ -4,15 +4,19 @@ import { Box } from '@mui/material';
 import CheckIcon from '@mui/icons-material/Check';
 import CloseIcon from '@mui/icons-material/Close';
 import ArrowForwardIcon from '@mui/icons-material/ArrowForward';
-import EditOutlinedIcon from '@mui/icons-material/EditOutlined';
+import SafeIcon from '@shared/icons/SafeIcon';
+import { EditIcon } from '@assets';
 import SearchIcon from '@mui/icons-material/Search';
 import KeyboardArrowDownIcon from '@mui/icons-material/KeyboardArrowDown';
 import KeyboardArrowUpIcon from '@mui/icons-material/KeyboardArrowUp';
 import Tooltip from '@ui/Tooltip';
+import { DropdownMenu } from '@ui/DropdownMenu';
+import { toast } from '@ui/Toast';
 import apiAskNudgebee from '@api1/ask-nudgebee';
 import MarkDowns from '@shared/viewers/MarkDowns';
-import { getNubiIconUrl } from '@hooks/useTenantBranding';
+import { getNubiIconUrl, getAssistantName } from '@hooks/useTenantBranding';
 import { ds } from '@utils/colors';
+import { unwrapTypedValueString } from '@utils/common';
 
 const ZERO_UUID = '00000000-0000-0000-0000-000000000000';
 
@@ -65,7 +69,7 @@ const Kbd = ({ children, sx }) => (
   <Box
     component='kbd'
     sx={{
-      fontFamily: 'ui-monospace, "SF Mono", Menlo, monospace',
+      fontFamily: ds.font.mono,
       fontWeight: 'var(--ds-font-weight-semibold)',
       fontSize: 'var(--ds-text-caption)',
       lineHeight: 1,
@@ -119,12 +123,12 @@ const NubiBeeIcon = () => (
   <Box
     component='img'
     src={getNubiIconUrl()}
-    alt='Nudgebee'
+    alt={getAssistantName()}
     sx={{ flexShrink: 0, width: ds.space.mul(0, 11), height: ds.space.mul(0, 11), display: 'block' }}
   />
 );
 
-const FollowupSheet = ({ followup, accountId, conversationId, selectedModel, popup, onStop, onSubmitted }) => {
+const FollowupSheet = ({ followup, accountId, conversationId, selectedModel, popup, onStop, onSubmitted, onOptimisticSubmit, onSubmitError }) => {
   const messageConfig = useMemo(() => {
     if (!followup?.response?.message_config) {
       return {};
@@ -142,7 +146,7 @@ const FollowupSheet = ({ followup, accountId, conversationId, selectedModel, pop
 
   const options = useMemo(() => messageConfig.followupOptions || [], [messageConfig]);
   const sheetType = resolveSheetType(messageConfig.followupType, options);
-  const question = messageConfig.question || '';
+  const question = unwrapTypedValueString(messageConfig.question || '');
   const isDanger = sheetType === 'yn' && isDangerQuestion(question);
 
   // For multi-paragraph or very long questions (e.g. clarification agent's "give me five
@@ -163,6 +167,7 @@ const FollowupSheet = ({ followup, accountId, conversationId, selectedModel, pop
   const [freeText, setFreeText] = useState('');
   const [textareaValue, setTextareaValue] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isCancelling, setIsCancelling] = useState(false);
   // Captures what the user just submitted so the sheet can paint instant feedback (option
   // highlight / textarea lock) without waiting for the backend round-trip and poll cycle.
   const [pendingAnswer, setPendingAnswer] = useState(null);
@@ -239,11 +244,16 @@ const FollowupSheet = ({ followup, accountId, conversationId, selectedModel, pop
       if (isSubmitting) {
         return;
       }
-      // Paint the user's selection instantly before the network call goes out — the rest
-      // (sheet hide, inline "You replied" pill) flows naturally through the polling cycle
-      // once the followup transitions to COMPLETED on the server.
+      // Paint the user's selection instantly, then hand the answer up so the parent can
+      // optimistically collapse this sheet into its inline "You replied" pill and surface
+      // the main-screen loader immediately — without waiting for the ~5s poll to flip the
+      // followup to COMPLETED on the server. `onOptimisticSubmit` fires *before* the POST
+      // resolves; if the POST later fails, `onSubmitError` (below) reverses it.
       setPendingAnswer(payloadQuery);
       setIsSubmitting(true);
+      if (onOptimisticSubmit) {
+        onOptimisticSubmit(payloadQuery);
+      }
       try {
         const agentId = followup?.response?.agent_id;
         const parentAgentId = followup?.response?.parent_agent_id;
@@ -277,14 +287,46 @@ const FollowupSheet = ({ followup, accountId, conversationId, selectedModel, pop
         // think nothing is happening. We let the parent unmount the sheet when the
         // followup transitions out of WAITING; that's the real "done" signal here.
       } catch (err) {
-        // Rollback so the user can retry from the sheet.
+        // Rollback so the user can retry: clear local paint AND tell the parent to reverse
+        // the optimistic collapse (bring the sheet back). By now the optimistic hide may
+        // have already unmounted this sheet, so the parent-side reversal is what the user
+        // actually sees — the local resets just keep a still-mounted sheet consistent.
         setPendingAnswer(null);
         setIsSubmitting(false);
+        if (onSubmitError) {
+          onSubmitError();
+        }
         throw err;
       }
     },
-    [accountId, conversationId, followup, isSubmitting, onSubmitted, selectedModel]
+    [accountId, conversationId, followup, isSubmitting, onSubmitted, onOptimisticSubmit, onSubmitError, selectedModel]
   );
+
+  // Soft-skips the current question without answering it: writes a dismissal marker
+  // and ends the conversation (same terminal outcome as onStop, distinguished only by
+  // that marker). Gated server-side behind FollowupCancelEnabled — a disabled backend
+  // fails the request rather than the UI, so surface that as a toast instead of a crash.
+  const cancelDismiss = useCallback(async () => {
+    if (isSubmitting || isCancelling) {
+      return;
+    }
+    setIsCancelling(true);
+    try {
+      await apiAskNudgebee.aiFollowupResponse({
+        account_id: accountId || followup?.response?.account_id,
+        conversation_id: conversationId,
+        message_id: followup?.response?.message_id,
+        agent_id: followup?.response?.agent_id,
+        resolution: 'dismiss',
+      });
+      // No local success state to paint — the conversation is terminating, and the
+      // parent unmounts this sheet once that lands via the polling cycle (same
+      // "let the poll be the done signal" pattern submit() uses).
+    } catch {
+      setIsCancelling(false);
+      toast.error('Unable to skip this question. Please try again.');
+    }
+  }, [accountId, conversationId, followup, isCancelling, isSubmitting]);
 
   const submitSingle = useCallback(
     (option) => {
@@ -469,7 +511,7 @@ const FollowupSheet = ({ followup, accountId, conversationId, selectedModel, pop
               padding: 0,
             },
             '& code': {
-              fontFamily: 'ui-monospace, "SF Mono", Menlo, monospace',
+              fontFamily: ds.font.mono,
               fontSize: 'var(--ds-text-body)',
               background: 'var(--ds-background-100)',
               padding: `${ds.space[0]} ${ds.space.mul(0, 3)} !important`,
@@ -532,13 +574,41 @@ const FollowupSheet = ({ followup, accountId, conversationId, selectedModel, pop
           )}
         </Box>
       </Tooltip>
-      {onStop && (
-        <Tooltip title='Stop conversation' placement='top'>
+      <Box
+        component='button'
+        type='button'
+        onClick={cancelDismiss}
+        disabled={isSubmitting || isCancelling || !followup?.response?.agent_id || !followup?.response?.message_id || !conversationId}
+        aria-label='Skip this question'
+        data-testid='followup-skip-button'
+        sx={{
+          flexShrink: 0,
+          height: ds.space.mul(0, 11),
+          padding: `0 ${ds.space[2]}`,
+          borderRadius: ds.radius.sm,
+          border: 'none',
+          background: 'transparent',
+          color: 'var(--ds-gray-500)',
+          fontSize: 'var(--ds-text-small)',
+          fontWeight: 'var(--ds-font-weight-medium)',
+          cursor: 'pointer',
+          display: 'grid',
+          placeItems: 'center',
+          transition: 'all 0.12s',
+          '&:hover:not(:disabled)': { color: 'var(--ds-red-600)', background: 'color-mix(in srgb, var(--ds-red-600) 8%, transparent)' },
+          '&:disabled': { opacity: 0.5, cursor: 'not-allowed' },
+        }}
+      >
+        Skip
+      </Box>
+      <DropdownMenu
+        align='end'
+        trigger={
           <Box
             component='button'
             type='button'
-            onClick={onStop}
-            aria-label='Stop conversation'
+            aria-label='Cancel this follow-up'
+            data-testid='followup-cancel-menu-trigger'
             sx={{
               flexShrink: 0,
               width: ds.space.mul(0, 11),
@@ -557,8 +627,19 @@ const FollowupSheet = ({ followup, accountId, conversationId, selectedModel, pop
           >
             <CloseIcon sx={{ fontSize: 'var(--ds-text-body-lg)' }} />
           </Box>
-        </Tooltip>
-      )}
+        }
+        items={
+          onStop
+            ? [
+                {
+                  label: 'End conversation',
+                  tone: 'danger',
+                  onSelect: onStop,
+                },
+              ]
+            : []
+        }
+      />
     </Box>
   );
 
@@ -625,7 +706,7 @@ const FollowupSheet = ({ followup, accountId, conversationId, selectedModel, pop
         borderTop: `1px dashed ${'var(--ds-gray-200)'}`,
       }}
     >
-      <EditOutlinedIcon sx={{ fontSize: 'var(--ds-text-body-lg)', color: 'var(--ds-gray-500)', flexShrink: 0 }} />
+      <SafeIcon src={EditIcon} alt='' width={14} height={14} style={{ flexShrink: 0 }} />
       <Box
         component='input'
         type='text'
@@ -774,7 +855,7 @@ const FollowupSheet = ({ followup, accountId, conversationId, selectedModel, pop
                 border: `1px solid ${isPending || isFocused ? 'var(--ds-blue-600)' : 'var(--ds-gray-200)'}`,
                 display: 'grid',
                 placeItems: 'center',
-                fontFamily: 'ui-monospace, "SF Mono", Menlo, monospace',
+                fontFamily: ds.font.mono,
                 fontWeight: 'var(--ds-font-weight-semibold)',
                 fontSize: 'var(--ds-text-caption)',
                 lineHeight: 1,
@@ -1267,7 +1348,7 @@ const FollowupSheet = ({ followup, accountId, conversationId, selectedModel, pop
                   '& p': { margin: `0 0 ${ds.space[2]}` },
                   '& p:last-child': { margin: 0 },
                   '& code': {
-                    fontFamily: 'ui-monospace, "SF Mono", Menlo, monospace',
+                    fontFamily: ds.font.mono,
                     fontSize: 'var(--ds-text-body)',
                     background: 'var(--ds-background-200)',
                     padding: `${ds.space[0]} ${ds.space.mul(0, 3)}`,
@@ -1316,6 +1397,8 @@ FollowupSheet.propTypes = {
   popup: PropTypes.bool,
   onStop: PropTypes.func,
   onSubmitted: PropTypes.func,
+  onOptimisticSubmit: PropTypes.func,
+  onSubmitError: PropTypes.func,
 };
 
 export default FollowupSheet;

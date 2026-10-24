@@ -30,8 +30,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
 	"github.com/tmc/langchaingo/llms"
-	"github.com/tmc/langchaingo/llms/anthropic"
-	"github.com/tmc/langchaingo/llms/openai"
+	"nudgebee/llm/llms/anthropic"
+	"nudgebee/llm/llms/openai"
 )
 
 // Field-name constants mirror api-server/services/integrations/llm.go's
@@ -53,12 +53,15 @@ const (
 
 // Concurrency limit for the multi-model probe burst. A typical config has
 // ~10-25 (provider, model) pairs across global + tiers + agents + fallbacks.
-// 5 concurrent probes keeps wall time bounded (~5-10s for a 25-model config)
-// without hammering providers hard enough to trigger genuine rate limits.
+// 5 concurrent probes keeps wall time bounded while the per-provider
+// semaphore below prevents a single provider from receiving a burst.
 const probeConcurrency = 5
 
 // Per-probe wall-clock budget. Same 15s used by the original single-probe.
 const probeTimeout = 15 * time.Second
+
+// probeMaxTokens is the ping reply budget; see probeOne.
+const probeMaxTokens = 1024
 
 // ProbeResult describes the outcome of probing one (provider, model) pair.
 // Surfaced via the test-connection HTTP response so the api-server can
@@ -121,13 +124,28 @@ func TestLLMProviderConnectionAll(ctx context.Context, cfg map[string]string) ([
 
 	results := make([]ProbeResult, len(targets))
 	sem := make(chan struct{}, probeConcurrency)
+	providerSems := make(map[string]chan struct{})
+	var providerSemsMu sync.Mutex
+	providerSem := func(provider string) chan struct{} {
+		key := strings.ToLower(strings.TrimSpace(provider))
+		providerSemsMu.Lock()
+		defer providerSemsMu.Unlock()
+		if existing, ok := providerSems[key]; ok {
+			return existing
+		}
+		created := make(chan struct{}, 1)
+		providerSems[key] = created
+		return created
+	}
 	var wg sync.WaitGroup
 	for i, t := range targets {
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(i int, t probeTarget) {
 			defer wg.Done()
+			sem <- struct{}{}
 			defer func() { <-sem }()
+			providerSem(t.provider) <- struct{}{}
+			defer func() { <-providerSem(t.provider) }()
 			results[i] = probeOne(ctx, t)
 		}(i, t)
 	}
@@ -154,10 +172,11 @@ func probeOne(ctx context.Context, t probeTarget) ProbeResult {
 	}
 	pingCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
-	// Cheap ping to verify auth + reachability; >1 token so thinking models still return a content block.
+	// Cheap ping to verify auth + reachability. Budget must cover thinking models' reasoning
+	// (Gemini 3.x spends ~60-200 tokens) or they return no content and the probe fails.
 	if _, err := llm.GenerateContent(pingCtx, []llms.MessageContent{
 		llms.TextParts(llms.ChatMessageTypeHuman, "ping"),
-	}, llms.WithMaxTokens(16)); err != nil {
+	}, llms.WithMaxTokens(probeMaxTokens)); err != nil {
 		return ProbeResult{
 			Provider: t.provider, Model: t.model, Source: t.source,
 			OK: false, Error: err.Error(),

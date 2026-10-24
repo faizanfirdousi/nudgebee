@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"math"
 	"strings"
 
 	"github.com/jmoiron/sqlx"
@@ -44,6 +45,13 @@ type ModelPriceRow struct {
 	InputPerMLongCtx       *float64 `json:"cost_per_million_input_tokens_long_ctx,omitempty"`
 	OutputPerMLongCtx      *float64 `json:"cost_per_million_output_tokens_long_ctx,omitempty"`
 
+	// Token ceilings (V878). NULL = unknown: llm-server falls back to its
+	// conservative floor (output) or the code model map (context).
+	MaxOutputTokens  *int64 `json:"max_output_tokens,omitempty"`
+	MaxContextTokens *int64 `json:"max_context_tokens,omitempty"`
+
+	SupportsImageInput *bool `json:"supports_image_input,omitempty"`
+
 	IsBuiltIn bool    `json:"is_built_in"`
 	UpdatedAt *string `json:"pricing_updated_at,omitempty"`
 
@@ -70,6 +78,13 @@ type ModelPriceInput struct {
 	ContextThresholdTokens *int64   `json:"context_threshold_tokens,omitempty"`
 	InputPerMLongCtx       *float64 `json:"cost_per_million_input_tokens_long_ctx,omitempty"`
 	OutputPerMLongCtx      *float64 `json:"cost_per_million_output_tokens_long_ctx,omitempty"`
+
+	// Optional token ceilings; unset leaves the model on llm-server's fallbacks.
+	MaxOutputTokens  *int64 `json:"max_output_tokens,omitempty"`
+	MaxContextTokens *int64 `json:"max_context_tokens,omitempty"`
+
+	// Unset keeps the stored verdict: the upsert COALESCEs, so a price edit can't erase it.
+	SupportsImageInput *bool `json:"supports_image_input,omitempty"`
 }
 
 // Validate rejects input that would produce a nonsensical bill rather than
@@ -98,6 +113,17 @@ func (in ModelPriceInput) Validate() error {
 	// both). Accepting one without the other would store a tier that never
 	// fires and silently bill long prompts at the short rate — the exact
 	// failure this validation exists to prevent.
+	// A zero or negative ceiling would silently floor every call on the model;
+	// "unknown" is expressed by leaving the field unset, never by 0. The upper
+	// bound matches the int4 columns — without it an oversized value passes Go
+	// validation and surfaces as a driver error instead of a clear message.
+	if in.MaxOutputTokens != nil && (*in.MaxOutputTokens <= 0 || *in.MaxOutputTokens > math.MaxInt32) {
+		return fmt.Errorf("max output tokens must be a positive token count up to %d", math.MaxInt32)
+	}
+	if in.MaxContextTokens != nil && (*in.MaxContextTokens <= 0 || *in.MaxContextTokens > math.MaxInt32) {
+		return fmt.Errorf("max context tokens must be a positive token count up to %d", math.MaxInt32)
+	}
+
 	hasThreshold := in.ContextThresholdTokens != nil
 	hasLongRates := in.InputPerMLongCtx != nil || in.OutputPerMLongCtx != nil
 	if hasThreshold != hasLongRates {
@@ -150,8 +176,9 @@ func UpsertModelPricing(dbManager *common.DatabaseManager, tenantId, userId stri
 			cost_per_million_cached_input_tokens, cost_per_million_cache_creation_tokens,
 			context_threshold_tokens,
 			cost_per_million_input_tokens_long_ctx, cost_per_million_output_tokens_long_ctx,
-			pricing_updated_at, pricing_updated_by
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now(), NULLIF($11, '')::uuid)
+			max_output_tokens, max_context_tokens,
+			pricing_updated_at, pricing_updated_by, supports_image_input
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now(), NULLIF($13, '')::uuid, $14)
 		ON CONFLICT (model_name, provider_name, tenant_id) WHERE tenant_id IS NOT NULL
 		DO UPDATE SET
 			cost_per_million_input_tokens          = EXCLUDED.cost_per_million_input_tokens,
@@ -161,6 +188,9 @@ func UpsertModelPricing(dbManager *common.DatabaseManager, tenantId, userId stri
 			context_threshold_tokens               = EXCLUDED.context_threshold_tokens,
 			cost_per_million_input_tokens_long_ctx  = EXCLUDED.cost_per_million_input_tokens_long_ctx,
 			cost_per_million_output_tokens_long_ctx = EXCLUDED.cost_per_million_output_tokens_long_ctx,
+			max_output_tokens                      = EXCLUDED.max_output_tokens,
+			max_context_tokens                     = EXCLUDED.max_context_tokens,
+			supports_image_input                   = COALESCE(EXCLUDED.supports_image_input, llm_model_pricing.supports_image_input),
 			pricing_updated_at                     = now(),
 			pricing_updated_by                     = EXCLUDED.pricing_updated_by`
 
@@ -172,7 +202,8 @@ func UpsertModelPricing(dbManager *common.DatabaseManager, tenantId, userId stri
 				nullableFloat(p.CachedInputPerM), nullableFloat(p.CacheCreationPerM),
 				nullableInt(p.ContextThresholdTokens),
 				nullableFloat(p.InputPerMLongCtx), nullableFloat(p.OutputPerMLongCtx),
-				userId,
+				nullableInt(p.MaxOutputTokens), nullableInt(p.MaxContextTokens),
+				userId, nullableBool(p.SupportsImageInput),
 			); err != nil {
 				return nil, fmt.Errorf("upsert %s/%s: %w", p.ProviderName, p.ModelName, err)
 			}
@@ -251,6 +282,7 @@ func ListModelPricing(dbManager *common.DatabaseManager, tenantId string) ([]Mod
 		       cost_per_million_cached_input_tokens, cost_per_million_cache_creation_tokens,
 		       context_threshold_tokens,
 		       cost_per_million_input_tokens_long_ctx, cost_per_million_output_tokens_long_ctx,
+		       max_output_tokens, max_context_tokens, supports_image_input,
 		       tenant_id IS NULL AS is_built_in,
 		       pricing_updated_at,
 		       EXISTS (
@@ -280,10 +312,14 @@ func ListModelPricing(dbManager *common.DatabaseManager, tenantId string) ([]Mod
 			threshold     sql.NullInt64
 			inputLong     sql.NullFloat64
 			outputLong    sql.NullFloat64
+			maxOutput     sql.NullInt64
+			maxContext    sql.NullInt64
+			supportsImage sql.NullBool
 			updatedAt     sql.NullTime
 		)
 		if err := rows.Scan(&r.ModelName, &r.ProviderName, &r.InputPerM, &r.OutputPerM,
 			&cachedInput, &cacheCreation, &threshold, &inputLong, &outputLong,
+			&maxOutput, &maxContext, &supportsImage,
 			&r.IsBuiltIn, &updatedAt, &r.HasBuiltIn); err != nil {
 			return nil, fmt.Errorf("ListModelPricing: scan failed: %w", err)
 		}
@@ -301,6 +337,15 @@ func ListModelPricing(dbManager *common.DatabaseManager, tenantId string) ([]Mod
 		}
 		if outputLong.Valid {
 			r.OutputPerMLongCtx = &outputLong.Float64
+		}
+		if maxOutput.Valid {
+			r.MaxOutputTokens = &maxOutput.Int64
+		}
+		if maxContext.Valid {
+			r.MaxContextTokens = &maxContext.Int64
+		}
+		if supportsImage.Valid {
+			r.SupportsImageInput = &supportsImage.Bool
 		}
 		if updatedAt.Valid {
 			s := updatedAt.Time.UTC().Format("2006-01-02T15:04:05Z")
@@ -322,6 +367,13 @@ func nullableInt(v *int64) any {
 }
 
 func nullableFloat(v *float64) any {
+	if v == nil {
+		return nil
+	}
+	return *v
+}
+
+func nullableBool(v *bool) any {
 	if v == nil {
 		return nil
 	}

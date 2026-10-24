@@ -39,7 +39,11 @@ func trimmedK8sCoreToolNames() []string {
 		tools.ToolResourceSearch,
 		tools.ToolCloudResourceSearch,
 		ServiceDependencyGraph,
-		RecommendationsAgentName,
+		// Recommendation records come from the raw SQL tool, one hop and a
+		// query: the tool carries the SQL and listing rules in its ToolPrompt.
+		// finops (below) is the agent for cost analysis, resolution history
+		// and every write on a recommendation.
+		tools.ToolRecommendationExecuteSql,
 		// websearch is preloaded so the model can ground error-message /
 		// version-specific investigation questions ("what's the fix for X CVE",
 		// "is Y a known bug in kubernetes 1.29") without needing to route via
@@ -52,6 +56,9 @@ func trimmedK8sCoreToolNames() []string {
 		// spend questions default-route to this agent (the router reaches finops
 		// only via @mention), and nothing steers the planner to search for it.
 		FinOpsAgentName,
+		// Unmentioned self-awareness questions arrive at the environment
+		// orchestrator. Mount Nubi so its description can route delegation.
+		NudgebeeAgentName,
 		DelegateAgentToolName,
 		SearchToolsToolName,
 		// search_skills preload preserved so the model can query knowledge bases

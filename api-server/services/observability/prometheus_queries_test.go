@@ -102,6 +102,11 @@ func TestBuildPrometheusNodeQueries(t *testing.T) {
 			expected: `count(karpenter_nodes_total_pod_requests{ __CLUSTER__ provisioner_name="",resource_type="pods"}) by (zone)`,
 		},
 		{
+			name:     "active_nodes is a static kube_node_info query with no substitution",
+			metric:   "active_nodes",
+			expected: `kube_node_info{__CLUSTER__}`,
+		},
+		{
 			name:     "node_pool_pod_trend is a static karpenter query",
 			metric:   "node_pool_pod_trend",
 			expected: `sum by (nodepool)(karpenter_pods_state{__CLUSTER__})`,
@@ -182,6 +187,28 @@ func TestBuildPrometheusWorkloadQueries_DeploymentResourceMetrics(t *testing.T) 
 			expected: `sum(rate(container_cpu_usage_seconds_total{__CLUSTER__  namespace="shop", pod=~"web-.*", container!="",}[5m]))`,
 		},
 		{
+			// container!="" is load-bearing: without it the pod-level cgroup series is
+			// summed with the per-container ones and every pod counts twice.
+			name:     "cpu_usage_by_pod is the same selection, one series per pod",
+			metric:   "cpu_usage_by_pod",
+			expected: `sum by (pod, namespace) (rate(container_cpu_usage_seconds_total{__CLUSTER__  namespace="shop", pod=~"web-.*", container!="",}[5m]))`,
+		},
+		{
+			name:     "memory_usage_by_pod is working set, one series per pod",
+			metric:   "memory_usage_by_pod",
+			expected: `sum by (pod, namespace) (container_memory_working_set_bytes{__CLUSTER__  namespace="shop", pod=~"web-.*", container!="",})`,
+		},
+		{
+			name:     "workload_http_latency_p99 is one p99 line for the workload",
+			metric:   "workload_http_latency_p99",
+			expected: `histogram_quantile(0.99, sum by (le) (rate(container_http_requests_duration_seconds_total_bucket{__CLUSTER__ destination_workload_name="web", actual_destination_workload_namespace="shop"}[5m])))`,
+		},
+		{
+			name:     "cpu_throttling from the node-agent's per-container counter",
+			metric:   "cpu_throttling",
+			expected: `sum by (container_id) (rate(container_resources_cpu_throttled_seconds_total{__CLUSTER__ container_id=~".*shop/web.*"}[5m]))`,
+		},
+		{
 			name:     "memory_usage over working set bytes",
 			metric:   "memory_usage",
 			expected: `sum(container_memory_working_set_bytes{__CLUSTER__  namespace="shop", pod=~"web-.*", container!="",})`,
@@ -200,6 +227,21 @@ func TestBuildPrometheusWorkloadQueries_DeploymentResourceMetrics(t *testing.T) 
 			name:     "memory_limit from kube-state-metrics limits",
 			metric:   "memory_limit",
 			expected: `sum(kube_pod_container_resource_limits{__CLUSTER__  namespace="shop", pod=~"web-.*", container!="",resource="memory"})`,
+		},
+		{
+			name:     "pod_count counts the pods carrying the filtered containers",
+			metric:   "pod_count",
+			expected: `count(count by (pod) (container_memory_working_set_bytes{__CLUSTER__  namespace="shop", pod=~"web-.*", container!="",}))`,
+		},
+		{
+			name:     "cpu_usage_max_pod is the busiest pod's rate",
+			metric:   "cpu_usage_max_pod",
+			expected: `max(sum by (pod) (rate(container_cpu_usage_seconds_total{__CLUSTER__  namespace="shop", pod=~"web-.*", container!="",}[5m])))`,
+		},
+		{
+			name:     "memory_usage_max_pod is the busiest pod's working set",
+			metric:   "memory_usage_max_pod",
+			expected: `max(sum by (pod) (container_memory_working_set_bytes{__CLUSTER__  namespace="shop", pod=~"web-.*", container!="",}))`,
 		},
 		{
 			// Preferred form excludes the pod-level rollup (container!=""); the `or`

@@ -12,7 +12,7 @@ import (
 	"nudgebee/services/cloud"
 	"nudgebee/services/knowledge_graph/core"
 	"nudgebee/services/knowledge_graph/flow_sources"
-	"nudgebee/services/relay"
+	"nudgebee/services/observability"
 	"nudgebee/services/security"
 )
 
@@ -40,6 +40,10 @@ func init() {
 // a Phase-2.1 cross-source enricher so it has a registered home.
 type LoadBalancerPodTargetEnricher struct {
 	logger *slog.Logger
+	// topology serves load-balancer target groups and tags from cloud_resourses.
+	// Set per run in EnrichCrossSources — the registry builds a fresh enricher
+	// per graph build, so this is not shared across tenants. Nil means CLI-only.
+	topology *flow_sources.CloudTopologyStore
 }
 
 // NewLoadBalancerPodTargetEnricher constructs the enricher.
@@ -67,6 +71,15 @@ func (e *LoadBalancerPodTargetEnricher) EnrichCrossSources(
 	allEdges []*core.DbEdge,
 	tenantID string,
 ) ([]*core.DbNode, []*core.DbEdge, error) {
+
+	topology, err := flow_sources.NewCloudTopologyStore(tenantID, e.logger)
+	if err != nil {
+		e.logger.Warn("failed to build cloud topology store, falling back to cloud CLI",
+			"tenant_id", tenantID, "error", err)
+		topology = nil
+	}
+	e.topology = topology
+	defer topology.LogStats("aws_lb_pod_target_enricher")
 
 	lbNodes := make([]*core.DbNode, 0)
 	for _, n := range allNodes {
@@ -190,34 +203,13 @@ func (e *LoadBalancerPodTargetEnricher) enrichLoadBalancerWithTargets(
 		return podNodes, edges, nil
 	}
 
-	// Step 1: Query AWS for target groups
-	tgCommand := fmt.Sprintf(
-		"aws elbv2 describe-target-groups --region %s --load-balancer-arn %s --output json",
-		region, arn,
-	)
-
-	tgResp, err := cloud.ExecuteCli(reqCtx, cloud.CloudExecuteCliCommandRequest{
-		AccountID: awsAccountID,
-		Command:   tgCommand,
-	})
+	// Step 1: Get the load balancer's target groups
+	targetGroups, err := flow_sources.FetchLoadBalancerTargetGroups(reqCtx, awsAccountID, region, arn, e.topology)
 	if err != nil {
 		e.logger.Warn("Failed to query LoadBalancer target groups",
 			"lb_name", lbNode.Properties["name"],
 			"error", err)
 		return podNodes, edges, nil
-	}
-
-	// Parse target groups
-	var targetGroups []map[string]interface{}
-	if data, ok := tgResp["data"].(string); ok {
-		var tgData struct {
-			TargetGroups []map[string]interface{} `json:"TargetGroups"`
-		}
-		if err := json.Unmarshal([]byte(data), &tgData); err != nil {
-			e.logger.Warn("Failed to parse target groups", "error", err)
-			return podNodes, edges, nil
-		}
-		targetGroups = tgData.TargetGroups
 	}
 
 	if len(targetGroups) == 0 {
@@ -226,44 +218,19 @@ func (e *LoadBalancerPodTargetEnricher) enrichLoadBalancerWithTargets(
 		return podNodes, edges, nil
 	}
 
-	// Step 1.5: Query LoadBalancer tags to check for Kubernetes service mapping
-	tagsCommand := fmt.Sprintf(
-		"aws elbv2 describe-tags --resource-arns %s --output json",
-		arn,
-	)
-
-	tagsResp, err := cloud.ExecuteCli(reqCtx, cloud.CloudExecuteCliCommandRequest{
-		AccountID: awsAccountID,
-		Command:   tagsCommand,
-	})
-
+	// Step 1.5: Read LoadBalancer tags to check for Kubernetes service mapping
 	var k8sServiceName, k8sNamespace string
-	if err == nil && tagsResp != nil {
-		if data, ok := tagsResp["data"].(string); ok {
-			var tagsData struct {
-				TagDescriptions []struct {
-					Tags []struct {
-						Key   string `json:"Key"`
-						Value string `json:"Value"`
-					} `json:"Tags"`
-				} `json:"TagDescriptions"`
-			}
-			if json.Unmarshal([]byte(data), &tagsData) == nil && len(tagsData.TagDescriptions) > 0 {
-				for _, tag := range tagsData.TagDescriptions[0].Tags {
-					if tag.Key == "kubernetes.io/service-name" {
-						parts := strings.Split(tag.Value, "/")
-						if len(parts) == 2 {
-							k8sNamespace = parts[0]
-							k8sServiceName = parts[1]
-							e.logger.Info("Found Kubernetes service for LoadBalancer",
-								"lb_name", lbNode.Properties["name"],
-								"k8s_service", tag.Value)
-						}
-						break
-					}
-				}
-			}
-		}
+	tags, tagsErr := flow_sources.FetchLoadBalancerTags(reqCtx, awsAccountID, region, arn, e.topology)
+	if tagsErr != nil {
+		e.logger.Debug("Failed to query LoadBalancer tags",
+			"lb_name", lbNode.Properties["name"],
+			"error", tagsErr)
+	} else if ns, name := flow_sources.K8sServiceFromLBTags(tags); ns != "" && name != "" {
+		k8sNamespace = ns
+		k8sServiceName = name
+		e.logger.Info("Found Kubernetes service for LoadBalancer",
+			"lb_name", lbNode.Properties["name"],
+			"k8s_service", tags["kubernetes.io/service-name"])
 	}
 
 	// If this LB is for an ingress controller, create ingress node and skip pod mapping
@@ -310,7 +277,7 @@ func (e *LoadBalancerPodTargetEnricher) enrichLoadBalancerWithTargets(
 			CloudAccountID: k8sAccountID,
 			TenantID:       tenantID,
 			Level:          "Tenant",
-			Source:         "cloud",
+			Source:         e.GetName(),
 			CreatedAt:      time.Now(),
 			UpdatedAt:      time.Now(),
 		}
@@ -330,6 +297,12 @@ func (e *LoadBalancerPodTargetEnricher) enrichLoadBalancerWithTargets(
 				"ingress_service", k8sServiceName)
 		} else if ingressBackendNodes != nil {
 			nodes = append(nodes, ingressBackendNodes...)
+			// The shared resolver stamps its edges "cloud", which the centralized
+			// external-service enricher also uses. Claim them under this enricher's
+			// name so a scoped build can sweep them without touching the others.
+			for _, backendEdge := range ingressBackendEdges {
+				backendEdge.Source = e.GetName()
+			}
 			resultEdges = append(resultEdges, ingressBackendEdges...)
 			e.logger.Info("Resolved Ingress backend services",
 				"ingress_service", k8sServiceName,
@@ -456,13 +429,17 @@ func (e *LoadBalancerPodTargetEnricher) enrichLoadBalancerWithTargets(
 		"pod_info": fmt.Sprintf(`kube_pod_info{pod_ip=~"%s"}`, ipFilter),
 	}
 
-	// Use UTC: relay.ExecutePrometheus formats the timestamp with a "UTC"
-	// suffix; the value must already be UTC or Prometheus is queried at a
-	// future time and returns empty. Defense in depth with the relay-side fix.
 	endTime := time.Now().UTC()
 	startTime := endTime.Add(-5 * time.Minute)
 
-	podInfoResp, err := relay.ExecutePrometheus(k8sAccountID, startTime, endTime, queries, true)
+	podInfoResp, err := observability.FetchMetricsQuery(reqCtx, observability.FetchMetricsRequest{
+		AccountId:      k8sAccountID,
+		MetricProvider: "prometheus",
+		Queries:        queries,
+		StartTime:      startTime.UnixMilli(),
+		EndTime:        endTime.UnixMilli(),
+		Instant:        true,
+	})
 	if err != nil {
 		e.logger.Warn("Failed to query kube_pod_info",
 			"lb_name", lbNode.Properties["name"],
@@ -471,45 +448,22 @@ func (e *LoadBalancerPodTargetEnricher) enrichLoadBalancerWithTargets(
 	}
 
 	// Step 4: Create Pod nodes and edges from query results
-	var resultArray []interface{}
+	podMetrics := observability.PromQLLabels(podInfoResp, "pod_info")
 
-	if podInfoData, ok := podInfoResp["pod_info"].([]interface{}); ok {
-		resultArray = podInfoData
-		e.logger.Debug("Found pod info with query name key", "count", len(podInfoData))
-	} else if data, ok := podInfoResp["data"].([]interface{}); ok {
-		resultArray = data
-		e.logger.Debug("Found pod info in data array", "count", len(data))
-	} else if data, ok := podInfoResp["data"].(map[string]interface{}); ok {
-		if podInfoData, ok := data["pod_info"].(map[string]interface{}); ok {
-			if result, ok := podInfoData["result"].([]interface{}); ok {
-				resultArray = result
-				e.logger.Debug("Found pod info in nested structure", "count", len(result))
-			}
-		}
-	}
-
-	if len(resultArray) == 0 {
+	if len(podMetrics) == 0 {
 		e.logger.Warn("No pod info results found in Prometheus response",
 			"lb_name", lbNode.Properties["name"],
 			"target_ips", len(uniqueIPs))
 	}
 
 	replicaSetsToQuery := make(map[string]bool)
-	podMetrics := make([]map[string]interface{}, 0)
+	for _, metric := range podMetrics {
+		createdByKind := metric["created_by_kind"]
+		createdByName := metric["created_by_name"]
+		namespace := metric["namespace"]
 
-	for _, item := range resultArray {
-		if pod, ok := item.(map[string]interface{}); ok {
-			if metric, ok := pod["metric"].(map[string]interface{}); ok {
-				podMetrics = append(podMetrics, metric)
-
-				createdByKind, _ := metric["created_by_kind"].(string)
-				createdByName, _ := metric["created_by_name"].(string)
-				namespace, _ := metric["namespace"].(string)
-
-				if createdByKind == "ReplicaSet" && createdByName != "" && namespace != "" {
-					replicaSetsToQuery[fmt.Sprintf("%s/%s", namespace, createdByName)] = true
-				}
-			}
+		if createdByKind == "ReplicaSet" && createdByName != "" && namespace != "" {
+			replicaSetsToQuery[fmt.Sprintf("%s/%s", namespace, createdByName)] = true
 		}
 	}
 
@@ -520,36 +474,26 @@ func (e *LoadBalancerPodTargetEnricher) enrichLoadBalancerWithTargets(
 			"rs_owner": "kube_replicaset_owner",
 		}
 
-		rsResp, err := relay.ExecutePrometheus(k8sAccountID, startTime, endTime, rsQueries, true)
+		rsResp, err := observability.FetchMetricsQuery(reqCtx, observability.FetchMetricsRequest{
+			AccountId:      k8sAccountID,
+			MetricProvider: "prometheus",
+			Queries:        rsQueries,
+			StartTime:      startTime.UnixMilli(),
+			EndTime:        endTime.UnixMilli(),
+			Instant:        true,
+		})
 		if err == nil {
-			var rsResultArray []interface{}
-			if rsData, ok := rsResp["rs_owner"].([]interface{}); ok {
-				rsResultArray = rsData
-			} else if data, ok := rsResp["data"].([]interface{}); ok {
-				rsResultArray = data
-			} else if data, ok := rsResp["data"].(map[string]interface{}); ok {
-				if rsData, ok := data["rs_owner"].(map[string]interface{}); ok {
-					if result, ok := rsData["result"].([]interface{}); ok {
-						rsResultArray = result
-					}
-				}
-			}
+			for _, metric := range observability.PromQLLabels(rsResp, "rs_owner") {
+				rsNamespace := metric["namespace"]
+				rsName := metric["replicaset"]
+				ownerKind := metric["owner_kind"]
+				ownerName := metric["owner_name"]
 
-			for _, item := range rsResultArray {
-				if rs, ok := item.(map[string]interface{}); ok {
-					if metric, ok := rs["metric"].(map[string]interface{}); ok {
-						rsNamespace, _ := metric["namespace"].(string)
-						rsName, _ := metric["replicaset"].(string)
-						ownerKind, _ := metric["owner_kind"].(string)
-						ownerName, _ := metric["owner_name"].(string)
-
-						if rsNamespace != "" && rsName != "" {
-							key := fmt.Sprintf("%s/%s", rsNamespace, rsName)
-							replicaSetOwners[key] = map[string]string{
-								"kind": ownerKind,
-								"name": ownerName,
-							}
-						}
+				if rsNamespace != "" && rsName != "" {
+					key := fmt.Sprintf("%s/%s", rsNamespace, rsName)
+					replicaSetOwners[key] = map[string]string{
+						"kind": ownerKind,
+						"name": ownerName,
 					}
 				}
 			}
@@ -558,12 +502,12 @@ func (e *LoadBalancerPodTargetEnricher) enrichLoadBalancerWithTargets(
 
 	// Step 6: Process all pod metrics and create owner nodes
 	for _, metric := range podMetrics {
-		podIP, _ := metric["pod_ip"].(string)
-		podName, _ := metric["pod"].(string)
-		namespace, _ := metric["namespace"].(string)
-		k8sCluster, _ := metric["k8s_cluster"].(string)
-		createdByKind, _ := metric["created_by_kind"].(string)
-		createdByName, _ := metric["created_by_name"].(string)
+		podIP := metric["pod_ip"]
+		podName := metric["pod"]
+		namespace := metric["namespace"]
+		k8sCluster := metric["k8s_cluster"]
+		createdByKind := metric["created_by_kind"]
+		createdByName := metric["created_by_name"]
 
 		if podName == "" || namespace == "" {
 			continue
@@ -624,9 +568,7 @@ func (e *LoadBalancerPodTargetEnricher) enrichLoadBalancerWithTargets(
 			} else {
 				labels := make(map[string]string)
 				for k, v := range metric {
-					if strVal, ok := v.(string); ok {
-						labels[k] = strVal
-					}
+					labels[k] = v
 				}
 
 				properties := map[string]interface{}{
@@ -693,7 +635,7 @@ func (e *LoadBalancerPodTargetEnricher) enrichLoadBalancerWithTargets(
 			CloudAccountID: awsAccountID,
 			TenantID:       tenantID,
 			Level:          "Tenant",
-			Source:         "cloud",
+			Source:         e.GetName(),
 			CreatedAt:      time.Now(),
 			UpdatedAt:      time.Now(),
 		}

@@ -89,17 +89,65 @@ type nbCustomAgent struct {
 	tools     []toolcore.NBTool
 }
 
-// Compile-time check: nbCustomAgent must opt out of default-tool injection so the
-// user-configured tool list (a.agent.Tools) is honored verbatim. Without this, the
-// planner silently injects shell_execute / load_skills on top of the user's selection.
+// Compile-time checks: database-backed agents keep their user-curated operational
+// tool list while allowing the framework-owned knowledge loader when discovery
+// has attached a candidate menu.
 var _ DefaultToolsOptOut = (*nbCustomAgent)(nil)
+var _ DefaultSkillsInjectOverride = (*nbCustomAgent)(nil)
+var _ NBAgentAccountContextProvider = (*nbCustomAgent)(nil)
+var _ NBAgentMemoryProvider = (*nbCustomAgent)(nil)
+var _ NBAgentThinkingLevelProvider = (*nbCustomAgent)(nil)
+var _ NBAgentReActPlannerCritiqueSupport = (*nbCustomAgent)(nil)
 
 // OptOutDefaultTools implements DefaultToolsOptOut. Custom agents are user-curated:
-// the operator picks the tool list explicitly via the UI/API. The planner must not
-// silently extend that scope with shell_execute or load_skills, regardless of global
-// config flags. If the operator wants shell, they add `shell_execute` to the tool list.
+// the operator picks the operational tool list explicitly via the UI/API. If the
+// operator wants shell or watch tools, they must add those tools themselves.
 func (a *nbCustomAgent) OptOutDefaultTools() bool {
 	return true
+}
+
+// InjectDefaultSkills keeps discovered knowledge usable by declarative ReAct and
+// orchestrating agents. FilterAndInjectDefaultTools still requires a non-empty
+// <skill-lists> marker, so this does not add load_skills when discovery found no
+// relevant account knowledge. The carve-out grants no shell or watch capability.
+func (a *nbCustomAgent) InjectDefaultSkills() bool {
+	return true
+}
+
+// GetAccountContextEnabled keeps database-backed custom agents scoped to the
+// instructions and tools explicitly configured by their owner. Global Context
+// can be large and may introduce unrelated infrastructure assumptions.
+func (a *nbCustomAgent) GetAccountContextEnabled() bool {
+	return false
+}
+
+// GetMemoryEnabled keeps database-backed custom agents isolated from account
+// and conversation memory. Their stored prompt and explicitly selected tools
+// define the context available to the agent.
+func (a *nbCustomAgent) GetMemoryEnabled() bool {
+	return false
+}
+
+// CritiqueEnabled keeps the shared ReAct critiquer opt-in for database-backed
+// custom agents. Their stored prompt and selected tools define an independent
+// completion contract that the built-in critiquer must not override by default.
+func (a *nbCustomAgent) CritiqueEnabled() bool {
+	enabled, _ := a.agent.Config["enable_shared_critiquer"].(bool)
+	return enabled
+}
+
+// GetThinkingLevel reads the optional custom-agent planner preference. Custom
+// agents default to low reasoning so their focused prompt/tool contract does not
+// inherit a potentially expensive provider default. A valid explicit setting
+// remains authoritative.
+func (a *nbCustomAgent) GetThinkingLevel() string {
+	level, _ := a.agent.Config["thinking_level"].(string)
+	level = strings.ToLower(strings.TrimSpace(level))
+	switch level {
+	case ThinkingLevelMinimal, ThinkingLevelLow, ThinkingLevelMedium, ThinkingLevelHigh:
+		return level
+	}
+	return ThinkingLevelLow
 }
 
 func (a *nbCustomAgent) GetName() string {
@@ -326,10 +374,9 @@ func (a *nbCustomAgent) GetSystemPrompt(ctx *security.RequestContext, query NBAg
 		}
 	}
 
-	// Orchestrating agents run as ReAct3. The user's prompt may contain
-	// ReWoo-era XML plan format instructions that would conflict with the
-	// thought/action/observation loop. Append a corrective note so the planner's base
-	// prompt format takes precedence over any stale format instructions in the user prompt.
+	// A stored orchestrating-agent prompt may contain legacy XML plan instructions
+	// that conflict with the current planner protocol. Append a corrective note so
+	// the planner's base prompt format takes precedence over stale user-authored rules.
 	if a.agent.ExecutorType == AgentPlannerTypeOrchestrating {
 		prompt.Instructions = append(prompt.Instructions,
 			"Use the ReAct thought/action/observation format. Do not generate an XML step plan.")

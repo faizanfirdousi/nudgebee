@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"nudgebee/collector/cloud/account"
 	"nudgebee/collector/cloud/audit"
 	"nudgebee/collector/cloud/common"
@@ -30,6 +31,12 @@ type getUsageRequest struct {
 	AccountId string     `json:"account_id" validate:"required"`
 	Month     time.Month `json:"month" validate:"required"`
 	Year      int        `json:"year" validate:"required"`
+	// Backfill asks for the account's already-available historical billing
+	// periods to be ingested as well, not just the requested month. Set when an
+	// account is first connected — without it a mid-month onboarding leaves the
+	// account with only a partial current month and no history to trend or
+	// baseline against.
+	Backfill bool `json:"backfill"`
 }
 
 type getRecommendationRequest struct {
@@ -94,6 +101,27 @@ type executeCommand struct {
 	AccountId string `json:"account_id" validate:"required"`
 	Command   string `json:"command" validate:"required"`
 }
+
+// cliCredentialsRequest asks for credentials that authenticate a caller's own
+// process as the account. DurationSeconds is what the caller needs them for;
+// the provider clamps it to what its credential type allows.
+type cliCredentialsRequest struct {
+	AccountId string `json:"account_id" validate:"required"`
+	// Bounded here as well as clamped by the provider: an unchecked value
+	// large enough to overflow time.Duration comes back negative, which reads
+	// as "unset" further down.
+	DurationSeconds int `json:"duration_seconds" validate:"min=0,max=86400"`
+}
+
+// cliCredentialsResponse carries the environment and when it stops working.
+// ExpiresAt is empty for credentials that cannot expire, which the caller is
+// expected to surface rather than hide.
+type cliCredentialsResponse struct {
+	Env       map[string]string `json:"env"`
+	ExpiresAt string            `json:"expires_at,omitempty"`
+}
+
+var executeCliCommandV2 = account.ExecuteCliCommandV2
 
 // maxBatchCommands caps the number of commands in a single execute_cli_batch call.
 // Recommendation resolution scripts rarely exceed 5 steps; 10 covers the most complex cases.
@@ -175,6 +203,11 @@ type validateCredentialsRequest struct {
 	AccessKey    string `json:"access_key,omitempty"`
 	AccessSecret string `json:"access_secret,omitempty"`
 	Region       string `json:"region,omitempty"`
+
+	// AWS CUR selection (optional — narrows discovery to one named report).
+	// Sent by Edit Billing Config; empty during onboarding, which auto-picks.
+	CurReportName string `json:"cur_report_name,omitempty"`
+	CurS3Bucket   string `json:"cur_s3_bucket,omitempty"`
 }
 
 func buildContextFromGin(c *gin.Context, logger *slog.Logger, tracer *trace.Tracer, meter *metric.Meter, account string) (*security.RequestContext, context.CancelFunc, error) {
@@ -367,6 +400,13 @@ func handleCloudProviderApis(r *gin.Engine, tracer *trace.Tracer, meter *metric.
 			c.JSON(500, buildApiResponse(nil, err))
 			return
 		}
+
+		// Detached: the requested month is already stored, and the historical
+		// sweep takes far longer than this request should stay open.
+		if request.Backfill {
+			account.StartHistoricalBackfill(ctx, request.AccountId, ctx.GetSecurityContext().GetTenantId(), month, year)
+		}
+
 		c.JSON(200, buildApiResponse(resp))
 	})
 
@@ -783,6 +823,74 @@ func handleCloudProviderApis(r *gin.Engine, tracer *trace.Tracer, meter *metric.
 		c.JSON(200, buildApiResponse(resp))
 	})
 
+	// cli_credentials hands the caller an environment instead of running the
+	// command here. It exists for callers whose work is not a single CLI
+	// process — a workflow script running terraform, say — where relaying each
+	// command is not possible. Credential resolution still happens in this
+	// service; only the result crosses the wire, and it is never logged.
+	groupV2.POST("/cli_credentials", func(c *gin.Context) {
+		request := cliCredentialsRequest{}
+		if err := c.ShouldBindJSON(&request); err != nil {
+			c.JSON(400, buildApiResponse(nil, err))
+			return
+		}
+		if err := common.ValidateStruct(request); err != nil {
+			slog.Error("error validating cli_credentials", "error", err)
+			c.JSON(400, buildApiResponse(nil, err))
+			return
+		}
+
+		ctx, cancel, err := buildContextFromGin(c, logger, tracer, meter, request.AccountId)
+		if err != nil {
+			c.JSON(400, buildApiResponse(nil, err))
+			return
+		}
+		if cancel != nil {
+			defer cancel()
+		}
+
+		credentials, err := account.CliCredentials(ctx, request.AccountId, time.Duration(request.DurationSeconds)*time.Second)
+		if err != nil {
+			c.JSON(500, buildApiResponse(nil, err))
+			return
+		}
+		response := cliCredentialsResponse{Env: credentials.Env}
+		if credentials.ExpiresAt != nil {
+			response.ExpiresAt = credentials.ExpiresAt.UTC().Format(time.RFC3339)
+		}
+		c.JSON(200, buildApiResponse(response))
+	})
+
+	// execute_cli_v2 is the workspace-shim contract. Unlike the legacy
+	// endpoint, a non-zero CLI exit is returned as a successful HTTP response
+	// with its exact process status; only validation, authentication, account,
+	// or executor failures use a non-2xx response.
+	groupV2.POST("/execute_cli_v2", func(c *gin.Context) {
+		request := executeCommand{}
+		if err := c.ShouldBindJSON(&request); err != nil {
+			c.JSON(http.StatusBadRequest, buildApiResponse(nil, err))
+			return
+		}
+		if err := common.ValidateStruct(request); err != nil {
+			c.JSON(http.StatusBadRequest, buildApiResponse(nil, err))
+			return
+		}
+		ctx, cancel, err := buildContextFromGin(c, logger, tracer, meter, request.AccountId)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, buildApiResponse(nil, err))
+			return
+		}
+		if cancel != nil {
+			defer cancel()
+		}
+		result, err := executeCliCommandV2(ctx, request.AccountId, request.Command)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, buildApiResponse(nil, err))
+			return
+		}
+		c.JSON(http.StatusOK, buildApiResponse(result))
+	})
+
 	groupV2.POST("/execute_cli_batch", func(c *gin.Context) {
 		request := executeBatchCommand{}
 		err := c.ShouldBindJSON(&request)
@@ -1057,12 +1165,17 @@ func handleCloudProviderApis(r *gin.Engine, tracer *trace.Tracer, meter *metric.
 		resp, err := account.UpdateAlertRule(ctx, request)
 		if err != nil {
 			ctx.GetLogger().Error("error updating alert rule", "error", err)
-			c.JSON(500, buildApiResponse(nil, err))
+			status := 500
+			if errors.Is(err, providers.ErrAlertRuleChangeUnsupported) {
+				status = 400
+			}
+			c.JSON(status, buildApiResponse(nil, err))
 			return
 		}
 		c.JSON(200, buildApiResponse(map[string]interface{}{
 			"external_rule_id": resp.ExternalRuleId,
 			"status":           resp.Status,
+			"previous":         resp.Previous,
 		}))
 	})
 
@@ -1304,11 +1417,13 @@ func handleCloudProviderApis(r *gin.Engine, tracer *trace.Tracer, meter *metric.
 			result = common.ValidateGCPCredentials(c.Request.Context(), creds)
 		case "AWS":
 			creds := common.AWSCredentials{
-				AssumeRole:   request.AssumeRole,
-				ExternalId:   request.ExternalID,
-				AccessKey:    request.AccessKey,
-				AccessSecret: request.AccessSecret,
-				Region:       request.Region,
+				AssumeRole:    request.AssumeRole,
+				ExternalId:    request.ExternalID,
+				AccessKey:     request.AccessKey,
+				AccessSecret:  request.AccessSecret,
+				Region:        request.Region,
+				CurReportName: request.CurReportName,
+				CurS3Bucket:   request.CurS3Bucket,
 			}
 			result = common.ValidateAWSCredentials(c.Request.Context(), creds)
 		default:

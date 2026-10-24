@@ -149,7 +149,7 @@ const AgentChart = ({ spec }) => {
               >
                 {label}
               </Box>
-              <Box sx={{ flex: '0 0 auto', fontSize: 'var(--ds-text-small)', fontWeight: 600, color: 'var(--ds-gray-800)' }}>
+              <Box sx={{ flex: '0 0 auto', fontSize: 'var(--ds-text-small)', fontWeight: ds.weight.semibold, color: 'var(--ds-gray-800)' }}>
                 {fmt(parsed.values[i])}
               </Box>
               <Box sx={{ flex: '0 0 auto', fontSize: 'var(--ds-text-small)', color: 'var(--ds-gray-500)', minWidth: 44, textAlign: 'right' }}>
@@ -179,6 +179,7 @@ const AgentChart = ({ spec }) => {
       data-testid='agent-chart'
       sx={{
         width: '100%',
+        boxSizing: 'border-box',
         my: ds.space[3],
         p: ds.space[3],
         borderRadius: ds.radius.lg,
@@ -190,7 +191,7 @@ const AgentChart = ({ spec }) => {
         <Typography
           sx={{
             fontSize: 'var(--ds-text-small)',
-            fontWeight: 600,
+            fontWeight: ds.weight.semibold,
             color: 'var(--ds-gray-700)',
             fontFamily: ds.font.sans,
             mb: ds.space[2],

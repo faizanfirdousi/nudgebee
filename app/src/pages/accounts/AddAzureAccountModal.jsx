@@ -1,19 +1,10 @@
-import { Grid, Typography, Stepper, Step, StepLabel, StepConnector, stepConnectorClasses, styled, Box, Collapse, Alert } from '@mui/material';
+import { Grid, Typography, Box } from '@mui/material';
 import { Chip } from '@ui/Chip';
+import { CollapsableCard } from '@ui/CollapsableCard';
+import { Stepper } from '@ui/Stepper';
 import { Checkbox } from '@ui/Checkbox';
 import { Input } from '@ui/Input';
-import {
-  Visibility,
-  VisibilityOff,
-  Check,
-  HelpOutline,
-  ExpandMore,
-  ExpandLess,
-  InfoOutlined,
-  SearchOutlined,
-  CheckCircleOutline,
-  ErrorOutline,
-} from '@mui/icons-material';
+import { Visibility, VisibilityOff, HelpOutline, SearchOutlined, CheckCircleOutline, ErrorOutline } from '@mui/icons-material';
 import { useState, useEffect, useRef } from 'react';
 import { Banner } from '@ui/Banner';
 import { useTour } from '@components/common/tour';
@@ -25,53 +16,7 @@ import { toast as snackbar } from '@ui/Toast';
 import MarkDowns from '@shared/viewers/MarkDowns';
 import AccountEnvToggle, { DEFAULT_ACCOUNT_ENV } from '@shared/forms/AccountEnvToggle';
 import { ds } from 'src/utils/colors';
-
-const StepConnectorStyled = styled(StepConnector)(() => ({
-  [`&.${stepConnectorClasses.alternativeLabel}`]: {
-    top: ds.space.mul(1, 5),
-    left: `calc(-50% + ${ds.space[4]})`,
-    right: `calc(50% + ${ds.space[4]})`,
-  },
-  [`&.${stepConnectorClasses.active}, &.${stepConnectorClasses.completed}`]: {
-    [`& .${stepConnectorClasses.line}`]: {
-      borderColor: ds.green[500],
-      borderTopWidth: 2,
-    },
-  },
-  [`& .${stepConnectorClasses.line}`]: {
-    borderColor: ds.brand[200],
-    borderTopWidth: 1,
-    borderRadius: ds.radius.sm,
-  },
-}));
-
-const StepIconCustom = ({ active, completed, icon }) => {
-  const styles = completed
-    ? { backgroundColor: ds.green[400], border: 'none', color: ds.background[100] }
-    : {
-        backgroundColor: ds.background[100],
-        border: active ? `1px solid ${ds.green[500]}` : `1px solid ${ds.gray[300]}`,
-        color: active ? ds.green[500] : ds.gray[600],
-      };
-
-  return (
-    <Box
-      sx={{
-        width: ds.space[5],
-        height: ds.space[5],
-        borderRadius: ds.radius.pill,
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        fontSize: ds.text.bodyLg,
-        fontWeight: 'bold',
-        ...styles,
-      }}
-    >
-      {completed ? <Check sx={{ fontSize: ds.text.title }} /> : icon}
-    </Box>
-  );
-};
+import { getIntegrationDescription } from '@lib/integrationDescriptions';
 
 const SETUP_GUIDE_CONTENT = `### Prerequisites
 
@@ -117,7 +62,6 @@ const AddAzureAccountModal = ({ open, onClose }) => {
   const [clientSecret, setClientSecret] = useState('');
   const [showSecret, setShowSecret] = useState(false);
   const [validationError, setValidationError] = useState({});
-  const [guideExpanded, setGuideExpanded] = useState(false);
 
   // Step 1: Subscriptions
   const [step, setStep] = useState(0);
@@ -139,7 +83,6 @@ const AddAzureAccountModal = ({ open, onClose }) => {
     setClientSecret('');
     setShowSecret(false);
     setValidationError({});
-    setGuideExpanded(false);
     setStep(0);
     setIsDiscovering(false);
     setDiscoveredSubscriptions([]);
@@ -370,27 +313,12 @@ const AddAzureAccountModal = ({ open, onClose }) => {
       open={open}
       handleClose={isLoading ? () => {} : () => handleCloseModal(onboardResults !== null)}
       title='Add Azure Account'
+      subtitle={getIntegrationDescription('AZURE')}
       loader={isLoading}
     >
-      <Stepper activeStep={step} alternativeLabel connector={<StepConnectorStyled />} sx={{ mb: ds.space[5], mt: ds.space[4] }}>
-        {STEP_LABELS.map((label, index) => (
-          <Step key={label} completed={step > index}>
-            <StepLabel
-              StepIconComponent={StepIconCustom}
-              sx={{
-                '& .MuiStepLabel-label.MuiStepLabel-alternativeLabel': {
-                  fontSize: ds.text.bodyLg,
-                  marginTop: ds.space[2],
-                  color: step === index ? ds.gray[700] : 'inherit',
-                  fontWeight: step === index ? 500 : 'normal',
-                },
-              }}
-            >
-              {label}
-            </StepLabel>
-          </Step>
-        ))}
-      </Stepper>
+      <Box sx={{ mb: ds.space[5], mt: ds.space[4] }}>
+        <Stepper steps={STEP_LABELS.map((label) => ({ id: label, label }))} current={step} orientation='horizontal' />
+      </Box>
 
       {isTourDemo && step > 0 && (
         <Banner
@@ -404,45 +332,29 @@ const AddAzureAccountModal = ({ open, onClose }) => {
       {step === 0 && (
         <>
           {/* Collapsible Setup Guide */}
-          <Box sx={{ mb: ds.space[2] }}>
-            <Box
-              sx={{
-                display: 'flex',
-                alignItems: 'center',
-                cursor: 'pointer',
-                gap: ds.space[1],
-                py: ds.space[2],
-              }}
-              onClick={() => setGuideExpanded(!guideExpanded)}
-            >
-              <HelpOutline sx={{ fontSize: 18, color: ds.gray[600] }} />
-              <Typography sx={{ fontSize: ds.text.body, color: ds.gray[600], fontWeight: ds.weight.medium }}>
-                Setup Guide — How to create an Azure service principal
-              </Typography>
-              {guideExpanded ? <ExpandLess sx={{ fontSize: 18, color: ds.gray[600] }} /> : <ExpandMore sx={{ fontSize: 18, color: ds.gray[600] }} />}
-            </Box>
-            <Collapse in={guideExpanded}>
-              <Box
-                sx={{
-                  mt: ds.space[2],
-                  p: ds.space[4],
-                  bgcolor: ds.background[200],
-                  borderRadius: ds.radius.lg,
-                  border: `1px solid ${ds.gray[300]}`,
-                }}
-              >
-                <MarkDowns
-                  data={SETUP_GUIDE_CONTENT}
-                  sx={{
-                    maxHeight: ds.space.mul(1, 75),
-                    overflowY: 'auto',
-                    padding: '0px',
-                    borderRadius: '0px',
-                  }}
-                />
+          <CollapsableCard
+            defaultOpen={false}
+            elevation='flat'
+            sx={{ mb: ds.space[2] }}
+            header={
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: ds.space[1] }}>
+                <HelpOutline sx={{ fontSize: 18, color: ds.gray[600] }} />
+                <Typography sx={{ fontSize: ds.text.body, color: ds.gray[600], fontWeight: ds.weight.medium }}>
+                  Setup Guide — How to create an Azure service principal
+                </Typography>
               </Box>
-            </Collapse>
-          </Box>
+            }
+          >
+            <MarkDowns
+              data={SETUP_GUIDE_CONTENT}
+              sx={{
+                maxHeight: ds.space.mul(1, 75),
+                overflowY: 'auto',
+                padding: '0px',
+                borderRadius: '0px',
+              }}
+            />
+          </CollapsableCard>
 
           <Grid container>
             <Box sx={{ mt: ds.space[4], width: '100%' }}>
@@ -556,9 +468,9 @@ const AddAzureAccountModal = ({ open, onClose }) => {
 
           {discoveryError && (
             <Box sx={{ py: ds.space[4] }}>
-              <Alert severity='error' sx={{ mb: ds.space[4] }}>
-                {discoveryError}
-              </Alert>
+              <Box sx={{ mb: ds.space[4] }}>
+                <Banner tone='critical' message={discoveryError} />
+              </Box>
               <Box sx={{ textAlign: 'center' }}>
                 <Button size='md' id='retry-discover' tone='secondary' onClick={handleDiscoverSubscriptions} disabled={isDiscovering}>
                   Retry
@@ -663,11 +575,18 @@ const AddAzureAccountModal = ({ open, onClose }) => {
         <>
           {!onboardResults && (
             <>
-              <Alert severity='info' icon={<InfoOutlined sx={{ fontSize: 16 }} />} sx={{ mb: ds.space[4] }}>
-                {selectedSubscriptionIds.size} subscription{selectedSubscriptionIds.size > 1 ? 's' : ''} will be onboarded under &quot;
-                {accountNameValue}&quot;.
-                {selectedSubscriptionIds.size > 1 && ' The first subscription becomes the parent account.'}
-              </Alert>
+              <Box sx={{ mb: ds.space[4] }}>
+                <Banner
+                  tone='info'
+                  message={
+                    <>
+                      {selectedSubscriptionIds.size} subscription{selectedSubscriptionIds.size > 1 ? 's' : ''} will be onboarded under &quot;
+                      {accountNameValue}&quot;.
+                      {selectedSubscriptionIds.size > 1 && ' The first subscription becomes the parent account.'}
+                    </>
+                  }
+                />
+              </Box>
 
               <Box
                 sx={{

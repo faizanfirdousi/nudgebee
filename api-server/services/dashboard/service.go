@@ -37,13 +37,13 @@ var (
 		"resource_type": true, "all": true,
 	}
 	validPanelTypes = map[string]bool{
-		VizTimeseries: true, VizStat: true, VizTable: true, VizBar: true, VizText: true,
+		VizTimeseries: true, VizStat: true, VizGauge: true, VizTable: true, VizBar: true, VizText: true,
 	}
 	validDatasources = map[string]bool{
 		DatasourceMetrics: true, DatasourceLogs: true,
 		DatasourceTraces: true, DatasourceNudgebee: true,
 		DatasourceRedis: true, DatasourceRabbitMQ: true,
-		DatasourcePostgres: true,
+		DatasourcePostgres: true, DatasourceKubectl: true,
 	}
 )
 
@@ -107,6 +107,24 @@ func ValidateDefinition(def Definition) error {
 		}
 		if !hasType && !hasIds {
 			return fmt.Errorf("panel %q: an account type or at least one account is required", p.Title)
+		}
+		// kubectl runs against the account's own agent, which only a Kubernetes
+		// account has. A type-scoped panel can be checked here; an id-scoped one
+		// is checked in ExecuteQuery, which has the request context this does not
+		// and can read the account itself.
+		if p.Datasource == DatasourceKubectl && hasType && !strings.EqualFold(p.AccountType, KubernetesAccountProvider) {
+			return fmt.Errorf("panel %q: a kubectl panel runs on Kubernetes accounts only", p.Title)
+		}
+		// A provider names the query language the panel's expression is written in,
+		// which only means something where a provider is resolved per account.
+		// Carrying one anywhere else would be a stored value nothing ever reads.
+		if strings.TrimSpace(p.Provider) != "" && !IsProviderDatasource(p.Datasource) {
+			return fmt.Errorf("panel %q: a %s panel has no provider to pin", p.Title, p.Datasource)
+		}
+		// An index with no provider would be forced across accounts that are each
+		// on their own default backend, most of which have no index at all.
+		if strings.TrimSpace(p.ProviderIndex) != "" && strings.TrimSpace(p.Provider) == "" {
+			return fmt.Errorf("panel %q: an index needs a provider to belong to", p.Title)
 		}
 		if len(p.Targets) == 0 {
 			return fmt.Errorf("panel %q: at least one target is required", p.Title)

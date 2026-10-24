@@ -1094,24 +1094,40 @@ type cloudServiceMapActionParams struct {
 	ResourceId  string `json:"resource_id" validate:"required"`
 }
 
+// CanAutoExecute always returns false: the cloud provider's service map is no
+// longer attached to events. The knowledge graph is the single source of
+// dependency topology, and this map does not add to it — it contradicts it.
+//
+// What it returns for an EC2 instance, as "Downstreams": the AMI it booted
+// from, its VPC, its subnet, its security group, its instance profile and its
+// EBS volume. Those are attributes of the resource, not things it depends on —
+// nothing downstream of an instance is its own AMI. The payload carries no
+// relationship type, only Upstreams/Downstreams, so containment cannot be
+// filtered out of it.
+//
+// Beside the knowledge-graph card it is worse than redundant: it is labelled
+// like topology, so an operator reads six downstream dependencies where there
+// are none, while the real ones — from VPC flow logs, eBPF or traces — sit in
+// the card below.
+//
+// An earlier attempt suppressed only maps where nothing had any upstream or
+// downstream (see Execute). That tested whether links were present, not whether
+// they meant anything, so a VPC/subnet/AMI map passed it and still rendered.
+//
+// Refused for every provider, not just AWS: Azure returns the same shape, and a
+// per-provider carve-out would leave the contradiction wherever it was not
+// applied. (GCP was already skipped here — unimplemented in cloud-collector.)
+//
+// Declining at the gate rather than in Execute means existing deployments,
+// whose agent_playbook_action rows the template upsert never deletes, stop
+// scheduling the action instead of running a provider query per cloud event
+// and discarding the result.
+//
+// Execute is left intact, so a playbook naming this action explicitly still
+// gets an answer. The direct API path never reached it anyway —
+// handleCloudServiceMap calls cloud.QueryServiceMap itself — so the RPC is
+// unaffected.
 func (a *cloudServiceMapAction) CanAutoExecute(ctx playbooks.PlaybookActionContext) bool {
-	labels := ctx.GetEvent().Labels
-
-	// AWS
-	if labels["aws_region"] != "" && labels["aws_event_instance"] != "" && labels["aws_service_name"] != "" {
-		return true
-	}
-
-	// GCP — service map is not implemented in cloud-collector (returns ErrUnsupported),
-	// so skip auto-execution to avoid producing an empty card.
-
-	// Azure Monitor Alert (polling-based or webhook)
-	if isAzureAlertSource(ctx.GetEvent().Source) && labels["azure_alert_target_resource"] != "" {
-		if isAzureResourceID(labels["azure_alert_target_resource"]) {
-			return true
-		}
-	}
-
 	return false
 }
 
@@ -1208,6 +1224,31 @@ func (a *cloudServiceMapAction) Execute(ctx playbooks.PlaybookActionContext, raw
 		"region":       params.Region,
 	}
 	if len(resourceResp.Applications) == 0 {
+		return nil, nil
+	}
+
+	// A map where nothing has an upstream or a downstream is containment only:
+	// the resource, its VPC, its security group. It carries no dependency
+	// information, and the knowledge-graph card on the same event already holds
+	// the real traffic edges (VPC flow logs, eBPF, traces).
+	//
+	// Emitting it anyway was actively harmful rather than merely useless. The
+	// cloud card is written before the knowledge-graph card, and correlation
+	// used to take the first service_map evidence it found - so every cloud
+	// event built its dependency graph from this empty one and could never
+	// score a hop. Correlation now prefers the knowledge-graph card, but the
+	// empty card still renders in the UI and still tells an operator a database
+	// alarm has no callers when the same event carries "instance CALLS
+	// database". Provider-agnostic on purpose: AWS Config, GCP and Azure all
+	// produce containment-only maps for resources with no discovered links.
+	hasDependency := false
+	for _, app := range resourceResp.Applications {
+		if len(app.Upstreams) > 0 || len(app.Downstreams) > 0 {
+			hasDependency = true
+			break
+		}
+	}
+	if !hasDependency {
 		return nil, nil
 	}
 
@@ -1378,6 +1419,44 @@ func gcpLogRawParams(labels map[string]string) map[string]any {
 	return params
 }
 
+// logQueryIncomplete reports whether a log query ended before it finished, as opposed to
+// finishing with nothing to show. Both cases used to return zero rows and no card, so a
+// provider rate-limit was indistinguishable from a resource that simply has no logs.
+//
+// Only an explicit non-Complete status counts. Providers that do not populate Status keep
+// their existing behaviour — the AWS path returns a zero-value response (empty status) for
+// its three legitimately-empty cases (service without direct CloudWatch logs, no log group
+// found after detection, ResourceNotFoundException), and those must stay "no logs", not
+// "failed". Collectors older than this change always send "Complete".
+func logQueryIncomplete(status string) bool {
+	return status != "" && status != "Complete"
+}
+
+// logMetricLookbackWindow returns the query window for a log-based metric alert: the
+// hour ending at the alert. The default 10-minute window from getPlaybookStartEndTime is
+// too narrow because such alerts accumulate over time before firing; with the metric's
+// own filter applied the result set stays small enough for the wider window.
+//
+// The window is anchored on the event's end when it has one, else on when it fired.
+// Webhook-ingested GCP alerts (gcp_monitoring_webhook) carry no ends_at, so before the
+// startedAt fallback the widening was skipped entirely and buildLogFilter defaulted the
+// end to time.Now() — a forward-looking [fired, now] window. A log-based metric fires
+// *because* of logs that already happened, so that window structurally cannot contain
+// them, the query returned nothing, and no Logs card was ever rendered (#36870).
+func logMetricLookbackWindow(startTime, endTime, startedAt *time.Time) (*time.Time, *time.Time) {
+	anchor := endTime
+	if anchor == nil {
+		anchor = startedAt
+	}
+	if anchor == nil {
+		return startTime, endTime
+	}
+	// Copy rather than hand back the event's own StartedAt pointer.
+	end := *anchor
+	start := end.Add(-1 * time.Hour)
+	return &start, &end
+}
+
 func (a *cloudLogAction) AutoExecute(ctx playbooks.PlaybookActionContext) (playbooks.PlaybookActionResponse, error) {
 	labels := ctx.GetEvent().Labels
 
@@ -1516,13 +1595,8 @@ func (a *cloudLogAction) Execute(ctx playbooks.PlaybookActionContext, rawParams 
 		params.EndTime = ctx.GetEvent().EndedAt
 	}
 
-	// For log-based metric alerts, widen the time window to 1 hour.
-	// The default 10-minute window from getPlaybookStartEndTime is too narrow
-	// because alerts accumulate over time before firing. With the metric filter
-	// applied, the result set will be small enough for a wider window.
-	if params.LogMetricName != "" && params.EndTime != nil {
-		widerStart := params.EndTime.Add(-1 * time.Hour)
-		params.StartTime = &widerStart
+	if params.LogMetricName != "" {
+		params.StartTime, params.EndTime = logMetricLookbackWindow(params.StartTime, params.EndTime, ctx.GetEvent().StartedAt)
 	}
 
 	query := params.Query
@@ -1630,7 +1704,9 @@ func (a *cloudLogAction) Execute(ctx playbooks.PlaybookActionContext, rawParams 
 		metadata["truncated_reason"] = "cloud_logs evidence size/entry cap"
 	}
 
-	if len(logoutput) == 0 {
+	queryFailed := logQueryIncomplete(resourceResp.Status)
+
+	if len(logoutput) == 0 && !queryFailed {
 		// Surface "no evidence captured" so a systemically-empty account (wrong
 		// resource id, missing log scope, permissions) is diagnosable instead of
 		// silently leaving only the Raw Event on the event.
@@ -1644,6 +1720,26 @@ func (a *cloudLogAction) Execute(ctx playbooks.PlaybookActionContext, rawParams 
 	}
 
 	insights := actionLogExtractErrorPatterns(logoutput, 2)
+	if queryFailed {
+		// Returning an error here would be swallowed by the auto-action loop
+		// (eventrule.ExecutePlaybook logs a warning and drops the result), leaving the
+		// event with no trace of the failure. An insight rides the evidence card into
+		// the investigation view, where the reader and the LLM analysis both see it.
+		ctx.GetLogger().Error("cloud_logs: query did not complete",
+			"account_id", params.AccountId,
+			"status", resourceResp.Status,
+			"service_name", params.ServiceName,
+			"resource_id", params.ResourceId,
+			"entries_returned", len(logoutput))
+		insights = append(insights, playbooks.PlaybookActionResponseInsight{
+			Message: fmt.Sprintf("Log query did not complete (status %q); %d entries returned. "+
+				"Evidence is incomplete — the provider may have rate-limited or rejected the query.",
+				resourceResp.Status, len(logoutput)),
+			Severity: "error",
+		})
+		metadata["query_status"] = resourceResp.Status
+		metadata["incomplete"] = true
+	}
 	labels := map[string]any{}
 	if len(logoutput) > 0 {
 		firstElement := logoutput[0]
@@ -1816,7 +1912,9 @@ func (a *cloudDeploymentDiffAction) Execute(ctx playbooks.PlaybookActionContext,
 	deployedAt := time.UnixMilli(newest.CreateTime).UTC()
 
 	insights := []playbooks.PlaybookActionResponseInsight{}
-	if started := ctx.GetEvent().StartedAt; started != nil && newest.CreateTime > 0 {
+	// The alert start, not StartedAt (the query window start, 10 minutes early): a
+	// revision deployed in those 10 minutes came out negative and got no insight.
+	if started := ctx.GetEvent().AlertStart(); started != nil && newest.CreateTime > 0 {
 		delta := started.Sub(deployedAt)
 		if delta >= 0 {
 			sev := "info"
@@ -2315,9 +2413,11 @@ func (a *cloudAzureActivityLogAction) AutoExecute(ctx playbooks.PlaybookActionCo
 		return nil, err
 	}
 
+	// The alert start, not StartedAt: that is the query window start, 10 minutes
+	// early, and ending there dropped the operations just before the alert.
 	eventTime := time.Now().UTC()
-	if ctx.GetEvent().StartedAt != nil {
-		eventTime = *ctx.GetEvent().StartedAt
+	if t := ctx.GetEvent().AlertStart(); t != nil {
+		eventTime = *t
 	}
 
 	cmd := fmt.Sprintf(
@@ -3426,23 +3526,17 @@ func (a *cloudVpcFlowLogsAction) Execute(ctx playbooks.PlaybookActionContext, ra
 		return nil, fmt.Errorf("invalid log_group_name format: %q", params.LogGroupName)
 	}
 
-	// Prioritize time sources: explicit params > event times > default (last 1 hour)
-	var startTime, endTime time.Time
-
+	// Prioritize time sources: explicit params > event window > default (last 1 hour).
+	// The event window goes through ResolveQueryWindow rather than being used raw: a
+	// just-fired EventBridge alarm has EndedAt nil and StartedAt seconds ago, which made
+	// the CloudWatch Insights range a few seconds wide and returned no flows — 36 of the
+	// 41 VPC-flow evidences stored in a week were empty for that reason.
+	startTime, endTime := ctx.GetEvent().ResolveQueryWindow(0)
 	if params.StartTime != nil {
 		startTime = *params.StartTime
-	} else if ctx.GetEvent().StartedAt != nil {
-		startTime = *ctx.GetEvent().StartedAt
-	} else {
-		startTime = time.Now().Add(-1 * time.Hour)
 	}
-
 	if params.EndTime != nil {
 		endTime = *params.EndTime
-	} else if ctx.GetEvent().EndedAt != nil {
-		endTime = *ctx.GetEvent().EndedAt
-	} else {
-		endTime = time.Now()
 	}
 
 	// Discover VPC Flow Logs log group name and format

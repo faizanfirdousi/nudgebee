@@ -2,8 +2,10 @@ package anomoly
 
 import (
 	"context"
+	"database/sql"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand"
@@ -13,6 +15,7 @@ import (
 	"nudgebee/services/event"
 	"nudgebee/services/internal/database"
 	"nudgebee/services/ml"
+	"nudgebee/services/observability"
 	"nudgebee/services/relay"
 	"nudgebee/services/security"
 	"nudgebee/services/tenant"
@@ -91,7 +94,13 @@ func Execute(context *security.RequestContext) error {
 	if err != nil {
 		return err
 	}
-	rows, err := dbms.Db.Queryx(`select ca.id as cloud_account_id , ca.tenant as tenant from cloud_accounts ca inner join agent a on ca.id = a.cloud_account_id where ca.cloud_provider = 'K8s' and a.status = 'CONNECTED' group by ca.tenant, ca.id`)
+	// The agent join MUST pin a.type = 'k8s'. An account can carry several agent
+	// rows (k8s, proxy, and the cloud-sync AWS/Azure/GCP registrations); without
+	// the type filter a CONNECTED *proxy* row makes an account whose in-cluster
+	// agent is long dead look eligible, and every work item it generates then
+	// fails at the relay with "agent not connected". ca.status keeps retired
+	// accounts out for the same reason (insight/service.go filters the same way).
+	rows, err := dbms.Db.Queryx(`select ca.id as cloud_account_id , ca.tenant as tenant from cloud_accounts ca inner join agent a on ca.id = a.cloud_account_id where ca.cloud_provider = 'K8s' and ca.status = 'active' and a.type = 'k8s' and a.status = 'CONNECTED' group by ca.tenant, ca.id`)
 	if err != nil {
 		slog.Error("anomaly: failed to query accounts for processing", "error", err)
 		return err
@@ -132,13 +141,16 @@ func ExecuteForAccount(context *security.RequestContext, accountId string) error
 		return err
 	}
 
-	// Validate account exists, is K8s type, and has connected agent
+	// Validate account exists, is active, is K8s type, and has a connected
+	// in-cluster agent. Same predicate as Execute above — a.type = 'k8s' keeps a
+	// CONNECTED proxy row from vouching for a dead cluster agent.
 	var tenantId string
 	err = dbms.Db.Get(&tenantId, `
 		SELECT ca.tenant
 		FROM cloud_accounts ca
 		INNER JOIN agent a ON ca.id = a.cloud_account_id
-		WHERE ca.id = $1 AND ca.cloud_provider = 'K8s' AND a.status = 'CONNECTED'
+		WHERE ca.id = $1 AND ca.cloud_provider = 'K8s' AND ca.status = 'active'
+			AND a.type = 'k8s' AND a.status = 'CONNECTED'
 		LIMIT 1
 	`, accountId)
 	if err != nil {
@@ -194,6 +206,8 @@ func executeForAccountPairs(ctx *security.RequestContext, pairs []accountTenantP
 		}
 	}
 
+	closeOrphanedAnomalyEvents(eligibleAccountIds)
+
 	if len(workItems) == 0 {
 		slog.Info("anomaly: no work items generated for processing.")
 		return nil
@@ -217,18 +231,13 @@ func executeForAccountPairs(ctx *security.RequestContext, pairs []accountTenantP
 		slog.Info("anomaly: processing work item",
 			"accountId", item.AccountID, "tenantId", item.TenantID,
 			"application", item.Application.Name, "namespace", item.Application.K8sNamespace,
-			"anomalyType", item.AnomalyConfig.AnomalyType, "provider", item.AnomalyConfig.AnomalyProvider)
+			"anomalyType", item.AnomalyConfig.AnomalyType)
 
-		var processingErr error
-		if item.AnomalyConfig.AnomalyProvider == "prometheus" {
-			processingErr = processSingleApplicationPrometheus(ctx, item.AnomalyConfig, item.TenantID, item.AccountID, item.Application)
-		} else {
-			var existingCount int
-			if typeCounts, ok := existingAnomalyCounts[item.AccountID]; ok {
-				existingCount = typeCounts[item.AnomalyConfig.AnomalyType]
-			}
-			processingErr = processSingleApplicationMlAsync(ctx, item.AnomalyConfig, item.TenantID, item.AccountID, item.Application, existingCount)
+		var existingCount int
+		if typeCounts, ok := existingAnomalyCounts[item.AccountID]; ok {
+			existingCount = typeCounts[item.AnomalyConfig.AnomalyType]
 		}
+		processingErr := processSingleApplicationMlAsync(ctx, item.AnomalyConfig, item.TenantID, item.AccountID, item.Application, existingCount)
 
 		if processingErr != nil {
 			slog.Error("anomaly: failed to process work item", "error", processingErr,
@@ -300,6 +309,168 @@ func fetchExistingAnomalyCounts(accountIds []string) map[string]map[AnomalyType]
 		slog.Error("anomaly: error iterating existing-anomaly-counts rows", "error", err)
 	}
 	return result
+}
+
+// anomalyFingerprint is the single source of truth for a K8s metric anomaly's
+// dedup/close identity — the same instance (account, type, workload,
+// namespace) always produces the same string, across every detection cycle,
+// which is what lets InsertEvent's ON CONFLICT(tenant, cloud_account_id,
+// finding_id) upsert collapse repeat detections into one row instead of
+// inserting a new one every cycle.
+//
+// Uses "|" as the field separator, not "-": account is a UUID and name/
+// namespace are Kubernetes DNS-1123 labels, both of which routinely contain
+// "-" themselves. Joining with "-" is ambiguous — name="api",
+// namespace="prod-payments" and name="api-prod", namespace="payments" both
+// serialize to the identical string under the same account+type — so two
+// unrelated workloads could silently share one event and incorrectly close
+// each other's anomalies. "|" cannot appear in a UUID, this type's enum
+// values, or a DNS-1123 label, so it can't collide.
+func anomalyFingerprint(accountId string, anomalyType AnomalyType, name, namespace string) string {
+	return fmt.Sprintf("anomaly|%s|%s|%s|%s", accountId, anomalyType, name, namespace)
+}
+
+// closeAnomalyEventIfOpen auto-resolves the FIRING Anomaly event for exactly
+// this (account, type, name, namespace) instance, if one is open. Call this
+// when a detection cycle EXPLICITLY evaluated this instance and found it
+// clean — ml.AnomalyResponse.HasAnomaly == false from the ML path, or
+// isAnomaly == false from the Prometheus comparison — not merely "no result
+// came back" (e.g. the ML new-workload/insufficient-training-data guard),
+// which carries no information about whether a prior anomaly recovered.
+//
+// This is a real per-cycle recovery signal, not an inferred one, so it closes
+// immediately — no debounce/buffer needed, unlike closeOrphanedAnomalyEvents.
+func closeAnomalyEventIfOpen(accountId, tenantId string, anomalyType AnomalyType, name, namespace string) {
+	dbms, err := database.GetDatabaseManager(database.Metastore)
+	if err != nil {
+		slog.Error("anomaly: failed to get db manager for closing recovered anomaly event", "error", err)
+		return
+	}
+	fingerprint := anomalyFingerprint(accountId, anomalyType, name, namespace)
+
+	var id string
+	err = dbms.Db.QueryRowx(
+		// events.ends_at is `timestamp` with no timezone (see V175); binding an
+		// explicit UTC value here — rather than the SQL now(), which would cast
+		// through the session's timezone setting — keeps it consistent with
+		// every other write in this codebase, which timestamps in Go as UTC.
+		`UPDATE events SET status = 'RESOLVED', ends_at = $4
+		 WHERE tenant = $1 AND cloud_account_id = $2 AND finding_id = $3 AND status = 'FIRING'
+		 RETURNING id`,
+		tenantId, accountId, fingerprint, time.Now().UTC(),
+	).Scan(&id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return
+		}
+		slog.Error("anomaly: failed to close recovered anomaly event", "error", err, "fingerprint", fingerprint)
+		return
+	}
+
+	publishAnomalyEventResolved(id)
+}
+
+// publishAnomalyEventResolved delivers the resolved notification the same
+// way webhook-driven resolves do (integrations/core/integration_webhook.go
+// resolveEvent) — status alone doesn't notify anyone, this does.
+func publishAnomalyEventResolved(eventId string) {
+	_ = common.MqPublish(
+		config.Config.RabbitMqEventPostProcessExchange,
+		config.Config.RabbitMqEventPostProcessQueue,
+		map[string]any{"event_id": eventId, "notify_resolved": true},
+		common.MqPublishWithExpiration(1*time.Hour),
+		common.MqPublishWithBackgroundRetry(),
+	)
+}
+
+// closeOrphanedAnomalyEvents is a backstop, not the primary close path (see
+// closeAnomalyEventIfOpen for that). It only catches anomaly instances that
+// stop being evaluated AT ALL — the workload was deleted, the app no longer
+// shows up in application.ListApplications, or the tenant disabled anomaly
+// detection — so no cycle, clean or dirty, ever runs again to report a
+// recovery. A FIRING anomaly event whose updated_at hasn't moved in a long
+// time (default: 7 days) almost certainly fits that description, since a
+// live, still-evaluated instance is either re-confirmed as FIRING (bumping
+// updated_at via the upsert) or actively closed by closeAnomalyEventIfOpen
+// every single cycle.
+//
+// The window is deliberately much longer than the detection cadence — this
+// is cleanup for abandoned events, not a substitute for prompt closing.
+//
+// category = 'Anomaly' scopes this to K8s metric anomalies only — spend
+// anomalies also use finding_type = 'Anomaly' but category = 'CostAnomaly',
+// and already have their own OPEN/RESOLVED lifecycle (see spend_anomaly.go).
+func closeOrphanedAnomalyEvents(accountIds []string) {
+	closeAnomalyEventsUpdatedBefore(accountIds, time.Now().UTC().Add(-7*24*time.Hour))
+}
+
+// closeAnomalyEventsUpdatedBefore is closeOrphanedAnomalyEvents with the
+// staleness cutoff as a parameter instead of a hardcoded "now - 7 days", so
+// the WHERE clause's account/finding_type/category/status scoping can be
+// tested without needing to backdate a real events.updated_at value — the
+// table's set_public_events_updated_at trigger forces updated_at to NOW() on
+// every UPDATE, so a freshly inserted row can't be backdated by SQL from the
+// application; passing a cutoff in the future makes a fresh row "stale"
+// relative to it instead.
+func closeAnomalyEventsUpdatedBefore(accountIds []string, staleBefore time.Time) {
+	nonEmptyAccountIds := make([]string, 0, len(accountIds))
+	for _, id := range accountIds {
+		if id != "" {
+			nonEmptyAccountIds = append(nonEmptyAccountIds, id)
+		}
+	}
+	if len(nonEmptyAccountIds) == 0 {
+		return
+	}
+
+	dbms, err := database.GetDatabaseManager(database.Metastore)
+	if err != nil {
+		slog.Error("anomaly: failed to get db manager for closing orphaned anomaly events", "error", err)
+		return
+	}
+
+	query, args, err := sqlx.In(`
+		UPDATE events
+		   SET status = 'RESOLVED', ends_at = updated_at
+		 WHERE cloud_account_id IN (?) AND finding_type = 'Anomaly' AND category = 'Anomaly'
+		   AND status = 'FIRING' AND updated_at < ?
+		 RETURNING id`, nonEmptyAccountIds, staleBefore)
+	if err != nil {
+		slog.Error("anomaly: failed to build orphaned-anomaly-close query", "error", err)
+		return
+	}
+	query = dbms.Db.Rebind(query)
+
+	rows, err := dbms.Db.Queryx(query, args...)
+	if err != nil {
+		slog.Error("anomaly: failed to close orphaned anomaly events", "error", err)
+		return
+	}
+	defer func() {
+		if cerr := rows.Close(); cerr != nil {
+			slog.Error("anomaly: failed to close rows after closing orphaned anomaly events", "error", cerr)
+		}
+	}()
+
+	var resolvedIds []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			slog.Error("anomaly: failed to scan resolved anomaly event id", "error", err)
+			continue
+		}
+		resolvedIds = append(resolvedIds, id)
+	}
+	if err := rows.Err(); err != nil {
+		slog.Error("anomaly: error iterating resolved anomaly event rows", "error", err)
+	}
+
+	for _, id := range resolvedIds {
+		publishAnomalyEventResolved(id)
+	}
+	if len(resolvedIds) > 0 {
+		slog.Info("anomaly: closed orphaned anomaly events", "count", len(resolvedIds))
+	}
 }
 
 func processSingleApplicationMlAsync(
@@ -394,15 +565,20 @@ func ProcessAnomaly(ctx *security.RequestContext, app AnomalyProcessingMessage) 
 	}
 
 	if len(mlAnomalies) == 0 {
+		// The ML server returns an empty list only when it couldn't evaluate at
+		// all (e.g. CancelPrediction for a new workload with too little training
+		// data yet) — that's "no information", not "recovered", so don't close.
 		ctx.GetLogger().Info("anomaly: no anomalies found", "account", app.AccountId)
 		return
 	}
 
 	// Process each anomaly
+	anomalyFound := false
 	for _, mlAnomaly := range mlAnomalies {
 		if !mlAnomaly.HasAnomaly {
 			continue
 		}
+		anomalyFound = true
 		anomalyValue := 0.0
 		for _, d := range mlAnomaly.Data {
 			if d.Anomaly {
@@ -464,202 +640,14 @@ func ProcessAnomaly(ctx *security.RequestContext, app AnomalyProcessingMessage) 
 			ctx.GetLogger().Error("anomaly: unable to handle callback for anomaly", "app", app.ApplicationName, "namespace", app.ApplicationNamespace, "error", err)
 		}
 	}
+
+	// The ML server returned a definitive result (len(mlAnomalies) > 0) and none
+	// of them had an anomaly — a real "this instance is clean" signal for this
+	// cycle, not just an absence of one. Close its event if it was open.
+	if !anomalyFound {
+		closeAnomalyEventIfOpen(app.AccountId, app.TenantId, app.AnomalyType, app.ApplicationName, app.ApplicationNamespace)
+	}
 	ctx.GetLogger().Info("anomaly: processing anomaly", "account", app.AccountId, "tenant", app.TenantId, "app", app.ApplicationName, "namespace", app.ApplicationNamespace, "type", app.AnomalyType, "time", time.Since(t0).Seconds())
-}
-
-func processSingleApplicationPrometheus(
-	ctx *security.RequestContext,
-	anomalyCfg AnomalyTemplate,
-	tenantId string,
-	accountId string,
-	app application.Application,
-) error {
-	slog.Debug("anomaly: processing prometheus config for single application",
-		"accountId", accountId, "tenantId", tenantId, "app", app.Name, "namespace", app.K8sNamespace, "anomalyType", anomalyCfg.AnomalyType)
-
-	queryName, promQuery := getQuery(anomalyCfg)
-	if promQuery == "" {
-		slog.Warn("anomaly: Prometheus query not found for anomaly type", "type", anomalyCfg.AnomalyType, "app", app.Name)
-		return nil
-	}
-
-	referencePeriods := []int{1, 7, 14}
-	endTime := time.Now().UTC()
-
-	// 1. Get current data for the specific application
-	currentDataStartTime := endTime.Add(-time.Hour) // Example: last hour
-	rCurrentStartTime := currentDataStartTime.Format("2006-01-02T15:04:05.000000Z")
-	rCurrentEndTime := endTime.Format("2006-01-02T15:04:05.000000Z")
-
-	applicationsFilterForCurrent := map[string]any{
-		app.Name: map[string]any{"namespace": app.K8sNamespace},
-	}
-	currentAppStatsResponses, err := queryRelayServer(accountId, rCurrentStartTime, rCurrentEndTime, promQuery, queryName, applicationsFilterForCurrent)
-	if err != nil {
-		slog.Error("anomaly: failed to query current relay server data for app", "error", err, "accountId", accountId, "app", app.Name)
-		return err
-	}
-
-	if len(currentAppStatsResponses) == 0 {
-		slog.Info("anomaly: no current data from relay for app", "accountId", accountId, "app", app.Name, "queryName", queryName)
-		return nil
-	}
-	currentAppMetricValue, foundCurrent := currentAppStatsResponses[0].OtherMetrics[queryName]
-	if !foundCurrent {
-		slog.Info("anomaly: current metric not found in relay response for app", "metric", queryName, "app", app.Name)
-		return nil
-	}
-
-	// Fan the per-period relay fetches out concurrently — each period is an independent
-	// network round-trip to the agent (no shared state), so running them in parallel
-	// cuts wall time from sum(latencies) to ~max(latencies) per app.
-	var g errgroup.Group
-	for _, period := range referencePeriods {
-		period := period
-		g.Go(func() error {
-			historicalDataStartTime := endTime.AddDate(0, 0, -period)
-			rHistStartTime := historicalDataStartTime.Format("2006-01-02T15:04:05.000000Z")
-			rHistEndTime := endTime.Format("2006-01-02T15:04:05.000000Z") // Using 'now' as end for historical window
-
-			applicationsFilterForHist := map[string]any{
-				app.Name: map[string]any{"namespace": app.K8sNamespace},
-			}
-			historicalAppStatsResponses, err := queryRelayServer(accountId, rHistStartTime, rHistEndTime, promQuery, queryName, applicationsFilterForHist)
-			if err != nil {
-				// Match prior behavior: skip this period on relay error, don't fail the whole app.
-				slog.Error("anomaly: failed to query historical relay server data for app", "error", err, "accountId", accountId, "app", app.Name, "period", period)
-				return nil
-			}
-
-			if len(historicalAppStatsResponses) == 0 {
-				slog.Info("anomaly: no historical data from relay for app", "accountId", accountId, "app", app.Name, "period", period, "queryName", queryName)
-				return nil
-			}
-			historicalAppMetricValue, foundHist := historicalAppStatsResponses[0].OtherMetrics[queryName]
-			if !foundHist || historicalAppMetricValue == 0 {
-				slog.Info("anomaly: historical metric not found or is zero for app", "metric", queryName, "app", app.Name, "period", period)
-				return nil
-			}
-
-			calculatedChangePerc := ((currentAppMetricValue - historicalAppMetricValue) / historicalAppMetricValue) * 100.0
-
-			isAnomaly := false
-			switch anomalyCfg.ChangeOperator {
-			case "GT":
-				isAnomaly = currentAppMetricValue > historicalAppMetricValue && calculatedChangePerc > anomalyCfg.BufferPercenatge
-			case "LT":
-				isAnomaly = currentAppMetricValue < historicalAppMetricValue && (-calculatedChangePerc) > anomalyCfg.BufferPercenatge
-			case "GTE":
-				isAnomaly = currentAppMetricValue >= historicalAppMetricValue && calculatedChangePerc >= anomalyCfg.BufferPercenatge
-			case "LTE":
-				isAnomaly = currentAppMetricValue <= historicalAppMetricValue && (-calculatedChangePerc) >= anomalyCfg.BufferPercenatge
-			default:
-				slog.Warn("anomaly: unknown change operator", "operator", anomalyCfg.ChangeOperator, "app", app.Name)
-			}
-
-			if !isAnomaly {
-				return nil
-			}
-
-			slog.Info("anomaly: Prometheus-based anomaly detected",
-				"accountId", accountId, "app", app.Name, "namespace", app.K8sNamespace, "type", anomalyCfg.AnomalyType,
-				"current", currentAppMetricValue, "historical", historicalAppMetricValue, "period", period)
-
-			refValueMap := map[string]any{
-				fmt.Sprintf("historical_%d_days_value", period): historicalAppMetricValue,
-				"query_name": queryName,
-			}
-			evalTime := time.Now().UTC()
-			anomalyToInsert := Anomaly{
-				Id:           common.GenerateUUID(),
-				AccountId:    accountId,
-				Tenant:       tenantId,
-				Name:         app.Name,
-				Namespace:    app.K8sNamespace,
-				OldValue:     refValueMap,
-				CurrentValue: currentAppMetricValue,
-				AnomalyType:  anomalyCfg.AnomalyType,
-				IsAnomaly:    true,
-				EvaluatedAt:  &evalTime,
-			}
-			if err := insertAnomaly([]Anomaly{anomalyToInsert}); err != nil {
-				slog.Error("anomaly: failed to insert prometheus-based anomaly", "error", err, "accountId", accountId, "app", app.Name, "period", period)
-				return err
-			}
-			return nil
-		})
-	}
-
-	return g.Wait()
-}
-
-func queryRelayServer(accountId string, rStartTime string, rEndTime string, query string, queryName string, applicationsFilter map[string]any) ([]relay.ApplicationStatsResponse, error) {
-	request :=
-		relay.ActionExecuteBody{
-			AccountID:  accountId,
-			ActionName: "application_stats",
-			ActionParams: map[string]any{
-				"r_start_time": rStartTime,
-				"r_end_time":   rEndTime,
-				"queries": map[string]any{
-					queryName: query,
-				},
-				"applications": applicationsFilter, // Use the provided filter
-			},
-		}
-
-	resp, err := relay.Execute(relay.RelayExecuteRequest{
-		NoSinks: true,
-		Cache:   false,
-		Body:    request,
-	})
-
-	if err != nil {
-		slog.Error("Failed to execute relay task", "error", err, "accountId", accountId, "response_detail", resp["response"])
-		return nil, err
-	}
-
-	if resp["status_code"] == 500 {
-		slog.Error("Relay task returned 500", "error_response", resp["response"], "accountId", accountId)
-		return nil, fmt.Errorf("anomaly: failed to execute relay task error %s accountId %s ", resp["response"], accountId)
-	}
-
-	reports := make([]relay.ApplicationStatsResponse, 0)
-	sloReports := resp["data"].(map[string]any)["data"]
-	for _, m := range sloReports.([]any) {
-		jsonData, err := common.MarshalJson(m)
-		if err != nil {
-			slog.Warn("Failed to marshal relay report item to JSON", "error", err)
-			continue
-		}
-
-		var sloReport relay.ApplicationStatsResponse
-		if err := common.UnmarshalJson(jsonData, &sloReport); err != nil {
-			slog.Warn("Failed to unmarshal relay report item from JSON", "error", err)
-			continue
-		}
-		reports = append(reports, sloReport)
-	}
-	return reports, nil
-}
-
-func getQuery(config AnomalyTemplate) (string, string) {
-	if config.AnomalyType == MetricAnomolyTypeCPU {
-		return "max", "quantile(0.99, rate(container_cpu_usage_seconds_total{container!=\"\"}[5m])) by (pod, namespace, container) / quantile(0.99, kube_pod_container_resource_limits{resource=\"cpu\", container!=\"\"}) by (pod, namespace, container)"
-	}
-	if config.AnomalyType == MetricAnomolyTypeMemory {
-		return "max", "quantile(0.99, container_memory_usage_bytes{container!=\"\"}) by (pod, namespace, container) / quantile(0.99, kube_pod_container_resource_limits{resource=\"memory\", container!=\"\"}) by (pod, namespace, container)"
-	}
-	if config.AnomalyType == MetricAnomolyTypeLatency {
-		return "max", "histogram_quantile(0.99, sum(rate(container_http_requests_duration_seconds_total_bucket{destination_workload_name!~\"(kubernetes)\", destination_workload_namespace!~\"(external|node)\", destination_workload_name!=\"\"}[5m])) by (le, destination_workload_name, destination_workload_namespace))"
-	}
-	if config.AnomalyType == MetricAnomolyTypeErrorRate {
-		return "max", "(sum by (destination_workload_name, destination_workload_namespace)( increase(container_http_requests_total{destination_workload_name!~\"(kubernetes)\", destination_workload_namespace!~\"(external|node)\", status=~\"5..|4..\"}[5m]) ) / sum by (destination_workload_name, destination_workload_namespace)( increase(container_http_requests_total{destination_workload_name!~\"(kubernetes)\", destination_workload_namespace!~\"(external|node)\"}[5m]) ) )"
-	}
-	if config.AnomalyType == MetricAnomolyTypeNetwork {
-		return "max", "sum(rate(container_network_receive_bytes_total{}[5m])) by (pod, namespace, container) + sum(rate (container_network_transmit_bytes_total{}[5m])) by (pod, namespace, container)"
-	}
-	return "", ""
 }
 
 func insertAnomaly(anomalies []Anomaly) error {
@@ -769,7 +757,7 @@ func GenerateAnomalyEvent(dbms *database.DatabaseManager, anomaly *Anomaly) erro
 		}
 		workloadKindMap[name] = kind
 	}
-	evidences, err := collectEvidences(anomaly)
+	evidences, err := collectEvidences(anomaly, workloadKindMap[anomaly.Name])
 	if err != nil {
 		slog.Error("anomaly: error collecting evidences", "error", err, "account_id", anomaly.AccountId, "anomaly_id", anomaly.Id, "anomaly_type", anomaly.AnomalyType, "name", anomaly.Name, "namespace", anomaly.Namespace)
 		evidences = []any{}
@@ -783,6 +771,12 @@ func GenerateAnomalyEvent(dbms *database.DatabaseManager, anomaly *Anomaly) erro
 		return err
 	}
 
+	// FindingId is the dedup fingerprint, not anomaly.Id (a fresh UUID every
+	// detection cycle) — otherwise InsertEvent's ON CONFLICT(tenant,
+	// cloud_account_id, finding_id) upsert never matches a prior cycle's row,
+	// and every cycle inserts a brand-new FIRING event instead of refreshing
+	// the existing one. See closeAnomalyEventIfOpen for the corresponding close.
+	fingerprint := anomalyFingerprint(anomaly.AccountId, anomaly.AnomalyType, anomaly.Name, anomaly.Namespace)
 	eventObj := event.Event{
 		AccountId:        anomaly.AccountId,
 		Tenant:           anomaly.Tenant,
@@ -795,14 +789,14 @@ func GenerateAnomalyEvent(dbms *database.DatabaseManager, anomaly *Anomaly) erro
 		SubjectName:      anomaly.Name,
 		SubjectNamespace: anomaly.Namespace,
 		Evidences:        evidences,
-		FindingId:        anomaly.Id,
+		FindingId:        fingerprint,
 		AggregationKey:   "Anomaly",
 		Description:      fmt.Sprintf("%s Anomaly detected for %s in namespace %s", anomaly.AnomalyType, anomaly.Name, anomaly.Namespace),
 		SubjectType:      workloadKindMap[anomaly.Name],
 		SubjectNode:      "",
 		Status:           "FIRING",
 		StartsAt:         anomaly.EvaluatedAt,
-		Fingerprint:      fmt.Sprintf("anomaly-%s-%s-%s-%s", anomaly.AccountId, anomaly.AnomalyType, anomaly.Name, anomaly.Namespace),
+		Fingerprint:      fingerprint,
 		Cluster:          accountName,
 		Labels:           metricStatLabels(anomaly),
 	}
@@ -813,7 +807,7 @@ func GenerateAnomalyEvent(dbms *database.DatabaseManager, anomaly *Anomaly) erro
 	return err
 }
 
-func collectEvidences(anomaly *Anomaly) ([]any, error) {
+func collectEvidences(anomaly *Anomaly, workloadKind string) ([]any, error) {
 	// anomaly to map
 	anomalyMap, err := common.MarshalStructToMap(anomaly)
 	if err != nil {
@@ -837,25 +831,16 @@ func collectEvidences(anomaly *Anomaly) ([]any, error) {
 
 	var g errgroup.Group
 
-	// Workload metrics (memory, cpu, latency, cpu_throttling)
+	// Workload metrics (memory, cpu, latency, cpu_throttling), through the
+	// metrics layer so the account's default metrics provider answers.
+	metricsCtx := security.NewRequestContextForTenantAdmin(anomaly.Tenant, slog.Default(), nil, nil)
 	for i, metricName := range metricNames {
 		i, metricName := i, metricName
 		g.Go(func() error {
-			ev, err := relay.WorkloadMetricsExecutor(
-				anomaly.AccountId,
-				anomaly.Name,
-				anomaly.Namespace,
-				metricName,
-				startTime,
-				endTime,
-			)
+			title := fmt.Sprintf("%s Metric", strings.ToTitle(strings.ReplaceAll(metricName, "_", " ")))
+			res, err := observability.WorkloadMetricEvidence(metricsCtx, anomaly.AccountId, anomaly.Name, anomaly.Namespace, workloadKind, metricName, title, startTime, endTime)
 			if err != nil {
 				slog.Error("anomaly: error getting workload ", "error", err, "metric", metricName, "workload", anomaly.Name, "namespace", anomaly.Namespace)
-				return nil
-			}
-			res, err := relay.FormatEvidenceResponseFromAgent(fmt.Sprintf("%s Metric", strings.ToTitle(strings.ReplaceAll(metricName, "_", " "))), ev)
-			if err != nil {
-				slog.Error("anomaly: error formatting evidence response", "metric", metricName, "error", err)
 				return nil
 			}
 			slots[1+i] = res

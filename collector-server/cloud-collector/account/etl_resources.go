@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"nudgebee/collector/cloud/common"
 	"nudgebee/collector/cloud/providers"
+	awsProvider "nudgebee/collector/cloud/providers/aws"
 	"nudgebee/collector/cloud/security"
 	"regexp"
 	"strings"
@@ -15,6 +16,12 @@ import (
 	"github.com/samber/lo"
 	"golang.org/x/exp/maps"
 )
+
+// notYetArchived keeps the archive UPDATEs off rows already at their target: an
+// UPDATE writes a new row version and fires the updated_at trigger even when
+// nothing changed. Both columns are nullable, so `status != 'Deleted'` would
+// skip (Deleted, NULL) rows and `is_active = false` would skip NULL.
+const notYetArchived = `(is_active IS DISTINCT FROM false OR status IS DISTINCT FROM 'Deleted')`
 
 // gcpRegionShape matches a real GCP regional value (geo-direction-number, e.g.
 // us-central1, asia-south1). It deliberately rejects "global" and multi-region
@@ -245,6 +252,16 @@ func archivableRegions(queried, skipped []string) []string {
 	return lo.Without(queried, skipped...)
 }
 
+// resolveArchiveRegions picks the region set archival reconciles against:
+// archive when it was widened beyond the crawl set (an AWS allowlist that lost a
+// region), otherwise the crawl set itself.
+func resolveArchiveRegions(crawled, archive []string) []string {
+	if len(archive) > 0 {
+		return archive
+	}
+	return crawled
+}
+
 func StoreResources(ctx *security.RequestContext, accountId string, serviceName string, regions ...string) (StoreResourcesResponse, error) {
 	t0 := time.Now()
 
@@ -268,6 +285,11 @@ func StoreResources(ctx *security.RequestContext, accountId string, serviceName 
 	// lock-in described above.
 	selfDiscoverRegions := alwaysSelfDiscoverRegionsServices[strings.ToLower(serviceName)]
 
+	// archiveRegions is the region set the archival pass reconciles against. It
+	// is normally just the crawl set, and stays nil until something needs the
+	// two to differ — see the AWS allowlist branch below.
+	var archiveRegions []string
+
 	if len(regions) == 0 && !isRegionless && !selfDiscoverRegions {
 		query := `select distinct region from cloud_resourses where account = $1 and lower(service_name) = lower($2) and region is not null and region != ''`
 		err := dbms.QueryAndScan(&regions, query, accountId, serviceName)
@@ -278,6 +300,11 @@ func StoreResources(ctx *security.RequestContext, accountId string, serviceName 
 				Duration: time.Since(t0),
 			}, err
 		}
+
+		// The regions this service has actually been seen in, captured before any
+		// widening or override below. Archival reconciles against these too, so a
+		// region that drops out of the crawl set still gets its rows retired.
+		observedRegions := append([]string(nil), regions...)
 
 		// GCP: widen to the account's full cross-service region footprint so a
 		// service locked to a partial first scan is still crawled everywhere the
@@ -372,6 +399,30 @@ func StoreResources(ctx *security.RequestContext, accountId string, serviceName 
 				}
 			}
 		}
+
+		// An AWS account with an operator-configured region allowlist crawls
+		// exactly that list, overriding whatever history says. Deriving the crawl
+		// set from cloud_resourses alone would lock the account to the regions
+		// its first scan happened to cover, so adding a region to the list would
+		// never take effect (the #31101 partial-first-scan lock-in).
+		//
+		// Archival keeps covering the regions we have rows for even after they
+		// leave the list. Without that, de-listing a region would strand its
+		// resources as is_active = true forever: they are never crawled again, so
+		// they are never observed absent. Retiring them is reversible — re-adding
+		// the region re-discovers them on the next sync.
+		if strings.EqualFold(accountInfo.CloudProvider, "aws") {
+			if allowed := awsProvider.ConfiguredRegions(accountInfo); len(allowed) > 0 {
+				if dropped := lo.Without(observedRegions, allowed...); len(dropped) > 0 {
+					ctx.GetLogger().Info("regions dropped from the account allowlist will be archived",
+						"service", serviceName,
+						"account", accountId,
+						"dropped_regions", dropped)
+				}
+				archiveRegions = lo.Union(allowed, observedRegions)
+				regions = allowed
+			}
+		}
 	} else if isRegionless {
 		ctx.GetLogger().Debug("regionless provider - skipping region bootstrap logic",
 			"service", serviceName,
@@ -458,7 +509,7 @@ func StoreResources(ctx *security.RequestContext, accountId string, serviceName 
 		// Global services (S3, IAM, Route53, CloudFront, WAF, …) are account-wide,
 		// so a region-scoped archive would leak rows whose region wasn't iterated.
 		// Treat archival as unscoped for them — same logic as in storeResourcesInsert.
-		archiveScopeRegions := archivableRegions(regions, resources.SkippedRegions)
+		archiveScopeRegions := archivableRegions(resolveArchiveRegions(regions, archiveRegions), resources.SkippedRegions)
 		if isGlobalAwsService(serviceName) {
 			archiveScopeRegions = nil
 		} else if len(regions) > 0 && len(archiveScopeRegions) == 0 {
@@ -485,10 +536,10 @@ func StoreResources(ctx *security.RequestContext, accountId string, serviceName 
 			for i := range archiveScopeRegions {
 				placeholders[i] = fmt.Sprintf("$%d", i+3)
 			}
-			archiveResourcesQuery = fmt.Sprintf(`update cloud_resourses set is_active = false, status = 'Deleted' where account = $1 and lower(service_name) = $2 and (meta->>'nb_source' IS NULL OR meta->>'nb_source' != 'billing') and region in (%s)`, strings.Join(placeholders, ", "))
+			archiveResourcesQuery = fmt.Sprintf(`update cloud_resourses set is_active = false, status = 'Deleted' where account = $1 and lower(service_name) = $2 and `+notYetArchived+` and (meta->>'nb_source' IS NULL OR meta->>'nb_source' != 'billing') and region in (%s)`, strings.Join(placeholders, ", "))
 			args = append([]any{accountId, strings.ToLower(serviceName)}, lo.ToAnySlice(archiveScopeRegions)...)
 		} else {
-			archiveResourcesQuery = `update cloud_resourses set is_active = false, status = 'Deleted' where account = $1 and lower(service_name) = $2 and (meta->>'nb_source' IS NULL OR meta->>'nb_source' != 'billing')`
+			archiveResourcesQuery = `update cloud_resourses set is_active = false, status = 'Deleted' where account = $1 and lower(service_name) = $2 and ` + notYetArchived + ` and (meta->>'nb_source' IS NULL OR meta->>'nb_source' != 'billing')`
 			args = []any{accountId, strings.ToLower(serviceName)}
 		}
 		updatedResources, err := dbms.Exec(archiveResourcesQuery, args...)
@@ -513,10 +564,10 @@ func StoreResources(ctx *security.RequestContext, accountId string, serviceName 
 			for i := range archiveScopeRegions {
 				bPlaceholders[i] = fmt.Sprintf("$%d", i+3)
 			}
-			billingArchiveQuery = fmt.Sprintf(`update cloud_resourses set is_active = false, status = 'Deleted' where account = $1 and lower(service_name) = $2 and meta->>'nb_source' = 'billing' and region in (%s)`, strings.Join(bPlaceholders, ", "))
+			billingArchiveQuery = fmt.Sprintf(`update cloud_resourses set is_active = false, status = 'Deleted' where account = $1 and lower(service_name) = $2 and `+notYetArchived+` and meta->>'nb_source' = 'billing' and region in (%s)`, strings.Join(bPlaceholders, ", "))
 			billingArgs = append([]any{accountId, strings.ToLower(serviceName)}, lo.ToAnySlice(archiveScopeRegions)...)
 		} else {
-			billingArchiveQuery = `update cloud_resourses set is_active = false, status = 'Deleted' where account = $1 and lower(service_name) = $2 and meta->>'nb_source' = 'billing'`
+			billingArchiveQuery = `update cloud_resourses set is_active = false, status = 'Deleted' where account = $1 and lower(service_name) = $2 and ` + notYetArchived + ` and meta->>'nb_source' = 'billing'`
 			billingArgs = []any{accountId, strings.ToLower(serviceName)}
 		}
 		if billingResult, billingErr := dbms.Exec(billingArchiveQuery, billingArgs...); billingErr != nil {
@@ -530,6 +581,22 @@ func StoreResources(ctx *security.RequestContext, accountId string, serviceName 
 			Arns:     []string{},
 			Duration: time.Since(t0),
 		}, nil
+	}
+
+	// AWS CloudFormation only: put each stack's managed-resource list on the
+	// stack's own row, so the knowledge graph stops shelling out to
+	// `aws cloudformation list-stack-resources` once per stack per build.
+	//
+	// Here and not inside the provider's GetResources on purpose: GetResources
+	// runs inside main.go's per-region goroutine, where a returned throttle error
+	// makes the collector skip that entire region for the cycle. Out here the
+	// worst a failure can do is leave one stack's key absent, which the graph
+	// reads as "never captured" and answers with its existing CLI path.
+	//
+	// Runs before the marshal below, so the keys ride the existing
+	// `meta = EXCLUDED.meta` upsert with no SQL change.
+	if strings.EqualFold(account.CloudProvider, "aws") && strings.EqualFold(serviceName, awsProvider.ServiceNameCloudFormation) {
+		enrichCloudFormationStacks(ctx, dbms, accountId, account, resources.Items)
 	}
 
 	resourceMap := map[string]map[string]any{}
@@ -607,7 +674,7 @@ func StoreResources(ctx *security.RequestContext, accountId string, serviceName 
 	// Skipped regions are excluded from the archival scope; if that empties the
 	// list, storeResourcesInsert falls back to the regions actually present in
 	// resourceMap (never to unscoped archival for non-global services).
-	err = storeResourcesInsert(ctx, dbms, accountId, serviceName, resourceMap, archivableRegions(regions, resources.SkippedRegions))
+	err = storeResourcesInsert(ctx, dbms, accountId, serviceName, resourceMap, archivableRegions(resolveArchiveRegions(regions, archiveRegions), resources.SkippedRegions))
 	if err != nil {
 		ctx.GetLogger().Error("unable to insert resources", "error", err)
 		return StoreResourcesResponse{
@@ -667,7 +734,7 @@ func storeResourcesInsert(ctx *security.RequestContext, dbms *common.DatabaseMan
 				placeholders[i] = fmt.Sprintf("$%d", i+3) // $3, $4, $5...
 			}
 			inClause := strings.Join(placeholders, ", ")
-			archiveResourcesQuery = fmt.Sprintf(`update cloud_resourses set is_active = false, status = 'Deleted' where account = $1 and lower(service_name) = $2 and (meta->>'nb_source' IS NULL OR meta->>'nb_source' != 'billing') and region in (%s)`, inClause)
+			archiveResourcesQuery = fmt.Sprintf(`update cloud_resourses set is_active = false, status = 'Deleted' where account = $1 and lower(service_name) = $2 and `+notYetArchived+` and (meta->>'nb_source' IS NULL OR meta->>'nb_source' != 'billing') and region in (%s)`, inClause)
 			archiveArgs = []any{accountId, strings.ToLower(serviceName)}
 			for _, region := range allRegions {
 				archiveArgs = append(archiveArgs, region)
@@ -675,7 +742,7 @@ func storeResourcesInsert(ctx *security.RequestContext, dbms *common.DatabaseMan
 		} else {
 			// No regions in resourceMap (e.g., global services like IAM, S3)
 			// Archive all resources for this service/account
-			archiveResourcesQuery = `update cloud_resourses set is_active = false, status = 'Deleted' where account = $1 and lower(service_name) = $2 and (meta->>'nb_source' IS NULL OR meta->>'nb_source' != 'billing')`
+			archiveResourcesQuery = `update cloud_resourses set is_active = false, status = 'Deleted' where account = $1 and lower(service_name) = $2 and ` + notYetArchived + ` and (meta->>'nb_source' IS NULL OR meta->>'nb_source' != 'billing')`
 			archiveArgs = []any{accountId, strings.ToLower(serviceName)}
 		}
 

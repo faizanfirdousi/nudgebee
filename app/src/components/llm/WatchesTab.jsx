@@ -1,6 +1,10 @@
 import { useEffect, useMemo, useState, useCallback, useRef } from 'react';
 import PropTypes from 'prop-types';
-import { Box, Typography, Chip, Tooltip, IconButton, LinearProgress } from '@mui/material';
+import { ds } from '@utils/colors';
+import { Box, Typography, IconButton } from '@mui/material';
+import { ProgressLinear } from '@ui/ProgressLinear';
+import Label from '@ui/Label';
+import Tooltip from '@ui/Tooltip';
 import CancelOutlinedIcon from '@mui/icons-material/CancelOutlined';
 import RefreshIcon from '@mui/icons-material/Refresh';
 import api from '@api1/ask-nudgebee';
@@ -13,36 +17,42 @@ import { useWatchFeatureEnabled } from '@hooks/useTenantBranding';
 // ideal but the existing service layer doesn't have a subscription helper, and
 // 5s polling is cheap for the tab-volume we expect).
 //
-// Status pill colors use explicit status hexes — green/red/blue/gray/orange to
-// match the rest of the app's tabular conventions.
+// Status pills are read-only Status-axis tags, so they use ds/Label tones
+// rather than per-status colours (design-system.md §3).
 
-const STATUS_STYLES = {
-  PENDING: { bg: '#FEF3C7', fg: '#B45309', border: '#F59E0B' },
-  ACTIVE: { bg: '#DBEAFE', fg: '#1D4ED8', border: '#3B82F6' },
-  COMPLETED: { bg: '#DCFCE7', fg: '#15803D', border: '#16A34A' },
-  EXPIRED: { bg: '#F3F4F6', fg: '#4B5563', border: '#9CA3AF' },
-  FAILED: { bg: '#FEE2E2', fg: '#B91C1C', border: '#EF4444' },
-  CANCELLED: { bg: '#F3F4F6', fg: '#4B5563', border: '#9CA3AF' },
+const STATUS_TONES = {
+  PENDING: 'warning',
+  ACTIVE: 'info',
+  COMPLETED: 'success',
+  EXPIRED: 'neutral',
+  FAILED: 'critical',
+  CANCELLED: 'neutral',
+};
+
+// DB statuses are internal: PENDING vs ACTIVE is "dispatcher picked it up yet",
+// not user-actionable. Both -> "Watching".
+const STATUS_LABELS = {
+  PENDING: 'Watching',
+  ACTIVE: 'Watching',
+  COMPLETED: 'Done',
+  EXPIRED: 'Timed out',
+  FAILED: 'Failed',
+  CANCELLED: 'Cancelled',
 };
 
 const TERMINAL_STATUSES = new Set(['COMPLETED', 'EXPIRED', 'FAILED', 'CANCELLED']);
 
 function StatusPill({ status }) {
-  const s = STATUS_STYLES[status] || STATUS_STYLES.PENDING;
+  // `status` is declared required but comes straight from the API, so guard the
+  // string ops rather than trusting propTypes at runtime.
+  const safeStatus = typeof status === 'string' ? status : '';
+  // Label takes no data-testid, so the span carries the id the e2e suite binds to.
   return (
-    <Chip
-      label={status}
-      size='small'
-      sx={{
-        bgcolor: s.bg,
-        color: s.fg,
-        border: `1px solid ${s.border}`,
-        fontWeight: 600,
-        fontSize: '11px',
-        height: '22px',
-      }}
-      data-testid={`watch-status-${status.toLowerCase()}`}
-    />
+    <span data-testid={`watch-status-${safeStatus.toLowerCase()}`}>
+      <Label tone={STATUS_TONES[safeStatus] || STATUS_TONES.PENDING} size='md'>
+        {STATUS_LABELS[safeStatus] || safeStatus}
+      </Label>
+    </span>
   );
 }
 
@@ -76,9 +86,56 @@ function formatRelative(dateString) {
 
 const WATCH_FIELDS_TO_SHOW_ON_HOVER = ['source_kind', 'predicate_kind', 'predicate_expr', 'predicate_negate'];
 
+// Diagnostics -> tooltip: one hover away for on-call, not the headline.
+export function buildHoverDetails(w) {
+  const lines = WATCH_FIELDS_TO_SHOW_ON_HOVER.map((k) => `${k}: ${String(w?.[k])}`);
+  lines.push(`id: ${w?.id ?? ''}`);
+  const pollCount = w?.poll_count ?? 0;
+  const interval = w?.poll_interval_sec;
+  lines.push(`${pollCount} ${pollCount === 1 ? 'check' : 'checks'} so far${interval ? `, every ${interval}s` : ''}`);
+  const failureCount = w?.failure_count ?? 0;
+  if (failureCount > 0) {
+    lines.push(`${failureCount} transient ${failureCount === 1 ? 'failure' : 'failures'} (retried)`);
+  }
+  return lines.join('\n');
+}
+
+// What this watch polls. The backend derives it (watch.DescribeTarget) so the
+// precedence matches the poller — deriving it here got that backwards.
+export function describeWatchTarget(w) {
+  const target = typeof w?.watch_target === 'string' ? w.watch_target.trim() : '';
+  if (!target) {
+    const expr = typeof w?.predicate_expr === 'string' ? w.predicate_expr : '';
+    if (expr) {
+      return `for “${expr.length > 40 ? `${expr.slice(0, 40)}…` : expr}”`;
+    }
+    return w?.source_kind === 'sql' ? 'a database query' : 'a command';
+  }
+  return target.length > 48 ? `${target.slice(0, 48)}…` : target;
+}
+
+// One-phrase reason a terminal watch ended, without the internal
+// `regex "x" matched: y` framing.
+export function describeWatchOutcome(w) {
+  if (w?.status === 'COMPLETED') {
+    const expr = typeof w.predicate_expr === 'string' ? w.predicate_expr : '';
+    return expr ? `matched “${expr}”` : 'condition met';
+  }
+  if (w?.status === 'FAILED') {
+    return 'the check could not run';
+  }
+  if (w?.status === 'EXPIRED') {
+    return 'gave up before the condition was met';
+  }
+  return '';
+}
+
 function WatchRow({ watch: w, onCancel }) {
   const isTerminal = TERMINAL_STATUSES.has(w.status);
-  const hoverDetails = WATCH_FIELDS_TO_SHOW_ON_HOVER.map((k) => `${k}: ${String(w[k])}`).join('\n');
+  const hoverDetails = buildHoverDetails(w);
+  // '' only if a status joins TERMINAL_STATUSES without a describeWatchOutcome
+  // case — guard so the row can't render a leading " · ".
+  const outcome = isTerminal ? describeWatchOutcome(w) : '';
   // For terminal watches, prioritize final_result (the canonical "what won")
   // and fall back to error/last_poll_result. last_poll_result for terminal watches
   // is sometimes the in-flight poll that fired right after the matching one — useful
@@ -110,16 +167,26 @@ function WatchRow({ watch: w, onCancel }) {
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
           <StatusPill status={w.status} />
           <Tooltip title={hoverDetails} placement='right'>
-            <Typography sx={{ fontFamily: 'monospace', fontSize: '12px', color: 'var(--ds-gray-500)' }}>{w.id.slice(0, 8)}…</Typography>
+            <Typography
+              sx={{
+                fontSize: 'var(--ds-text-small)',
+                color: 'var(--ds-gray-700)',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+              }}
+            >
+              {describeWatchTarget(w)}
+            </Typography>
           </Tooltip>
         </Box>
         {!isTerminal && (
-          <Tooltip title='Cancel watch'>
+          <Tooltip title='Cancel watch' placement='bottom'>
             <IconButton
               size='small'
               onClick={() => onCancel(w)}
               data-testid={`watch-cancel-btn-${w.id}`}
-              sx={{ color: 'var(--ds-gray-500)', '&:hover': { color: '#B91C1C' } }}
+              sx={{ color: 'var(--ds-gray-500)', '&:hover': { color: 'var(--ds-red-700)' } }}
             >
               <CancelOutlinedIcon sx={{ fontSize: 18 }} />
             </IconButton>
@@ -127,22 +194,18 @@ function WatchRow({ watch: w, onCancel }) {
         )}
       </Box>
 
-      {/* mid row: poll progress + interval + duration cap */}
-      <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, flexWrap: 'wrap' }}>
-        <Typography sx={{ fontSize: '12px', color: 'var(--ds-gray-500)' }}>
-          <strong>{w.poll_count}</strong> polls
-          {w.failure_count > 0 && <span style={{ color: '#B91C1C', marginLeft: 6 }}>· {w.failure_count} failed</span>}
-        </Typography>
-        <Typography sx={{ fontSize: '12px', color: 'var(--ds-gray-500)' }}>
-          every <strong>{w.poll_interval_sec}s</strong>
-        </Typography>
-        {!isTerminal && w.next_poll_at && (
-          <Typography sx={{ fontSize: '12px', color: 'var(--ds-gray-500)' }}>next {formatRelative(w.next_poll_at)}</Typography>
-        )}
+      {/* Live: when you'll hear back. Terminal: why it ended. Counts & transient
+          failures -> tooltip: a failure_count on a healthy watch reads as breakage. */}
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap' }}>
         {isTerminal ? (
-          <Typography sx={{ fontSize: '12px', color: 'var(--ds-gray-500)' }}>terminated {formatRelative(w.updated_at)}</Typography>
+          <Typography sx={{ fontSize: 'var(--ds-text-small)', color: 'var(--ds-gray-500)' }}>
+            {outcome ? `${outcome} · ` : ''}
+            {formatRelative(w.updated_at)}
+          </Typography>
         ) : (
-          <Typography sx={{ fontSize: '12px', color: 'var(--ds-gray-500)' }}>expires {formatRelative(w.expires_at)}</Typography>
+          <Typography sx={{ fontSize: 'var(--ds-text-small)', color: 'var(--ds-gray-500)' }}>
+            {w.next_poll_at ? `Next check ${formatRelative(w.next_poll_at)}` : 'Checking'} · stops {formatRelative(w.expires_at)}
+          </Typography>
         )}
       </Box>
 
@@ -154,8 +217,8 @@ function WatchRow({ watch: w, onCancel }) {
             p: 1,
             bgcolor: 'var(--ds-gray-100)',
             borderRadius: 1,
-            fontFamily: 'monospace',
-            fontSize: '11px',
+            fontFamily: 'var(--ds-font-mono)',
+            fontSize: 'var(--ds-text-caption)',
             color: 'var(--ds-gray-500)',
             whiteSpace: 'pre-wrap',
             wordBreak: 'break-word',
@@ -295,7 +358,7 @@ export default function WatchesTab({ conversationId }) {
   if (error) {
     return (
       <Box sx={{ p: 3 }} data-testid='watches-tab-error'>
-        <Typography sx={{ color: '#B91C1C' }}>Could not load watches: {error}</Typography>
+        <Typography sx={{ color: 'var(--ds-red-700)' }}>Could not load watches: {error}</Typography>
       </Box>
     );
   }
@@ -314,17 +377,17 @@ export default function WatchesTab({ conversationId }) {
   }
 
   return (
-    <Box sx={{ p: 1.5, display: 'flex', flexDirection: 'column', gap: 1 }} data-testid='watches-tab'>
+    <Box sx={{ p: 1.5, display: 'flex', flexDirection: 'column', gap: ds.space[2] }} data-testid='watches-tab'>
       {/* header strip with active-poll progress hint */}
       <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
         <Typography className='nb-text-h3-widget'>Watches ({watches.length})</Typography>
-        <Tooltip title='Refresh'>
+        <Tooltip title='Refresh' placement='bottom'>
           <IconButton size='small' onClick={refresh} data-testid='watches-refresh-btn'>
             <RefreshIcon sx={{ fontSize: 18 }} />
           </IconButton>
         </Tooltip>
       </Box>
-      {hasNonTerminal && <LinearProgress variant='indeterminate' sx={{ height: 2, bgcolor: 'var(--ds-gray-100)' }} />}
+      {hasNonTerminal && <ProgressLinear surface='section' aria-label='Polling active watches' />}
       {watches.map((w) => (
         <WatchRow key={w.id} watch={w} onCancel={handleCancel} />
       ))}

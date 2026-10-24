@@ -1,6 +1,7 @@
 import React from 'react';
 import { Box, Stack, Typography } from '@mui/material';
-import DeleteOutlineIcon from '@mui/icons-material/DeleteOutline';
+import SafeIcon from '@shared/icons/SafeIcon';
+import { DeleteIconRed } from '@assets';
 import LockOutlinedIcon from '@mui/icons-material/LockOutlined';
 import { Button } from '@ui/Button';
 import { Input } from '@ui/Input';
@@ -16,8 +17,10 @@ import {
   filterableColumns,
   findTable,
   operatorTakesList,
+  operatorTakesRegex,
   operatorTakesValue,
   operatorsFor,
+  selectableColumns,
   type EntityQuery,
   type EntityQueryDraft,
   type EntityTable,
@@ -28,6 +31,14 @@ interface Props {
   /** Tables this panel's datasource may query — events, or traces. */
   tables: EntityTable[];
   onChange: (draft: EntityQueryDraft, query: EntityQuery, timeColumn: string) => void;
+}
+
+/** What the value box asks for: nothing, a list, a regex, or a literal. */
+function valuePlaceholder(operator: string): string {
+  if (!operatorTakesValue(operator)) return '—';
+  if (operatorTakesList(operator)) return 'P0, P1';
+  if (operatorTakesRegex(operator)) return 'central|edge';
+  return 'value or $namespace';
 }
 
 /**
@@ -63,28 +74,36 @@ const EntityQueryBuilder: React.FC<Props> = ({ draft, tables, onChange }) => {
   // hidden: the panel would only fail at render, and naming the grant is what
   // lets the author ask for the right one. Nothing is gated for a tenant admin
   // or any account user — see panelAccess.ts.
-  const tableOptions = tables.map((t) => {
-    const missing = missingTableGrant(t);
-    if (!missing) return { label: t.label, value: t.value };
-    return {
-      value: t.value,
-      disabled: true,
-      label: (
-        <Tooltip title={grantTooltip(missing)}>
-          {/* A disabled MUI menu item sets `pointer-events: none`, which would
-              swallow the hover the tooltip needs — this span opts back in. */}
-          <Box component='span' sx={{ pointerEvents: 'auto', display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
-            <LockOutlinedIcon sx={{ fontSize: 13, flexShrink: 0 }} />
-            {t.label}
-          </Box>
-        </Tooltip>
-      ),
-    };
-  });
+  const tableOptions = React.useMemo(
+    () =>
+      tables.map((t) => {
+        const missing = missingTableGrant(t);
+        if (!missing) return { label: t.label, value: t.value };
+        return {
+          value: t.value,
+          disabled: true,
+          label: (
+            <Tooltip title={grantTooltip(missing)}>
+              {/* A disabled MUI menu item sets `pointer-events: none`, which would
+                  swallow the hover the tooltip needs — this span opts back in. */}
+              <Box component='span' sx={{ pointerEvents: 'auto', display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
+                <LockOutlinedIcon sx={{ fontSize: 13, flexShrink: 0 }} />
+                {t.label}
+              </Box>
+            </Tooltip>
+          ),
+        };
+      }),
+    [tables]
+  );
 
-  const columnOptions = table.columns.map((c) => ({ label: c.label, value: c.name }));
-  // Traces filter through named API parameters, so only some columns can carry
-  // a filter — offering the rest would build panels that ignore them.
+  // Filter-only columns are left out: a trace grouping can be NARROWED by a
+  // column its fixed response never returns, but selecting or sorting by one
+  // would render a blank column.
+  const columnOptions = selectableColumns(table).map((c) => ({ label: c.label, value: c.name }));
+  // On the query-engine tables this is every column: a filter on an aggregate
+  // is routed into a HAVING rather than being refused. The traces tables have no
+  // HAVING surface, so theirs are the subset the span store can filter on.
   const filterColumns = filterableColumns(table);
   const filterColumnOptions = filterColumns.map((c) => ({ label: c.label, value: c.name }));
 
@@ -102,8 +121,8 @@ const EntityQueryBuilder: React.FC<Props> = ({ draft, tables, onChange }) => {
       {/* Which of the two event tables to reach for is the one thing an author
           cannot work out from the column names, so it is spelled out rather
           than hidden in a tooltip. */}
-      <Box sx={{ p: 1.5, border: `1px solid ${ds.gray[300]}`, background: ds.background[200], borderRadius: '6px' }}>
-        <Typography variant='body2' sx={{ color: ds.gray[700], fontWeight: 600, mb: 0.25 }}>
+      <Box sx={{ p: 1.5, border: `1px solid ${ds.gray[300]}`, background: ds.background[200], borderRadius: ds.radius.md }}>
+        <Typography variant='body2' sx={{ color: ds.gray[700], fontWeight: ds.weight.semibold, mb: 0.25 }}>
           {table.label} — {table.description}
         </Typography>
         <Typography variant='body2' sx={{ color: ds.gray[600] }}>
@@ -150,7 +169,9 @@ const EntityQueryBuilder: React.FC<Props> = ({ draft, tables, onChange }) => {
 
       <Box>
         <Stack direction='row' alignItems='center' gap={1} sx={{ mb: 1 }}>
-          <Typography sx={{ fontFamily: 'var(--ds-font-display)', fontSize: 13, fontWeight: 600, color: ds.gray[700] }}>Filters</Typography>
+          <Typography sx={{ fontFamily: 'var(--ds-font-display)', fontSize: 13, fontWeight: ds.weight.semibold, color: ds.gray[700] }}>
+            Filters
+          </Typography>
           <Box sx={{ flex: 1 }} />
           <Button
             tone='secondary'
@@ -185,8 +206,9 @@ const EntityQueryBuilder: React.FC<Props> = ({ draft, tables, onChange }) => {
                       value={filter.column}
                       options={filterColumnOptions}
                       onChange={(v: string) => {
-                        // The operator list is per column TYPE, so a carried-over
-                        // operator can be one the new column does not support.
+                        // The operator list is per column TYPE (and per table —
+                        // traces drop `_is_null`), so a carried-over operator can
+                        // be one the new column does not support.
                         const next = operatorsFor(table, v);
                         patchFilter(index, { column: v, operator: next.some((o) => o.value === filter.operator) ? filter.operator : next[0].value });
                       }}
@@ -200,14 +222,14 @@ const EntityQueryBuilder: React.FC<Props> = ({ draft, tables, onChange }) => {
                       value={filter.value}
                       onChange={(v: string) => patchFilter(index, { value: v })}
                       disabled={!operatorTakesValue(operator)}
-                      placeholder={operatorTakesList(operator) ? 'P0, P1' : operatorTakesValue(operator) ? 'value or $namespace' : '—'}
+                      placeholder={valuePlaceholder(operator)}
                     />
                   </Box>
                   <Button
                     tone='ghost'
                     composition='icon-only'
                     aria-label='Remove filter'
-                    icon={<DeleteOutlineIcon sx={{ fontSize: 18 }} />}
+                    icon={<SafeIcon src={DeleteIconRed} alt='delete' width={16} height={16} />}
                     onClick={() => patch({ filters: draft.filters.filter((_f, i) => i !== index) })}
                     id={`remove-entity-filter-${index}`}
                   />

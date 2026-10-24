@@ -157,6 +157,7 @@ var nodeCategoryMap = map[NodeType]NodeCategory{
 	NodeTypeNetworkInterface:    NodeCategoryInfrastructure,
 	NodeTypeRouteTable:          NodeCategoryInfrastructure,
 	NodeTypeCloudResource:       NodeCategoryInfrastructure,
+	NodeTypeInfraStack:          NodeCategoryInfrastructure,
 	NodeTypeNetworkGateway:      NodeCategoryInfrastructure,
 	NodeTypePrivateEndpoint:     NodeCategoryInfrastructure,
 	NodeTypeAPIGateway:          NodeCategoryInfrastructure,
@@ -186,6 +187,12 @@ func (nt NodeType) GetCategory() NodeCategory {
 	}
 	// Default to Infrastructure for unknown types
 	return NodeCategoryInfrastructure
+}
+
+// IsKnown reports whether the node type is one of the declared NodeTypes.
+func (nt NodeType) IsKnown() bool {
+	_, exists := nodeCategoryMap[nt]
+	return exists
 }
 
 // IsInfrastructure returns true if this node type is categorized as infrastructure
@@ -430,10 +437,11 @@ type KgNodeSlim struct {
 	AccountID    string   `json:"account_id"` // maps to cloud_account_id
 	TenantID     string   `json:"tenant_id"`
 	UniqueKey    string   `json:"unique_key"`
-	LogoID       string   `json:"logo_id,omitempty"`  // Icon identifier resolved by the backend for UI rendering
-	Role         string   `json:"role,omitempty"`     // Datastore facet: "database"/"cache"/"messagequeue" for in-cluster datastores
-	Engine       string   `json:"engine,omitempty"`   // Canonical engine for datastore nodes (e.g. "postgres", "redis")
-	Location     string   `json:"location,omitempty"` // Region/zone/AZ for cloud resources — disambiguates identically-named nodes (e.g. many "default" subnets) in the UI
+	LogoID       string   `json:"logo_id,omitempty"`   // Icon identifier resolved by the backend for UI rendering
+	Role         string   `json:"role,omitempty"`      // Datastore facet: "database"/"cache"/"messagequeue" for in-cluster datastores
+	Engine       string   `json:"engine,omitempty"`    // Canonical engine for datastore nodes (e.g. "postgres", "redis")
+	Location     string   `json:"location,omitempty"`  // Region/zone/AZ for cloud resources — disambiguates identically-named nodes (e.g. many "default" subnets) in the UI
+	Namespace    string   `json:"namespace,omitempty"` // K8s namespace for namespaced resources — the k8s analogue of Location, which K8s nodes leave blank
 }
 
 // KgEdgeSlim is a lightweight edge for graph traversal API responses
@@ -616,6 +624,18 @@ type BuildRequest struct {
 	SaveToDB                  bool                       `json:"save_to_db"`                  // Whether to persist the graph to database
 	CrossAccountRelationships []CrossAccountRelationship `json:"cross_account_relationships"` // Rules for creating cross-account/cross-source relationships
 	AccountIDs                []string                   `json:"account_ids"`                 // tell which account ids to consider
+	// Partial marks an account-scoped incremental build. Requires AccountIDs.
+	//
+	// A partial build rebuilds ONLY the listed accounts, loads every other
+	// account's active nodes from the database as read-only context (so the
+	// cross-source enrichers and the cross-account rules still match), persists
+	// only the rebuilt accounts' nodes, and scopes both tombstone sweeps to
+	// those accounts. Tenant-scoped producers (GitHub/GitLab/PagerDuty
+	// integrations, the identity and ownership enrichers) and flow sources do
+	// not run, so their rows are excluded from the sweeps rather than swept.
+	//
+	// Partial = false reproduces the tenant-wide behaviour exactly.
+	Partial bool `json:"partial"`
 }
 
 // AccountGraphMetadata contains metadata about graphs built for a specific account

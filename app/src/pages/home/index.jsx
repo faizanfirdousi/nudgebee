@@ -16,18 +16,6 @@ import TroubleshootIconBlue from '@assets/header/TroubleshootIconBlue.icon.svg';
 import OptimizeIconBlue from '@assets/header/optimize-blue.icon.svg';
 import OptimizeGaugeIcon from '@assets/home/optimize-icon.svg';
 import { getBrandingAsset, getIsWhiteLabel } from '@hooks/useTenantBranding';
-import DataBaseBlueIcon from '@assets/kubernetes/app-nodes-icons/database-blue.icon.svg';
-import SirenBlueIcon from '@assets/home/new/siren-rounded-blue.icon.svg';
-import TicketBlueIcon from '@assets/home/new/ticket-blue.icon.svg';
-import RepoBlueIcon from '@assets/home/new/repo-forked-blue.icon.svg';
-import SlackIcon from '@assets/slack_icon.icon.svg';
-import MsTeamsIcon from '@assets/ou-management/ms_teams.icon.svg';
-import GChatIcon from '@assets/gchat-icon.icon.svg';
-import PagerDutyIcon from '@assets/auto-pilot/pager-duty.svg';
-import ServiceNowIcon from '@assets/servicenow.icon.svg';
-import FreshdeskIcon from '@assets/freshdesk.icon.svg';
-import JiraIcon from '@assets/jira_icon.icon.svg';
-import GithubIcon from '@assets/github-icon.icon.svg';
 import LogsIcon from '@assets/home/logs-icon.icon.svg';
 import TraceIcon from '@assets/home/traces-icon.icon.svg';
 import NamespacesIcon from '@assets/kubernetes/app-nodes-icons/namespace-icon.icon.svg';
@@ -45,6 +33,7 @@ import GCPCloudStorageIcon from '@assets/cloud-account/gcp-cloud-storage.icon.sv
 import PropTypes from 'prop-types';
 import Link from 'next/link';
 import apiWorkflow from '@api1/workflow';
+import SetupProgressBanner from '@components/onboarding/SetupProgressBanner';
 import { getLast24Hrs } from '@lib/datetime';
 import DSCard from '@ui/Card';
 import CollapsableCard from '@ui/CollapsableCard';
@@ -76,120 +65,17 @@ import ImageOutlinedIcon from '@mui/icons-material/ImageOutlined';
 import ArrowForwardIcon from '@mui/icons-material/ArrowForward';
 import { useData } from '@context/DataContext';
 import K8sAccountModal from '@components/integrations/modal/K8sAccountModal';
-import ConnectClusterHelp from '@components/onboarding/ConnectClusterHelp';
 import SafeIcon from '@shared/icons/SafeIcon';
 import { getUserSession, getCurrentTenant, hasPermission, missingPermissionMessage, isGrantsOnlyUser } from '@lib/auth';
 import DSTooltip from '@ui/Tooltip';
 import { FiArrowRight } from 'react-icons/fi';
 import useCurrencySymbol from '@hooks/useCurrencySymbol';
 import PendingFollowUps from '@components/home/PendingFollowUps';
+import VmOverviewCard from '@components/home/VmOverviewCard';
 
 const replaceCurrencyInText = (text, targetCurrencySymbol) => {
   if (!text || targetCurrencySymbol === '$') return text;
   return text.replace(/\$(\d[\d,]*\.?\d*)/g, `${targetCurrencySymbol}$1`);
-};
-
-const FILTER_COLUMN_TO_PARAM = {
-  status: 'status',
-  eventstatus: 'eventStatus',
-  category: 'category',
-  severity: 'severity',
-  rule_name: 'rule_name',
-  source: 'source',
-  aggregation_key: 'aggregation_key',
-  subject_name: 'subject_name',
-};
-
-const applyFiltersToLink = (baseLink, filters) => {
-  if (!baseLink || !filters || filters.length === 0) return baseLink;
-  const hashIndex = baseLink.indexOf('#');
-  const [pathAndQuery, hash] = hashIndex >= 0 ? [baseLink.slice(0, hashIndex), baseLink.slice(hashIndex)] : [baseLink, ''];
-  let result = pathAndQuery;
-  for (const filter of filters) {
-    if (!filter?.value || (Array.isArray(filter?.value) && filter?.value.length === 0)) {
-      continue;
-    }
-    const param = FILTER_COLUMN_TO_PARAM[filter.column?.toLowerCase()];
-    if (!param) continue;
-    const paramRegex = new RegExp(`[?&]${param}=`);
-    if (paramRegex.test(result)) continue;
-    const value = Array.isArray(filter.value) ? filter.value.join(',') : filter.value;
-    const separator = result.includes('?') ? '&' : '?';
-    result = `${result}${separator}${param}=${value}`;
-  }
-  return `${result}${hash}`;
-};
-
-// Extracts named placeholder values from a title using an insight_format template.
-// e.g. format = "Most frequent issue: {aggregation_key} ({} FIRING events)"
-//      title  = "Most frequent issue: RabbitmqUnroutableMessages (2058 FIRING events)"
-//      returns { aggregation_key: "RabbitmqUnroutableMessages" }
-//
-// Named placeholders  {key} → regex named capture group (?<key>.+?)
-// Unnamed placeholders {}   → non-capturing group        .+?   (value discarded)
-const extractFromFormat = (format, title) => {
-  if (!format || !title) return {};
-
-  const placeholderRegex = /\{(\w*)\}/g;
-  let match;
-  const placeholders = [];
-  while ((match = placeholderRegex.exec(format)) !== null) {
-    placeholders.push({ name: match[1], index: match.index, length: match[0].length });
-  }
-  if (placeholders.length === 0) return {};
-
-  let regexStr = '^';
-  let lastIndex = 0;
-  for (const ph of placeholders) {
-    regexStr += format.slice(lastIndex, ph.index).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    regexStr += ph.name ? `(?<${ph.name}>.+?)` : '.+?';
-    lastIndex = ph.index + ph.length;
-  }
-  regexStr += format.slice(lastIndex).replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$';
-
-  try {
-    return new RegExp(regexStr).exec(title)?.groups ?? {};
-  } catch {
-    return {};
-  }
-};
-
-const specialUniqueIdsForApplyFilter = {
-  129: {
-    keys: ['aggregation_key'],
-    defaultFilters: [
-      {
-        column: 'eventStatus',
-        value: 'FIRING',
-      },
-    ],
-  },
-  127: {
-    keys: ['subject_name'],
-    defaultFilters: null,
-  },
-  17: {
-    keys: [],
-    defaultFilters: [
-      {
-        column: 'severity',
-        value: ['Critical', 'High'],
-      },
-      {
-        column: 'status',
-        value: 'Open',
-      },
-    ],
-  },
-  114: {
-    keys: [],
-    defaultFilters: [
-      {
-        column: 'severity',
-        value: ['Low', 'Medium'],
-      },
-    ],
-  },
 };
 
 // ─── Module-level helpers ─────────────────────────────────────────────────
@@ -219,20 +105,10 @@ const getApplicationLink = (rule, workloadFqdn) => {
   return `${url.pathname}?${url.searchParams.toString()}${url.hash}`;
 };
 
-const buildInsightLink = (item) => {
-  let link = item?.rule?.redirect_url || null;
-  if (link && item.rule?.filters) {
-    link = applyFiltersToLink(link, item.rule.filters);
-  }
-  if (link && specialUniqueIdsForApplyFilter[item?.rule?.unique_id]) {
-    const { keys, defaultFilters } = specialUniqueIdsForApplyFilter[item.rule.unique_id];
-    if (defaultFilters) link = applyFiltersToLink(link, defaultFilters);
-    const extracted = extractFromFormat(item.rule.insight_format, item.title);
-    const extractedFilters = keys.filter((key) => extracted[key]).map((key) => ({ column: key, value: extracted[key] }));
-    link = applyFiltersToLink(link, extractedFilters);
-  }
-  return link;
-};
+// The backend (Go computeRedirectURL) is the single source of truth for insight
+// deep-links: it emits a complete, filter-applied relative URL, recomputed live
+// on the insight-list endpoint. Consume it verbatim.
+const buildInsightLink = (item) => item?.rule?.redirect_url || null;
 
 const getInsightSeverity = (item) => {
   const cat = item?.rule?.category || item?.type;
@@ -254,6 +130,34 @@ const getInsightSeverity = (item) => {
     default:
       return 'info';
   }
+};
+
+// Parse an insight's `applications` field (JSON string, array, or 'null'/null)
+// into an array of { name, namespace } — mirrors ServiceChipRow's parsing.
+const parseInsightApps = (applications) => {
+  if (!applications || applications === 'null') return [];
+  let apps = applications;
+  if (typeof apps === 'string') {
+    try {
+      apps = JSON.parse(apps);
+    } catch {
+      return [];
+    }
+  }
+  return Array.isArray(apps) ? apps : [];
+};
+
+// Distinct workloads/services affected across a set of insights. Deduped by
+// name:namespace so a workload hit by several insights is counted once — a
+// truthful "N workloads affected" figure rather than an inflated sum.
+const countAffectedWorkloads = (items) => {
+  const seen = new Set();
+  for (const item of items) {
+    for (const app of parseInsightApps(item?.applications)) {
+      if (app?.name) seen.add(`${app.name}:${app.namespace ?? ''}`);
+    }
+  }
+  return seen.size;
 };
 
 const getActionLabel = (item) => {
@@ -628,7 +532,7 @@ const SectionHeader = ({ icon, title, subtitle, tone = 'neutral' }) => {
       <Box sx={{ minWidth: 0 }}>
         <Typography
           sx={{
-            fontFamily: 'Poppins, sans-serif',
+            fontFamily: 'var(--ds-font-display)',
             fontSize: 'var(--ds-text-body-lg)',
             fontWeight: 'var(--ds-font-weight-semibold)',
             color: 'var(--ds-gray-900)',
@@ -640,7 +544,7 @@ const SectionHeader = ({ icon, title, subtitle, tone = 'neutral' }) => {
         </Typography>
         {subtitle && (
           <Typography
-            sx={{ fontFamily: 'Poppins, sans-serif', fontSize: 'var(--ds-text-caption)', color: 'var(--ds-gray-500)', mt: 'var(--ds-space-1)' }}
+            sx={{ fontFamily: 'var(--ds-font-display)', fontSize: 'var(--ds-text-caption)', color: 'var(--ds-gray-500)', mt: 'var(--ds-space-1)' }}
           >
             {subtitle}
           </Typography>
@@ -691,7 +595,7 @@ const AutomationsCard = ({ workflowData, accountId, onManage, onViewWorkflows })
         </Box>
         <Typography
           sx={{
-            fontFamily: 'Poppins, sans-serif',
+            fontFamily: 'var(--ds-font-display)',
             fontSize: 'var(--ds-text-body)',
             fontWeight: 'var(--ds-font-weight-semibold)',
             color: 'var(--ds-gray-900)',
@@ -766,6 +670,12 @@ const openSupportChat = () => {
 // Support chat is only available on saas-tier deployments.
 const isSupportChatAvailable = () => getUserSession()?.tier === 'saas';
 
+// The mascot illustrations are declared at their intrinsic size for next/image, but the
+// column that holds them collapses well below 180px on narrow viewports. Without this the
+// fixed-width <img> keeps its declared width and spills over the copy beside it, so scale
+// it down to whatever the column actually offers.
+const MASCOT_IMAGE_STYLE = { maxWidth: '100%', height: 'auto' };
+
 // The Nudgebee mascot illustrations are Nudgebee branding, so they only render on the
 // default (non-white-labeled) deployment. On a partner / white-labeled tenant we drop
 // the left illustration entirely rather than show the bee or the partner's logo (their
@@ -776,11 +686,11 @@ const renderNoDataState = ({ illustrationKey, alt, heading, body, secondary }) =
     <Box maxWidth={'90%'} mx={'auto'} py={2}>
       <Grid container spacing={1}>
         {showMascot && (
-          <Grid item xs={3} sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-            <SafeIcon src={getBrandingAsset(illustrationKey)} alt={alt} width={180} height={180} />
+          <Grid item xs={12} sm={4} md={3} sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <SafeIcon src={getBrandingAsset(illustrationKey)} alt={alt} width={180} height={180} style={MASCOT_IMAGE_STYLE} />
           </Grid>
         )}
-        <Grid item xs={showMascot ? 9 : 12} sx={{ display: 'flex', alignItems: 'center' }}>
+        <Grid item xs={12} sm={showMascot ? 8 : 12} md={showMascot ? 9 : 12} sx={{ display: 'flex', alignItems: 'center' }}>
           <Box>
             <Typography
               sx={{
@@ -870,10 +780,16 @@ const renderContent = (title, accountId, cloudProvider, noData = false) => {
       return (
         <Box maxWidth={'90%'} mx={'auto'} py={2}>
           <Grid container spacing={1}>
-            <Grid item xs={3}>
-              <SafeIcon src={getBrandingAsset('troubleshootBee')} alt='Bee with magnifying glass' width={180} height={180} />
+            <Grid item xs={12} sm={4} md={3} sx={{ display: 'flex', justifyContent: 'center' }}>
+              <SafeIcon
+                src={getBrandingAsset('troubleshootBee')}
+                alt='Bee with magnifying glass'
+                width={180}
+                height={180}
+                style={MASCOT_IMAGE_STYLE}
+              />
             </Grid>
-            <Grid item xs={9} sx={{ display: 'flex', alignItems: 'center' }}>
+            <Grid item xs={12} sm={8} md={9} sx={{ display: 'flex', alignItems: 'center' }}>
               <Box>
                 <Typography
                   sx={{
@@ -919,10 +835,20 @@ const renderContent = (title, accountId, cloudProvider, noData = false) => {
       return (
         <Box maxWidth={'90%'} mx={'auto'} py={2}>
           <Grid container spacing={1}>
-            <Grid item xs={3} sx={{ '@media (max-width: 1200px)': { pl: '0px !important', pr: 'var(--ds-space-4) !important' } }}>
-              <SafeIcon src={getBrandingAsset('optimizeBee')} alt='Bee with magnifying glass' width={180} height={180} />
+            <Grid
+              item
+              xs={12}
+              sm={4}
+              md={3}
+              sx={{
+                display: 'flex',
+                justifyContent: 'center',
+                '@media (max-width: 1200px)': { pl: '0px !important', pr: 'var(--ds-space-4) !important' },
+              }}
+            >
+              <SafeIcon src={getBrandingAsset('optimizeBee')} alt='Bee with magnifying glass' width={180} height={180} style={MASCOT_IMAGE_STYLE} />
             </Grid>
-            <Grid item xs={9} sx={{ display: 'flex', alignItems: 'center' }}>
+            <Grid item xs={12} sm={8} md={9} sx={{ display: 'flex', alignItems: 'center' }}>
               <Box>
                 <Typography
                   sx={{
@@ -963,7 +889,7 @@ const renderContent = (title, accountId, cloudProvider, noData = false) => {
       return (
         <Box maxWidth={'90%'} mx={'auto'} py={2}>
           <Grid container spacing={2}>
-            <Grid item xs={9}>
+            <Grid item xs={12} sm={8} md={9}>
               <Typography
                 sx={{
                   mb: 'var(--ds-space-4)',
@@ -995,8 +921,8 @@ const renderContent = (title, accountId, cloudProvider, noData = false) => {
                 </Box>
               ))}
             </Grid>
-            <Grid item xs={3}>
-              <SafeIcon src={getBrandingAsset('k8sBee')} alt='Bee with magnifying glass' width={150} height={152} />
+            <Grid item xs={12} sm={4} md={3} sx={{ display: 'flex', justifyContent: 'center' }}>
+              <SafeIcon src={getBrandingAsset('k8sBee')} alt='Bee with magnifying glass' width={150} height={152} style={MASCOT_IMAGE_STYLE} />
             </Grid>
           </Grid>
         </Box>
@@ -1006,10 +932,16 @@ const renderContent = (title, accountId, cloudProvider, noData = false) => {
       return (
         <Box maxWidth={'90%'} mx={'auto'} py={2}>
           <Grid container spacing={1}>
-            <Grid item xs={3}>
-              <SafeIcon src={getBrandingAsset('securityBee')} alt='Bee inspecting for security findings' width={180} height={180} />
+            <Grid item xs={12} sm={4} md={3} sx={{ display: 'flex', justifyContent: 'center' }}>
+              <SafeIcon
+                src={getBrandingAsset('securityBee')}
+                alt='Bee inspecting for security findings'
+                width={180}
+                height={180}
+                style={MASCOT_IMAGE_STYLE}
+              />
             </Grid>
-            <Grid item xs={9} sx={{ display: 'flex', alignItems: 'center' }}>
+            <Grid item xs={12} sm={8} md={9} sx={{ display: 'flex', alignItems: 'center' }}>
               <Box>
                 <Typography
                   sx={{
@@ -1641,11 +1573,11 @@ const HomeWidgets = React.memo(({ selectedCluster, cluster }) => {
           flexShrink: 0,
         }}
       >
-        <SafeIcon src={QuickLink} width='14px' height='14px' />
+        <SafeIcon src={QuickLink} alt='' width='14px' height='14px' />
       </Box>
       <Typography
         sx={{
-          fontFamily: 'Poppins, sans-serif',
+          fontFamily: 'var(--ds-font-display)',
           fontSize: 'var(--ds-text-body)',
           fontWeight: 'var(--ds-font-weight-semibold)',
           color: 'var(--ds-gray-900)',
@@ -1736,7 +1668,7 @@ const HomeWidgets = React.memo(({ selectedCluster, cluster }) => {
                 <Box className='ql-icon'>
                   <SafeIcon src={link.icon} alt={link.name} width='16px' height='16px' />
                 </Box>
-                <Typography fontSize={'var(--ds-text-small)'} fontWeight={400} color='var(--ds-gray-700)'>
+                <Typography fontSize={'var(--ds-text-small)'} fontWeight={'var(--ds-font-weight-regular)'} color='var(--ds-gray-700)'>
                   {link.name}
                 </Typography>
               </Box>
@@ -1777,70 +1709,9 @@ const Home = () => {
     troubleshooting: false,
     k8sOps: false,
   });
-  const { selectedCluster, allCluster } = useData();
+  const { selectedCluster } = useData();
   const currencySymbol = useCurrencySymbol(cluster);
   // Map integers to fragments based on KubernetesDetails config
-
-  const integrationData = [
-    {
-      id: 'messaging',
-      anchor: 'messaging',
-      startIcon: DataBaseBlueIcon,
-      title: 'Connect to your messaging tool',
-      options: [
-        { name: 'Slack', icon: SlackIcon, redirect: '/accounts/account-form?cloudProvider=SLACK' },
-        { name: 'MS Teams', icon: MsTeamsIcon, redirect: '/accounts/account-form?cloudProvider=MSTEAMS' },
-        { name: 'G Chat', icon: GChatIcon, redirect: '/accounts/account-form?cloudProvider=GOOGLE_CHAT' },
-      ],
-      actionText: 'Add Messaging',
-      actionIcon: <FiArrowRight />,
-    },
-    {
-      id: 'pagerduty',
-      anchor: 'messaging',
-      startIcon: SirenBlueIcon,
-      title: 'Using PagerDuty? You can connect to your',
-      options: [{ name: 'PagerDuty', icon: PagerDutyIcon, redirect: '/accounts/account-form?cloudProvider=PAGERDUTY' }],
-      actionText: 'Add PagerDuty',
-      actionIcon: <FiArrowRight />,
-    },
-    {
-      id: 'ticketing',
-      anchor: 'ticket',
-      startIcon: TicketBlueIcon,
-      title: 'I offer integrations with your Ticketing system',
-      options: [
-        { name: 'Service Now', icon: ServiceNowIcon, redirect: '/accounts/account-form?cloudProvider=SERVICENOW' },
-        { name: 'Jira', icon: JiraIcon, redirect: '/accounts/account-form?cloudProvider=JIRA' },
-        { name: 'Freshdesk', icon: FreshdeskIcon, redirect: '/accounts/account-form?cloudProvider=FRESHDESK' },
-      ],
-      actionText: 'Add Ticketing',
-      actionIcon: <FiArrowRight />,
-    },
-    {
-      id: 'code',
-      anchor: 'repo',
-      startIcon: RepoBlueIcon,
-      title: 'btw, I can also integrate with your code repo',
-      options: [],
-      actionText: 'Add GitHub',
-
-      actionIcon: <FiArrowRight />,
-      actionStartIcon: GithubIcon,
-    },
-  ];
-
-  const footerSections = [
-    {
-      type: 'integrations',
-      title: "We've got many other integrations available for you to explore.",
-      icon: DataBaseBlueIcon,
-      action: {
-        label: 'Check Integrations',
-        redirect: '/user-management#integrations',
-      },
-    },
-  ];
 
   useEffect(() => {
     if (router.query.accountId) {
@@ -2005,10 +1876,25 @@ const Home = () => {
     workflowData.configuredCount > 0 ||
     workflowData.actionedCount > 0;
 
-  // Static subtitles — live counts were unreliable due to row-list truncation
-  // and savings sum quirks. Revert to descriptive text per design.
-  const troubleshootSubtitle = 'Active incidents and event trends';
-  const optimizeSubtitle = 'Right-sizing, storage, and cost recommendations';
+  // Count subtitles mirror the Security card's "X · Y" shape: the issue/rec
+  // count (full filtered arrays — insights_list is unpaged) plus the distinct
+  // workloads those insights touch. Avoids the summed-savings / truncated-row
+  // quirks that got the earlier attempt reverted; falls back to descriptive
+  // text when there's nothing to count / still loading.
+  const troubleshootSubtitle = useMemo(() => {
+    if (!troubleshootItems.length) return 'Active incidents and event trends';
+    const parts = [`${troubleshootItems.length} ${troubleshootItems.length === 1 ? 'issue' : 'issues'}`];
+    const workloads = countAffectedWorkloads(troubleshootItems);
+    if (workloads) parts.push(`${workloads} ${workloads === 1 ? 'workload' : 'workloads'} affected`);
+    return parts.join(' · ');
+  }, [troubleshootItems]);
+  const optimizeSubtitle = useMemo(() => {
+    if (!optimizeItems.length) return 'Right-sizing, storage, and cost recommendations';
+    const parts = [`${optimizeItems.length} ${optimizeItems.length === 1 ? 'recommendation' : 'recommendations'}`];
+    const workloads = countAffectedWorkloads(optimizeItems);
+    if (workloads) parts.push(`${workloads} ${workloads === 1 ? 'workload' : 'workloads'}`);
+    return parts.join(' · ');
+  }, [optimizeItems]);
 
   const securitySubtitle = useMemo(() => {
     const parts = [];
@@ -2019,369 +1905,181 @@ const Home = () => {
   }, [imageScanData?.totalCritical, certificateData?.expiringSoon, opsItems.length]);
 
   return (
-    <Grid container spacing={6} mt='calc(var(--ds-space-0) * 14)'>
-      <Grid item xs={9} sx={{ pt: '0px !important' }}>
-        <Grid container>
+    <>
+      <SetupProgressBanner />
+      <Grid container spacing={6} mt='calc(var(--ds-space-0) * 14)'>
+        <Grid item xs={12} lg={9} sx={{ pt: '0px !important' }}>
           <K8sAccountModal openModal={showModal} handleClose={closeModal} />
-          {getUserSession()?.user?.name && allCluster?.length == 1 ? (
-            <Grid item xs={12} sx={{ mr: 'var(--ds-space-5)', pb: 'var(--ds-space-4)' }}>
-              <CollapsableCard
-                elevation='flat'
-                defaultOpen={allCluster?.length == 0 || false}
-                header={
-                  <Typography
-                    sx={{
-                      fontSize: 'var(--ds-text-title)',
-                      fontWeight: 'var(--ds-font-weight-semibold)',
-                      color: 'var(--ds-brand-600)',
-                    }}
-                  >
-                    Hi {(getUserSession()?.user?.name || '')?.split(' ')[0]}, Nice to have you here.
-                  </Typography>
-                }
-              >
-                <Box
-                  sx={{
-                    display: 'grid',
-                    gridTemplateColumns: 'calc(var(--ds-space-0) * 110) 1fr',
-                    gap: 'var(--ds-space-5)',
-                    '@media (max-width: 1230px)': {
-                      gridTemplateColumns: 'calc(var(--ds-space-0) * 75) 1fr',
-                    },
-                  }}
+          <>
+            <CardsBlock
+              title='Troubleshoot'
+              subtitle={troubleshootSubtitle}
+              icon={ErrorOutlineIcon}
+              tone='critical'
+              items={troubleshootItems}
+              type={'troubleshooting'}
+              accountId={selectedCluster.value || ''}
+              loadingInsights={loadingInsights.troubleshooting}
+              connectedAt={selectedCluster?.created_at || ''}
+              currencySymbol={currencySymbol || '$'}
+              cloudProvider={selectedCluster?.cloud_provider || ''}
+              footer={
+                <Button
+                  tone='ghost'
+                  size='xs'
+                  icon={<KeyboardArrowRightIcon />}
+                  iconPlacement='end'
+                  onClick={() =>
+                    window.open(`/troubleshoot?accountId=${selectedCluster?.value || ''}&accountIds=${selectedCluster?.value || ''}`, '_blank')
+                  }
                 >
-                  <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
-                    <SafeIcon src={getBrandingAsset('newUserBee')} alt='Welcome' width={200} height={200} />
-                  </Box>
-                  <Box sx={{ display: 'flex', flexDirection: 'column', gap: 'var(--ds-space-3)' }}>
-                    <DSCard variant='accent' tone='info' size='md' elevation='flat'>
+                  View all issues
+                </Button>
+              }
+            />
+            {selectedCluster?.cloud_provider !== 'CloudFoundry' && (
+              <CardsBlock
+                title='Optimize'
+                subtitle={optimizeSubtitle}
+                icon={OptimizeGaugeIcon}
+                tone='info'
+                items={optimizeItems}
+                type={'optimization'}
+                accountId={selectedCluster?.value || ''}
+                loadingInsights={loadingInsights.troubleshooting}
+                connectedAt={selectedCluster?.created_at || ''}
+                currencySymbol={currencySymbol || '$'}
+                cloudProvider={selectedCluster?.cloud_provider || ''}
+                footer={
+                  <Button
+                    tone='ghost'
+                    size='xs'
+                    icon={<KeyboardArrowRightIcon />}
+                    iconPlacement='end'
+                    onClick={() =>
+                      window.open(`/optimise?accountId=${selectedCluster?.value || ''}&account=${selectedCluster?.value || ''}#cost`, '_blank')
+                    }
+                  >
+                    View all recommendations
+                  </Button>
+                }
+              />
+            )}
+            {selectedCluster?.cloud_provider === 'K8s' && (
+              <CardsBlock
+                title='Security & Compliance'
+                subtitle={securitySubtitle}
+                icon={ShieldOutlinedIcon}
+                tone='agent'
+                items={opsItems}
+                type={'Ops'}
+                loadingInsights={loadingInsights.k8sOps}
+                accountId={selectedCluster?.value || ''}
+                connectedAt={selectedCluster?.created_at || ''}
+                currencySymbol={currencySymbol || '$'}
+                hasExternalData={securityHasExternal}
+                footer={
+                  <Button
+                    tone='ghost'
+                    size='xs'
+                    icon={<KeyboardArrowRightIcon />}
+                    iconPlacement='end'
+                    onClick={() => window.open(`/kubernetes/details/${selectedCluster?.value || ''}#security/image-scan`, '_blank')}
+                  >
+                    View security dashboard
+                  </Button>
+                }
+                extra={
+                  <>
+                    {imageScanData && Object.keys(imageScanData).length > 0 ? (
                       <Box
                         sx={{
                           display: 'flex',
                           alignItems: 'center',
-                          justifyContent: 'space-between',
                           gap: 'var(--ds-space-3)',
-                          flexWrap: 'wrap',
+                          py: 'var(--ds-space-2)',
+                          px: 'var(--ds-space-3)',
+                          mx: 'var(--ds-space-2)',
+                          borderBottom: '1px solid var(--ds-gray-100)',
                         }}
                       >
-                        <Box sx={{ flex: 1, minWidth: 'calc(var(--ds-space-0) * 120)' }}>
-                          {getUserSession()?.user?.name && (
-                            <Typography
-                              sx={{
-                                fontSize: 'var(--ds-text-title)',
-                                fontWeight: 'var(--ds-font-weight-semibold)',
-                                color: 'var(--ds-brand-600)',
-                                mb: 'var(--ds-space-1)',
-                              }}
-                            >
-                              Hi {getUserSession()?.user?.name?.split(' ')[0]}, Nice to have you here.
-                            </Typography>
-                          )}
-                          <Typography
-                            sx={{
-                              fontSize: 'var(--ds-text-body-lg)',
-                              fontWeight: 'var(--ds-font-weight-regular)',
-                              color: 'var(--ds-gray-600)',
-                              lineHeight: 'var(--ds-text-body-lg-lh)',
-                            }}
-                          >
-                            You are currently on our Demo Account (which only has partial data) Let&apos;s get you started with your cluster/account
-                          </Typography>
+                        <Box sx={{ flexShrink: 0 }}>
+                          <InsightIcon severity='critical' icon={ImageOutlinedIcon} />
                         </Box>
-                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 'var(--ds-space-1)' }}>
-                          <ConnectClusterHelp />
-                          <Button
-                            tone='primary'
-                            size='sm'
-                            trailingAccent={<ArrowForwardIcon />}
-                            onClick={() => router.push(`/user-management#integrations`)}
-                          >
-                            Add K8s Account
-                          </Button>
-                        </Box>
-                      </Box>
-                    </DSCard>
-
-                    <Box>
-                      <Typography
-                        sx={{
-                          fontSize: 'var(--ds-text-body-lg)',
-                          fontWeight: 'var(--ds-font-weight-medium)',
-                          color: 'var(--ds-gray-700)',
-                          mb: 'var(--ds-space-2)',
-                        }}
-                      >
-                        Other things you can do to make sure you get the full intelligent automation experience.
-                      </Typography>
-                      {integrationData.map((item, index) => (
-                        <Box
-                          key={item.id}
-                          sx={{
-                            display: 'flex',
-                            alignItems: 'center',
-                            justifyContent: 'space-between',
-                            gap: 'var(--ds-space-3)',
-                            py: 'var(--ds-space-2)',
-                            borderBottom: index < integrationData.length - 1 ? '1px solid var(--ds-gray-200)' : 'none',
-                            flexWrap: 'wrap',
-                          }}
+                        <Typography sx={{ flex: 1, minWidth: 0, fontSize: 'var(--ds-text-body)', lineHeight: 1.5, color: 'var(--ds-gray-800)' }}>
+                          {`${imageScanData.appCount} apps have ${imageScanData.totalCritical} critical CVEs in ${imageScanData.imageCount} images`}
+                        </Typography>
+                        <Button
+                          tone='ghost'
+                          size='xs'
+                          icon={<AgentSparkleIcon />}
+                          iconPlacement='start'
+                          onClick={() =>
+                            window.open(`/kubernetes/details/${selectedCluster?.value}?status=Open&severity=Critical#security/image-scan`, '_blank')
+                          }
                         >
-                          <Box sx={{ display: 'flex', alignItems: 'center', gap: 'var(--ds-space-2)', flexWrap: 'wrap' }}>
-                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 'var(--ds-space-1)' }}>
-                              {item.startIcon && <SafeIcon src={item.startIcon} alt={item.id} width={20} height={20} />}
-                              <Typography
-                                sx={{
-                                  fontSize: 'var(--ds-text-body-lg)',
-                                  fontWeight: 'var(--ds-font-weight-regular)',
-                                  color: 'var(--ds-gray-700)',
-                                  lineHeight: 'var(--ds-text-body-lg-lh)',
-                                }}
-                              >
-                                {item.title}
-                              </Typography>
-                            </Box>
-                            {item.options && item.options.length > 0 && (
-                              <Box sx={{ display: 'flex', gap: 'var(--ds-space-1)', flexWrap: 'wrap' }}>
-                                {item.options.map((option) => (
-                                  <Chip
-                                    key={option.name}
-                                    size='xs'
-                                    tone='info'
-                                    shape='rect'
-                                    icon={option.icon && <SafeIcon src={option.icon} alt={option.name} width={14} height={14} />}
-                                    onClick={() => router.push(option.redirect)}
-                                  >
-                                    {option.name}
-                                  </Chip>
-                                ))}
-                              </Box>
-                            )}
-                          </Box>
-                          <Button
-                            tone='secondary'
-                            size='xs'
-                            icon={item.actionStartIcon && <SafeIcon src={item.actionStartIcon} alt={item.actionText} width={14} height={14} />}
-                            iconPlacement='start'
-                            trailingAccent={<ArrowForwardIcon />}
-                            onClick={() => router.push(`/user-management#integrations`)}
-                          >
-                            {item.actionText}
-                          </Button>
+                          Review
+                        </Button>
+                      </Box>
+                    ) : null}
+                    {certificateData && Object.keys(certificateData).length > 0 ? (
+                      <Box
+                        sx={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 'var(--ds-space-3)',
+                          py: 'var(--ds-space-2)',
+                          px: 'var(--ds-space-3)',
+                          mx: 'var(--ds-space-2)',
+                          borderBottom: '1px solid var(--ds-gray-100)',
+                          '&:last-child': { borderBottom: 'none' },
+                        }}
+                      >
+                        <Box sx={{ flexShrink: 0 }}>
+                          <InsightIcon severity='high' icon={LockOutlinedIcon} />
                         </Box>
-                      ))}
-                      <Grid container spacing={2} sx={{ mt: 'var(--ds-space-1)' }}>
-                        {footerSections.map((section) => (
-                          <Grid item xl={6} md={12} key={section.type}>
-                            <DSCard variant='accent' tone='success' size='sm' elevation='flat'>
-                              <Box
-                                sx={{
-                                  display: 'flex',
-                                  alignItems: 'center',
-                                  justifyContent: 'space-between',
-                                  gap: 'var(--ds-space-3)',
-                                  flexWrap: 'wrap',
-                                }}
-                              >
-                                <Box sx={{ display: 'flex', alignItems: 'center', gap: 'var(--ds-space-2)', flex: 1, minWidth: 0 }}>
-                                  {section.icon && <SafeIcon src={section.icon} alt={section.title} width={20} height={20} />}
-                                  <Typography
-                                    sx={{
-                                      fontSize: 'var(--ds-text-body-lg)',
-                                      fontWeight: 'var(--ds-font-weight-regular)',
-                                      color: 'var(--ds-gray-700)',
-                                      lineHeight: 'var(--ds-text-body-lg-lh)',
-                                    }}
-                                  >
-                                    {section.title}
-                                  </Typography>
-                                </Box>
-                                <Button
-                                  tone='secondary'
-                                  size='xs'
-                                  icon={
-                                    section?.action?.icon && (
-                                      <SafeIcon src={section.action.icon} alt={section?.action?.label} width={14} height={14} />
-                                    )
-                                  }
-                                  iconPlacement='start'
-                                  trailingAccent={<ArrowForwardIcon />}
-                                  onClick={() => router.push(`/user-management#integrations`)}
-                                >
-                                  {section?.action?.label}
-                                </Button>
-                              </Box>
-                            </DSCard>
-                          </Grid>
-                        ))}
-                      </Grid>
-                    </Box>
-                  </Box>
-                </Box>
-              </CollapsableCard>
-            </Grid>
-          ) : null}{' '}
-        </Grid>
-        <CardsBlock
-          title='Troubleshoot'
-          subtitle={troubleshootSubtitle}
-          icon={ErrorOutlineIcon}
-          tone='critical'
-          items={troubleshootItems}
-          type={'troubleshooting'}
-          accountId={selectedCluster.value || ''}
-          loadingInsights={loadingInsights.troubleshooting}
-          connectedAt={selectedCluster?.created_at || ''}
-          currencySymbol={currencySymbol || '$'}
-          cloudProvider={selectedCluster?.cloud_provider || ''}
-          footer={
-            <Button
-              tone='ghost'
-              size='xs'
-              icon={<KeyboardArrowRightIcon />}
-              iconPlacement='end'
-              onClick={() =>
-                window.open(`/troubleshoot?accountId=${selectedCluster?.value || ''}&accountIds=${selectedCluster?.value || ''}`, '_blank')
-              }
-            >
-              View all issues
-            </Button>
-          }
-        />
-        {selectedCluster?.cloud_provider !== 'CloudFoundry' && (
-          <CardsBlock
-            title='Optimize'
-            subtitle={optimizeSubtitle}
-            icon={OptimizeGaugeIcon}
-            tone='info'
-            items={optimizeItems}
-            type={'optimization'}
-            accountId={selectedCluster?.value || ''}
-            loadingInsights={loadingInsights.troubleshooting}
-            connectedAt={selectedCluster?.created_at || ''}
-            currencySymbol={currencySymbol || '$'}
-            cloudProvider={selectedCluster?.cloud_provider || ''}
-            footer={
-              <Button
-                tone='ghost'
-                size='xs'
-                icon={<KeyboardArrowRightIcon />}
-                iconPlacement='end'
-                onClick={() =>
-                  window.open(`/optimise?accountId=${selectedCluster?.value || ''}&account=${selectedCluster?.value || ''}#recommendations`, '_blank')
+                        <Typography sx={{ flex: 1, minWidth: 0, fontSize: 'var(--ds-text-body)', lineHeight: 1.5, color: 'var(--ds-gray-800)' }}>
+                          {`${certificateData.expiringSoon} certificates expiring in less than 30 days`}
+                        </Typography>
+                        <Button
+                          tone='ghost'
+                          size='xs'
+                          icon={<AgentSparkleIcon />}
+                          iconPlacement='start'
+                          onClick={() => window.open(`/kubernetes/details/${selectedCluster?.value}#security/ssl-certificate-issues`, '_blank')}
+                        >
+                          Review
+                        </Button>
+                      </Box>
+                    ) : null}
+                  </>
                 }
-              >
-                View all recommendations
-              </Button>
-            }
-          />
-        )}
-        {selectedCluster?.cloud_provider === 'K8s' && (
-          <CardsBlock
-            title='Security & Compliance'
-            subtitle={securitySubtitle}
-            icon={ShieldOutlinedIcon}
-            tone='agent'
-            items={opsItems}
-            type={'Ops'}
-            loadingInsights={loadingInsights.k8sOps}
+              />
+            )}
+          </>
+        </Grid>
+        <Grid
+          item
+          xs={12}
+          lg={3}
+          sx={{ pl: 'var(--ds-space-4) !important', pt: '0px !important', display: 'flex', flexDirection: 'column', gap: 'var(--ds-space-4)' }}
+        >
+          <AutomationsCard
+            workflowData={workflowData}
             accountId={selectedCluster?.value || ''}
-            connectedAt={selectedCluster?.created_at || ''}
-            currencySymbol={currencySymbol || '$'}
-            hasExternalData={securityHasExternal}
-            footer={
-              <Button
-                tone='ghost'
-                size='xs'
-                icon={<KeyboardArrowRightIcon />}
-                iconPlacement='end'
-                onClick={() => window.open(`/kubernetes/details/${selectedCluster?.value || ''}#security/image-scan`, '_blank')}
-              >
-                View security dashboard
-              </Button>
-            }
-            extra={
-              <>
-                {imageScanData && Object.keys(imageScanData).length > 0 ? (
-                  <Box
-                    sx={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: 'var(--ds-space-3)',
-                      py: 'var(--ds-space-2)',
-                      px: 'var(--ds-space-3)',
-                      mx: 'var(--ds-space-2)',
-                      borderBottom: '1px solid var(--ds-gray-100)',
-                    }}
-                  >
-                    <Box sx={{ flexShrink: 0 }}>
-                      <InsightIcon severity='critical' icon={ImageOutlinedIcon} />
-                    </Box>
-                    <Typography sx={{ flex: 1, minWidth: 0, fontSize: 'var(--ds-text-body)', lineHeight: 1.5, color: 'var(--ds-gray-800)' }}>
-                      {`${imageScanData.appCount} apps have ${imageScanData.totalCritical} critical CVEs in ${imageScanData.imageCount} images`}
-                    </Typography>
-                    <Button
-                      tone='ghost'
-                      size='xs'
-                      icon={<AgentSparkleIcon />}
-                      iconPlacement='start'
-                      onClick={() =>
-                        window.open(`/kubernetes/details/${selectedCluster?.value}?status=Open&severity=Critical#security/image-scan`, '_blank')
-                      }
-                    >
-                      Review
-                    </Button>
-                  </Box>
-                ) : null}
-                {certificateData && Object.keys(certificateData).length > 0 ? (
-                  <Box
-                    sx={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: 'var(--ds-space-3)',
-                      py: 'var(--ds-space-2)',
-                      px: 'var(--ds-space-3)',
-                      mx: 'var(--ds-space-2)',
-                      borderBottom: '1px solid var(--ds-gray-100)',
-                      '&:last-child': { borderBottom: 'none' },
-                    }}
-                  >
-                    <Box sx={{ flexShrink: 0 }}>
-                      <InsightIcon severity='high' icon={LockOutlinedIcon} />
-                    </Box>
-                    <Typography sx={{ flex: 1, minWidth: 0, fontSize: 'var(--ds-text-body)', lineHeight: 1.5, color: 'var(--ds-gray-800)' }}>
-                      {`${certificateData.expiringSoon} certificates expiring in less than 30 days`}
-                    </Typography>
-                    <Button
-                      tone='ghost'
-                      size='xs'
-                      icon={<AgentSparkleIcon />}
-                      iconPlacement='start'
-                      onClick={() => window.open(`/kubernetes/details/${selectedCluster?.value}#security/ssl-certificate-issues`, '_blank')}
-                    >
-                      Review
-                    </Button>
-                  </Box>
-                ) : null}
-              </>
-            }
+            onManage={(id) => window.open(`/automation?accountId=${id}&status=Active`, '_blank')}
+            onViewWorkflows={(query) => router.push({ pathname: '/automation', query })}
           />
-        )}
+          <VmOverviewCard
+            accountId={selectedCluster?.value || ''}
+            cloudProvider={selectedCluster?.cloud_provider || ''}
+            onViewAll={(id) => router.push({ pathname: '/vm', query: { accountId: id }, hash: 'summary' })}
+          />
+          <PendingFollowUps accountId={cluster} />
+          <HomeWidgets selectedCluster={selectedCluster} cluster={cluster} />
+        </Grid>
       </Grid>
-      <Grid
-        item
-        xs={3}
-        sx={{ pl: 'var(--ds-space-4) !important', pt: '0px !important', display: 'flex', flexDirection: 'column', gap: 'var(--ds-space-4)' }}
-      >
-        <AutomationsCard
-          workflowData={workflowData}
-          accountId={selectedCluster?.value || ''}
-          onManage={(id) => window.open(`/automation?accountId=${id}&status=Active`, '_blank')}
-          onViewWorkflows={(query) => router.push({ pathname: '/automation', query })}
-        />
-        <PendingFollowUps accountId={cluster} />
-        <HomeWidgets selectedCluster={selectedCluster} cluster={cluster} />
-      </Grid>
-    </Grid>
+    </>
   );
 };
 

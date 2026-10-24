@@ -12,7 +12,6 @@ import CustomTable from '@shared/tables/CustomTable';
 import { Button as DsButton } from '@ui/Button';
 import { DropdownMenu as DsDropdownMenu } from '@ui/DropdownMenu';
 import { SeverityIcon as DsSeverityIcon } from '@ui/SeverityIcon';
-import { Label } from '@ui/Label';
 import { ds } from 'src/utils/colors';
 import MoreVertIcon from '@mui/icons-material/MoreVert';
 import HelpBeeModal from '@components/helpbee';
@@ -25,8 +24,10 @@ import { useEventCloudFilter } from '@hooks/useCloudFilters';
 import { syncFilterFromQuery, toSeverityLevel } from '@utils/common';
 import { FiArrowRight } from 'react-icons/fi';
 import NBStatusBadge from '@shared/widgets/NBStatusBadge';
+import AlertStatusBadge from '@shared/widgets/AlertStatusBadge';
+import k8sApi from '@api1/kubernetes';
 import { usePagination } from '@hooks/usePagination';
-import { hasReadAccess, hasWriteAccess } from '@lib/auth';
+import { hasReadAccess, hasWriteAccess, getUserSession } from '@lib/auth';
 import { TicketsIcon, dashboardIcon1 as ClassifyIcon, infoIcon } from '@assets';
 import ticketsApi from '@api1/tickets';
 import TicketCreatePopupForm from '@components/tickets/TicketCreatePopupForm';
@@ -37,7 +38,7 @@ import PriorityPinControl from '@shared/widgets/PriorityPinControl';
 import WorkflowIcon from '@assets/WorkflowIcon';
 import Tooltip from '@ui/Tooltip';
 import TicketLink from '@shared/links/TicketLink';
-import { getTriageStatusTooltip } from '@api1/triage';
+import { TRIAGE_SCORE_INFO, getTriageStatusTooltip } from '@api1/triage';
 import SafeIcon from '@shared/icons/SafeIcon';
 
 const TABLE_COLUMNS = [
@@ -59,7 +60,7 @@ const TABLE_COLUMNS = [
   {
     name: 'Triage Score',
     width: '9%',
-    info: "Triage Score is NudgeBee's context-aware triage score/level, computed using multiple signals beyond raw thresholds such as service criticality, customer/user impact, recurrence frequency, dependency (upstream/downstream) blast radius, and the nature of the service/workload.",
+    info: TRIAGE_SCORE_INFO,
   },
   {
     name: 'Alert Status',
@@ -95,19 +96,6 @@ const getValidParam = (param: any, defaultValue = ''): string => {
     return defaultValue;
   }
   return String(param);
-};
-
-const getStatusText = (status: string | undefined): string => {
-  if (status === 'FIRING') return 'Open';
-  if (status === 'CLOSED') return 'Closed';
-  if (status === 'RESOLVED') return 'Resolved';
-  return status || '-';
-};
-
-const getStatusTone = (status: string | undefined): 'critical' | 'success' | 'neutral' => {
-  if (status === 'FIRING') return 'critical';
-  if (status === 'RESOLVED') return 'success';
-  return 'neutral';
 };
 
 const parseSubjectName = (item: any): string | undefined => {
@@ -169,6 +157,7 @@ const CloudAccountEvents = (props: {
   const [selectedEventName, setSelectedEventName] = useState(() => getValidParam(router?.query?.eventAggregationKey));
   const [selectedSource, setSelectedSource] = useState<{ label: string; value: string }[]>([]);
   const [selectedStatus, setSelectedStatus] = useState(() => getValidParam(router?.query?.eventStatus));
+  const [selectedNbPriority, setSelectedNbPriority] = useState(() => getValidParam(router?.query?.eventNbPriority));
   // Free-text message search. Raw input vs the applied value that actually drives
   // the refetch (the listEvents dep), seeded from the URL so the filter survives
   // reload / share.
@@ -200,6 +189,10 @@ const CloudAccountEvents = (props: {
   const rawEventsRef = useRef<any[]>([]);
   const ticketReferenceMapRef = useRef<Map<string, any>>(new Map());
   const buildRowDataRef = useRef<((evts: any[], map: Map<string, any>) => ICustomTableRow[][]) | null>(null);
+  // event id -> who manually closed it and why, prefetched below alongside
+  // the ticket badges. Read directly by mapEventToRow's Alert Status cell
+  // (see KubernetesEvents.jsx's identical pattern).
+  const closedByMapRef = useRef<Map<string, { name: string; reasonCode?: string; reasonText?: string; evidenceUrl?: string }>>(new Map());
 
   const cloudAccountEventsTable = 'cloudaccount-events';
   const _showEllipsis = true;
@@ -278,6 +271,12 @@ const CloudAccountEvents = (props: {
   const onStatusFilterChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     setSelectedStatus(e?.target?.value || '');
     applyFiltersOnRouter(router, { eventStatus: e?.target?.value });
+    setPage(0);
+  };
+
+  const onNbPriorityFilterChange = (value: string) => {
+    setSelectedNbPriority(value);
+    applyFiltersOnRouter(router, { eventNbPriority: value || undefined });
     setPage(0);
   };
 
@@ -363,6 +362,34 @@ const CloudAccountEvents = (props: {
     setEvents(rawEventsRef.current.map((item: any) => mapEventToRow(item, ticketReferenceMapRef.current)));
   };
 
+  const handleToggleEventStatus = async (
+    eventId: string,
+    newStatus: string,
+    details: { reasonCode: string; reasonText?: string; evidenceUrl?: string }
+  ) => {
+    try {
+      await k8sApi.updateEventStatus(eventId, newStatus, details);
+      rawEventsRef.current = rawEventsRef.current.map((e: any) => (e.id === eventId ? { ...e, status: newStatus } : e));
+      if (newStatus === 'CLOSED') {
+        const closerName = getUserSession()?.user?.name || getUserSession()?.user?.email;
+        if (closerName) {
+          closedByMapRef.current.set(eventId, {
+            name: closerName,
+            reasonCode: details?.reasonCode,
+            reasonText: details?.reasonText,
+            evidenceUrl: details?.evidenceUrl,
+          });
+        }
+      } else {
+        closedByMapRef.current.delete(eventId);
+      }
+      setEvents(rawEventsRef.current.map((item: any) => mapEventToRow(item, ticketReferenceMapRef.current)));
+      snackbar.success(newStatus === 'CLOSED' ? 'Event closed' : 'Event opened');
+    } catch (_error) {
+      snackbar.error(newStatus === 'CLOSED' ? 'Failed to close event' : 'Failed to open event');
+    }
+  };
+
   const mapEventToRow = (item: any, ticketReferenceMap: Map<string, any>): ICustomTableRow[] => {
     const subjectName = parseSubjectName(item);
     const rowData: ICustomTableRow[] = [];
@@ -442,9 +469,16 @@ const CloudAccountEvents = (props: {
     rowData.push({
       component: (
         <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
-          <Label tone={getStatusTone(item?.status)} size='sm'>
-            {getStatusText(item?.status)}
-          </Label>
+          <AlertStatusBadge
+            eventId={item.id}
+            status={item?.status}
+            canToggle={hasWriteAccess(item.account_id || props.accountId)}
+            closedByName={closedByMapRef.current.get(item.id)?.name}
+            closedReasonCode={closedByMapRef.current.get(item.id)?.reasonCode}
+            closedReasonText={closedByMapRef.current.get(item.id)?.reasonText}
+            closedEvidenceUrl={closedByMapRef.current.get(item.id)?.evidenceUrl}
+            onToggle={handleToggleEventStatus}
+          />
           <Text value={item.source?.replace('AWS_', '')} secondaryText sx={{ fontSize: ds.text.caption, mt: 'var(--ds-space-1)' }} />
         </Box>
       ),
@@ -477,9 +511,9 @@ const CloudAccountEvents = (props: {
             size='xs'
             trailingAccent={<FiArrowRight />}
             href={`/investigate?id=${item.id}&accountId=${props?.accountId}`}
-            data-testid='investigate-btn'
+            data-testid={item.is_investigated ? 'view-analysis-btn' : 'investigate-btn'}
           >
-            Investigate
+            {item.is_investigated ? 'View Analysis' : 'Investigate'}
           </DsButton>
           {menuItemsConfig && menuItemsConfig.length > 0 && (
             <DsDropdownMenu
@@ -502,7 +536,7 @@ const CloudAccountEvents = (props: {
     return rowData;
   };
 
-  const listCloudAccountEvents = () => {
+  const listCloudAccountEvents = (isCancelled: () => boolean = () => false) => {
     setLoading(true);
 
     apiCloudAccount
@@ -518,6 +552,7 @@ const CloudAccountEvents = (props: {
           priority: selectedSeverity,
           source: selectedSource.map((s) => s.value),
           status: selectedStatus,
+          nbPriority: selectedNbPriority || undefined,
           nbStatus: selectedNbStatus.length > 0 ? selectedNbStatus.map((s) => s?.value) : undefined,
           messageSearch: appliedSearchByMessage || undefined,
         },
@@ -525,6 +560,7 @@ const CloudAccountEvents = (props: {
         page * rowsPerPage
       )
       .then(async (res: any) => {
+        if (isCancelled()) return;
         const events = res.data?.events || [];
         const totalCount = res.data?.events_aggregate?.aggregate?.count ?? 0;
 
@@ -535,7 +571,41 @@ const CloudAccountEvents = (props: {
           return;
         }
 
-        // 1. Extract all unique fingerprints (Reference IDs)
+        // Render rows now; ticket badges and "Closed by" data are non-blocking
+        // second passes below.
+        rawEventsRef.current = events;
+        ticketReferenceMapRef.current = new Map();
+        closedByMapRef.current = new Map();
+        buildRowDataRef.current = (evts: any[], map: Map<string, any>) => evts.map((item: any) => mapEventToRow(item, map));
+        setEvents(events.map((item: any) => mapEventToRow(item, ticketReferenceMapRef.current)));
+        setEventsCount(totalCount);
+        setLoading(false);
+
+        const closedEventIds = events.filter((item: any) => item.status === 'CLOSED').map((item: any) => item.id);
+        if (closedEventIds.length) {
+          k8sApi
+            .getEventStatusChanges(closedEventIds)
+            .then((changes: any[]) => {
+              if (isCancelled()) return;
+              const closedByMap = new Map<string, { name: string; reasonCode?: string; reasonText?: string; evidenceUrl?: string }>();
+              (changes || []).forEach((change) => {
+                if (change.event_id && change.changed_by_name) {
+                  closedByMap.set(change.event_id, {
+                    name: change.changed_by_name,
+                    reasonCode: change.reason_code,
+                    reasonText: change.reason_text,
+                    evidenceUrl: change.evidence_url,
+                  });
+                }
+              });
+              closedByMapRef.current = closedByMap;
+              setEvents(events.map((item: any) => mapEventToRow(item, ticketReferenceMapRef.current)));
+            })
+            .catch(() => {
+              // Non-critical: the badge just falls back to no reopen option.
+            });
+        }
+
         const uniqueReferenceIds = new Set();
         events.forEach((item: any) => {
           if (item.fingerprint) {
@@ -543,35 +613,24 @@ const CloudAccountEvents = (props: {
           }
         });
         const references: any = Array.from(uniqueReferenceIds);
+        if (references.length === 0) return;
 
         try {
-          // 2. Fetch Tickets for all events in one go
           const ticketRes: any = await ticketsApi.listTicketsSummary({ reference_id: references });
+          if (isCancelled()) return;
 
-          // 3. Create a Map for quick lookup
           const ticketReferenceMap = new Map();
           ticketRes?.data?.tickets?.forEach((element: any) => {
             ticketReferenceMap.set(element.reference_id, element);
           });
-
-          // 4. Map events to table rows
-          const ec2ResourceData = events.map((item: any) => mapEventToRow(item, ticketReferenceMap));
-
-          // 5. Update State
-          rawEventsRef.current = events;
           ticketReferenceMapRef.current = ticketReferenceMap;
-          buildRowDataRef.current = (evts: any[], map: Map<string, any>) => evts.map((item: any) => mapEventToRow(item, map));
-          setEvents(ec2ResourceData);
-          setEventsCount(totalCount);
+          setEvents(events.map((item: any) => mapEventToRow(item, ticketReferenceMap)));
         } catch (err) {
           console.error('Error fetching ticket summaries', err);
-          // Optional: handle partial failure (show events without tickets)
-        } finally {
-          setLoading(false);
         }
       })
       .catch(() => {
-        setLoading(false);
+        if (!isCancelled()) setLoading(false);
       });
   };
 
@@ -579,7 +638,11 @@ const CloudAccountEvents = (props: {
     if (!props?.accountId) {
       return;
     }
-    listCloudAccountEvents();
+    let cancelled = false;
+    listCloudAccountEvents(() => cancelled);
+    return () => {
+      cancelled = true;
+    };
   }, [
     props?.accountId,
     page,
@@ -589,6 +652,7 @@ const CloudAccountEvents = (props: {
     selectedEventName,
     selectedSource,
     selectedStatus,
+    selectedNbPriority,
     selectedNbStatus,
     appliedSearchByMessage,
     props?.subjectName,
@@ -729,6 +793,18 @@ const CloudAccountEvents = (props: {
             options={(severityFilterType || []).map((s: string) => ({ label: s, value: s }))}
             value={selectedSeverity ? { label: selectedSeverity, value: selectedSeverity } : null}
             onSelect={(_e: any, item: any) => onSeverityFilterChange({ target: { value: item?.value || '' } } as any)}
+          />
+          <FilterDropdown
+            id={`${cloudAccountEventsTable}-filter-triage-priority`}
+            label='Triage Priority'
+            options={[
+              { label: 'P0', value: 'P0' },
+              { label: 'P1', value: 'P1' },
+              { label: 'P2', value: 'P2' },
+              { label: 'P3', value: 'P3' },
+            ]}
+            value={selectedNbPriority ? { label: selectedNbPriority, value: selectedNbPriority } : null}
+            onSelect={(_e: any, item: any) => onNbPriorityFilterChange(item?.value || '')}
           />
           <FilterDropdown
             id={`${cloudAccountEventsTable}-filter-source`}

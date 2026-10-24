@@ -2,7 +2,6 @@ import React, { useEffect, useState, useRef, useCallback } from 'react';
 import CustomTable from '@shared/tables/CustomTable';
 import { Box, Typography, Grid } from '@mui/material';
 import { Card } from '@ui/Card';
-import WidgetCard from '@ui/WidgetCard';
 import dynamic from 'next/dynamic';
 import { useRouter } from 'next/router';
 import Chart from '@ui/Chart';
@@ -18,7 +17,7 @@ import Datetime from '@shared/format/Datetime';
 import SafeIcon from '@shared/icons/SafeIcon';
 import Loader from '@shared/Loader';
 import { getDateString, getLast30Days, getSpecificTime, getTimeString, timeFormatIn24HoursCompact } from '@lib/datetime';
-import KubernetesPodYaml from '@components/k8s/details/KubernetesPodYaml';
+const KubernetesPodYaml = dynamic(() => import('@components/k8s/details/KubernetesPodYaml'), { ssr: false });
 import {
   convertNumberToTimestamp,
   getMsInTimestamp,
@@ -36,8 +35,6 @@ import PropTypes from 'prop-types';
 import KubernetesSecurity from '@components/recommendations/KubernetesSecurity';
 import CustomDateTimeRangePicker from '@shared/widgets/CustomDateTimeRangePicker';
 import RefreshIcon from '@mui/icons-material/Refresh';
-import CodeMirror, { EditorView } from '@uiw/react-codemirror';
-import { json } from '@codemirror/lang-json';
 import apiKubernetes1 from '@api1/kubernetes1';
 import apiTriage from '@api1/triage';
 import { SeverityIcon } from '@ui/SeverityIcon';
@@ -53,12 +50,16 @@ import { FiArrowRight } from 'react-icons/fi';
 import NBStatusBadge from '@shared/widgets/NBStatusBadge';
 import TicketCreatePopupForm from '@components/tickets/TicketCreatePopupForm';
 import KubernetesPlusMinusLogsGradual from '@components/k8s/details/KubernetesPlusMinusLogsGradual';
-import CodeMirrorDiffViewer from '@shared/viewers/DiffViewer';
+const CodeMirrorDiffViewer = dynamic(() => import('@shared/viewers/DiffViewer'), { ssr: false });
+const KubernetesLogstashDetails = dynamic(() => import('./KubernetesLogstashDetails'), { ssr: false });
 import { useNubiGlobalChat } from '@context/NubiGlobalChatContext';
 import { md5 } from '@lib/encode';
 import { buildNubiChartPrompt } from 'src/utils/nubiPromptBuilder';
 import { ds, resolveColor, resolveColors } from 'src/utils/colors';
 import MetricQueryInfo, { K8S_METRIC_QUERY_LABELS, buildPromQueries } from '@shared/MetricQueryInfo';
+
+// WidgetCard's defaults (24px top margin, 16px 24px padding), kept so moving to Card doesn't shift the layout.
+const detailCardSx = { mt: 'var(--ds-space-5)', padding: 'var(--ds-space-4) var(--ds-space-5)' };
 
 const chartContainerStyle = {
   border: '1px solid var(--ds-gray-200)',
@@ -411,10 +412,9 @@ const getLimitsAndRequests = (query, memLimit, cpuLimit) => {
   return { memLimit: newMemLimit, cpuLimit: newCpuLimit, memReq, cpuReq };
 };
 
-const processChartData = (podGroupings, cpuLimit, memLimit, cpuReq, memReq, differenceInHours, gpuTrend) => {
+const processChartData = (podGroupings, cpuLimit, memLimit, cpuReq, memReq, differenceInHours) => {
   const cpuData = { data: [[], [], []], labels: [], timestamps: [] };
   const memData = { data: [[], [], []], labels: [], timestamps: [] };
-  const gpuData = { data: [[], [], [], []], labels: [] };
   const diskData = { data: [[], []], labels: [] };
 
   podGroupings.forEach((e) => {
@@ -430,13 +430,6 @@ const processChartData = (podGroupings, cpuLimit, memLimit, cpuReq, memReq, diff
       diskData.data[1].push(e.disk_total / (1024 * 1024 * 1024));
     }
 
-    if (gpuTrend) {
-      gpuData.data[0].push(e.sum_gpu_used);
-      gpuData.data[1].push(e.sum_gpu_temp);
-      gpuData.data[2].push(e.sum_gpu_mem_temp);
-      gpuData.data[3].push(e.sum_gpu_mem_usage);
-    }
-
     const label = differenceInHours > 24 ? getDateString(e.timestamp) : getTimeString(e.timestamp);
     cpuData.labels.push(label);
     memData.labels.push(label);
@@ -445,9 +438,6 @@ const processChartData = (podGroupings, cpuLimit, memLimit, cpuReq, memReq, diff
     memData.timestamps.push(ts);
     if (diskData.data[0].length > 0 && diskData.data[1].length > 0) {
       diskData.labels.push(label);
-    }
-    if (gpuTrend) {
-      gpuData.labels.push(label);
     }
   });
 
@@ -466,7 +456,7 @@ const processChartData = (podGroupings, cpuLimit, memLimit, cpuReq, memReq, diff
     });
   }
 
-  return { cpuData, memData, gpuData, diskData };
+  return { cpuData, memData, diskData };
 };
 
 export const KubernetesUtilizationCharts = ({ accountId, query = {}, selectedDateRange, memLimit, cpuLimit }) => {
@@ -570,7 +560,7 @@ export const KubernetesUtilizationCharts2 = ({
       const podGroupings = res?.data?.k8s_pod_groupings || [];
       const differenceInHours = (dateTimeRange.endDate - dateTimeRange.startDate) / (1000 * 60 * 60);
       const { memReq, cpuReq } = getLimitsAndRequests(query, memLimit, cpuLimit);
-      const processedChartData = processChartData(podGroupings, cpuLimit, memLimit, cpuReq, memReq, differenceInHours, query.gpuTrend);
+      const processedChartData = processChartData(podGroupings, cpuLimit, memLimit, cpuReq, memReq, differenceInHours);
 
       setCpuData(processedChartData.cpuData);
       setMemData(processedChartData.memData);
@@ -1043,7 +1033,7 @@ const KubernetesLogDetails = ({ query }) => {
         )}
         {key === 'timestamp' && query.callback && <Typography style={{ fontWeight: 'bold', minWidth: ds.space.mul(0, 40) }} />}
         <Typography style={{ fontWeight: 'bold', minWidth: ds.space.mul(0, 65) }}>{key}:</Typography>
-        {key === 'timestamp' ? <Datetime value={new Date(value / 1000000)} /> : <span style={{ fontFamily: 'monospace' }}>{value}</span>}
+        {key === 'timestamp' ? <Datetime value={new Date(value / 1000000)} /> : <span style={{ fontFamily: ds.font.mono }}>{value}</span>}
       </Typography>
     </Grid>
   );
@@ -1075,7 +1065,7 @@ const KubernetesLogDetails = ({ query }) => {
     });
 
   return (
-    <WidgetCard>
+    <Card sx={detailCardSx}>
       {labelEntries.length > 0 ? (
         <Grid container sx={{ backgroundColor: 'white' }}>
           {labelEntries.map((entry) => renderLabelRow(entry.key, entry.value, entry.index))}
@@ -1084,7 +1074,7 @@ const KubernetesLogDetails = ({ query }) => {
             <Card variant='outlined' size='md' header={<Typography sx={{ fontWeight: 'bold' }}>Message</Typography>}>
               <MarkDowns
                 data={cleanupMessage(query.data.message)}
-                sx={{ width: '100%', wordBreak: 'break-word', overflowY: 'none', fontFamily: 'monospace' }}
+                sx={{ width: '100%', wordBreak: 'break-word', overflowY: 'none', fontFamily: ds.font.mono }}
               />
             </Card>
           </Grid>
@@ -1092,27 +1082,10 @@ const KubernetesLogDetails = ({ query }) => {
       ) : (
         <Typography>No Data</Typography>
       )}
-    </WidgetCard>
+    </Card>
   );
 };
 KubernetesLogDetails.propTypes = {
-  query: PropTypes.object,
-};
-
-const KubernetesLogstashDetails = ({ query }) => {
-  return (
-    <CodeMirror
-      value={JSON.stringify(query, null, 4)}
-      height={ds.space.mul(0, 150)}
-      extensions={[json(), EditorView.lineWrapping]}
-      editable={false}
-      style={{
-        border: '1px solid silver',
-      }}
-    />
-  );
-};
-KubernetesLogstashDetails.propTypes = {
   query: PropTypes.object,
 };
 
@@ -1122,7 +1095,7 @@ const KubernetesLogPatternDetails = ({ query }) => {
     <Card variant='outlined' size='md' header={<Typography sx={{ fontWeight: 'bold' }}>Sample</Typography>}>
       <Typography
         sx={{
-          fontFamily: 'monospace',
+          fontFamily: ds.font.mono,
           fontSize: 'var(--ds-text-body)',
           lineHeight: '1.6',
           wordBreak: 'break-word',
@@ -1139,7 +1112,7 @@ const KubernetesLogPatternDetails = ({ query }) => {
   }
 
   return (
-    <WidgetCard>
+    <Card sx={detailCardSx}>
       {sampleCard}
       <Box sx={{ mt: 'var(--ds-space-3)' }}>
         <Chart.Bar
@@ -1149,7 +1122,7 @@ const KubernetesLogPatternDetails = ({ query }) => {
           style={{ width: '100%' }}
         />
       </Box>
-    </WidgetCard>
+    </Card>
   );
 };
 KubernetesLogPatternDetails.propTypes = {

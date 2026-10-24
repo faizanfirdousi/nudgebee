@@ -151,7 +151,7 @@ func TestGetMergedTraceLabelMapping_EmptyCustom(t *testing.T) {
 		"span_name":          "operation_name",
 		"workload_namespace": "kube_namespace",
 	}
-	result := getMergedTraceLabelMapping(newLogLabelCtx(), key, &mockTraceSource{staticMapping: staticMap})
+	result := getMergedTraceLabelMapping(newLogLabelCtx(), key, providerRef{}, &mockTraceSource{staticMapping: staticMap})
 	assert.Equal(t, staticMap, result)
 }
 
@@ -166,7 +166,7 @@ func TestGetMergedTraceLabelMapping_CustomOverridesStatic(t *testing.T) {
 		"span_name":          "operation_name", // overridden
 		"workload_namespace": "kube_namespace", // preserved
 	}
-	result := getMergedTraceLabelMapping(newLogLabelCtx(), key, &mockTraceSource{staticMapping: staticMap})
+	result := getMergedTraceLabelMapping(newLogLabelCtx(), key, providerRef{}, &mockTraceSource{staticMapping: staticMap})
 
 	assert.Equal(t, "custom_service", result["workload_name"], "custom should override static")
 	assert.Equal(t, "custom_op", result["span_name"], "custom should override static")
@@ -181,7 +181,7 @@ func TestGetMergedTraceLabelMapping_CustomAddsNewKey(t *testing.T) {
 	seedTraceCache(t, key, map[string]string{"resource": "resource_name"}) // not in static
 
 	staticMap := map[string]string{"workload_name": "service"}
-	result := getMergedTraceLabelMapping(newLogLabelCtx(), key, &mockTraceSource{staticMapping: staticMap})
+	result := getMergedTraceLabelMapping(newLogLabelCtx(), key, providerRef{}, &mockTraceSource{staticMapping: staticMap})
 
 	assert.Equal(t, "resource_name", result["resource"], "new key from custom should appear")
 	assert.Equal(t, "service", result["workload_name"], "existing static key should remain")
@@ -201,7 +201,7 @@ func TestGetMergedTraceLabelMapping_DynamicOverridesAccount(t *testing.T) {
 		}},
 		dynamicMapping: map[string]string{"workload_name": "dynamic_service"},
 	}
-	result := getMergedTraceLabelMapping(newLogLabelCtx(), key, source)
+	result := getMergedTraceLabelMapping(newLogLabelCtx(), key, providerRef{}, source)
 
 	assert.Equal(t, "dynamic_service", result["workload_name"], "dynamic should win over account")
 	assert.Equal(t, "account_op", result["span_name"], "account-only key should remain")
@@ -220,7 +220,7 @@ func TestGetMergedTraceLabelMapping_DynamicEmpty_FallsBackToStatic(t *testing.T)
 		mockTraceSource: mockTraceSource{staticMapping: staticMap},
 		dynamicMapping:  map[string]string{},
 	}
-	result := getMergedTraceLabelMapping(newLogLabelCtx(), key, source)
+	result := getMergedTraceLabelMapping(newLogLabelCtx(), key, providerRef{}, source)
 	assert.Equal(t, staticMap, result)
 }
 
@@ -237,56 +237,112 @@ func TestFetchTraceLabels_EmptyAccountID(t *testing.T) {
 // FetchTraceLabels relies on: canonical fields (canonical-first, each once, carrying
 // their type in attributes) unioned with merged-mapping keys, with a merged key that
 // duplicates a canonical field not doubling up.
-func TestBuildTraceLabels_UnionsCanonicalAndMerged(t *testing.T) {
+func TestBuildTraceLabels_UnionsResolvableCanonicalAndMerged(t *testing.T) {
 	merged := map[string]string{
 		"custom_attr":  "backend_attr", // brand-new key
-		"service_name": "svc",          // duplicates a canonical field — must not double up
+		"service_name": "svc",          // canonical field this provider CAN resolve
 	}
 
-	labels := buildTraceLabels(merged, nil)
+	labels := buildTraceLabels(merged, true, nil)
 
 	byLabel := make(map[string]OutputTraceLabel)
 	for _, l := range labels {
 		byLabel[l.Label] = l
 	}
 
-	// All canonical fields present, exactly once, with their declared type in attributes.
+	// The one canonical field the mapping declares is present, once, with its type.
+	svc, ok := byLabel["service_name"]
+	require.True(t, ok, "a canonical field present in the mapping should be advertised")
+	assert.NotNil(t, svc.Attributes, "attributes must default to an empty object, never nil")
+	assert.Equal(t, "string", svc.Attributes["type"], "canonical type must win over the mapping entry")
+
+	// Every canonical field the mapping does NOT declare is withheld: advertising it
+	// would invite a filter the provider cannot resolve.
 	for _, f := range canonicalTraceFields {
-		l, ok := byLabel[f.name]
-		assert.True(t, ok, "canonical field %q should be present", f.name)
-		assert.NotNil(t, l.Attributes, "attributes must default to an empty object, never nil")
-		assert.Equal(t, f.typ, l.Attributes["type"], "canonical field %q should carry its type", f.name)
+		if f.name == "service_name" {
+			continue
+		}
+		assert.NotContains(t, byLabel, f.name, "unresolvable canonical field %q must not be advertised", f.name)
 	}
+
 	// Merged-only key present with empty (typeless) attributes.
 	assert.NotNil(t, byLabel["custom_attr"].Attributes, "override key attributes must be {}, not nil")
 	assert.Empty(t, byLabel["custom_attr"].Attributes, "override key should have no type attribute")
-	// No duplicate for the colliding name, canonical type retained.
-	assert.Equal(t, "string", byLabel["service_name"].Attributes["type"], "canonical type must win over override")
-	assert.Len(t, labels, len(canonicalTraceFields)+1)
+	assert.Len(t, labels, 2)
 
-	// Canonical fields come first, in declared order.
+	// Resolvable canonical fields still lead, in declared order.
+	assert.Equal(t, "service_name", labels[0].Label, "canonical fields should lead")
+}
+
+// TestBuildTraceLabels_UndeclaredProviderKeepsFullVocabulary covers the passthrough case:
+// a provider that publishes no static mapping has declared nothing about what it
+// resolves, so the full canonical set stays advertised for it exactly as before. This is
+// what keeps ClickHouse, Jaeger and Application Insights whole.
+func TestBuildTraceLabels_UndeclaredProviderKeepsFullVocabulary(t *testing.T) {
+	labels := buildTraceLabels(map[string]string{}, false, nil)
+	assert.Len(t, labels, len(canonicalTraceFields))
 	for i, f := range canonicalTraceFields {
-		assert.Equal(t, f.name, labels[i].Label, "canonical fields should lead in order")
+		assert.Equal(t, f.name, labels[i].Label, "canonical fields lead, in declared order")
+		assert.Equal(t, f.typ, labels[i].Attributes["type"], "canonical field %q keeps its type", f.name)
 	}
 }
 
-func TestBuildTraceLabels_EmptyMerged(t *testing.T) {
-	labels := buildTraceLabels(map[string]string{}, nil)
-	assert.Len(t, labels, len(canonicalTraceFields))
+// TestBuildTraceLabels_UndeclaredProviderIgnoresTenantOverrides is the regression for the
+// trap in this design. The declaration test reads the STATIC mapping, but buildTraceLabels
+// receives the MERGED one — static ∪ tenant ∪ account ∪ dynamic. A tenant adding one
+// trace_labels override to a passthrough account must not flip it into "declared" mode and
+// collapse its canonical list to that single key; overrides are additive here as everywhere.
+func TestBuildTraceLabels_UndeclaredProviderIgnoresTenantOverrides(t *testing.T) {
+	// Static mapping is empty (providerDeclares=false), but a tenant override made the
+	// merged map non-empty.
+	merged := map[string]string{"tenant_custom_attr": "backend_attr"}
+
+	labels := buildTraceLabels(merged, false, nil)
+
+	byLabel := make(map[string]OutputTraceLabel)
+	for _, l := range labels {
+		byLabel[l.Label] = l
+	}
+	for _, f := range canonicalTraceFields {
+		assert.Contains(t, byLabel, f.name,
+			"a tenant override must not withhold canonical field %q from an undeclared provider", f.name)
+	}
+	assert.Contains(t, byLabel, "tenant_custom_attr", "the override key is still advertised")
+	assert.Len(t, labels, len(canonicalTraceFields)+1)
+}
+
+// TestBuildTraceLabels_CanonicalOrderingPreserved verifies that when several canonical
+// fields resolve, they still lead the list in canonicalTraceFields order.
+func TestBuildTraceLabels_CanonicalOrderingPreserved(t *testing.T) {
+	merged := map[string]string{
+		"span_name":    "span_name",
+		"service_name": "service_name",
+		"duration_ns":  "duration_ns",
+		"custom_attr":  "backend_attr",
+	}
+
+	labels := buildTraceLabels(merged, true, nil)
+	require.Len(t, labels, 4)
+
+	// canonicalTraceFields order is service_name, …, span_name, …, duration_ns.
+	assert.Equal(t, []string{"service_name", "span_name", "duration_ns", "custom_attr"},
+		[]string{labels[0].Label, labels[1].Label, labels[2].Label, labels[3].Label})
+	assert.Equal(t, "integer", labels[2].Attributes["type"], "duration_ns keeps its declared type")
 }
 
 // TestBuildTraceLabels_IncludesDiscoveredKeys verifies backend-discovered keys are
-// unioned in with empty attributes, deduped against canonical fields and mapping keys.
+// unioned in with empty attributes, deduped against canonical fields and mapping keys —
+// and that live discovery alone is enough to make a canonical field resolvable.
 func TestBuildTraceLabels_IncludesDiscoveredKeys(t *testing.T) {
 	merged := map[string]string{"custom_attr": "backend_attr"}
 	discovered := []OutputTraceLabel{
 		{Label: "http.method", Attributes: map[string]any{}},  // brand-new discovered key
-		{Label: "service_name", Attributes: map[string]any{}}, // collides with canonical — keep canonical type
+		{Label: "service_name", Attributes: map[string]any{}}, // canonical, unmapped but discovered live
 		{Label: "custom_attr", Attributes: map[string]any{}},  // collides with mapping key — no double up
 		{Label: "http.method", Attributes: map[string]any{}},  // duplicate discovered key — no double up
 	}
 
-	labels := buildTraceLabels(merged, discovered)
+	labels := buildTraceLabels(merged, true, discovered)
 
 	byLabel := make(map[string]OutputTraceLabel)
 	for _, l := range labels {
@@ -296,9 +352,12 @@ func TestBuildTraceLabels_IncludesDiscoveredKeys(t *testing.T) {
 	httpMethod, ok := byLabel["http.method"]
 	assert.True(t, ok, "discovered key should be present")
 	assert.Empty(t, httpMethod.Attributes, "discovered key should have no type")
-	assert.Equal(t, "string", byLabel["service_name"].Attributes["type"], "canonical type retained over discovered collision")
-	// canonical set + custom_attr + http.method, each once.
-	assert.Len(t, labels, len(canonicalTraceFields)+2)
+	assert.Equal(t, "string", byLabel["service_name"].Attributes["type"],
+		"a canonical field discovered live is advertised, and keeps its canonical type")
+	assert.NotContains(t, byLabel, "duration_ns", "canonical field neither mapped nor discovered stays out")
+	// service_name + custom_attr + http.method, each once.
+	assert.Len(t, labels, 3)
+	assert.Equal(t, "service_name", labels[0].Label, "canonical still leads")
 }
 
 // ---------------------------------------------------------------------------
@@ -333,4 +392,94 @@ func TestGetProviderCapabilities_TracesMergesAccountOverride(t *testing.T) {
 	assert.Equal(t, "backend_attr", caps.LabelMappings["custom_attr"], "account override should be merged")
 	// A datadog static key must still be present.
 	assert.Contains(t, caps.LabelMappings, "workload_name", "static datadog keys should remain")
+}
+
+// ---------------------------------------------------------------------------
+// Cache invalidation
+// ---------------------------------------------------------------------------
+
+// TestInvalidateTraceLabelsCacheForAccount covers the reason the Settings form needs a
+// hook at all: without one a saved trace mapping takes up to the 10 min TTL to apply,
+// so an operator who saves and immediately re-asks sees the old behaviour and reports
+// the form as broken. Mirrors TestInvalidateLogLabelsCacheForAccount.
+func TestInvalidateTraceLabelsCacheForAccount(t *testing.T) {
+	const accountId = "unit-invalidate-trace-account"
+	const tenantId = "unit-invalidate-trace-tenant"
+
+	seedTraceCache(t, accountId, map[string]string{"service_name": "old_service"})
+	seedTraceCache(t, tenantCacheKeyPrefix+tenantId, map[string]string{"service_name": "tenant_service"})
+
+	InvalidateTraceLabelsCacheForAccount(accountId)
+
+	_, accountCached := common.CacheGet(traceLabelsCacheNamespace, accountId)
+	assert.False(t, accountCached, "the account entry must be dropped")
+
+	_, tenantCached := common.CacheGet(traceLabelsCacheNamespace, tenantCacheKeyPrefix+tenantId)
+	assert.True(t, tenantCached, "an account invalidation must not drop the tenant entry")
+}
+
+// TestInvalidateTraceLabelsCacheForAccount_LeavesOtherAccounts is the assertion that
+// distinguishes a per-key CacheDelete from a tag/namespace-wide invalidate: the latter
+// would wipe every account and still pass a single-account test.
+func TestInvalidateTraceLabelsCacheForAccount_LeavesOtherAccounts(t *testing.T) {
+	const accountA = "unit-invalidate-trace-a"
+	const accountB = "unit-invalidate-trace-b"
+
+	seedTraceCache(t, accountA, map[string]string{"service_name": "a"})
+	seedTraceCache(t, accountB, map[string]string{"service_name": "b"})
+
+	InvalidateTraceLabelsCacheForAccount(accountA)
+
+	_, aCached := common.CacheGet(traceLabelsCacheNamespace, accountA)
+	assert.False(t, aCached, "the invalidated account must be dropped")
+
+	_, bCached := common.CacheGet(traceLabelsCacheNamespace, accountB)
+	assert.True(t, bCached, "invalidating one account must not wipe the namespace")
+}
+
+// TestInvalidateTraceLabelsCacheForTenant pins the "t:" key prefix. A bare tenantId
+// would address the account key space and delete the wrong entry.
+func TestInvalidateTraceLabelsCacheForTenant(t *testing.T) {
+	const tenantId = "unit-invalidate-trace-tenant-only"
+
+	seedTraceCache(t, tenantId, map[string]string{"service_name": "same_id_as_account"})
+	seedTraceCache(t, tenantCacheKeyPrefix+tenantId, map[string]string{"service_name": "tenant_service"})
+
+	InvalidateTraceLabelsCacheForTenant(tenantId)
+
+	_, tenantCached := common.CacheGet(traceLabelsCacheNamespace, tenantCacheKeyPrefix+tenantId)
+	assert.False(t, tenantCached, "the prefixed tenant entry must be dropped")
+
+	_, unprefixedCached := common.CacheGet(traceLabelsCacheNamespace, tenantId)
+	assert.True(t, unprefixedCached, "a tenant invalidation must not touch the unprefixed (account) key")
+}
+
+// TestInvalidateTraceLabelsCache_DoesNotTouchLogLabels proves the namespace isolation
+// the two caches are separated for: the same id is a legal key in both.
+func TestInvalidateTraceLabelsCache_DoesNotTouchLogLabels(t *testing.T) {
+	const accountId = "unit-invalidate-shared-id"
+
+	seedTraceCache(t, accountId, map[string]string{"service_name": "trace_service"})
+	seedCache(t, accountId, map[string]string{"pod": "log_pod"})
+
+	InvalidateTraceLabelsCacheForAccount(accountId)
+
+	_, traceCached := common.CacheGet(traceLabelsCacheNamespace, accountId)
+	assert.False(t, traceCached, "the trace entry must be dropped")
+
+	_, logCached := common.CacheGet(logLabelsCacheNamespace, accountId)
+	assert.True(t, logCached, "a trace invalidation must not drop the log entry for the same account")
+}
+
+func TestInvalidateTraceLabelsCache_EmptyIdsAreNoOps(t *testing.T) {
+	const accountId = "unit-invalidate-trace-empty-guard"
+	seedTraceCache(t, accountId, map[string]string{"service_name": "kept"})
+
+	assert.NotPanics(t, func() {
+		InvalidateTraceLabelsCacheForAccount("")
+		InvalidateTraceLabelsCacheForTenant("")
+	})
+
+	_, cached := common.CacheGet(traceLabelsCacheNamespace, accountId)
+	assert.True(t, cached, "an empty id must be a no-op, not a namespace wipe")
 }

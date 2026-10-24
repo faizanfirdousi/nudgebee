@@ -1,9 +1,11 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { Typography, Box } from '@mui/material';
 import { Checkbox } from '@ui/Checkbox';
+import { CodeBlock } from '@ui/CodeBlock';
 import { Input } from '@ui/Input';
 import { Button } from '@ui/Button';
 import { Modal } from '@ui/Modal';
+import { ds } from '@utils/colors';
 
 interface TriggerWorkflowModalProps {
   open: boolean;
@@ -34,6 +36,25 @@ interface TriggerWorkflowModalProps {
   runVariant?: 'live' | 'current';
 }
 
+// Initial box contents: explicit defaultInputs first, then schema defaults, else {}.
+const seedInputs = (defaultInputs: any, inputSchema: NonNullable<TriggerWorkflowModalProps['inputSchema']>): string => {
+  try {
+    if (defaultInputs && Object.keys(defaultInputs).length > 0) {
+      return JSON.stringify(defaultInputs, null, 2);
+    }
+    if (inputSchema.length > 0) {
+      const fromSchema = inputSchema.reduce((acc, input) => {
+        acc[input.id] = input.default;
+        return acc;
+      }, {} as any);
+      return JSON.stringify(fromSchema, null, 2);
+    }
+  } catch (_error) {
+    console.error(_error);
+  }
+  return '{}';
+};
+
 const TriggerWorkflowModal: React.FC<TriggerWorkflowModalProps> = ({
   open,
   onClose,
@@ -48,39 +69,15 @@ const TriggerWorkflowModal: React.FC<TriggerWorkflowModalProps> = ({
   draftVersionNumber,
   runVariant = 'live',
 }) => {
-  const [inputsJson, setInputsJson] = useState<string>('{}');
+  // Seeded once, at mount. Call sites mount this modal only while it is open
+  // (keyed per workflow), so every open is a fresh mount and nothing a parent
+  // does afterwards — polling re-renders, new prop identities — can overwrite
+  // what the user typed. Seeding from an effect kept re-wiping the box (#37242).
+  const [inputsJson, setInputsJson] = useState<string>(() => seedInputs(defaultInputs, inputSchema));
   const [jsonError, setJsonError] = useState<string>('');
   const [useDefaults, setUseDefaults] = useState<boolean>(true);
 
   const hasDefaults = inputSchema.some((input) => input.default !== undefined && input.default !== null && input.default !== '');
-
-  // Initialize inputs when modal opens or defaultInputs change
-  useEffect(() => {
-    if (open) {
-      try {
-        let initialInputs = {};
-
-        // First try to use defaultInputs if available
-        if (defaultInputs && Object.keys(defaultInputs).length > 0) {
-          initialInputs = defaultInputs;
-        }
-        // If no defaultInputs but we have inputSchema, generate initial structure from schema
-        else if (inputSchema && inputSchema.length > 0) {
-          initialInputs = inputSchema.reduce((acc, input) => {
-            acc[input.id] = input.default;
-            return acc;
-          }, {} as any);
-        }
-
-        setInputsJson(JSON.stringify(initialInputs, null, 2));
-        setJsonError('');
-      } catch (_error) {
-        console.error(_error);
-        setInputsJson('{}');
-        setJsonError('');
-      }
-    }
-  }, [open, defaultInputs, inputSchema]);
 
   const validateJson = (jsonString: string): boolean => {
     if (!jsonString.trim()) {
@@ -106,6 +103,8 @@ const TriggerWorkflowModal: React.FC<TriggerWorkflowModalProps> = ({
   const handleInputsChange = (value: string) => {
     setInputsJson(value);
     validateJson(value);
+    // An edited box no longer holds the defaults.
+    setUseDefaults(false);
   };
 
   const handleTrigger = async () => {
@@ -124,8 +123,6 @@ const TriggerWorkflowModal: React.FC<TriggerWorkflowModalProps> = ({
   };
 
   const handleClose = () => {
-    setInputsJson('{}');
-    setJsonError('');
     onClose();
   };
 
@@ -294,7 +291,7 @@ const TriggerWorkflowModal: React.FC<TriggerWorkflowModalProps> = ({
                           fontSize: 'var(--ds-text-body)',
                           fontWeight: 'var(--ds-font-weight-semibold)',
                           color: 'var(--ds-brand-500)',
-                          fontFamily: 'monospace',
+                          fontFamily: ds.font.mono,
                         }}
                       >
                         {input.id}
@@ -328,7 +325,7 @@ const TriggerWorkflowModal: React.FC<TriggerWorkflowModalProps> = ({
                     sx={{
                       fontSize: 'var(--ds-text-caption)',
                       color: 'var(--ds-gray-600)',
-                      fontFamily: 'monospace',
+                      fontFamily: ds.font.mono,
                       backgroundColor: 'var(--ds-background-300)',
                       px: 1,
                       py: 0.5,
@@ -387,10 +384,8 @@ const TriggerWorkflowModal: React.FC<TriggerWorkflowModalProps> = ({
                   }, {} as any);
                   setInputsJson(JSON.stringify(defaults, null, 2));
                   setJsonError('');
-                } else {
-                  setInputsJson('{}');
-                  setJsonError('');
                 }
+                // Unchecking keeps the current text — clearing it discarded typed input.
               }}
             />
           </Box>
@@ -451,13 +446,13 @@ const TriggerWorkflowModal: React.FC<TriggerWorkflowModalProps> = ({
               fontSize: 'var(--ds-text-small)',
               color: 'var(--ds-gray-400)',
               lineHeight: 1.5,
-              fontFamily: 'monospace',
+              fontFamily: ds.font.mono,
             }}
             component='div'
           >
-            • Simple parameters: <code>{`{"env": "test", "debug": true}`}</code>
-            <br />• Complex data: <code>{`{"user": {"id": 123, "name": "test"}, "config": {"timeout": 30}}`}</code>
-            <br />• Empty inputs: <code>{`{}`}</code>
+            • Simple parameters: <CodeBlock inline code={`{"env": "test", "debug": true}`} />
+            <br />• Complex data: <CodeBlock inline code={`{"user": {"id": 123, "name": "test"}, "config": {"timeout": 30}}`} />
+            <br />• Empty inputs: <CodeBlock inline code='{}' />
           </Typography>
         </Box>
       </Box>

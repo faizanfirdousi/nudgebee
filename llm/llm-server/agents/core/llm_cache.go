@@ -49,6 +49,14 @@ type CacheRequest struct {
 	Scope          CacheScope
 	Capabilities   toolcore.AgentCapabilities // Optional; used to isolate cache slots when tool set varies per request
 	PromptVariant  string                     // Optional; isolates the lean vs full orchestrator prompt into distinct cache slots (empty = full/default)
+	// Tools, when non-empty, are baked INTO the cached content at creation time.
+	// Google AI rejects a request that sets both CachedContent and tools, so a
+	// native tool-calling caller cannot send them per-request; they must be part
+	// of the cache. They also participate in the content hash, so changing an
+	// agent's tool set invalidates the slot rather than silently serving a cache
+	// built with different tool declarations. Empty for callers that send no
+	// tools (e.g. the react_3 planner), leaving behavior byte-identical.
+	Tools []llms.Tool
 }
 
 // CacheResponse contains the result of cache operation
@@ -239,7 +247,11 @@ func (p *GoogleAICacheProvider) ApplyCache(ctx context.Context, req *CacheReques
 	// same reason as the capability fingerprint: the lean prompt is a different
 	// cacheable prefix and must not overwrite the full-prompt slot. Empty
 	// (full/default) appends nothing, leaving existing slots byte-identical.
-	if req.PromptVariant != "" {
+	// Global scope is shared by helpers (memory_rerank, summaries) that inherit the
+	// variant from whichever orchestrator called them; their prompt does not depend
+	// on it, so a suffix there only splits one cache into two identical slots.
+	// Must match the key built in InvalidateCache.
+	if req.PromptVariant != "" && req.Scope != CacheScopeGlobal {
 		agentName = agentName + ":" + req.PromptVariant
 	}
 
@@ -281,13 +293,30 @@ func (p *GoogleAICacheProvider) ApplyCache(ctx context.Context, req *CacheReques
 		"cacheableMessages", len(cacheableMessages),
 		"nonCachedMessages", len(nonCacheableMessages))
 
+	// Conversation-scope CachedContent is created after a conversation's first
+	// call and rarely read before it expires, and a request that references one
+	// gets no implicit prefix caching on the rest of the prompt. For react_3/react_4
+	// its content is only the system prompt, so it also blocked implicit caching of
+	// every tool step (#39633). Leave these calls to Gemini's implicit caching.
+	if req.Scope == CacheScopeConversation {
+		logger.Info("Google AI cache: Not using cache - conversation scope left to implicit caching",
+			"conversationId", req.ConversationId,
+			"reason", "conversation_scope_implicit",
+			"cacheMode", "implicit")
+		common.MetricsLLMCacheSkip(req.Provider, req.Model, "conversation_scope_implicit", req.AccountId, req.AgentName, string(req.Scope))
+		return &CacheResponse{
+			Messages: req.Messages,
+			CacheHit: false,
+		}
+	}
+
 	// For Global and Account scopes, apply deterministic padding so system prompts meet minimum threshold
 	if req.Scope == CacheScopeGlobal || req.Scope == CacheScopeAccount {
 		cacheableMessages = padMessagesIfRequired(cacheableMessages, req.Scope)
 	}
 
 	// Calculate content hash
-	contentHash := hashContent(cacheableMessages)
+	contentHash := hashContent(cacheableMessages, req.Tools)
 
 	// Check if cache exists and is valid (shared cache)
 	var cacheInfo CacheInfo
@@ -307,6 +336,22 @@ func (p *GoogleAICacheProvider) ApplyCache(ctx context.Context, req *CacheReques
 
 	// Cache hit path (zero-latency: trust Redis TTL and let GenerateContent execute immediately)
 	if exists && cacheInfo.ExpiresAt.After(now) && cacheInfo.ContentHash == contentHash {
+		// Referencing the cache turns off implicit caching for the rest of the
+		// request. Once the tool history outweighs the cache, send the full prompt
+		// instead and let implicit caching cover the longer prefix (#39633).
+		if coverage, skip := geminiHybridSkip(cacheInfo.CacheCreationTokens, nonCacheableMessages); skip {
+			logger.Info("Google AI cache: Not using cache - tool history outweighs cached content",
+				"cacheName", cacheInfo.CacheName,
+				"conversationId", req.ConversationId,
+				"coverage", fmt.Sprintf("%.2f", coverage),
+				"reason", "hybrid_low_coverage",
+				"cacheMode", "implicit")
+			common.MetricsLLMCacheSkip(req.Provider, req.Model, "hybrid_low_coverage", req.AccountId, req.AgentName, string(req.Scope))
+			return &CacheResponse{
+				Messages: req.Messages,
+				CacheHit: false,
+			}
+		}
 		timeToExpiry := cacheInfo.ExpiresAt.Sub(now)
 		logger.Info("Google AI cache: CACHE HIT - Using existing cache",
 			"cacheName", cacheInfo.CacheName,
@@ -468,22 +513,50 @@ func (p *GoogleAICacheProvider) ApplyCache(ctx context.Context, req *CacheReques
 				logger.Warn("Google AI cache: failed to delete stale pointer on content_changed",
 					"error", delErr, "cacheKey", cacheKey, "conversationId", req.ConversationId)
 			}
-			// Explicitly delete the old Google AI cache.
-			if helper, helperErr := googleai.NewCachingHelper(ctx, googleAICacheOpts(req.ApiKey, req.Endpoint)...); helperErr == nil {
-				if delErr := helper.DeleteCachedContent(ctx, cacheInfo.CacheName); delErr != nil {
-					logger.Warn("Google AI cache: failed to delete orphaned content_changed cache",
-						"error", delErr,
-						"cacheName", cacheInfo.CacheName,
-						"conversationId", req.ConversationId)
-				} else {
-					recordCacheLifecycleInvalidation(cacheInfo.CacheName)
-					common.MetricsLLMCacheInvalidations(req.Provider, req.Model, invalidationScope(req.Scope), "content_changed")
+			// Asynchronously delete the old Google AI cache so the request is not blocked.
+			go func(cacheName, apiKey, endpoint string, scope CacheScope, provider, model, conversationId string) {
+				bgCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+				defer cancel()
+
+				var logger *slog.Logger
+				if bgCtx != nil {
+					logger = common.TraceLogger(bgCtx)
 				}
-			} else {
-				logger.Warn("Google AI cache: failed to init helper for orphan deletion",
-					"error", helperErr,
-					"conversationId", req.ConversationId)
-			}
+
+				defer func() {
+					if r := recover(); r != nil {
+						log := logger
+						if log == nil {
+							log = slog.Default()
+						}
+						log.Error("Google AI cache: panic recovered in async orphan deletion", "panic", r, "cacheName", cacheName)
+					}
+				}()
+
+				if helper, helperErr := googleai.NewCachingHelper(bgCtx, googleAICacheOpts(apiKey, endpoint)...); helperErr == nil {
+					if delErr := helper.DeleteCachedContent(bgCtx, cacheName); delErr != nil {
+						log := logger
+						if log == nil {
+							log = slog.Default()
+						}
+						log.Warn("Google AI cache: failed to delete orphaned content_changed cache",
+							"error", delErr,
+							"cacheName", cacheName,
+							"conversationId", conversationId)
+					} else {
+						recordCacheLifecycleInvalidation(cacheName)
+						common.MetricsLLMCacheInvalidations(provider, model, invalidationScope(scope), "content_changed")
+					}
+				} else {
+					log := logger
+					if log == nil {
+						log = slog.Default()
+					}
+					log.Warn("Google AI cache: failed to init helper for orphan deletion",
+						"error", helperErr,
+						"conversationId", conversationId)
+				}
+			}(cacheInfo.CacheName, req.ApiKey, req.Endpoint, req.Scope, req.Provider, req.Model, req.ConversationId)
 		}
 	}
 
@@ -624,6 +697,61 @@ func (p *GoogleAICacheProvider) ApplyCache(ctx context.Context, req *CacheReques
 	}
 }
 
+// geminiHybridSkip reports whether the "hybrid" strategy should skip a live
+// CachedContent for this call, and the estimated share of the prompt it covers.
+// cachedTokens is the entry's exact size; the rest of the prompt is estimated
+// from its characters (tool output runs about 3 characters per token). An entry
+// with no recorded size is never skipped, and neither is a request without tool
+// history: implicit caching only pays off on a prompt that repeats across calls,
+// which is a tool loop. A one-shot call (a helper whose fixed prompt is small next
+// to its per-call input) would otherwise lose its explicit hit and gain nothing.
+func geminiHybridSkip(cachedTokens int32, rest []llms.MessageContent) (float64, bool) {
+	if !strings.EqualFold(strings.TrimSpace(config.Config.LlmServerGeminiCacheStrategy), "hybrid") || cachedTokens <= 0 || !hasToolHistory(rest) {
+		return 1, false
+	}
+	threshold := config.Config.LlmServerGeminiCacheHybridMinCoverage
+	if threshold <= 0 {
+		threshold = 0.65
+	}
+	restTokens := float64(messageChars(rest)) / scratchpadCharsPerToken
+	coverage := float64(cachedTokens) / (float64(cachedTokens) + restTokens)
+	return coverage, coverage < threshold
+}
+
+// hasToolHistory reports whether messages include a tool call or tool result.
+func hasToolHistory(messages []llms.MessageContent) bool {
+	for _, msg := range messages {
+		for _, part := range msg.Parts {
+			switch part.(type) {
+			case llms.ToolCall, llms.ToolCallResponse:
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// messageChars sums the characters a prompt sends for text, tool calls and tool
+// results.
+func messageChars(messages []llms.MessageContent) int {
+	n := 0
+	for _, msg := range messages {
+		for _, part := range msg.Parts {
+			switch p := part.(type) {
+			case llms.TextContent:
+				n += len(p.Text)
+			case llms.ToolCall:
+				if p.FunctionCall != nil {
+					n += len(p.FunctionCall.Name) + len(p.FunctionCall.Arguments)
+				}
+			case llms.ToolCallResponse:
+				n += len(p.Name) + len(p.Content)
+			}
+		}
+	}
+	return n
+}
+
 // cacheInfoUsable reports whether a shared-cache pointer can be safely reused
 // for a request with the given contentHash. It must reference the SAME content
 // (Google prepends the cached block verbatim, so a mismatch would send the wrong
@@ -700,9 +828,15 @@ func (p *GoogleAICacheProvider) createCache(ctx context.Context, req *CacheReque
 		"cacheableMessages", len(cacheableMessages),
 		"displayName", displayName)
 
-	cachedContent, err := cachingHelper.CreateCachedContent(ctx, req.Model, cacheableMessages, ttl, displayName)
+	cachedContent, err := cachingHelper.CreateCachedContent(ctx, req.Model, cacheableMessages, ttl, displayName, req.Tools)
 	if err != nil {
 		return nil, err
+	}
+	// CountTokens above measures the messages only; the created entry also holds
+	// the tool declarations. Prefer the provider's total so storage cost and the
+	// hybrid coverage check see what Gemini actually caches.
+	if cachedContent.UsageMetadata != nil && cachedContent.UsageMetadata.TotalTokenCount > 0 {
+		tokenCount = cachedContent.UsageMetadata.TotalTokenCount
 	}
 
 	logger.Debug("Google AI cache: CreateCachedContent API returned",
@@ -784,7 +918,11 @@ func (p *GoogleAICacheProvider) InvalidateCache(ctx context.Context, req *CacheR
 	// same reason as the capability fingerprint: the lean prompt is a different
 	// cacheable prefix and must not overwrite the full-prompt slot. Empty
 	// (full/default) appends nothing, leaving existing slots byte-identical.
-	if req.PromptVariant != "" {
+	// Global scope is shared by helpers (memory_rerank, summaries) that inherit the
+	// variant from whichever orchestrator called them; their prompt does not depend
+	// on it, so a suffix there only splits one cache into two identical slots.
+	// Must match the key built in ApplyCache.
+	if req.PromptVariant != "" && req.Scope != CacheScopeGlobal {
 		agentName = agentName + ":" + req.PromptVariant
 	}
 	cacheKey := generateCacheKey(req.Scope, req.AccountId, req.ConversationId, agentName, req.Model, credsFingerprint(req.ApiKey, "", "", "", "", "", ""))
@@ -1043,10 +1181,25 @@ func padMessagesIfRequired(messages []llms.MessageContent, scope CacheScope) []l
 	return newMessages
 }
 
-func hashContent(messages []llms.MessageContent) string {
+// hashContent fingerprints what actually got baked into a cached content entry.
+//
+// tools participate because they are stored INSIDE the cached content (see
+// CacheRequest.Tools). Without them, an agent whose tool set changed would match
+// the existing hash and be served a cache built with the OLD tool declarations —
+// the model would then be offered tools that no longer exist, or miss new ones.
+// They are only mixed in when non-empty, so entries created by tool-less callers
+// (the react_3 planner, every summarizer) keep their existing hash and are not
+// invalidated on deploy.
+func hashContent(messages []llms.MessageContent, tools []llms.Tool) string {
 	hasher := sha256.New()
 	for _, msg := range messages {
 		_, _ = fmt.Fprintf(hasher, "%v:%v", msg.Role, msg.Parts)
+	}
+	for _, t := range tools {
+		if t.Function == nil {
+			continue
+		}
+		_, _ = fmt.Fprintf(hasher, "|tool:%s:%s:%s:%v", t.Type, t.Function.Name, t.Function.Description, t.Function.Parameters)
 	}
 	return hex.EncodeToString(hasher.Sum(nil))
 }

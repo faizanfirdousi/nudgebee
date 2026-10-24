@@ -113,6 +113,7 @@ class SyncRecommendationData(MlMessageAbstract):
                     deployment_name=deployment,
                     account_id=account_id,
                     from_time=from_timestamp,
+                    tenant_id=tenant_id,
                 )
                 dt = prometheus_instance.get_metrics()
                 if dt.empty:
@@ -155,8 +156,8 @@ class SyncRecommendationData(MlMessageAbstract):
         }
 
 
-class KrrMessageHandler(MlMessageAbstract):
-    """Ml server create krr message object
+class RightsizingMessageHandler(MlMessageAbstract):
+    """Ml server create rightsizing message object
     sample message
     {
     "account_id": "00000000-0000-0000-0000-000000000000",
@@ -177,8 +178,8 @@ class KrrMessageHandler(MlMessageAbstract):
     queue: str = QueueConfig.ML_RECOMMENDATION_EXCHANGE
 
     def process_message(self):
-        logger.info(f"Creating KRR for account {self.account_id} and tenant {self.tenant_id}")
-        with get_trace(__name__).start_as_current_span("Update_krr_recommendations"):
+        logger.info(f"Creating rightsizing for account {self.account_id} and tenant {self.tenant_id}")
+        with get_trace(__name__).start_as_current_span("Update_rightsizing_recommendations"):
             asyncio.run(
                 generate_and_process_recommendation(tenant_id=str(self.tenant_id), account_id=str(self.account_id))
             )
@@ -223,6 +224,14 @@ class VerticalRightsizingRequest(MlMessageAbstract):
     datadog_api_key: Optional[str] = None
     datadog_app_key: Optional[str] = None
     datadog_site: Optional[str] = None
+    # Elasticsearch connection for metrics_provider == "ES"; api-server resolves and
+    # sends it the same way it sends the Datadog keys above.
+    elasticsearch: Optional[Dict[str, Any]] = None
+    # Set only when the account's own default metrics provider cannot answer the
+    # rightsizing keys at all and its agent can. api-server decides that and sends
+    # both fields or neither; this service forwards them without interpreting them.
+    metric_provider: Optional[str] = None
+    metric_provider_source: Optional[str] = None
     exchange: str = QueueConfig.ML_RECOMMENDATION_EXCHANGE
     queue: str = QueueConfig.ML_RECOMMENDATION_QUEUE
 
@@ -245,6 +254,9 @@ class VerticalRightsizingRequest(MlMessageAbstract):
                     datadog_api_key=self.datadog_api_key,
                     datadog_app_key=self.datadog_app_key,
                     datadog_site=self.datadog_site,
+                    elasticsearch=self.elasticsearch,
+                    metric_provider=self.metric_provider,
+                    metric_provider_source=self.metric_provider_source,
                 )
             )
             logger.info(
@@ -266,6 +278,9 @@ class VerticalRightsizingRequest(MlMessageAbstract):
             "datadog_api_key": self.datadog_api_key,
             "datadog_app_key": self.datadog_app_key,
             "datadog_site": self.datadog_site,
+            "elasticsearch": self.elasticsearch,
+            "metric_provider": self.metric_provider,
+            "metric_provider_source": self.metric_provider_source,
         }
 
 
@@ -296,6 +311,9 @@ class VolumeRightsizingRequest(MlMessageAbstract):
     datadog_api_key: Optional[str] = None
     datadog_app_key: Optional[str] = None
     datadog_site: Optional[str] = None
+    # Elasticsearch connection for metrics_provider == "ES"; api-server resolves and
+    # sends it the same way it sends the Datadog keys above.
+    elasticsearch: Optional[Dict[str, Any]] = None
     exchange: str = QueueConfig.ML_RECOMMENDATION_EXCHANGE
     queue: str = QueueConfig.ML_RECOMMENDATION_QUEUE
 
@@ -316,6 +334,7 @@ class VolumeRightsizingRequest(MlMessageAbstract):
                     datadog_api_key=self.datadog_api_key,
                     datadog_app_key=self.datadog_app_key,
                     datadog_site=self.datadog_site,
+                    elasticsearch=self.elasticsearch,
                 )
             )
             logger.info(
@@ -335,6 +354,7 @@ class VolumeRightsizingRequest(MlMessageAbstract):
             "datadog_api_key": self.datadog_api_key,
             "datadog_app_key": self.datadog_app_key,
             "datadog_site": self.datadog_site,
+            "elasticsearch": self.elasticsearch,
         }
 
 
@@ -342,7 +362,7 @@ def ml_server_message_handler(body: str) -> None:
     parsed_message: Dict[str, Any] = json.loads(body)
     message_mapping: Dict[str, Type[MlMessageAbstract]] = {
         "ml_recomm_sync": SyncRecommendationData,
-        "vertical_rightsize_update": KrrMessageHandler,
+        "vertical_rightsize_update": RightsizingMessageHandler,
         "vertical_rightsizing_request": VerticalRightsizingRequest,
         "volume_rightsizing_request": VolumeRightsizingRequest,
     }

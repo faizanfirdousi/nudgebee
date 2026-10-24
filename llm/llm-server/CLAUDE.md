@@ -35,11 +35,26 @@ The LLM Server depends on services running in Kubernetes that must be port-forwa
 | Service | Local Port | Port-Forward Command |
 |---------|-----------|---------------------|
 | cloud-collector-server | 8000 | `kubectl port-forward -n nudgebee svc/cloud-collector-server 8000:8000` |
-| services-server (api-server) | 8120 | `kubectl port-forward -n nudgebee svc/api-server 8120:8000` |
+| services-server (api-server) | 8120 | `kubectl port-forward -n nudgebee svc/services-server 8120:8000` |
 | rag-server | 8700 | `kubectl port-forward -n nudgebee svc/rag-server 8700:8700` |
-| relay-server | 8110 | `kubectl port-forward -n nudgebee svc/relay-server 8110:8110` |
+| relay-server | 8006 | `kubectl port-forward -n nudgebee svc/relay-server 8006:8080` |
 
-Verify with: `curl http://localhost:<port>/health` for each service.
+Verify with: `curl http://localhost:<port>/health` for each service. The relay
+serves `/request`, not `/health`, so a 404 there means it is alive.
+
+> **Relay gotcha — this silently breaks every tool call.** `RELAY_SERVER_ENDPOINT`
+> is NOT set by default, and `config/config.go` falls back to
+> `http://127.0.0.1:52832` — a port nothing forwards to. The symptom is not a
+> startup error: the server comes up fine and every kubectl/CLI tool call fails
+> at execution time with `unable to access relay server ... connection refused`,
+> which the agent then reports as a findings-level failure. Set
+> `RELAY_SERVER_ENDPOINT=http://127.0.0.1:8006` in `.env` (it is present but
+> commented out in `.env.example`) to match the forward above.
+>
+> `kubectl port-forward` also drops on pod restarts and network blips, and each
+> drop breaks tool calls until it is restarted. When running the e2e suites,
+> check the run for `unable to access relay server` before trusting any result —
+> a dropped forward produces failures that look like agent regressions.
 
 ### Environment Configuration
 
@@ -233,20 +248,20 @@ See [docs/caching.md](docs/caching.md) for the ReAct3 planner message layout, ca
 - Loading priority: experiment config → account override → global DB config → embedded file
 - **Prompts must not contain literal "TODO"** — enforced by `TestPromptContent_NoTODOMarkers`
 
-## The `_2` and `_3` Suffixes on Planners
+## Planner Versions
 
-The runtime has exactly one planner: **`planner_react_3.go`** (the ReAct3 planner — iterative reasoning with parallel action execution). The executor routes every non-tool/non-custom/non-classification agent to `NewReActAgent3()`. The older `planner_react_2.go` and `planner_rewoo_2.go` have been deleted; symbols they hosted that ReAct3 still needs live in `planner_react_shared.go`.
+ReAct and Orchestrating agents use **ReAct4** (`planner_react_4.go`) by default when the selected provider/model supports native tools (via `LLM_SERVER_PLANNER_ENGINE=auto`). `LLM_SERVER_PLANNER_ENGINE=react3` is the rollback path, and unsupported models fall back to **ReAct3** (`planner_react_3.go`). The older `planner_react_2.go` and `planner_rewoo_2.go` were deleted; shared compatibility symbols live in `planner_react_shared.go`.
 
 For agent files, `_2` / `V2` suffixes mark genuinely versioned agents where both versions still coexist:
 
 | Component | v1 | v2 | Active? |
 |-----------|----|----|---------|
-| Planner runtime | — | `planner_react_3.go` | Only planner at runtime |
+| Planner runtime | `planner_react_3.go` | `planner_react_4.go` | ReAct4 by default; ReAct3 fallback |
 | Tickets | `agent_tickets.go` | `agent_tickets_V2.go` | Both; v2 opt-in via `TicketV2Enabled` |
 
-The domain orchestrators — `agent_k8s_orchestrator.go`, `agent_aws_orchestrator.go`, `agent_gcp_orchestrator.go`, `agent_azure_orchestrator.go`, `agent_datadog_orchestrator.go` — declare `Orchestrating` and run under ReAct3. They were renamed from `*_debug` (which itself dropped a vestigial `_2`); the old `*_debug` names stay registered as back-compat aliases (`RegisterNBAgentFactoryWithAliases`) so stored history and `@*_debug` invocations keep resolving. Note `agent_aws.go` is a *distinct* sub-agent (direct CLI), not the AWS orchestrator.
+The domain orchestrators — `agent_k8s_orchestrator.go`, `agent_aws_orchestrator.go`, `agent_gcp_orchestrator.go`, `agent_azure_orchestrator.go`, `agent_datadog_orchestrator.go` — declare `Orchestrating` and use the same ReAct4-default/ReAct3-fallback routing. They were renamed from `*_debug` (which itself dropped a vestigial `_2`); the old `*_debug` names stay registered as back-compat aliases (`RegisterNBAgentFactoryWithAliases`) so stored history and `@*_debug` invocations keep resolving. Note `agent_aws.go` is a *distinct* sub-agent (direct CLI), not the AWS orchestrator.
 
-**Rule: new code targets ReAct3. There is no v1/v2 planner choice to make.**
+**Rule: new planner behavior must account for both ReAct4 and the ReAct3 rollback/capability fallback. There is no v1/v2 planner choice to make.**
 
 ### Deprecated Patterns
 
@@ -382,7 +397,7 @@ All configuration in `config/config.go` via environment variables.
 **LLM Provider:** `LLM_PROVIDER`, `LLM_MODEL_NAME`, `LLM_PROVIDER_REGION`, `LLM_PROVIDER_API_KEY`, `LLM_PROVIDER_API_ENDPOINT`
 **Database:** `LLM_SERVER_DB_URL` (PostgreSQL)
 **RabbitMQ:** `RABBIT_MQ_HOST`, `RABBIT_MQ_USERNAME`, `RABBIT_MQ_PASSWORD`, `RABBIT_MQ_TROUBLESHOOT_EXCHANGE`
-**Agent Behavior:** `LLM_SERVER_AGENT_REACT_MAX_ITERATIONS` (default 50), `LLM_SERVER_REACT_CRITIQUE_ENABLED` (default true), `LLM_SERVER_AGENT_MAX_LOGLINES`, `LLM_SERVER_PLANNER_PARALLEL_EXEC_ENABLED` (gates ReAct3 parallel action batches), `LLM_SERVER_AGENT_MAX_PARALLEL` (parallel action concurrency limit)
+**Agent Behavior:** `LLM_SERVER_AGENT_REACT_MAX_ITERATIONS` (default 50), `LLM_SERVER_ORCHESTRATOR_THINKING_LEVEL` (default medium), `LLM_SERVER_AGENT_MAX_LOGLINES`, `LLM_SERVER_PLANNER_PARALLEL_EXEC_ENABLED` (gates ReAct3 parallel action batches), `LLM_SERVER_AGENT_MAX_PARALLEL` (parallel action concurrency limit)
 **External Services:** `SERVICE_API_SERVER_URL`, `RAG_SERVER_URL`, `CLOUD_COLLECTOR_SERVER_URL`, `RELAY_SERVER_ENDPOINT`
 
 ## Key Integrations
@@ -425,7 +440,8 @@ chore(deps): bump github.com/gin-contrib/pprof (#27311)
 
 **Modifying planner logic:**
 - Executor loop: `agents/core/executor_planner.go`
-- ReAct3 loop (all runtime planning): `agents/core/planner_react_3.go`
+- ReAct4 native-tool loop (default): `agents/core/planner_react_4.go`
+- ReAct3 XML loop (rollback/capability fallback): `agents/core/planner_react_3.go`
 
 **Adding an LLM provider:**
 1. Create client in `llms/<provider>/`, implement provider interface

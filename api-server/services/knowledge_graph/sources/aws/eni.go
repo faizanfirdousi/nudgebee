@@ -263,7 +263,7 @@ func (s *AWSSource) createENINodeFromAWSData(eniInfo *ENINetworkInterface, req *
 	properties["type"] = "network-interface"
 	properties["status"] = eniInfo.Status
 	properties["cloud_provider"] = "AWS"
-	properties["region"] = req.Region
+	properties["region"] = eniInfo.Region
 	properties["resource_id"] = eniInfo.NetworkInterfaceId
 	properties["service_name"] = "AmazonVPC"
 	properties["is_active"] = true
@@ -357,6 +357,12 @@ func (s *AWSSource) fetchENIDataFromAWS(_ *security.RequestContext, _ *core.Sour
 			s.logger.Warn("Failed to parse ENI meta, skipping", "resource_id", row.ResourceID, "error", err)
 			continue
 		}
+		// Carry the row's region across: the parsed CLI shape has only an AZ, and
+		// nodes built from it would otherwise land with an empty region (#36573).
+		eni.Region = row.Region
+		if eni.Region == "" {
+			eni.Region = regionFromAZ(eni.AvailabilityZone)
+		}
 		enis = append(enis, &eni)
 	}
 	s.logger.Info("Fetched ENI data from DB cache", "eni_count", len(enis))
@@ -418,4 +424,38 @@ func (s *AWSSource) matchENIToRDS(eniInfo *ENINetworkInterface, rdsNode *core.Db
 	}
 
 	return false
+}
+
+// The inventory rows this file's resources claim: what each row's node
+// type, concrete label and metadata extraction are (see kinds.go).
+func init() {
+	registerKind(resourceKind{
+		Service:      "AmazonVPC",
+		Types:        []string{"network-interface"},
+		NodeType:     core.NodeTypeNetworkInterface,
+		SpecificType: "NetworkInterface",
+		Extract:      (*AWSSource).extractENIMetadata,
+	})
+}
+
+// The edges the account build asks this file's resources for (see dispatch.go).
+func init() {
+	// The DB rows are a stale superset of the account's network interfaces, and
+	// the service filter drops some the resolver still needs, so the ENI
+	// resolver decides which ENI nodes the graph keeps. Everything that
+	// resolves an ENI through the lookup (elastic IPs, VPC endpoints, EFS
+	// mount targets, NAT gateways) therefore sees the same set.
+	registerNodeSetRebuild(nodeSetRebuild{NodeType: core.NodeTypeNetworkInterface, Name: "eni",
+		Rebuild: func(s *AWSSource, reqCtx *security.RequestContext, nodes []*core.DbNode, lookup *sources.NodeLookup, req *core.SourceBuildRequest) ([]*core.DbNode, []*core.DbEdge) {
+			return s.createENIEdges(reqCtx, nodes, lookup, req)
+		}})
+}
+
+// Per-resource updates (see patch.go). createENIEdges creates and replaces
+// network interface nodes from the row cache in an account-wide pass.
+func init() {
+	registerPatchSpec(sources.PatchSpec{
+		SpecificTypes: []string{"NetworkInterface"},
+		AccountLevel:  true,
+	}, nil)
 }

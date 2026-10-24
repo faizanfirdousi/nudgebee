@@ -1,0 +1,182 @@
+package core
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+	"nudgebee/llm/security"
+	toolcore "nudgebee/llm/tools/core"
+)
+
+type mockAliasedTool struct {
+	mockTool
+	aliases []string
+}
+
+func (m mockAliasedTool) GetNameAliases() []string { return m.aliases }
+
+type mockAgentWithTools struct {
+	mockPlainAgent
+	tools []toolcore.NBTool
+}
+
+func (a mockAgentWithTools) GetSupportedTools(_ *security.RequestContext) []toolcore.NBTool {
+	return a.tools
+}
+
+func TestIsAgentToolAuthorizedToProcessRequest_ToolAliases(t *testing.T) {
+	// Register a registry alias: mock_canonical_registry -> mock_alias_registry
+	toolcore.RegisterNBToolAlias("mock_alias_registry", "mock_canonical_registry")
+
+	registryTool := mockTool{name: "mock_canonical_registry"}
+	structAliasedTool := mockAliasedTool{
+		mockTool: mockTool{name: "mock_canonical_struct"},
+		aliases:  []string{"mock_alias_struct"},
+	}
+
+	agent := mockAgentWithTools{
+		mockPlainAgent: mockPlainAgent{name: "test_agent"},
+		tools:          []toolcore.NBTool{registryTool, structAliasedTool},
+	}
+
+	reqCtx := security.NewRequestContextForSuperAdmin()
+	request := NBAgentRequest{
+		AccountId:      "test-account",
+		ConversationId: "test-conv",
+	}
+
+	// 1. Calling canonical tool names directly should succeed
+	finish, _, err := IsAgentToolAuthorizedToProcessRequest(
+		reqCtx, agent, request,
+		NBAgentPlannerToolAction{Tool: "mock_canonical_registry"},
+	)
+	require.NoError(t, err)
+	require.Nil(t, finish)
+
+	finish, _, err = IsAgentToolAuthorizedToProcessRequest(
+		reqCtx, agent, request,
+		NBAgentPlannerToolAction{Tool: "mock_canonical_struct"},
+	)
+	require.NoError(t, err)
+	require.Nil(t, finish)
+
+	// 2. Calling via registered alias should succeed
+	finish, _, err = IsAgentToolAuthorizedToProcessRequest(
+		reqCtx, agent, request,
+		NBAgentPlannerToolAction{Tool: "mock_alias_registry"},
+	)
+	require.NoError(t, err)
+	require.Nil(t, finish)
+
+	// 3. Calling via struct GetNameAliases() should succeed
+	finish, _, err = IsAgentToolAuthorizedToProcessRequest(
+		reqCtx, agent, request,
+		NBAgentPlannerToolAction{Tool: "mock_alias_struct"},
+	)
+	require.NoError(t, err)
+	require.Nil(t, finish)
+
+	// 4. Calling an unauthorized or non-existent tool should fail
+	_, _, err = IsAgentToolAuthorizedToProcessRequest(
+		reqCtx, agent, request,
+		NBAgentPlannerToolAction{Tool: "completely_unknown_tool"},
+	)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "auth: tool not found")
+}
+
+func TestGetNameToTool_ResolvesAliases(t *testing.T) {
+	toolcore.RegisterNBToolAlias("mock_tool_alias_gnt", "mock_tool_canonical_gnt")
+
+	t1 := mockAliasedTool{
+		mockTool: mockTool{name: "mock_tool_canonical_struct_gnt"},
+		aliases:  []string{"mock_alias_struct_gnt"},
+	}
+	t2 := mockTool{name: "mock_tool_canonical_gnt"}
+
+	toolsList := []toolcore.NBTool{t1, t2}
+	toolsMap := getNameToTool(toolsList)
+
+	require.NotNil(t, toolsMap[strings.ToUpper("mock_tool_canonical_struct_gnt")])
+	require.NotNil(t, toolsMap[strings.ToUpper("mock_alias_struct_gnt")])
+	require.Equal(t, toolsMap[strings.ToUpper("mock_tool_canonical_struct_gnt")], toolsMap[strings.ToUpper("mock_alias_struct_gnt")])
+
+	require.NotNil(t, toolsMap[strings.ToUpper("mock_tool_canonical_gnt")])
+	require.NotNil(t, toolsMap[strings.ToUpper("mock_tool_alias_gnt")])
+	require.Equal(t, toolsMap[strings.ToUpper("mock_tool_canonical_gnt")], toolsMap[strings.ToUpper("mock_tool_alias_gnt")])
+}
+
+type mockInferenceTool struct {
+	mockTool
+	inferredType toolcore.ToolRequestType
+	prompt       string
+}
+
+func (m mockInferenceTool) InferToolRequestType(ctx *security.RequestContext, toolName, input string) (toolcore.ToolRequestType, error) {
+	return m.inferredType, nil
+}
+
+func (m mockInferenceTool) InferToolRequestTypePrompt(ctx *security.RequestContext, toolName, input string) (string, error) {
+	return m.prompt, nil
+}
+
+func TestIsAgentToolAuthorizedToProcessRequest_DeterministicMutationAuthoritative(t *testing.T) {
+	fake := &fakeLLMModel{
+		response: "read",
+	}
+	withFakeLLMModel(t, fake)
+
+	ctx := llmOverrideContext()
+
+	// Case 1: Deterministic heuristic identifies an Update mutation.
+	// Even though LLM prompt response is "read", deterministic mutation is authoritative and must NOT be downgraded.
+	tool := mockInferenceTool{
+		mockTool:     mockTool{name: "mock_gcp_cli"},
+		inferredType: toolcore.ToolRequestTypeUpdate,
+		prompt:       "Classify the command",
+	}
+	agent := mockAgentWithTools{
+		mockPlainAgent: mockPlainAgent{name: "test_agent"},
+		tools:          []toolcore.NBTool{tool},
+	}
+	request := NBAgentRequest{
+		AccountId:      "test-account",
+		ConversationId: "test-conv",
+	}
+
+	finish, reqType, err := IsAgentToolAuthorizedToProcessRequest(
+		ctx, agent, request,
+		NBAgentPlannerToolAction{
+			Tool:      "mock_gcp_cli",
+			ToolInput: "gcloud compute instances stop my-vm",
+		},
+	)
+	require.NoError(t, err)
+	require.Nil(t, finish)
+	require.NotNil(t, reqType)
+	require.Equal(t, toolcore.ToolRequestTypeUpdate, *reqType)
+
+	// Case 2: Deterministic heuristic returns unknown ("").
+	// Falls back to LLM prompt classifier, which classifies as Read.
+	unknownTool := mockInferenceTool{
+		mockTool:     mockTool{name: "mock_unknown_tool"},
+		inferredType: "",
+		prompt:       "Classify the command",
+	}
+	agentUnknown := mockAgentWithTools{
+		mockPlainAgent: mockPlainAgent{name: "test_agent"},
+		tools:          []toolcore.NBTool{unknownTool},
+	}
+	finish2, reqType2, err2 := IsAgentToolAuthorizedToProcessRequest(
+		ctx, agentUnknown, request,
+		NBAgentPlannerToolAction{
+			Tool:      "mock_unknown_tool",
+			ToolInput: "custom_cli unknown_command",
+		},
+	)
+	require.NoError(t, err2)
+	require.Nil(t, finish2)
+	require.NotNil(t, reqType2)
+	require.Equal(t, toolcore.ToolRequestTypeRead, *reqType2)
+}

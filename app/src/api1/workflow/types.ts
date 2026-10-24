@@ -122,6 +122,9 @@ export interface WorkflowRequest {
   /** Opt-in for AI invocation. Workflow-level rather than in the definition so
    * revoking it takes effect immediately, without a publish. */
   ai_invocable?: boolean;
+  /** Opt-in for running without an in-chat confirmation. Only meaningful with
+   * ai_invocable; the server rejects it otherwise. */
+  ai_auto_approve?: boolean;
 }
 
 export interface WorkflowCreateRequest {
@@ -298,6 +301,26 @@ export interface WorkflowDryRunResponse {
   dryrun_id?: string;
   execution_id?: string;
   tasks?: WorkflowDryRunTaskResult[];
+}
+
+export interface CheckTriggerMatchRequest {
+  account_id: string;
+  /** 'event' or 'optimization' — other trigger types have nothing to match. */
+  trigger_type: string;
+  /** Trigger params as they would be saved: event -> filter/event_type/on, optimization -> categories/rule_names/clusters/filter. */
+  params?: Record<string, any>;
+  payload: Record<string, any>;
+}
+
+export interface CheckTriggerMatchResponse {
+  matched: boolean;
+  /** Which stage decided it: 'account' | 'event_type' | 'lifecycle_phase' | 'filter'. */
+  gate?: string;
+  reason?: string;
+  /** Set when the filter could not be evaluated at all — distinct from a filter that returned false. */
+  error?: string;
+  /** The expression that was evaluated. For optimization triggers this is built from the dropdowns. */
+  filter?: string;
 }
 
 export interface WorkflowRetriggerRequest {

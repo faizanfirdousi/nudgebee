@@ -254,15 +254,52 @@ def handle_telemetry(tenant_id: str, cloud_account_id: str, agent_id: str, data:
             logging.warning(f"Invalid activity_stats format: {activity_stats}")
             activity_stats = {}
 
-    connection_status = json.dumps(activity_stats)
+    reported_at = datetime.datetime.now(datetime.timezone.utc)
+
+    # healthCheckedAt is server-owned, like providerStatus — the agent never sends it,
+    # and it survives because this merge is additive (see the note below).
+    #
+    # It is NOT a check the server performed: it is this collector's receive time for
+    # the agent's own self-report, stamped with our clock rather than the agent's so
+    # clock skew can't render as "in 4h" in the UI's relative times. Its granularity is
+    # the whole activity_stats block, not one signal — a post that omits a flag still
+    # refreshes it — so read it as "the agent last reported its health at", which is
+    # what Agent Details shows next to an agent-served signal.
+    #
+    # Only stamped for a non-empty dict: an empty or malformed activity_stats refreshes
+    # no flag, so dating one would claim a freshness the row does not have. The
+    # isinstance guard also catches a JSON array, which the str-normalisation above
+    # lets through untouched.
+    reported_stats = activity_stats
+    if isinstance(activity_stats, dict) and activity_stats:
+        reported_stats = {**activity_stats, "healthCheckedAt": reported_at.strftime("%Y-%m-%dT%H:%M:%SZ")}
+
+    connection_status = json.dumps(reported_stats)
 
     # Merge activity_stats into connection_status instead of overwriting.
     # Other writers (scan_orchestrator's schedule_jobs, relay-server's datasources /
     # agentBuild / relayConnection) own their own top-level keys; a full replace
     # here used to wipe them on every heartbeat, which caused scan_orchestrator
     # to treat every scheduled scan as "never run" and re-fire it each cycle.
+    # Deliberately does NOT write `status`. This heartbeat proves the runner
+    # process is alive and can reach us over HTTP — it says nothing about the
+    # relay websocket, which is what `status` means to every consumer
+    # (relay-server gates request routing on it, and the UI shows it). Writing
+    # CONNECTED here re-marked agents whose websocket was dead within 60s of
+    # relay-server correctly marking them NOT_CONNECTED, so requests were
+    # routed onto a queue with no consumer and timed out instead of failing
+    # fast, and the UI reported a connected agent that could not be reached.
+    # relay-server owns `status`; see its UpdateRelayConnectionStatus and
+    # TouchRelaySession.
+    #
+    # last_connected_at stays: api-server's "Agent Status Check" cron uses it
+    # as one of two staleness signals, and this post is genuine evidence the
+    # agent side is alive. It shares reported_at with healthCheckedAt so the two
+    # are the same instant, but it is not a substitute for it: relay-server also
+    # sets last_connected_at on connect and disconnect, so a reconnect refreshes
+    # it without a single flag having been re-reported.
     update_agent = sql.SQL("""UPDATE {}
-           SET version = %s, last_connected_at = %s, status = %s,
+           SET version = %s, last_connected_at = %s,
                k8s_version = %s,
                connection_status = COALESCE(connection_status, '{{}}'::jsonb) || %s::jsonb,
                k8s_provider = %s
@@ -272,8 +309,7 @@ def handle_telemetry(tenant_id: str, cloud_account_id: str, agent_id: str, data:
         update_agent,
         [
             data["version"],
-            datetime.datetime.now(datetime.timezone.utc),
-            "CONNECTED",
+            reported_at,
             k8s_version,
             connection_status,
             k8s_provider,

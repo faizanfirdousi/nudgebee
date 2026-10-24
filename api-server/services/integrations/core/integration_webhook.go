@@ -44,6 +44,17 @@ type EventIncomingWebhook struct {
 	EventSubjectOwnerKind string                            `json:"event_subject_owner_kind"`
 	CloudResourceId       string                            `json:"cloud_resource_id"`
 	ServiceKey            string                            `json:"service_key"`
+	// FiringKey identifies one firing of the alert EventId names, for parsers whose
+	// EventId is stable across firings. Set it and each firing gets its own events
+	// row (see firingFindingIDFor); leave it empty when the source offers no such
+	// key, or when EventId is already per firing.
+	FiringKey string `json:"firing_key,omitempty"`
+	// PodNameCandidates are names that may be pods, from a parser whose payload
+	// cannot say which of its values is the pod (a Kibana group id is the group
+	// values joined together). ResolveSubjectFromPodCandidates looks each one up in
+	// the pod inventory. A field rather than a label, so it never reaches the stored
+	// event.
+	PodNameCandidates []string `json:"-"`
 }
 
 type EventIncomingWebhookInvestigationSeverity string
@@ -58,6 +69,10 @@ const (
 	webhookProcessingStatusFailed    = "failed"
 	webhookProcessingStatusSkipped   = "skipped"
 )
+
+// maxWebhookProcessingErrorLen caps the processing_error stored per delivery so a
+// parser error that echoes a large payload does not bloat the row.
+const maxWebhookProcessingErrorLen = 2000
 
 // webhookProcessingStatusForError maps a ProcessEventWebook error onto the
 // processing_status recorded for that delivery.
@@ -91,6 +106,7 @@ var eventAnalysisSources = map[string]bool{
 	"elasticsearch_webhook":           true,
 	"prometheus_alertmanager_webhook": true,
 	"workflow_webhook":                true,
+	"cubeapm_webhook":                 true,
 }
 
 const (
@@ -424,22 +440,25 @@ func ProcessStoredWebhook(sc *security.RequestContext, webhookRowID string) erro
 	var row StoredWebhookEventData
 	err = dbms.Db.Get(&row, `SELECT id, tenant_id, COALESCE(account_id::text, '') as account_id, integration_id, integration_type, raw, COALESCE(request_url, '') as request_url FROM event_incoming_webhooks WHERE id = $1`, webhookRowID)
 	if err != nil {
-		updateWebhookStatus(dbms, webhookRowID, webhookProcessingStatusFailed)
-		return fmt.Errorf("integrations: webhook row not found: %w", err)
+		err = fmt.Errorf("integrations: failed to load webhook row: %w", err)
+		updateWebhookStatus(dbms, webhookRowID, webhookProcessingStatusFailed, err)
+		return err
 	}
 
 	sc = security.NewRequestContextForTenantAdmin(row.TenantID, sc.GetLogger().With("integration_id", row.IntegrationID, "webhook_row_id", webhookRowID), sc.GetTracer(), sc.GetMeter())
 
 	integration, found := GetIntegration(row.IntegrationType)
 	if !found {
-		updateWebhookStatus(dbms, webhookRowID, webhookProcessingStatusFailed)
-		return fmt.Errorf("integrations: integration type %s not found", row.IntegrationType)
+		err = fmt.Errorf("integrations: integration type %s not found", row.IntegrationType)
+		updateWebhookStatus(dbms, webhookRowID, webhookProcessingStatusFailed, err)
+		return err
 	}
 
 	webhookIntegration, ok := integration.(EventIncomingTroubleshootWebhookIntegration)
 	if !ok {
-		updateWebhookStatus(dbms, webhookRowID, webhookProcessingStatusFailed)
-		return fmt.Errorf("integrations: integration type %s does not support webhook events", row.IntegrationType)
+		err = fmt.Errorf("integrations: integration type %s does not support webhook events", row.IntegrationType)
+		updateWebhookStatus(dbms, webhookRowID, webhookProcessingStatusFailed, err)
+		return err
 	}
 
 	webhookSettings, err := getIntegrationSettings(dbms, row.IntegrationID)
@@ -450,7 +469,7 @@ func ProcessStoredWebhook(sc *security.RequestContext, webhookRowID string) erro
 	webhookEvents, err := webhookIntegration.ProcessEventWebook(sc, webhookSettings, row.AccountID, row.Raw)
 	if err != nil {
 		status := webhookProcessingStatusForError(err)
-		updateWebhookStatus(dbms, webhookRowID, status)
+		updateWebhookStatus(dbms, webhookRowID, status, err)
 		if status != webhookProcessingStatusSkipped {
 			sc.GetLogger().Error("integrations: unable to process webhook payload", "error", err)
 		}
@@ -481,7 +500,7 @@ func ProcessStoredWebhook(sc *security.RequestContext, webhookRowID string) erro
 			_, updateErr := dbms.Exec(`UPDATE event_incoming_webhooks SET
 				webhook_id = $2, event_type = $3, event_id = $4, event_url = $5,
 				event_status = $6, event_priority = $7, event_created_at = $8,
-				event_title = $9, event_description = $10, account_id = $11, processing_status = 'processed'
+				event_title = $9, event_description = $10, account_id = $11, processing_status = 'processed', processing_error = NULL
 				WHERE id = $1`,
 				webhookRowID, e.WebhookId, e.EventType, e.EventId, e.EventUrl,
 				e.EventStatus, e.EventPriority, e.EventCreatedAt, e.EventTitle, e.EventDescription, nullableAccountID(eventAccountId))
@@ -504,7 +523,7 @@ func ProcessStoredWebhook(sc *security.RequestContext, webhookRowID string) erro
 	}
 
 	if len(webhookEvents) == 0 {
-		updateWebhookStatus(dbms, webhookRowID, webhookProcessingStatusProcessed)
+		updateWebhookStatus(dbms, webhookRowID, webhookProcessingStatusProcessed, nil)
 	}
 
 	return nil
@@ -526,9 +545,23 @@ func routeWebhookEvent(sc *security.RequestContext, tenantId, accountId, source 
 	}
 }
 
-// updateWebhookStatus updates the processing_status of a webhook row.
-func updateWebhookStatus(dbms *database.DatabaseManager, webhookRowID, status string) {
-	_, err := dbms.Exec(`UPDATE event_incoming_webhooks SET processing_status = $2 WHERE id = $1`, webhookRowID, status)
+// updateWebhookStatus updates the processing_status of a webhook row and records
+// processErr as its processing_error. A nil processErr clears any earlier error.
+func updateWebhookStatus(dbms *database.DatabaseManager, webhookRowID, status string, processErr error) {
+	var processingError *string
+	if processErr != nil {
+		msg := processErr.Error()
+		if len(msg) > maxWebhookProcessingErrorLen {
+			msg = msg[:maxWebhookProcessingErrorLen]
+		}
+		// Postgres rejects invalid UTF-8 and NUL bytes in text. Both can reach
+		// here from a parser error that echoes the payload, or from the cut
+		// above splitting a rune; either would fail this UPDATE and leave the
+		// row stuck in 'processing'.
+		msg = strings.ReplaceAll(strings.ToValidUTF8(msg, ""), "\x00", "")
+		processingError = &msg
+	}
+	_, err := dbms.Exec(`UPDATE event_incoming_webhooks SET processing_status = $2, processing_error = $3 WHERE id = $1`, webhookRowID, status, processingError)
 	if err != nil {
 		slog.Error("integrations: failed to update webhook processing status", "webhook_row_id", webhookRowID, "status", status, "error", err)
 	}
@@ -777,23 +810,6 @@ func convertSliceAnyToSliceInterface(evidences []eventtypes.EventEvidence) []any
 	return s
 }
 
-// resolveEventQuery closes the event a resolve delivery refers to.
-//
-// It matches finding_id as well as fingerprint. convertWebhookEventToEvent writes
-// FindingId from EventId, so the triggering delivery always leaves the event
-// findable by the id its own resolve delivery carries — whereas fingerprint is
-// whatever the producing integration chose. PagerDuty overwrites
-// Investigation.Fingerprint with the CEF dedup_key, which is stable across every
-// incident for the same alert and so never equals the incident id a resolve
-// carries: the fingerprint predicate alone matched nothing and PagerDuty resolves
-// closed no events at all. That went unnoticed because the k8s-collector's
-// resource reconciliation bulk-closes events later, so they did eventually clear.
-//
-// Tenant-scoped so the finding_id predicate can use events_cloudaccount_findingid,
-// whose leading column is tenant. Verified on a real dataset: both predicates
-// resolve through a BitmapOr of index scans, no sequential scan.
-const resolveEventQuery = `update events set status = $4 where tenant = $1 and cloud_account_id = $2 and (fingerprint = $3 or finding_id = $3) and status != $4 returning id`
-
 func resolveEvent(sc *security.RequestContext, tenantId, accountId string, source string, event EventIncomingWebhook) error {
 	if accountId == "" || accountId == uuid.Nil.String() {
 		sc.GetLogger().Info("integrations: skipping event resolution — no cloud account linked", "source", source, "event_id", event.EventId)
@@ -808,9 +824,9 @@ func resolveEvent(sc *security.RequestContext, tenantId, accountId string, sourc
 	if source == "datadog_webhook" || source == "gcp_monitoring_webhook" {
 		fingerPrint = event.Investigation.Fingerprint
 	}
-	// The status guard in resolveEventQuery makes repeated resolve webhooks no-ops,
+	// The status guard in eventtypes.ResolveEventQuery makes repeated resolve webhooks no-ops,
 	// so only a genuine open→closed transition publishes the resolved notification.
-	rows, err := dbms.Query(resolveEventQuery, tenantId, accountId, fingerPrint, "CLOSED")
+	rows, err := dbms.Query(eventtypes.ResolveEventQuery, tenantId, accountId, fingerPrint, string(eventtypes.EventStatusClosed), eventtypes.ResolveEndsAt(event.EventEndsAt))
 	if err != nil {
 		return err
 	}
@@ -864,6 +880,17 @@ func investigateWebhookEvent(sc *security.RequestContext, tenantId, accountId st
 
 func triggerEventAnalysisUsingLLM(sc *security.RequestContext, webhookEvent EventIncomingWebhook, tenantId, accountId, userId string, source string) error {
 	eventToInsert := convertWebhookEventToEvent(webhookEvent, tenantId, accountId, source)
+	if webhookEvent.FiringKey != "" {
+		dbms, err := database.GetDatabaseManager(database.Metastore)
+		if err != nil {
+			return fmt.Errorf("integrations: unable to get database manager: %w", err)
+		}
+		findingId, err := firingFindingIDFor(dbms, tenantId, accountId, source, webhookEvent)
+		if err != nil {
+			sc.GetLogger().Warn("integrations: firing row lookup failed, using the minted id", "error", err, "event_id", webhookEvent.EventId, "finding_id", findingId)
+		}
+		eventToInsert.FindingId = findingId
+	}
 
 	if InvestigateEventFn == nil {
 		return errors.New("integrations: InvestigateEventFn not registered")

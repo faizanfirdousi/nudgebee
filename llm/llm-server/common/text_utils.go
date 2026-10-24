@@ -102,6 +102,134 @@ func StripFirstAgentMention(query string) string {
 	return query
 }
 
+// canonicalModelRegionPrefixes and canonicalModelVendorPrefixes are stripped, in
+// order, by CanonicalModelID. Longest/most-specific entries aren't required since
+// each list is checked with HasPrefix and stops at the first match.
+var canonicalModelRegionPrefixes = []string{"us.", "eu.", "apac.", "jp.", "au.", "ca.", "global."}
+var canonicalModelVendorPrefixes = []string{"anthropic.", "amazon.", "meta.", "google.", "vertex.", "vertex/", "openai.", "azure.", "mistral.", "cohere.", "ai21.", "models/"}
+
+// trailingInvocationVersionRE strips a trailing Bedrock-style invocation version
+// (e.g. "-v1", "-v2") that decorates some cross-region model ids.
+var trailingInvocationVersionRE = regexp.MustCompile(`-v\d+$`)
+
+// versionSeparatorRE normalizes a hyphenated version number to dotted
+// (e.g. "claude-sonnet-4-6" -> "claude-sonnet-4.6") so the same model isn't
+// treated as two different ids depending on which separator a deployment used.
+var versionSeparatorRE = regexp.MustCompile(`(\d)-(\d)`)
+
+// CanonicalModelID reduces a provider-qualified, deployment-specific model id to
+// a bare, comparable form: lowercased, region/vendor prefix and invocation-version
+// suffix stripped, hyphenated version numbers dotted. Two raw strings for the same
+// underlying model (e.g. a Bedrock cross-region id vs. its short name) canonicalize
+// to the same value; two genuinely different models do not collide by construction
+// (the transformations only remove known decorations, never merge distinct names).
+func CanonicalModelID(model string) string {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if i := strings.IndexByte(m, ':'); i >= 0 {
+		m = m[:i]
+	}
+	for _, p := range canonicalModelRegionPrefixes {
+		if strings.HasPrefix(m, p) {
+			m = strings.TrimPrefix(m, p)
+			break
+		}
+	}
+	for _, p := range canonicalModelVendorPrefixes {
+		if strings.HasPrefix(m, p) {
+			m = strings.TrimPrefix(m, p)
+			break
+		}
+	}
+	m = trailingInvocationVersionRE.ReplaceAllString(m, "")
+	m = versionSeparatorRE.ReplaceAllString(m, "$1.$2")
+	return m
+}
+
+var titleFieldKeys = []string{"title", "subject", "summary", "name", "alertname", "description", "message", "text"}
+
+// maxDerivedTitleRunes caps a JSON-derived title. Aligned with the short-query
+// title path's 100-char cap so both title routes bound length the same way.
+const maxDerivedTitleRunes = 100
+
+// leadingMarkdownHeadingRegex matches a leading markdown heading marker ("#" ..
+// "######") plus its trailing space, so "# grafana Alert" renders as "grafana Alert".
+var leadingMarkdownHeadingRegex = regexp.MustCompile(`^\s*#{1,6}\s+`)
+
+// whitespaceRunRegex collapses any run of whitespace (incl. newlines/tabs) to one space.
+var whitespaceRunRegex = regexp.MustCompile(`\s+`)
+
+func DeriveTitleFromJSONQuery(query string) (string, bool) {
+	trimmed := strings.TrimSpace(query)
+	// Only object payloads — arrays / scalars / plain text are left to the caller.
+	if !strings.HasPrefix(trimmed, "{") {
+		return "", false
+	}
+	var obj map[string]any
+	if err := UnmarshalJson([]byte(trimmed), &obj); err != nil {
+		return "", false
+	}
+	// Case-insensitive key resolution, preferring titleFieldKeys order.
+	byLowerKey := make(map[string]string, len(obj))
+	for k := range obj {
+		byLowerKey[strings.ToLower(k)] = k
+	}
+	for _, want := range titleFieldKeys {
+		actual, ok := byLowerKey[want]
+		if !ok {
+			continue
+		}
+		val, ok := obj[actual].(string)
+		if !ok {
+			continue // non-string field (nested object, number, …)
+		}
+		if cleaned := cleanTitleLine(val); cleaned != "" {
+			return cleaned, true
+		}
+	}
+	return "", false
+}
+
+// cleanTitleLine reduces a (possibly multi-line, markdown) field value to one
+// title line, capped at maxDerivedTitleRunes runes. Returns "" when the value has
+// no non-empty line.
+func cleanTitleLine(s string) string {
+	// Scan line by line without splitting the whole (possibly large) value into a
+	// slice — we only need the first non-empty line.
+	for rest := s; rest != ""; {
+		line := rest
+		if idx := strings.IndexByte(rest, '\n'); idx >= 0 {
+			line, rest = rest[:idx], rest[idx+1:]
+		} else {
+			rest = ""
+		}
+		line = leadingMarkdownHeadingRegex.ReplaceAllString(line, "")
+		line = whitespaceRunRegex.ReplaceAllString(line, " ")
+		line = strings.TrimSpace(line)
+		if line != "" {
+			return truncateAtWord(line, maxDerivedTitleRunes)
+		}
+	}
+	return ""
+}
+
+// truncateAtWord shortens s to at most maxRunes runes, preferring to cut on the
+// last word boundary, and appends a single-character ellipsis when it truncates.
+func truncateAtWord(s string, maxRunes int) string {
+	// A string can't hold more runes than bytes, so a short-enough byte length is
+	// already within the rune limit — return early without the rune count/alloc.
+	if len(s) <= maxRunes {
+		return s
+	}
+	if utf8.RuneCountInString(s) <= maxRunes {
+		return s
+	}
+	cut := string([]rune(s)[:maxRunes])
+	if idx := strings.LastIndexByte(cut, ' '); idx > 0 {
+		cut = cut[:idx]
+	}
+	return strings.TrimRight(cut, " ") + "…"
+}
+
 // TruncateHead truncates s to at most maxBytes from the start, ensuring the cut
 // does not split a multi-byte UTF-8 character.
 func TruncateHead(s string, maxBytes int) string {

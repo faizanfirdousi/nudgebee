@@ -1,7 +1,7 @@
 import type { AccountOption } from '@api1/dashboards';
 import {
+  accountPickerOptions,
   applyAccountFilter,
-  coversAllOfTypes,
   deriveAccountType,
   deriveAccountTypes,
   describePanelScope,
@@ -205,6 +205,14 @@ describe('panelQueryAccounts', () => {
     expect(panelQueryAccounts([], [])).toEqual({ accounts: [], autoSelected: false });
   });
 
+  it('keeps every account for a stat, which shows one number per account', () => {
+    // A stat renders four numbers in a card, not four lines on a chart, so the
+    // "unreadable" half of the auto-select rule does not apply. Slicing showed
+    // one account's number under that account's name and dropped the rest.
+    const scoped = resolvePanelAccounts({ account_type: 'K8S' }, ACCOUNTS);
+    expect(panelQueryAccounts(scoped, [], true)).toEqual({ accounts: scoped, autoSelected: false });
+  });
+
   it('keeps every account for a datasource that takes them in one call', () => {
     // The query engine answers an account_id LIST in a single request, so the
     // two reasons for auto-selecting — cost per call, and N identical series —
@@ -261,22 +269,56 @@ describe('multi-provider scope', () => {
     expect(deriveAccountTypes({ account_ids: ['a1', 'a2', 'g1'] }, ACCOUNTS)).toEqual(['AWS', 'GCP']);
   });
 
-  it('tells "all of these providers" apart from a hand-picked subset', () => {
-    // Every AWS + GCP account — what panelScopeFromTypes writes, so the editor
-    // should reopen it as two providers with the account picker empty.
-    expect(coversAllOfTypes({ account_ids: ['a1', 'a2', 'g1'] }, ACCOUNTS)).toBe(true);
-    // One of two AWS accounts is a real choice, and must be shown as one.
-    expect(coversAllOfTypes({ account_ids: ['a1'] }, ACCOUNTS)).toBe(false);
-    expect(coversAllOfTypes({ account_ids: [] }, ACCOUNTS)).toBe(false);
-  });
-
   it('round-trips a multi-provider scope through the editor', () => {
     const stored = panelScopeFromTypes(['AWS', 'GCP'], [], ACCOUNTS);
+    // What PanelEditorModal seeds its two controls with.
     const types = deriveAccountTypes(stored, ACCOUNTS);
-    const ids = coversAllOfTypes(stored, ACCOUNTS) ? [] : stored.account_ids || [];
+    const ids = stored.account_ids || [];
 
     expect(types).toEqual(['AWS', 'GCP']);
-    expect(ids).toEqual([]);
+    // Shown as ticked, not collapsed to an empty "all of these providers" field:
+    // the stored scope is PINNED to these ids and will not widen on its own, so
+    // an empty picker would claim a behaviour the panel does not have.
+    expect(ids).toEqual(['a1', 'a2', 'g1']);
     expect(panelScopeFromTypes(types, ids, ACCOUNTS)).toEqual(stored);
+  });
+});
+
+// #38137: the picker used to suffix every row with its provider — "aws-demo
+// (AWS)" — so a mixed list made the reader parse the same word on every row.
+// The provider is a section instead, and the row is just the account.
+describe('accountPickerOptions', () => {
+  const MIXED: AccountOption[] = [
+    { label: 'sandbox cluster', value: 'k2', cloud_provider: 'K8S' },
+    { label: 'aws-prod', value: 'w2', cloud_provider: 'AWS' },
+    { label: 'k8s-prod', value: 'k1', cloud_provider: 'K8S' },
+    { label: 'aws-demo', value: 'w1', cloud_provider: 'AWS' },
+  ];
+
+  it('names the provider on the group, not on every row', () => {
+    expect(accountPickerOptions(['K8S', 'AWS'], MIXED)).toEqual([
+      { label: 'aws-demo', value: 'w1', group: 'AWS' },
+      { label: 'aws-prod', value: 'w2', group: 'AWS' },
+      { label: 'k8s-prod', value: 'k1', group: 'K8S' },
+      { label: 'sandbox cluster', value: 'k2', group: 'K8S' },
+    ]);
+  });
+
+  it('sorts by provider then name, so sections and rows hold a stable order', () => {
+    const groups = accountPickerOptions(['K8S', 'AWS'], MIXED).map((o) => o.group);
+    expect(groups).toEqual(['AWS', 'AWS', 'K8S', 'K8S']);
+  });
+
+  it('lists only the chosen providers', () => {
+    expect(accountPickerOptions(['AWS'], MIXED).map((o) => o.value)).toEqual(['w1', 'w2']);
+  });
+
+  it('keeps a disabled account listed and says so', () => {
+    const withDisabled: AccountOption[] = [{ label: 'old-cluster', value: 'k9', cloud_provider: 'K8S', status: 'disabled' }];
+    expect(accountPickerOptions(['K8S'], withDisabled)).toEqual([{ label: 'old-cluster — disabled', value: 'k9', group: 'K8S' }]);
+  });
+
+  it('is empty when no type is chosen', () => {
+    expect(accountPickerOptions([], MIXED)).toEqual([]);
   });
 });

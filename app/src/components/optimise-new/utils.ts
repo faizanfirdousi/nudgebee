@@ -60,6 +60,13 @@ export const CATEGORY_RULE_LABELS: Record<string, Record<string, string>> = {
 };
 
 export const NON_SECURITY_CATEGORIES = ['RightSizing', 'InfraUpgrade', 'Configuration', 'K8sSpotRecommendation'];
+
+// What the Recommendations tab covers now that Configuration has its own tab:
+// the savings-bearing categories. Deliberately NOT the same as
+// NON_SECURITY_CATEGORIES, which stays the full set and is what the Summary tab
+// still reports on — Summary is a portfolio view and is updated separately, so
+// until then its totals legitimately exceed this tab's.
+export const RECOMMENDATION_CATEGORIES = ['RightSizing', 'InfraUpgrade', 'K8sSpotRecommendation'];
 export const DEFAULT_STATUS = ['Open', 'InProgress'];
 
 // Options for the Status filter. An empty selection means DEFAULT_STATUS, so the
@@ -214,6 +221,74 @@ export const ruleNameSearchText = (ruleName: string): string => {
 // A bare value (no separator) means "this rule, any category" — the legacy
 // shape, still produced by old shared ?rules= URLs, and treated as unscoped.
 const RULE_FILTER_SEP = '::';
+
+/** Parse a URL query param that may be a string or string[] into a string[] */
+export const parseQueryArray = (param: string | string[] | undefined): string[] => {
+  if (!param) {
+    return [];
+  }
+  return Array.isArray(param) ? param : [param];
+};
+
+// Accounts the list opens filtered to. Links here are written with two names for
+// the same thing: `account` is the filter's own, and `accountId` is what the
+// cluster, workload and home pages send and what the page keeps for its
+// write-permission check. Either one selects the account; `account` wins when a
+// link carries both.
+export const accountFilterFromQuery = (query: { account?: string | string[]; accountId?: string | string[] }): string[] => {
+  const named = parseQueryArray(query.account);
+  return named.length > 0 ? named : parseQueryArray(query.accountId);
+};
+
+// The query a filter selection is written back to the address as. Pure so the
+// rules below can be pinned without mounting the page.
+//
+// `accountId` follows the selection — the first of several, and absent when
+// nothing is selected. It is the name links here carry, the Resolutions tab
+// seeds from and the Auto Optimize write check reads, so leaving a stale one
+// behind would re-select an account the reader had just cleared.
+export const filtersToUrlQuery = (filters: {
+  severity: string[];
+  account: string[];
+  category: string[];
+  search: string;
+  safety: string[];
+  rules: string[];
+  status: string[];
+  savings: string;
+  lastSeen: string;
+}): Record<string, string | string[]> => {
+  const query: Record<string, string | string[]> = {};
+  if (filters.account.length > 0) {
+    query.accountId = filters.account[0];
+    query.account = filters.account;
+  }
+  if (filters.severity.length > 0) {
+    query.severity = filters.severity;
+  }
+  if (filters.category.length > 0) {
+    query.category = filters.category;
+  }
+  if (filters.search) {
+    query.search = filters.search;
+  }
+  if (filters.safety.length > 0) {
+    query.safety = filters.safety;
+  }
+  if (filters.rules.length > 0) {
+    query.rules = filters.rules;
+  }
+  if (filters.status.length > 0) {
+    query.status = filters.status;
+  }
+  if (filters.savings) {
+    query.savings = filters.savings;
+  }
+  if (filters.lastSeen) {
+    query.seen = filters.lastSeen;
+  }
+  return query;
+};
 
 export const makeRuleFilterValue = (ruleName: string, category?: string): string =>
   category ? `${ruleName}${RULE_FILTER_SEP}${category}` : ruleName;
@@ -477,4 +552,47 @@ export const getRecommendationBrief = (rec: any): string => {
     default:
       return getGenericBrief(data);
   }
+};
+
+// ─── Stat-card tabs ───
+
+/**
+ * Shared sx for the clickable stat-card tabs above a listing, each an interactive
+ * ds/Card (size='sm', `pressed`, and `disabled` when muted): the active card carries
+ * the same blue border + tint the Troubleshoot summary widgets use for their active
+ * drill-down. A zero-count card is a disabled Card, which dims it and makes it inert.
+ */
+export const cardTabSx = (pressed: boolean, muted: boolean) => ({
+  flex: 1,
+  minWidth: 0,
+  ...(muted
+    ? {}
+    : {
+        // Stat and Chip pin their own `cursor: default`, which would otherwise leave
+        // the hand pointer showing only on the card's bare padding. `&&` outranks them.
+        '&& *': { cursor: 'pointer' },
+        transition: `border-color ${ds.motion.micro} ${ds.motion.ease}, background-color ${ds.motion.micro} ${ds.motion.ease}`,
+        // Replaces Card's own hover, so the tab doesn't lift. Re-assert the blue border on
+        // hover for the active card — the gray hover border would otherwise mask its highlight.
+        '&:hover': { borderColor: pressed ? ds.blue[400] : ds.gray[400] },
+      }),
+  ...(pressed ? { borderColor: ds.blue[400], backgroundColor: ds.blue[100] } : {}),
+});
+
+/**
+ * Chrome for a detail panel's sticky footer action bar — the bar that holds what
+ * you can DO about the thing the panel is describing. Shared so the resolution
+ * panel's footer sits at the same height, tone and rhythm as the recommendation
+ * panel's, rather than approximating it.
+ */
+export const panelActionBarSx = {
+  borderTop: `1px solid ${ds.gray[200]}`,
+  backgroundColor: ds.background[100],
+  flexShrink: 0,
+  px: ds.space[4],
+  py: ds.space.mul(0, 6),
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'space-between',
+  gap: ds.space[2],
 };

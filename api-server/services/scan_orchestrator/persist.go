@@ -6,6 +6,7 @@ import (
 
 	"nudgebee/services/internal/database"
 	"nudgebee/services/internal/database/models"
+	"nudgebee/services/internal/database/pgbatch"
 	"nudgebee/services/security"
 
 	"github.com/jmoiron/sqlx"
@@ -121,13 +122,35 @@ func persistArchive(tx *sqlx.Tx, ctx *security.RequestContext, account ScanAccou
 		// image's open rows to Archive on each call, leaving only the last image
 		// scanned in a cycle visible in the UI. Scope the archive to THIS image,
 		// keyed on the image_name the parser embeds. account.TargetImage is the
-		// image being scanned; rides idx_recommendation_security_account_image_name.
+		// image being scanned; rides idx_recommendation_image_scan_account_image_name.
 		// Empty TargetImage matches no rows (image_name is never "") — a safe no-op.
+		//
+		// Do NOT narrow this with `account_object_id IS NOT NULL` to court an index:
+		// V733's index carried that predicate, which is why this statement could not
+		// use it at all (the planner can't prove an unasserted predicate) and fell
+		// back to scanning every image_scan row in the account, detoasting the
+		// recommendation JSONB per row to evaluate image_name as a filter. V902
+		// widened the index instead — adding the predicate here would leave rows with
+		// a NULL account_object_id permanently un-archived. That is not hypothetical:
+		// dev carries one such row today, status 'Open', which the narrowed form
+		// would strand forever.
+		//
+		// rule_name is spelled as a literal rather than bound so the planner can
+		// prove the second conjunct of V902's partial predicate (category='Security'
+		// AND rule_name='image_scan') without depending on plan type. With
+		// `rule_name = $4` the proof needs a CUSTOM plan; lib/pq issues unnamed
+		// prepared statements, which Postgres does plan with the actual values, so
+		// it works today — but a move to a driver with statement caching (pgx) or a
+		// named statement would silently fall back to a generic plan and lose the
+		// index again. Verified: under force_generic_plan the planner drops to
+		// idx_recommendation_tenant_account_status and filters image_name post-scan.
+		// The literal is a no-op on the result set — this branch runs only for
+		// image_scanner, whose RuleName is the ImageScanRuleName constant.
 		_, err := tx.Exec(
 			`UPDATE recommendation SET status = 'Archive', updated_at = $1
 			 WHERE tenant_id = $2 AND cloud_account_id = $3 AND category = 'Security'
-			   AND rule_name = $4 AND recommendation->>'image_name' = $5 AND status = 'Open'`,
-			time.Now(), account.TenantID, account.AccountID, scanner.RuleName, account.TargetImage,
+			   AND rule_name = 'image_scan' AND recommendation->>'image_name' = $4 AND status = 'Open'`,
+			time.Now(), account.TenantID, account.AccountID, account.TargetImage,
 		)
 		if err != nil {
 			ctx.GetLogger().Error("scan_orchestrator: image_scan archive failed",
@@ -170,9 +193,10 @@ func collectVulnerabilityRows(recs []Recommendation) []models.Vulnerability {
 	return vulnRows
 }
 
-// persistUpsertRecommendations UPSERTs recs in a single batch. Mirrors
-// recommendation.upsertRecommendationData (k8s_recommendation_service.go:43-61);
-// the on-conflict tuple is the recommendation table's unique index on
+// persistUpsertRecommendations UPSERTs recs, batched under Postgres's
+// bind-parameter limit (a single image can carry thousands of CVEs). Shares its shape
+// with recommendation.upsertRecommendationData; the on-conflict tuple is the
+// recommendation table's unique index on
 // (rule_name, cloud_account_id, resource_id, category, account_object_id).
 //
 // The status column is guarded by a CASE (below): a re-scan may move a row
@@ -215,14 +239,14 @@ func persistUpsertRecommendations(tx *sqlx.Tx, recs []Recommendation, vulnIDs ma
 			"vulnerability_id":       vulnerabilityID,
 		}
 		// finops_score / finops_band / finops_score_breakdown are inserted as zero
-		// values and filled by the 6h score-recompute cron — computing them inline
+		// values and filled by the score-recompute crons — computing them inline
 		// would create an import cycle with services/recommendation. They are NOT
 		// in the ON CONFLICT update below: overwriting on re-scan wiped real
 		// scores back to zero until the next cron pass.
 		rows = append(rows, row)
 	}
 
-	_, err := tx.NamedExec(
+	return pgbatch.NamedExec(tx,
 		`INSERT INTO recommendation
 		   (status, tenant_id, cloud_account_id, recommendation, severity, category, rule_name,
 		    estimated_savings, recommendation_action, resource_id, account_object_id, updated_at,
@@ -242,7 +266,6 @@ func persistUpsertRecommendations(tx *sqlx.Tx, recs []Recommendation, vulnIDs ma
 		               vulnerability_id = EXCLUDED.vulnerability_id`,
 		rows,
 	)
-	return err
 }
 
 func nullIfEmpty(s string) any {

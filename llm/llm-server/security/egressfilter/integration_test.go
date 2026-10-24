@@ -19,7 +19,7 @@ import (
 // running provider — they use fakeModel from egressfilter_test.go to assert the
 // egressfilter gates the call without altering payload semantics.
 
-// realisticConversation builds a representative ReWOO-style multi-turn message
+// realisticConversation builds a representative tool-calling multi-turn message
 // slice (system prompt + history + tool round-trip + new query).
 func realisticConversation(toolOutput string) []llms.MessageContent {
 	return []llms.MessageContent{
@@ -274,4 +274,22 @@ func TestIntegration_PointerTextContentIsHandled(t *testing.T) {
 	_, err := wrapped.GenerateContent(context.Background(), msgs)
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ErrSecretsBlocked))
+}
+
+// Anthropic prompt caching wraps the newest tool result (and the system /
+// human parts) in llms.CachedContent before the call reaches this wrapper.
+// A secret inside a cache-marked part must still be caught.
+func TestIntegration_SecretInCacheMarkedToolResponseIsBlocked(t *testing.T) {
+	msgs := realisticConversation("AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE")
+	msgs[3].Parts[0] = llms.WithCacheControl(msgs[3].Parts[0], &llms.CacheControl{Type: "ephemeral"})
+
+	inner := &fakeModel{respText: "should never reach"}
+	wrapped := WrapModel(inner, "anthropic", "claude-sonnet-4", true, ModeEnforce)
+
+	_, err := wrapped.GenerateContent(context.Background(), msgs)
+	require.Error(t, err)
+	assert.Equal(t, 0, inner.callCount(), "a secret in a cache-marked tool result must be blocked")
+	se, ok := AsError(err)
+	require.True(t, ok)
+	assert.Contains(t, se.RuleIDs, "aws-access-key-id")
 }

@@ -9,9 +9,10 @@ import Datetime from '@shared/format/Datetime';
 import DownloadButton from '@shared/buttons/DownloadButton';
 import { usePagination } from '@hooks/usePagination';
 import { hasWriteAccess } from '@lib/auth';
-import apiVm, { VmResource } from '@api1/vm';
-import { CellText, SeverityCounts, useLatestRequest } from './common';
+import apiVm, { VmResource, VmScanStatus } from '@api1/vm';
+import { CellText, ScanStatusIndicator, SeverityCounts, useLatestRequest } from './common';
 import ScanVmDialog from './ScanVmDialog';
+import ScanAccountDialog from './ScanAccountDialog';
 import VmPackages from './VmPackages';
 import VmVulnerabilities from './VmVulnerabilities';
 import { ds } from '@utils/colors';
@@ -46,9 +47,11 @@ const VmInventory = ({ accountId }: VmInventoryProps) => {
   const [packageCounts, setPackageCounts] = useState<Record<string, { count: number; lastSeenAt: string }>>({});
   const [osByVm, setOsByVm] = useState<Record<string, string>>({});
   const [vulnCounts, setVulnCounts] = useState<Record<string, Record<string, number>>>({});
+  const [scanStatuses, setScanStatuses] = useState<Record<string, VmScanStatus>>({});
   const [searchInput, setSearchInput] = useState('');
   const [appliedSearch, setAppliedSearch] = useState('');
   const [scanTarget, setScanTarget] = useState<VmResource | null>(null);
+  const [showAccountScan, setShowAccountScan] = useState(false);
   const { page, rowsPerPage, changePage, setPage } = usePagination();
   const beginVmsRequest = useLatestRequest();
   const beginEnrichmentRequest = useLatestRequest();
@@ -98,6 +101,10 @@ const VmInventory = ({ accountId }: VmInventoryProps) => {
       .getVulnerabilityCountsByVm(accountId)
       .then((counts) => isLatest() && setVulnCounts(counts))
       .catch((error) => console.error('Failed to load VM vulnerability counts:', error));
+    apiVm
+      .getScanStatuses(accountId)
+      .then((rows) => isLatest() && setScanStatuses(Object.fromEntries(rows.map((row) => [row.cloudResourceId, row]))))
+      .catch((error) => console.error('Failed to load VM scan statuses:', error));
   }, [accountId, beginEnrichmentRequest]);
 
   useEffect(() => {
@@ -107,6 +114,37 @@ const VmInventory = ({ accountId }: VmInventoryProps) => {
   useEffect(() => {
     fetchEnrichment();
   }, [fetchEnrichment]);
+
+  // While any VM is mid-scan, poll so "Scanning…" resolves to a fresh Last
+  // Scan time or "Scan failed" without a manual reload — the RPC only acks
+  // the start (see #38466). Capped at scanTimeout (server-side) + a margin,
+  // so a tab left open doesn't poll forever if a status write is ever lost.
+  const [pollDeadline, setPollDeadline] = useState<number | null>(null);
+  const hasActiveScan = Object.values(scanStatuses).some((status) => status.status === 'started');
+
+  // extendPoll is also called directly when an account-wide scan is
+  // acknowledged (see ScanAccountDialog's onClose below): scanVmAccount only
+  // publishes queue messages, so no vm_scan_status row — and therefore no
+  // hasActiveScan — exists until the queue consumer picks the work up later.
+  // Without this, the page would never start polling for an account scan and
+  // would sit on stale data until a manual reload.
+  const extendPoll = useCallback(() => setPollDeadline(Date.now() + 16 * 60 * 1000), []);
+
+  useEffect(() => {
+    if (hasActiveScan) extendPoll();
+  }, [hasActiveScan, extendPoll]);
+
+  useEffect(() => {
+    if (!pollDeadline) return undefined;
+    const interval = setInterval(() => {
+      if (Date.now() > pollDeadline) {
+        setPollDeadline(null);
+        return;
+      }
+      fetchEnrichment();
+    }, 10000);
+    return () => clearInterval(interval);
+  }, [pollDeadline, fetchEnrichment]);
 
   const onSearchEnter = () => {
     setAppliedSearch(searchInput);
@@ -133,7 +171,14 @@ const VmInventory = ({ accountId }: VmInventoryProps) => {
       { component: <Label tone={statusTone(vm.status)} size='sm' text={vm.status || 'Unknown'} /> },
       { component: <CellText text={packages ? String(packages.count) : 'Not scanned'} /> },
       { component: <SeverityCounts counts={severities} /> },
-      { component: packages?.lastSeenAt ? <Datetime value={packages.lastSeenAt} /> : <CellText text='—' /> },
+      {
+        component: (
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: ds.space[2] }}>
+            {packages?.lastSeenAt ? <Datetime value={packages.lastSeenAt} /> : <CellText text='—' />}
+            <ScanStatusIndicator status={scanStatuses[vm.id]} />
+          </Box>
+        ),
+      },
       {
         component: canScan ? (
           <Button id={`vm-scan-${vm.id}`} tone='secondary' size='sm' onClick={() => setScanTarget(vm)}>
@@ -149,7 +194,18 @@ const VmInventory = ({ accountId }: VmInventoryProps) => {
   return (
     <Box sx={{ px: ds.space[5], pb: ds.space[5] }}>
       <ListingLayout id='vm-inventory'>
-        <ListingLayout.Toolbar actions={<DownloadButton id={`${TABLE_ID}-download`} onClick={() => ({ tableId: TABLE_ID })} />}>
+        <ListingLayout.Toolbar
+          actions={
+            <Box sx={{ display: 'flex', gap: ds.space[2] }}>
+              {canScan && (
+                <Button id='vm-scan-account' tone='secondary' size='sm' onClick={() => setShowAccountScan(true)}>
+                  Scan
+                </Button>
+              )}
+              <DownloadButton id={`${TABLE_ID}-download`} onClick={() => ({ tableId: TABLE_ID })} />
+            </Box>
+          }
+        >
           <SearchInput
             id='vm-inventory-search'
             label='Search By Name Or Resource ID'
@@ -209,6 +265,21 @@ const VmInventory = ({ accountId }: VmInventoryProps) => {
           // A scan that just started has not written anything yet; refresh the
           // enrichment anyway so a scan finished a moment ago is picked up.
           if (started) fetchEnrichment();
+        }}
+      />
+
+      <ScanAccountDialog
+        open={showAccountScan}
+        accountId={accountId}
+        onClose={(started: boolean) => {
+          setShowAccountScan(false);
+          if (started) {
+            fetchEnrichment();
+            // The account-wide scan only publishes queue messages here — no
+            // vm_scan_status row exists yet, so hasActiveScan alone would
+            // never trigger polling. Start it explicitly.
+            extendPoll();
+          }
         }}
       />
     </Box>

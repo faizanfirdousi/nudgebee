@@ -2,8 +2,35 @@ import type { NextApiRequest, NextApiResponse } from 'next';
 import crypto from 'crypto';
 import { context, propagation, trace, SpanStatusCode } from '@opentelemetry/api';
 import { authenticateRequest, tryBypassGraphQL } from '@lib/rpcGateway';
+import { checkIdentityRateLimit, checkPreAuthRateLimit } from '@lib/rateLimitHooks';
 
 const SLOW_THRESHOLD_MS = 500;
+
+// Rate limiting is an EE feature. The budgets, the key derivation and the
+// shared counters all live in `@ee/ratelimit`, which registers itself through
+// `@lib/rateLimitHooks` at server boot. With nothing registered — an OSS
+// build, where the EE tree is removed — both checks below admit every
+// request and this gateway is unthrottled by design.
+
+const THROTTLED_MESSAGE = 'Too many requests. Please retry in a moment.';
+
+// GraphQL clients expect an `errors` array; keep the 429 and Retry-After so a
+// caller that reads status codes can back off properly.
+function sendThrottled(res: NextApiResponse, retryAfterSec: number) {
+  res.setHeader('Retry-After', String(retryAfterSec));
+  res.status(429).json({ errors: [{ message: THROTTLED_MESSAGE }] });
+}
+
+// NextAuth puts the user id in `sub`; bearer-synthesized JWTs carry the same
+// shape. Fall back through the fields that identify a caller, and return an
+// empty string when none is present — the limiter decides the fallback.
+function jwtSubject(jwt: Record<string, unknown> | null | undefined): string {
+  if (!jwt) {
+    return '';
+  }
+  const candidate = jwt.sub ?? jwt.email ?? jwt.userId;
+  return typeof candidate === 'string' ? candidate : '';
+}
 
 export type GatewayHandlerOptions = {
   // OpenTelemetry tracer name + log prefix.
@@ -12,6 +39,24 @@ export type GatewayHandlerOptions = {
 };
 
 // Shared GraphQL→RPC gateway request handler used by /api/graphql.
+/**
+ * A signal that aborts when the client stops waiting: the browser cancelled
+ * (a panel's 30s deadline), or nginx cut the upstream read at its timeout.
+ * `res` closes in both cases; `writableFinished` separates them from the
+ * normal close that follows a sent response.
+ */
+export function clientGone(res: NextApiResponse): AbortSignal {
+  const controller = new AbortController();
+  // Already gone (left during auth or rate limiting): 'close' has fired and
+  // will not fire again, so abort now.
+  if (res.destroyed) controller.abort();
+  else
+    res.on('close', () => {
+      if (!res.writableFinished) controller.abort();
+    });
+  return controller.signal;
+}
+
 export async function handleGatewayRequest(req: NextApiRequest, res: NextApiResponse, opts: GatewayHandlerOptions) {
   const t0 = performance.now();
   const tracer = trace.getTracer(opts.tracerName);
@@ -44,6 +89,16 @@ export async function handleGatewayRequest(req: NextApiRequest, res: NextApiResp
     try {
       const body = req.body;
 
+      // --- Step 0: Throttle before authentication ---
+      // authenticateRequest decrypts a bearer token or verifies a session
+      // cookie on every call; an unauthenticated flood should not get that far.
+      const preAuthCheck = await checkPreAuthRateLimit(req);
+      if (!preAuthCheck.allowed) {
+        span.setAttribute('ratelimit.denied', preAuthCheck.deniedBy ?? 'preauth');
+        sendThrottled(res, preAuthCheck.retryAfterSec);
+        return;
+      }
+
       // --- Step 1: Authentication (NextAuth cookie OR Bearer token) ---
       // Two callers in practice: browser frontend (NextAuth session cookie)
       // and non-browser callers like nbctl (encrypted bearer token from
@@ -68,6 +123,17 @@ export async function handleGatewayRequest(req: NextApiRequest, res: NextApiResp
       authSpan.end();
       timing.auth_total_ms = Math.round(performance.now() - t0);
 
+      // --- Step 1b: Per-caller budget ---
+      // Passes the authenticated subject and lets the registered limiter
+      // decide what to key on (and what to fall back to when there is none),
+      // so no identity derivation lives on this side of the hook.
+      const userCheck = await checkIdentityRateLimit(req, jwtSubject(auth.jwt));
+      if (!userCheck.allowed) {
+        span.setAttribute('ratelimit.denied', userCheck.deniedBy ?? 'user');
+        sendThrottled(res, userCheck.retryAfterSec);
+        return;
+      }
+
       const jwtSessionToken = auth.jwt;
       const token = auth.token;
 
@@ -90,6 +156,7 @@ export async function handleGatewayRequest(req: NextApiRequest, res: NextApiResp
         clientAuthorization: token ? `Bearer ${token}` : undefined,
         traceparent: traceParent,
         requestId,
+        signal: clientGone(res),
       });
       timing.gateway_ms = Math.round(performance.now() - tGateway);
 
@@ -129,9 +196,29 @@ export async function handleGatewayRequest(req: NextApiRequest, res: NextApiResp
       // so this line joins the backend services' logs for the same request in Loki.
       const traceId = traceParent.split('-')[1] || '';
       if (totalMs > SLOW_THRESHOLD_MS) {
-        console.warn(`[${opts.logPrefix}] SLOW ${operationName} ${totalMs}ms trace_id=${traceId}`, JSON.stringify(timing));
+        console.warn(
+          '%s',
+          JSON.stringify({
+            severity: 'warn',
+            prefix: opts.logPrefix,
+            operationName,
+            totalMs,
+            trace_id: traceId,
+            timing,
+          })
+        );
       } else {
-        console.log(`[${opts.logPrefix}] ${operationName} ${totalMs}ms trace_id=${traceId}`, JSON.stringify(timing));
+        console.log(
+          '%s',
+          JSON.stringify({
+            severity: 'info',
+            prefix: opts.logPrefix,
+            operationName,
+            totalMs,
+            trace_id: traceId,
+            timing,
+          })
+        );
       }
       span.end();
     }

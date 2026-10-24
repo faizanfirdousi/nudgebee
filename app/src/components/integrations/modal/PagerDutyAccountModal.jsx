@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { Modal } from '@ui/Modal';
+import { useBrandingConfig } from '@hooks/useTenantBranding';
 import { Typography, Box } from '@mui/material';
 import { Input } from '@ui/Input';
 import { Checkbox } from '@ui/Checkbox';
@@ -10,6 +11,7 @@ import PropTypes from 'prop-types';
 import { Button } from '@ui/Button';
 import { toast as snackbar } from '@ui/Toast';
 import { ds } from 'src/utils/colors';
+import { getIntegrationDescription } from '@lib/integrationDescriptions';
 
 const PAGERDUTY_DEFAULT_URL = 'api.pagerduty.com';
 
@@ -19,6 +21,7 @@ const PAGERDUTY_DEFAULT_URL = 'api.pagerduty.com';
 const TOKEN_PLACEHOLDER = '••••••••';
 
 const PagerDutyAccountModal = ({ openModal, handleClose, editConfig = null }) => {
+  const { title: baseTitle } = useBrandingConfig();
   const isEdit = !!editConfig;
   const [pagerDutyName, setPagerDutyName] = useState('');
   const [pagerDutyEmail, setPagerDutyEmail] = useState('');
@@ -174,6 +177,7 @@ const PagerDutyAccountModal = ({ openModal, handleClose, editConfig = null }) =>
       open={openModal}
       handleClose={handleClosePagerDutyModal}
       title={isEdit ? 'Edit PagerDuty Account' : 'Add PagerDuty Account'}
+      subtitle={getIntegrationDescription('PAGERDUTY')}
       loader={isSubmitting}
     >
       <Box sx={{ minHeight: ds.space.mul(0, 100), pt: ds.space[5], pb: ds.space[2] }}>
@@ -302,7 +306,7 @@ const PagerDutyAccountModal = ({ openModal, handleClose, editConfig = null }) =>
               onChange={(next) => setRcaWritebackEnabled(next)}
               disabled={isSubmitting}
               label='Post RCA analysis to PagerDuty incidents'
-              description='When enabled, NudgeBee posts its root-cause analysis as a note on the originating PagerDuty incident (HIGH severity).'
+              description={`When enabled, ${baseTitle} posts its root-cause analysis as a note on the originating PagerDuty incident (HIGH severity).`}
             />
           </Box>
         </Box>

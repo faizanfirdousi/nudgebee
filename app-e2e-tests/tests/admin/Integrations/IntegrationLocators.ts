@@ -15,6 +15,11 @@ export class IntegrationLocators extends CommonLocators {
   readonly serversTab!: Locator;
   readonly reposTab!: Locator;
 
+  // Loki default-log-provider toggle (Observability tab -> Loki card -> its
+  // account-form page). Card id follows AccountCard's derivation in
+  // integration.jsx: cloud_provider.split('_').map(capitalize).join('-') + '-section-card'.
+  readonly lokiSectionCard!: Locator;
+
   readonly azureBtn!: Locator;
   readonly azureHeader!: Locator;
   readonly addAzureAccountBtn!: Locator;
@@ -141,6 +146,7 @@ export class IntegrationLocators extends CommonLocators {
   readonly confluenceTokenInput!: Locator;
   readonly confluenceUserNameInput!: Locator;
   readonly confluenceSuccessToast!: Locator;
+  readonly confluenceUpdateSuccessToast!: Locator;
   readonly confluenceDuplicateErrorToast!: Locator;
   readonly confluenceTestConnectionBtn!: Locator;
   readonly confluenceTestConnectionSuccessToast!: Locator;
@@ -236,6 +242,8 @@ export class IntegrationLocators extends CommonLocators {
   readonly mcpLlmInstructionsInput!: Locator;
   readonly mcpSuccessToast!: Locator;
   readonly mcpDuplicateErrorToast!: Locator;
+  readonly mcpTestConnectionBtn!: Locator;
+  readonly mcpTestConnectionSuccessToast!: Locator;
 
   constructor(page: Page) {
     super(page);
@@ -246,6 +254,7 @@ export class IntegrationLocators extends CommonLocators {
     this.kubernetestcloudTab = page.locator("#cloud");
     this.databaseTab = page.locator("#database");
     this.observabilityTab = page.getByRole("tab", { name: "Observability" });
+    this.lokiSectionCard = page.locator("#Loki-section-card");
     this.inmemoryTab = page.locator("#in-memory");
     this.genericErrorToast = page.locator(
       '[role="alert"].MuiAlert-filledError, [role="alert"].MuiAlert-standardError, .toast-error',
@@ -530,6 +539,10 @@ export class IntegrationLocators extends CommonLocators {
     this.confluenceDuplicateErrorToast = page.getByText("already exists", {
       exact: false,
     });
+    this.confluenceUpdateSuccessToast = page.getByText(
+      "Confluence account updated successfully",
+      { exact: false },
+    );
     this.confluenceTestConnectionBtn = page.locator("#test-connection-btn")
       .or(page.getByRole("button", { name: /test connection/i }));
     this.confluenceTestConnectionSuccessToast = page.getByText("connection successful", { exact: false });
@@ -642,10 +655,9 @@ export class IntegrationLocators extends CommonLocators {
       "Test notification sent to Slack successfully!",
       { exact: false },
     );
-    this.slackTestErrorToast = page.getByText(
-      "Failed to send test notification to Slack",
-      { exact: false },
-    );
+    this.slackTestErrorToast = this.genericErrorToast
+      .or(page.getByText("Failed to send test notification to Slack", { exact: false }))
+      .first();
 
     // MS Teams Locators
     // Section card ID computed from provider "MSTEAMS" → "Msteams" → "Msteams-section-card"
@@ -654,13 +666,11 @@ export class IntegrationLocators extends CommonLocators {
     this.addToMsTeamsBtn = page.locator("#add-to-ms-teams-btn");
     this.testMsTeamsNotificationBtn = page.locator("#test-ms-teams-btn");
     this.msTeamsTestSuccessToast = page.getByText(
-      "Test notification sent to Ms Teams successfully!",
-      { exact: false },
+      /Test notification sent to (Microsoft|Ms) Teams successfully!/,
     );
-    this.msTeamsTestErrorToast = page.getByText(
-      "Failed to send test notification to Ms Teams",
-      { exact: false },
-    );
+    this.msTeamsTestErrorToast = this.genericErrorToast
+      .or(page.getByText(/Failed to send test notification to (Microsoft|Ms) Teams/))
+      .first();
 
     // Google Chat Locators
     // Section card ID computed from provider "GOOGLE_CHAT" → "Google-Chat" → "Google-Chat-section-card"
@@ -690,6 +700,9 @@ export class IntegrationLocators extends CommonLocators {
     this.mcpDuplicateErrorToast = page.getByText("already exists", {
       exact: false,
     });
+    this.mcpTestConnectionBtn = page.locator("#test-connection-btn")
+      .or(page.getByRole("button", { name: /test connection/i }));
+    this.mcpTestConnectionSuccessToast = page.getByText("connection successful", { exact: false });
   }
 
   getIntegrationByName(name: string): Locator {

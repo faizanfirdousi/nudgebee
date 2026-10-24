@@ -10,7 +10,7 @@ import { googleAuth, oktaAuth, oneloginAuth, azureAuth, auth0Auth, NBIconSignIn 
 import SafeIcon from '@shared/icons/SafeIcon';
 import { ds } from 'src/utils/colors';
 import { EmailRegEx } from '@lib/validation';
-import { Divider } from '@mui/material';
+import { Divider } from '@ui/Divider';
 import { useRouter } from 'next/router';
 import ArrowBackIcon from '@mui/icons-material/ArrowBack';
 import { SignInProviderExtraSlot } from '@shared/auth/SignInProviderExtraSlot';
@@ -54,7 +54,7 @@ const AuthMethodButton: React.FC<AuthMethodButtonProps> = ({ title, subtitle, on
           backgroundColor: 'white',
           border: `1px solid ${ds.gray[300]}`,
           transform: 'translateY(-1.5px)',
-          boxShadow: '0 6px 8px rgba(0, 0, 0, 0.08)',
+          boxShadow: `0 6px 8px ${ds.gray.alpha[200]}`,
         },
       }}
     >
@@ -307,8 +307,12 @@ export default function SignInV2({ providers, samlEnabled, tier }: any) {
       <>
         <Head>
           {!brandingLoading && brandFaviconUrl && <link rel='icon' href={brandFaviconUrl} />}
-          <title>{brandTitle || 'Nudgebee'}: Login</title>
-          <meta property='og:title' content={`${brandTitle || 'Nudgebee'} - Signin`} key='title' />
+          {/* Gated like the favicon above. Ungated, the `|| 'Nudgebee'` fallback
+              painted the house brand into the tab for every frame before
+              /api/public/app_config resolved, so a partner deployment read
+              "Nudgebee: Login" and then repainted to its own name. */}
+          {!brandingLoading && <title>{`${brandTitle}: Login`}</title>}
+          {!brandingLoading && <meta property='og:title' content={`${brandTitle} - Signin`} key='title' />}
         </Head>
         <Box
           sx={{
@@ -351,7 +355,7 @@ export default function SignInV2({ providers, samlEnabled, tier }: any) {
           fontSize: 'var(--ds-text-heading)',
           fontWeight: 'var(--ds-font-weight-semibold)',
           color: ds.gray[700],
-          fontFamily: 'Poppins, sans-serif',
+          fontFamily: ds.font.display,
           letterSpacing: '-0.6px',
         }}
       >
@@ -439,7 +443,7 @@ export default function SignInV2({ providers, samlEnabled, tier }: any) {
           fontSize: 'var(--ds-text-heading)',
           fontWeight: 'var(--ds-font-weight-semibold)',
           color: ds.gray[700],
-          fontFamily: 'Poppins, sans-serif',
+          fontFamily: ds.font.display,
           letterSpacing: '-0.6px',
         }}
       >
@@ -477,6 +481,7 @@ export default function SignInV2({ providers, samlEnabled, tier }: any) {
           label='LDAP Password'
           id='ldapPassword'
           type='password'
+          autoComplete='current-password'
           placeholder='Enter LDAP password'
           value={ldapCredsPassword}
           error={helperText.ldapPassword || undefined}
@@ -532,7 +537,7 @@ export default function SignInV2({ providers, samlEnabled, tier }: any) {
           fontSize: 'var(--ds-text-heading)',
           fontWeight: 'var(--ds-font-weight-semibold)',
           color: ds.gray[700],
-          fontFamily: 'Poppins, sans-serif',
+          fontFamily: ds.font.display,
           letterSpacing: '-0.6px',
         }}
       >
@@ -571,6 +576,7 @@ export default function SignInV2({ providers, samlEnabled, tier }: any) {
           label='Admin Password'
           id='credsPassword'
           type='password'
+          autoComplete='current-password'
           placeholder='Enter admin password'
           value={credsPassword}
           error={helperText.credsPassword || undefined}
@@ -626,7 +632,7 @@ export default function SignInV2({ providers, samlEnabled, tier }: any) {
             fontSize: 'var(--ds-text-display)',
             fontWeight: 'var(--ds-font-weight-semibold)',
             color: ds.gray[700],
-            fontFamily: 'Poppins, sans-serif',
+            fontFamily: ds.font.display,
             letterSpacing: -1,
           }}
         >
@@ -673,7 +679,7 @@ export default function SignInV2({ providers, samlEnabled, tier }: any) {
                   backgroundColor: 'white',
                   border: '1px solid var(--ds-brand-200)',
                   transform: 'translateY(-1px)',
-                  boxShadow: '0 6px 8px rgba(0, 0, 0, 0.1)',
+                  boxShadow: `0 6px 8px ${ds.gray.alpha[300]}`,
                 },
               }}
             >
@@ -693,15 +699,7 @@ export default function SignInV2({ providers, samlEnabled, tier }: any) {
       {/* Divider between providers and Magic Link */}
       {(otherIconProviders.length > 0 || samlEnabled) && emailProvider && (
         <Box sx={{ my: ds.space[5] }}>
-          <Divider
-            sx={{
-              color: ds.gray[300],
-              fontSize: 'var(--ds-text-small)',
-              '&::before, &::after': { borderColor: ds.gray[300] },
-            }}
-          >
-            OR
-          </Divider>
+          <Divider label='OR' color={ds.gray[300]} sx={{ my: 0 }} />
         </Box>
       )}
 
@@ -731,15 +729,7 @@ export default function SignInV2({ providers, samlEnabled, tier }: any) {
       {/* Divider between Magic Link and LDAP */}
       {emailProvider && ldapProvider && (
         <Box sx={{ my: ds.space[5] }}>
-          <Divider
-            sx={{
-              color: ds.gray[300],
-              fontSize: 'var(--ds-text-small)',
-              '&::before, &::after': { borderColor: ds.gray[300] },
-            }}
-          >
-            OR
-          </Divider>
+          <Divider label='OR' color={ds.gray[300]} sx={{ my: 0 }} />
         </Box>
       )}
 
@@ -764,15 +754,7 @@ export default function SignInV2({ providers, samlEnabled, tier }: any) {
       {/* Divider before Teleport */}
       {ldapProvider && teleportProvider && (
         <Box sx={{ my: ds.space[5] }}>
-          <Divider
-            sx={{
-              color: ds.gray[300],
-              fontSize: 'var(--ds-text-small)',
-              '&::before, &::after': { borderColor: ds.gray[300] },
-            }}
-          >
-            OR
-          </Divider>
+          <Divider label='OR' color={ds.gray[300]} sx={{ my: 0 }} />
         </Box>
       )}
 
@@ -796,15 +778,7 @@ export default function SignInV2({ providers, samlEnabled, tier }: any) {
       {/* Divider before Credentials */}
       {(ldapProvider || teleportProvider || emailProvider) && credentialsProvider && (
         <Box sx={{ my: ds.space[5] }}>
-          <Divider
-            sx={{
-              color: ds.gray[300],
-              fontSize: 'var(--ds-text-small)',
-              '&::before, &::after': { borderColor: ds.gray[300] },
-            }}
-          >
-            OR
-          </Divider>
+          <Divider label='OR' color={ds.gray[300]} sx={{ my: 0 }} />
         </Box>
       )}
 
@@ -837,8 +811,12 @@ export default function SignInV2({ providers, samlEnabled, tier }: any) {
     <>
       <Head>
         {!brandingLoading && brandFaviconUrl && <link rel='icon' href={brandFaviconUrl} />}
-        <title>{brandTitle || 'Nudgebee'}: Login</title>
-        <meta property='og:title' content={`${brandTitle || 'Nudgebee'} - Signin`} key='title' />
+        {/* Gated like the favicon above. Ungated, the `|| 'Nudgebee'` fallback
+            painted the house brand into the tab for every frame before
+            /api/public/app_config resolved, so a partner deployment read
+            "Nudgebee: Login" and then repainted to its own name. */}
+        {!brandingLoading && <title>{`${brandTitle}: Login`}</title>}
+        {!brandingLoading && <meta property='og:title' content={`${brandTitle} - Signin`} key='title' />}
       </Head>
 
       <AuthTemplateV2>

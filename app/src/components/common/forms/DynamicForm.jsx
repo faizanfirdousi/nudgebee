@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import PropTypes from 'prop-types';
-import { Box, Typography, Card, Stack, Paper, Alert, CircularProgress } from '@mui/material';
+import { Box, Typography, Stack, CircularProgress } from '@mui/material';
+import { Card } from '@ui/Card';
 import { Chip } from '@ui/Chip';
 import { Divider } from '@ui/Divider';
 import { Checkbox } from '@ui/Checkbox';
@@ -13,6 +14,7 @@ import { ds } from '@utils/colors';
 import { Textarea } from '@components/k8s/common/TextArea';
 import { snakeToTitleCase } from 'src/utils/common';
 import SigNozQueryAutocomplete from '@components/events/SigNozQueryAutocomplete';
+import ModelAliasList from '@components/common/forms/ModelAliasList';
 import SafeIcon from '@shared/icons/SafeIcon';
 
 const errorBorderStyle = {
@@ -50,14 +52,25 @@ const DynamicForm = ({ actionKey, onChange, errors = {}, initialValues = {}, act
     }
     let current = obj;
 
+    // The upfront check above already rejects these keys, so the per-key checks
+    // below never fire; they are kept inline at each write so CodeQL's
+    // js/prototype-pollution-utility query recognises the guard (alert #345).
     for (let i = 0; i < keys.length - 1; i++) {
-      if (!current[keys[i]] || typeof current[keys[i]] !== 'object') {
-        current[keys[i]] = {};
+      const key = keys[i];
+      if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
+        return;
       }
-      current = current[keys[i]];
+      if (!current[key] || typeof current[key] !== 'object') {
+        current[key] = {};
+      }
+      current = current[key];
     }
 
-    current[keys[keys.length - 1]] = value;
+    const lastKey = keys[keys.length - 1];
+    if (lastKey === '__proto__' || lastKey === 'constructor' || lastKey === 'prototype') {
+      return;
+    }
+    current[lastKey] = value;
   };
 
   // Helper function to get default value based on field type
@@ -136,7 +149,7 @@ const DynamicForm = ({ actionKey, onChange, errors = {}, initialValues = {}, act
               possible_values: generatedValues,
             };
           } catch (error) {
-            console.error(`Failed to generate values for ${key}:`, error);
+            console.error('Failed to generate values', { key, error });
           }
         }
       }
@@ -283,8 +296,10 @@ const DynamicForm = ({ actionKey, onChange, errors = {}, initialValues = {}, act
 
     const getErrorStyles = (error) => (error ? errorBorderStyle : {});
 
-    // showErrorAlert: when the wrapped child renders its own error message (DS Input does), the
-    // outer Alert would duplicate it. Pass `false` for those fields.
+    // showErrorAlert: when the wrapped child renders its own error message (DS Input and Select
+    // do, via `error`), the wrapper's message would duplicate it. Pass `false` for those fields.
+    // The wrapper's message matches their error caption, so every field's error looks the same
+    // (design-system.md: a field's own validation error is a caption, not a Callout).
     const fieldWrapper = (children, showDescription = true, showErrorAlert = true) => (
       <Box sx={{ mb: ds.space[5] }}>
         <Typography
@@ -310,9 +325,13 @@ const DynamicForm = ({ actionKey, onChange, errors = {}, initialValues = {}, act
           </Typography>
         )}
         {showErrorAlert && errorText && typeof errorText === 'string' && (
-          <Alert severity='error' sx={{ mt: ds.space[2] }}>
+          <Box
+            component='span'
+            role='alert'
+            sx={{ display: 'block', mt: 'var(--ds-space-1)', fontSize: 'var(--ds-text-caption)', color: 'var(--ds-red-600)' }}
+          >
             {errorText}
-          </Alert>
+          </Box>
         )}
       </Box>
     );
@@ -326,8 +345,10 @@ const DynamicForm = ({ actionKey, onChange, errors = {}, initialValues = {}, act
           disabled
           onChange={() => {}}
           placeholder={`${(field.display_name || key).toLowerCase()}`}
+          error={typeof errorText === 'string' && errorText ? errorText : undefined}
         />,
-        true
+        true,
+        false
       );
     }
 
@@ -339,7 +360,7 @@ const DynamicForm = ({ actionKey, onChange, errors = {}, initialValues = {}, act
             {(currentValue || []).length > 0 && (
               <Stack spacing={2} sx={{ mb: ds.space[4] }}>
                 {(currentValue || []).map((_obj, index) => (
-                  <Card key={index} variant='outlined' sx={{ p: ds.space[4], position: 'relative' }}>
+                  <Card key={index} variant='outlined' size='sm' elevation='flat' sx={{ position: 'relative' }}>
                     <Box sx={{ position: 'absolute', top: ds.space[2], right: ds.space[2] }}>
                       <DsButton
                         tone='secondary'
@@ -368,7 +389,7 @@ const DynamicForm = ({ actionKey, onChange, errors = {}, initialValues = {}, act
 
             {/* Inputs for a NEW object */}
             {field.extra_params && (
-              <Card variant='outlined' sx={{ p: ds.space[4], borderStyle: 'dashed' }}>
+              <Card variant='outlined' size='sm' elevation='flat' sx={{ borderStyle: 'dashed' }}>
                 <Typography variant='body2' sx={{ mb: ds.space[2], fontWeight: 'var(--ds-font-weight-medium)' }}>
                   Add New {(field.display_name || key).toLowerCase()}
                 </Typography>
@@ -399,31 +420,27 @@ const DynamicForm = ({ actionKey, onChange, errors = {}, initialValues = {}, act
         if (field.extra_params) {
           return (
             <Box key={key} sx={{ mb: ds.space[5] }}>
-              <Card variant='outlined' sx={{ backgroundColor: depth === 0 ? ds.background[200] : ds.background[100] }}>
-                <Box sx={{ p: ds.space[4] }}>
-                  <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: ds.space[2] }}>
-                    <Typography
-                      sx={{ fontSize: 'var(--ds-text-body-lg)', fontWeight: 'var(--ds-font-weight-semibold)', color: 'var(--ds-brand-500)' }}
-                    >
-                      {field.display_name || key}
-                      {field.required && (
-                        <Typography component='span' sx={{ color: 'error.main', ml: ds.space[1] }}>
-                          *
-                        </Typography>
-                      )}
-                    </Typography>
-                  </Box>
+              <Card variant={depth === 0 ? 'tinted' : 'outlined'} size='sm' elevation='flat'>
+                <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: ds.space[2] }}>
+                  <Typography sx={{ fontSize: ds.text.bodyLg, fontWeight: ds.weight.semibold, color: ds.brand[500] }}>
+                    {field.display_name || key}
+                    {field.required && (
+                      <Typography component='span' sx={{ color: 'error.main', ml: ds.space[1] }}>
+                        *
+                      </Typography>
+                    )}
+                  </Typography>
+                </Box>
 
-                  {field.description && (
-                    <Typography variant='caption' color='text.secondary' sx={{ mb: ds.space[4], display: 'block' }}>
-                      {field.description}
-                    </Typography>
-                  )}
-                  <Box sx={{ pl: ds.space[4], borderLeft: `${ds.space[0]} solid var(--ds-brand-150)`, mt: ds.space[4] }}>
-                    <Stack spacing={2}>
-                      {Object.keys(field.extra_params).map((subKey) => renderFieldGroup(subKey, field.extra_params[subKey], currentPath, depth + 1))}
-                    </Stack>
-                  </Box>
+                {field.description && (
+                  <Typography variant='caption' color='text.secondary' sx={{ mb: ds.space[4], display: 'block' }}>
+                    {field.description}
+                  </Typography>
+                )}
+                <Box sx={{ pl: ds.space[4], borderLeft: `${ds.space[0]} solid var(--ds-brand-150)`, mt: ds.space[4] }}>
+                  <Stack spacing={2}>
+                    {Object.keys(field.extra_params).map((subKey) => renderFieldGroup(subKey, field.extra_params[subKey], currentPath, depth + 1))}
+                  </Stack>
                 </Box>
               </Card>
             </Box>
@@ -442,7 +459,10 @@ const DynamicForm = ({ actionKey, onChange, errors = {}, initialValues = {}, act
               options={field.possible_values ?? []}
               disabled={field.possible_values?.length === 0 || isLoading}
               onChange={(next) => handleChange(currentPath, next)}
-            />
+              error={typeof errorText === 'string' && errorText ? errorText : undefined}
+            />,
+            true,
+            false
           );
         }
         break;
@@ -478,6 +498,19 @@ const DynamicForm = ({ actionKey, onChange, errors = {}, initialValues = {}, act
         );
 
       case 'string':
+        // A string field can opt into a structured pair-editor (client-facing name →
+        // served model) so the alias isn't hidden inside a comma-joined `alias=served`
+        // string. It serializes back to that exact string, so the stored value is unchanged.
+        if (field.widget === 'model_alias_list') {
+          return fieldWrapper(
+            <ModelAliasList
+              key={currentPath}
+              value={currentValue || ''}
+              onChange={(next) => handleChange(currentPath, next)}
+              disabled={field.is_editable === false || isLoading}
+            />
+          );
+        }
         if (field.possible_values?.length > 0) {
           return fieldWrapper(
             <Select
@@ -487,7 +520,10 @@ const DynamicForm = ({ actionKey, onChange, errors = {}, initialValues = {}, act
               onChange={(next) => handleChange(currentPath, next)}
               disabled={isLoading}
               label={snakeToTitleCase(key)}
-            />
+              error={typeof errorText === 'string' && errorText ? errorText : undefined}
+            />,
+            true,
+            false
           );
         }
         return fieldWrapper(
@@ -525,7 +561,7 @@ const DynamicForm = ({ actionKey, onChange, errors = {}, initialValues = {}, act
         return fieldWrapper(
           <Box>
             {Object.keys(currentValue || {}).length > 0 && (
-              <Paper sx={{ p: ds.space[4], mb: ds.space[4], bgcolor: 'grey.50' }}>
+              <Card variant='tinted' size='sm' elevation='flat' sx={{ mb: ds.space[4] }}>
                 <Typography variant='body2' sx={{ mb: ds.space[2], fontWeight: 'var(--ds-font-weight-medium)' }} />
                 <Stack spacing={1}>
                   {Object.entries(currentValue || {}).map(([mapKey, mapValue]) => (
@@ -542,7 +578,7 @@ const DynamicForm = ({ actionKey, onChange, errors = {}, initialValues = {}, act
                     </Box>
                   ))}
                 </Stack>
-              </Paper>
+              </Card>
             )}
             <Box display='flex' gap={ds.space[2]} alignItems='center'>
               <Box sx={{ flex: 1 }}>
@@ -584,7 +620,7 @@ const DynamicForm = ({ actionKey, onChange, errors = {}, initialValues = {}, act
         return fieldWrapper(
           <Box>
             {(currentValue || []).length > 0 && (
-              <Paper sx={{ p: ds.space[4], mb: ds.space[4], bgcolor: 'grey.50' }}>
+              <Card variant='tinted' size='sm' elevation='flat' sx={{ mb: ds.space[4] }}>
                 <Typography variant='body2' sx={{ mb: ds.space[2], fontWeight: 'var(--ds-font-weight-medium)' }} />
                 <Stack direction='row' spacing={1} flexWrap='wrap' useFlexGap>
                   {(currentValue || []).map((value, index) => (
@@ -599,7 +635,7 @@ const DynamicForm = ({ actionKey, onChange, errors = {}, initialValues = {}, act
                     </Chip>
                   ))}
                 </Stack>
-              </Paper>
+              </Card>
             )}
             <Box display='flex' gap={ds.space[2]} alignItems='center'>
               <Box sx={{ flex: 1, maxWidth: ds.space.mul(0, 200) }}>

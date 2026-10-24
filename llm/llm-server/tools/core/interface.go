@@ -1,6 +1,28 @@
 package core
 
-import "nudgebee/llm/security"
+import (
+	"errors"
+
+	"nudgebee/llm/security"
+)
+
+// MetadataResolvedTarget is the tool-call metadata key naming the configured
+// target a call ran against; MetadataResolvedBy names how it was chosen.
+//
+// Deliberately not "tool_config_name": that key is already carried in some
+// tools' own call context (watch's poll contract) and can hold the
+// "NoConfigToolsFound" sentinel, so reusing it would mix a tool's own value
+// with what actually ran and make the recorded data unusable for counting.
+const (
+	MetadataResolvedTarget = "nb_resolved_target"
+	MetadataResolvedBy     = "nb_resolved_by"
+)
+
+// ErrNoMatchingConfig means configs exist for this tool but none of them is the
+// system the question is about. Distinct from having no configuration at all:
+// the caller should be told which targets exist and that none matches, rather
+// than being handed one of them.
+var ErrNoMatchingConfig = errors.New("no configured target matches the subject")
 
 type NBToolType string
 
@@ -10,6 +32,12 @@ const (
 )
 
 const ToolExecuteShellCommand = "shell_execute"
+
+// NotebookToolName is the registered name of the update_notebook control tool.
+// Canonical here (in tools/core) because both the tool implementation (package
+// tools) and the ReAct4 planner (package agents/core) reference it and both
+// import this package, avoiding a duplicated literal or an import cycle.
+const NotebookToolName = "update_notebook"
 
 type NBToolCommand struct {
 	Name        string     `json:"name"`
@@ -103,6 +131,14 @@ type MissingFieldsResponder interface {
 	OnMissingRequiredFields(request NBToolCallRequest, missing []string) *NBToolResponse
 }
 
+// SchemaValidationInputNormalizer lets a tool canonicalize legacy input shapes
+// before its published InputSchema is enforced. The returned input is used only
+// for validation; Call still receives the original payload so compatibility
+// parsing and persisted tool parameters remain unchanged.
+type SchemaValidationInputNormalizer interface {
+	NormalizeInputForSchemaValidation(input string) string
+}
+
 type NBToolResposeType string
 
 const (
@@ -129,6 +165,11 @@ type NBToolResponseReference struct {
 	Type        string `json:"type"` // "link", "file", "k8s_resource", "citation"
 	Query       string `json:"query"`
 	Description string `json:"description"`
+	// Snippet is the retrieved text this reference stands for. Description
+	// carries the purpose guidance, which is identical for every knowledge base
+	// of a category, so it cannot tell a reader WHICH page or figure was used —
+	// the Additional Contexts panel renders this instead when it is set.
+	Snippet string `json:"snippet,omitempty"`
 }
 
 type NBToolResponse struct {
@@ -249,6 +290,30 @@ type ToolRequestInferencePrompt interface {
 	InferToolRequestTypePrompt(ctx *security.RequestContext, toolName, input string) (string, error)
 }
 
+// ShellWrappable is implemented by CLI tools whose executable name (`kubectl`,
+// `aws`, `gh`, ...) can also appear as the leading token of a `shell_execute`
+// command. When shell_execute is invoked with such a command, the shell tool's
+// classifier walks registered ShellWrappable tools and delegates
+// InferToolRequestType to the matching implementation — so the destructive-
+// action confirmation gate fires the same way as if the CLI tool had been
+// invoked directly. Without this, `shell_execute("kubectl delete deploy X")`
+// would run unconfirmed while `kubectl_execute("kubectl delete deploy X")`
+// asks for approval — a bypass that defeats the per-tool consent layer.
+//
+// A tool implementing ShellWrappable must also implement at least one of
+// ToolRequestInference or ToolRequestInferencePrompt so shell_execute can
+// delegate its classification.
+// TestShellCommandPrefixRegistry_CoversExpectedCLIs pins the expected built-in
+// CLI set. When adding a CLI tool, update that list as part of registration.
+//
+// Prefixes are the command name as typed at the shell (`gh`, `glab`, `az`) —
+// which frequently differs from the tool name (`github_execute`,
+// `gitlab_execute`, `azure_execute`). List every alias the CLI accepts (e.g.
+// `aws` alone; not `awscli`).
+type ShellWrappable interface {
+	ShellCommandPrefixes() []string
+}
+
 // ToolConfirmationScope is an optional interface for write tools whose user
 // confirmation must be per-action rather than per-tool. By default a
 // write-confirmation is recorded under the tool name, so the first "yes"
@@ -258,6 +323,29 @@ type ToolRequestInferencePrompt interface {
 // own approval.
 type ToolConfirmationScope interface {
 	ConfirmationKey(toolInput string) string
+}
+
+// PerCallTargetTool is an optional interface for account-sourced tools that
+// let one call name a target (cluster, cloud account) other than the
+// conversation's saved config. The executor checks write access on the named
+// target, since that is where a write lands.
+type PerCallTargetTool interface {
+	RequestedTarget(toolInput string) (string, error)
+}
+
+// ToolConfirmationExempt is an optional interface for write tools that may skip
+// the user-confirmation card for a particular invocation. It never affects
+// authorization: the tool is still classified as a write, so the RBAC check in
+// IsAgentToolAuthorizedToProcessRequest runs exactly as it would otherwise, and
+// a user who may not perform the action is still refused. All this removes is
+// the "are you sure" step.
+//
+// It exists for automations whose author has explicitly opted them in to
+// unattended AI invocation (workflows.ai_auto_approve). Returning true on a
+// tool nobody made that decision about would be a silent removal of the only
+// human checkpoint on a write, so implement it only where a human said so.
+type ToolConfirmationExempt interface {
+	SkipWriteConfirmation(toolInput string) bool
 }
 
 // ToolConfirmationPrompt is an optional interface for write tools that can

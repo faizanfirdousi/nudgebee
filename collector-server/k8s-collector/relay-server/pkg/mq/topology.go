@@ -3,6 +3,7 @@ package mq
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"nudgebee/relay-server/pkg/config"
@@ -24,8 +25,33 @@ type Topology struct {
 	connMgr     *ConnectionManager
 	exchange    string
 	dlxExchange string
-	declared    sync.Map // tenantID → struct{}
+	declared    sync.Map // queue name → *declaration
 	ttlMs       int32    // x-message-ttl in milliseconds
+
+	// consumerProbes caches HasConsumers answers per queue name
+	// (queue name → consumerProbe) so the /request hot path does not open a
+	// broker channel per call.
+	consumerProbes sync.Map
+	now            func() time.Time
+}
+
+// consumerProbe is one cached HasConsumers answer.
+type consumerProbe struct {
+	has bool
+	at  time.Time
+}
+
+// consumerProbeTTL bounds how stale a cached HasConsumers answer may be. Short
+// on purpose: it only has to absorb bursts of requests to the same agent, and
+// a longer window would keep routing to a queue whose agent just left (or keep
+// avoiding one whose agent just arrived) for longer than a caller would wait.
+const consumerProbeTTL = 5 * time.Second
+
+// ConsumerProber reports whether a queue currently has at least one consumer.
+// It is what lets the publish path prefer a per-agent queue only when the
+// owning agent's session is actually consuming it.
+type ConsumerProber interface {
+	HasConsumers(ctx context.Context, queue string) (bool, error)
 }
 
 // NewTopology declares the DLX and primary exchange exactly once.
@@ -165,21 +191,120 @@ func isRetryableError(err error) bool {
 	return false
 }
 
+// ForgetTenant drops the "already declared" record for a tenant queue, so the
+// next EnsureTenantForAgentType really talks to the broker instead of trusting
+// the cache.
+//
+// The cache assumes the broker still holds what we once declared, which stops
+// being true the moment the broker loses its definitions — a RabbitMQ that comes
+// back without its queues leaves consumers retrying a queue that no longer
+// exists, and nothing re-creates it, because the cache says it is already there.
+// Callers that see the broker disagree with the cache must call this first.
+func (t *Topology) ForgetTenant(id, agentType string) {
+	t.ForgetQueue(RelayQueueName(id, agentType))
+}
+
+// ForgetQueue is ForgetTenant for an explicit queue name, used for per-agent
+// proxy queues (see RelayAgentQueueName).
+func (t *Topology) ForgetQueue(qName string) {
+	t.declared.Delete(qName)
+}
+
+// declaration is an in-flight or finished attempt to declare one tenant's
+// queue. Concurrent callers for the same queue wait on it and share its result,
+// rather than the second caller assuming success because the first merely
+// started.
+//
+// err is written before done is closed and read only after, so the close is the
+// happens-before edge that makes it safe without a second lock.
+type declaration struct {
+	done chan struct{}
+	err  error
+}
+
 // EnsureTenantForAgentType idempotently declares the per-tenant queue for a specific agent type.
 // For k8s agents, uses the standard queue name. For other types (e.g. proxy), appends the type suffix.
 func (t *Topology) EnsureTenantForAgentType(ctx context.Context, id, agentType string) error {
-	qName := RelayQueueName(id, agentType)
-	// Use the queue name itself as the dedup key
-	if _, loaded := t.declared.LoadOrStore(qName, struct{}{}); loaded {
-		return nil
+	return t.EnsureQueue(ctx, RelayQueueName(id, agentType))
+}
+
+// EnsureQueue idempotently declares a relay request queue (and its DLQ) by
+// explicit name. EnsureTenantForAgentType is the per-account form; this one is
+// also used for per-agent proxy queues (see RelayAgentQueueName).
+func (t *Topology) EnsureQueue(ctx context.Context, qName string) error {
+	return t.ensureQueue(ctx, qName, 0)
+}
+
+// agentQueueExpiry is x-expires on per-agent queues and their DLQs: the
+// broker deletes them once they have gone this long with no consumer (and no
+// redeclare). Per-agent queues are named after an agent id, so without it
+// every agent that ever connected — including deleted and re-registered ones
+// — would leave two queues behind forever. A live session's consumer keeps
+// its queues from expiring, and the next session re-declares them.
+const agentQueueExpiry = 24 * time.Hour
+
+// EnsureAgentQueue is EnsureQueue for a per-agent queue (RelayAgentQueueName):
+// the queue and its DLQ are declared with x-expires = agentQueueExpiry.
+func (t *Topology) EnsureAgentQueue(ctx context.Context, qName string) error {
+	return t.ensureQueue(ctx, qName, int32(agentQueueExpiry.Milliseconds()))
+}
+
+// ForgetConsumerProbe drops the cached HasConsumers answer for qName. A
+// session calls it for its per-agent queue when it ends, so this replica stops
+// routing to that queue at once instead of for up to consumerProbeTTL.
+func (t *Topology) ForgetConsumerProbe(qName string) {
+	t.consumerProbes.Delete(qName)
+}
+
+// ensureQueue declares qName (and its DLQ); expiresMs > 0 adds x-expires.
+func (t *Topology) ensureQueue(ctx context.Context, qName string, expiresMs int32) error {
+
+	// Keyed on the queue name, so callers for the same tenant collapse onto one
+	// declare. This matters because the proxy config-push and resync handlers
+	// can run against the same queue a proxy agent is registering on: telling
+	// the second caller "declared" while the first is still talking to the
+	// broker would let it publish into an exchange with nothing bound yet, and
+	// that message is discarded without an error.
+	mine := &declaration{done: make(chan struct{})}
+	actual, loaded := t.declared.LoadOrStore(qName, mine)
+	if loaded {
+		theirs := actual.(*declaration)
+		select {
+		case <-theirs.done:
+			return theirs.err
+		case <-ctx.Done():
+			// Wait on our own deadline, never inherit theirs: the declaring
+			// caller may be a long-lived session while we are a short HTTP
+			// request, and blocking past our own deadline would be worse than
+			// reporting that we could not confirm the queue.
+			return ctx.Err()
+		}
 	}
 
-	dlqName := qName + ".dlq"
+	// The entry above is staked before the declare actually runs, so a failed
+	// declare has to retract it. Leaving it behind marks a queue that does not
+	// exist as declared, and every later call short-circuits to success — the
+	// tenant is then permanently unroutable until the process restarts.
+	mine.err = t.declareTenant(ctx, qName, qName+".dlq", expiresMs)
+	if mine.err != nil {
+		t.declared.Delete(qName)
+	}
+	close(mine.done)
+	return mine.err
+}
 
+// declareTenant declares a relay request queue and its DLQ. expiresMs > 0
+// sets x-expires on both. A queue that already exists with different
+// arguments (TTL or x-expires) fails the declare with 406 PRECONDITION_FAILED
+// and is deleted and re-declared below.
+func (t *Topology) declareTenant(ctx context.Context, qName, dlqName string, expiresMs int32) error {
 	return t.retryRabbitMQOperation(ctx, func(ch *amqp.Channel) error {
 		// 1) DLQ with TTL
 		dlqArgs := amqp.Table{
 			"x-message-ttl": t.ttlMs,
+		}
+		if expiresMs > 0 {
+			dlqArgs["x-expires"] = expiresMs
 		}
 		_, err := ch.QueueDeclare(dlqName, true, false, false, false, dlqArgs)
 		if err != nil {
@@ -214,6 +339,9 @@ func (t *Topology) EnsureTenantForAgentType(ctx context.Context, id, agentType s
 			"x-dead-letter-exchange":    t.dlxExchange,
 			"x-dead-letter-routing-key": qName,
 		}
+		if expiresMs > 0 {
+			args["x-expires"] = expiresMs
+		}
 		if _, err := ch.QueueDeclare(qName, true, false, false, false, args); err != nil {
 			slog.Warn("Queue declare failed", "queue_name", qName, "err", err)
 			amqpErr, ok := err.(*amqp.Error)
@@ -240,6 +368,60 @@ func (t *Topology) EnsureTenantForAgentType(ctx context.Context, id, agentType s
 
 		return nil
 	})
+}
+
+// HasConsumers reports whether qName currently has at least one consumer
+// attached on the broker. A queue that does not exist has none. Answers are
+// cached for consumerProbeTTL.
+//
+// It is a passive declare, so it never creates the queue: probing must not
+// leave behind a queue that nobody will ever consume.
+func (t *Topology) HasConsumers(ctx context.Context, qName string) (bool, error) {
+	now := time.Now
+	if t.now != nil {
+		now = t.now
+	}
+	if v, ok := t.consumerProbes.Load(qName); ok {
+		p := v.(consumerProbe)
+		if now().Sub(p.at) < consumerProbeTTL {
+			return p.has, nil
+		}
+	}
+
+	var consumers int
+	err := t.retryRabbitMQOperation(ctx, func(ch *amqp.Channel) error {
+		q, err := ch.QueueDeclarePassive(qName, true, false, false, false, nil)
+		if err != nil {
+			return err
+		}
+		consumers = q.Consumers
+		return nil
+	})
+	if err != nil {
+		var amqpErr *amqp.Error
+		if errors.As(err, &amqpErr) && amqpErr.Code == amqp.NotFound {
+			t.consumerProbes.Store(qName, consumerProbe{has: false, at: now()})
+			return false, nil
+		}
+		return false, err
+	}
+	has := consumers > 0
+	t.consumerProbes.Store(qName, consumerProbe{has: has, at: now()})
+	return has, nil
+}
+
+// RelayAgentQueueName is the request queue of one specific agent.
+//
+// Proxy agents each get their own queue, relay_requests_{id}_proxy_{agentID},
+// because an account may run several of them with disjoint datasources, and a
+// request consumed from the shared per-account queue could land on an agent
+// that does not have the addressed datasource. Every other agent type (and a
+// proxy agent whose id is unknown) keeps the per-account RelayQueueName.
+func RelayAgentQueueName(id, agentType, agentID string) string {
+	if agentType != "proxy" || agentID == "" {
+		return RelayQueueName(id, agentType)
+	}
+	return RelayQueueName(id, agentType) + "_" + agentID
 }
 
 // RelayQueueName builds the per-tenant queue name, with optional agent type suffix.

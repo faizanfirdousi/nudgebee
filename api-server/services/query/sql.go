@@ -211,6 +211,21 @@ func writeSafeValue(w *strings.Builder, v any, d sqlDialect) error {
 	return nil
 }
 
+// orderedCompareColumn resolves the column expression for an ordered comparison
+// (< <= > >=). A string-typed column is rejected -- lexicographic comparison against a
+// value the caller means numerically is a silent wrong answer, not a query. A column
+// that opts in via NumericCompareDef supplies a numeric projection of itself and is
+// compared numerically instead. Returns (expression, compareNumerically, error).
+func orderedCompareColumn(column string, columnDef ColumnDefinition, binaryType BinaryWhereClauseType) (string, bool, error) {
+	if columnDef.Type == ColumnDefinitionTypeString {
+		if columnDef.NumericCompareDef == "" {
+			return "", false, fmt.Errorf("binary clause type %s not supported for string type", binaryType)
+		}
+		return columnDef.NumericCompareDef, true, nil
+	}
+	return lo.Ternary(columnDef.Def == "", column, columnDef.Def), false, nil
+}
+
 // generateWhereClause builds the WHERE (or HAVING, when isHaving=true) SQL
 // fragment from a QueryWhereClause. Safety invariants enforced inline:
 //   - Binary column keys must be in tableDef.Columns (allowlist).
@@ -384,6 +399,19 @@ func generateWhereClause(whereClause QueryWhereClause, tableDef TableDefinition,
 					} else {
 						return "", fmt.Errorf("like clause %s not supported for non string type", binaryType)
 					}
+				case Regex, NRegex:
+					pattern, isString := value.(string)
+					if !isString || columnDef.Type != "string" {
+						return "", fmt.Errorf("regex clause %s needs a string column and a string pattern", binaryType)
+					}
+					if err := ValidateRegexFilter(pattern); err != nil {
+						return "", err
+					}
+					expr, err := regexMatchExpr(dialect, resolveColumnReference(column, columnDef, true), pattern, binaryType == NRegex)
+					if err != nil {
+						return "", err
+					}
+					binaryCondition.WriteString(expr)
 				case Eq:
 					binaryCondition.WriteString(resolveColumnReference(column, columnDef, true))
 					if columnDef.Type == "json" && tableDef.Source != database.AgentWarehouse {
@@ -458,12 +486,14 @@ func generateWhereClause(whereClause QueryWhereClause, tableDef TableDefinition,
 					}
 					binaryCondition.WriteString(colStr)
 				case Lt:
-					binaryCondition.WriteString(lo.Ternary(columnDef.Def == "", column, columnDef.Def))
+					colExpr, compareNumerically, err := orderedCompareColumn(column, columnDef, binaryType)
+					if err != nil {
+						return "", err
+					}
+					binaryCondition.WriteString(colExpr)
 					binaryCondition.WriteString(" < ")
-					switch columnDef.Type {
-					case "string":
-						return "", fmt.Errorf("binary clause type %s not supported for string type", binaryType)
-					case "datetime":
+					switch {
+					case !compareNumerically && columnDef.Type == "datetime":
 						binaryCondition.WriteString(dialect.FuncStringToDatetime(dialect.QuoteLiteral(value)))
 					default:
 						if err := writeSafeValue(&binaryCondition, value, dialect); err != nil {
@@ -479,12 +509,14 @@ func generateWhereClause(whereClause QueryWhereClause, tableDef TableDefinition,
 					}
 					binaryCondition.WriteString(colStr)
 				case Gt:
-					binaryCondition.WriteString(lo.Ternary(columnDef.Def == "", column, columnDef.Def))
+					colExpr, compareNumerically, err := orderedCompareColumn(column, columnDef, binaryType)
+					if err != nil {
+						return "", err
+					}
+					binaryCondition.WriteString(colExpr)
 					binaryCondition.WriteString(" > ")
-					switch columnDef.Type {
-					case "string":
-						return "", fmt.Errorf("binary clause type %s not supported for string type", binaryType)
-					case "datetime":
+					switch {
+					case !compareNumerically && columnDef.Type == "datetime":
 						binaryCondition.WriteString(dialect.FuncStringToDatetime(dialect.QuoteLiteral(value)))
 					default:
 						if err := writeSafeValue(&binaryCondition, value, dialect); err != nil {
@@ -500,12 +532,14 @@ func generateWhereClause(whereClause QueryWhereClause, tableDef TableDefinition,
 					}
 					binaryCondition.WriteString(colStr)
 				case Lte:
-					binaryCondition.WriteString(lo.Ternary(columnDef.Def == "", column, columnDef.Def))
+					colExpr, compareNumerically, err := orderedCompareColumn(column, columnDef, binaryType)
+					if err != nil {
+						return "", err
+					}
+					binaryCondition.WriteString(colExpr)
 					binaryCondition.WriteString(" <= ")
-					switch columnDef.Type {
-					case "string":
-						return "", fmt.Errorf("binary clause type %s not supported for string type", binaryType)
-					case "datetime":
+					switch {
+					case !compareNumerically && columnDef.Type == "datetime":
 						binaryCondition.WriteString(dialect.FuncStringToDatetime(dialect.QuoteLiteral(value)))
 					default:
 						if err := writeSafeValue(&binaryCondition, value, dialect); err != nil {
@@ -521,12 +555,14 @@ func generateWhereClause(whereClause QueryWhereClause, tableDef TableDefinition,
 					}
 					binaryCondition.WriteString(colStr)
 				case Gte:
-					binaryCondition.WriteString(lo.Ternary(columnDef.Def == "", column, columnDef.Def))
+					colExpr, compareNumerically, err := orderedCompareColumn(column, columnDef, binaryType)
+					if err != nil {
+						return "", err
+					}
+					binaryCondition.WriteString(colExpr)
 					binaryCondition.WriteString(" >= ")
-					switch columnDef.Type {
-					case "string":
-						return "", fmt.Errorf("binary clause type %s not supported for string type", binaryType)
-					case "datetime":
+					switch {
+					case !compareNumerically && columnDef.Type == "datetime":
 						binaryCondition.WriteString(dialect.FuncStringToDatetime(dialect.QuoteLiteral(value)))
 					default:
 						if err := writeSafeValue(&binaryCondition, value, dialect); err != nil {
@@ -954,6 +990,12 @@ func generateLimitOffsetClause(request QueryRequest, tableDef TableDefinition) (
 }
 
 func GenerateSqlQuery(ctx *security.RequestContext, accountId string, request QueryRequest, tableDef TableDefinition) (string, error) {
+	return generateSqlQuery(ctx, accountId, request, tableDef, "")
+}
+
+// generateSqlQuery builds the SQL for request. accountScope is a server-built
+// predicate (see TableDefinition.AccountScope) ANDed with the request's WHERE.
+func generateSqlQuery(ctx *security.RequestContext, accountId string, request QueryRequest, tableDef TableDefinition, accountScope string) (string, error) {
 	// column transformation fix for datetime grouping
 	// if transforamtions are misisng then use day as default unit
 	for _, groupColumn := range request.GroupBy {
@@ -1016,6 +1058,13 @@ func GenerateSqlQuery(ctx *security.RequestContext, accountId string, request Qu
 		whereStr, err := generateWhereClause(request.Where, tableDef)
 		if err != nil {
 			return "", err
+		}
+		if accountScope != "" {
+			if whereStr != "" {
+				whereStr = "(" + whereStr + ") AND (" + accountScope + ")"
+			} else {
+				whereStr = "(" + accountScope + ")"
+			}
 		}
 		if whereStr != "" {
 			queryBuilder.WriteString(" WHERE ")

@@ -8,7 +8,6 @@ import (
 	"math"
 	"nudgebee/llm/common"
 	"nudgebee/llm/config"
-	"nudgebee/llm/relay"
 	"nudgebee/llm/services_server"
 	"nudgebee/llm/tools/core"
 	"slices"
@@ -77,14 +76,18 @@ func init() {
 	core.RegisterNBToolFactory(ToolQueryPrometheus, func(accountId string) (core.NBTool, error) {
 		return PrometheusExecuteTool{}, nil
 	})
+	// Provider resolved the same way the agents resolve it. An agent that takes these
+	// from the registry rather than through GetSupportedTools would otherwise fall back
+	// to the literal "prometheus" below, which api-server honours verbatim and routes to
+	// the agent relay — discovery then fails on every non-Prometheus backend.
 	core.RegisterNBToolFactory(ToolMetricsList, func(accountId string) (core.NBTool, error) {
-		return MetricsListTool{}, nil
+		return MetricsListTool{Provider: MetricsDiscoveryProvider(accountId)}, nil
 	})
 	core.RegisterNBToolFactory(ToolMetricsLabelsList, func(accountId string) (core.NBTool, error) {
-		return ListMetricsLabelsTool{}, nil
+		return ListMetricsLabelsTool{Provider: MetricsDiscoveryProvider(accountId)}, nil
 	})
 	core.RegisterNBToolFactory(ToolMetricsLabelValues, func(accountId string) (core.NBTool, error) {
-		return ListMetricsLabelValuesTool{}, nil
+		return ListMetricsLabelValuesTool{Provider: MetricsDiscoveryProvider(accountId)}, nil
 	})
 	core.RegisterNBToolFactory(ToolSearchMetrics, func(accountId string) (core.NBTool, error) {
 		return SearchMetricsTool{}, nil
@@ -476,143 +479,66 @@ func (m PrometheusExecuteTool) executePromQl(nbRequestContext core.NbToolContext
 	if step < time.Minute {
 		step = time.Minute
 	}
-	// Round to nearest second for cleaner step string
 	stepSeconds := int(step.Seconds())
-	stepStr := strconv.Itoa(stepSeconds) + "s"
 
-	// Format the time to the specified string format
-	startTimeString := startTime.Format("2006-01-02 15:04:05 UTC")
-	endTimeString := endTime.Format("2006-01-02 15:04:05 UTC")
-	actionParam := relay.ActionExecuteBody{
-		AccountID:  accountId,
-		ActionName: "prometheus_enricher",
-		ActionParams: map[string]any{
-			"promql_query": query,
-			"duration":     map[string]any{"starts_at": startTimeString, "ends_at": endTimeString},
-			"step":         stepStr,
-		},
+	// Ask the services-server rather than the relay: it resolves the account's
+	// metrics provider, so a Prometheus connected without an agent (#37536) is
+	// queried over HTTP and an agent-backed one still goes through the relay —
+	// the same path the logs and traces tools already take.
+	slog.Debug("prometheus query", "query", query, "start_time", startTime, "end_time", endTime, "step_seconds", stepSeconds)
+	// A caller that builds an NbToolContext by hand can leave Ctx nil, and this
+	// dereference then takes the whole request down rather than failing one tool
+	// call — GetCurrentOtelHosts did exactly that, panicking every prompt build
+	// that reached it. Fail as an error so the caller can carry on without it.
+	if nbRequestContext.Ctx == nil {
+		return nil, fmt.Errorf("executePromQl: nil request context")
 	}
-	slog.Debug("prometheus query", "query", query, "start_time", startTimeString, "end_time", endTimeString)
-	response, err := relay.Execute(nbRequestContext.GoContext(), actionParam)
+	response, err := services_server.QueryMetrics(*nbRequestContext.Ctx, core.ObservabilityMetricsQueryRequest{
+		AccountId:    accountId,
+		Queries:      map[string]string{"query": query},
+		StartTime:    startTime.UnixMilli(),
+		EndTime:      endTime.UnixMilli(),
+		StepInterval: stepSeconds,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("executePromQl: relay execute: %w", err)
+		return nil, fmt.Errorf("executePromQl: metrics query: %w", err)
 	}
-	dataFromEvidence, err := m.getDataFromRelayPrometheusResponse(response)
+	seriesData, err := m.seriesFromMetricsResponse(response)
 	if err != nil {
-		slog.Error("error marshaling JSON at Prometheus API call:", "error", err)
-		return nil, fmt.Errorf("executePromQl: parse relay response: %w", err)
+		return nil, fmt.Errorf("executePromQl: %w", err)
 	}
-	slog.Debug("prometheus response data", "data", dataFromEvidence)
-	return dataFromEvidence, nil
-}
-
-func (m PrometheusExecuteTool) getDataFromRelayPrometheusResponse(relayResponse map[string]any) ([]any, error) {
-	dataFromResponse, ok := relayResponse["data"].(map[string]any)
-	if !ok || dataFromResponse == nil {
-		slog.Info("prometheus relay response", "relayResponse", relayResponse)
-		return nil, errors.New("data field not found or is nil from response")
-	}
-	findings, ok := dataFromResponse["findings"].([]any)
-	if !ok || findings == nil {
-		slog.Info("prometheus relay response", "data", dataFromResponse)
-		return nil, errors.New("findings field not found or is nil from data")
-	}
-	if len(findings) == 0 {
-		slog.Info("prometheus: query returned empty findings (no matching data)")
-		return []any{}, nil
-	}
-	firstFinding, ok := findings[0].(map[string]any)
-	if !ok || firstFinding == nil {
-		slog.Info("prometheus relay response", "findings", findings)
-		return nil, errors.New("findings field has no values from")
-	}
-	evidence, ok := firstFinding["evidence"].([]any)
-	if !ok || evidence == nil {
-		slog.Info("prometheus relay response", "firstFinding", firstFinding)
-		return nil, errors.New("evidence field not found or is nil from findings")
-	}
-	if len(evidence) == 0 {
-		slog.Info("prometheus relay response", "evidence", evidence)
-		return nil, errors.New("evidence field is empty")
-	}
-	firstEvidence, ok := evidence[0].(map[string]any)
-	if !ok || firstEvidence == nil {
-		slog.Info("prometheus relay response", "evidence", evidence)
-		return nil, errors.New("evidence field has no values")
-	}
-	evidenceData, ok := firstEvidence["data"].(string)
-	if !ok {
-		slog.Info("prometheus relay response", "firstEvidence", firstEvidence)
-		return nil, errors.New("data field not found or is nil from evidence")
-	}
-	var dataList []map[string]any
-	if err := common.UnmarshalJson([]byte(evidenceData), &dataList); err != nil {
-		slog.Info("prometheus relay response, unable to unmarshal", "evidenceData", evidenceData)
-		return nil, fmt.Errorf("getDataFromRelayPrometheusResponse: unmarshal evidence data: %w", err)
-	}
-	seriesData, err := m.getMappedValuesFromDataList(dataList)
-	if err != nil {
-		slog.Info("prometheus relay response, unable to unmarshal", "datalist", dataList)
-		return nil, fmt.Errorf("getDataFromRelayPrometheusResponse: map values: %w", err)
-	}
+	slog.Debug("prometheus response data", "data", seriesData)
 	return seriesData, nil
 }
 
-func (m PrometheusExecuteTool) getMappedValuesFromDataList(dataList []map[string]any) ([]any, error) {
-	for _, data := range dataList {
-		if data == nil || data["data"] == nil {
-			continue
+// seriesFromMetricsResponse flattens the services-server answer into the
+// `[{metric, timestamps, values}]` list the stats pass consumes — the shape the
+// relay's series_list_result carried, with numeric values. A per-query failure
+// arrives in results[].error rather than the HTTP status, so it is surfaced here
+// the way the relay's result_type=error envelope was.
+func (m PrometheusExecuteTool) seriesFromMetricsResponse(response core.ObservabilityMetricsQueryResponse) ([]any, error) {
+	out := []any{}
+	for _, result := range response.Results {
+		if result.Error != nil && *result.Error != "" {
+			return nil, errors.New(*result.Error)
 		}
-
-		// Handle both map and string (double-encoded JSON) formats for data["data"]
-		var dataMap map[string]any
-		switch v := data["data"].(type) {
-		case map[string]any:
-			dataMap = v
-		case string:
-			if err := common.UnmarshalJson([]byte(v), &dataMap); err != nil {
-				slog.Warn("prometheus: unable to parse data string from relay response", "error", err)
-				continue
+		for _, series := range result.Payload {
+			metric := make(map[string]any, len(series.Metric))
+			for k, v := range series.Metric {
+				metric[k] = v
 			}
-		default:
-			continue
-		}
-
-		// Handle "query" wrapper (prometheus_queries_enricher format)
-		if queryData, ok := dataMap["query"].(map[string]any); ok {
-			dataMap = queryData
-		}
-
-		// Check result_type for error responses
-		if resultType, _ := dataMap["result_type"].(string); resultType == "error" {
-			errMsg := "prometheus query returned an error"
-			if stringResult, ok := dataMap["string_result"].(string); ok && stringResult != "" {
-				errMsg = stringResult
+			timestamps := make([]any, 0, len(series.Timestamps))
+			for _, ts := range series.Timestamps {
+				timestamps = append(timestamps, float64(ts))
 			}
-			return nil, errors.New(errMsg)
+			values := make([]any, 0, len(series.Values))
+			for _, v := range series.Values {
+				values = append(values, v)
+			}
+			out = append(out, map[string]any{"metric": metric, "timestamps": timestamps, "values": values})
 		}
-
-		// Try series_list_result (matrix/range queries)
-		if seriesList, ok := dataMap["series_list_result"].([]any); ok && len(seriesList) > 0 {
-			return seriesList, nil
-		}
-
-		// Try vector_result (instant queries)
-		if vectorResult, ok := dataMap["vector_result"].([]any); ok && len(vectorResult) > 0 {
-			return vectorResult, nil
-		}
-
-		// Try scalar_result (scalar aggregation queries).
-		// Uses "value" (singular) intentionally — scalar results are a single [timestamp, value]
-		// pair, not a time series, so stats computation (min/max/avg/p99) in Call() is skipped.
-		if scalarResult, ok := dataMap["scalar_result"].([]any); ok && len(scalarResult) > 0 {
-			return []any{map[string]any{"metric": map[string]any{}, "value": scalarResult}}, nil
-		}
-
-		// No non-empty result found in this data entry
-		return []any{}, nil
 	}
-	return []any{}, nil
+	return out, nil
 }
 
 // sanitizeFloats recursively walks a data structure and replaces any +Inf/NaN
@@ -713,39 +639,107 @@ var esNumericFieldTypes = map[string]bool{
 // Querying only `name` — as this did — returned an empty list on every Beats index while
 // the data sat there in plain sight.
 func esDiscoverMetricNames(nbRequestContext core.NbToolContext, provider, indexPattern string) ([]core.ObservabilityMetricsSeries, string, error) {
-	labelValuesResp, err := services_server.ListMetricsSeriesLabelValues(
+	// Both sources are consulted and merged. Returning on the first non-empty answer
+	// is what produced the 2026-08-27 dev failure: under a pattern spanning five
+	// document shapes, one OTel-shaped index had two distinct `name` values in the
+	// lookup window, that counted as success, and eight CloudWatch metrics sitting in
+	// the same pattern were never looked for. The agent was told the environment had
+	// two metrics and reported "no RDS metrics found" without issuing a single query.
+	//
+	// Whichever shape happens to carry a `name` field must not hide the others.
+	seen := make(map[string]bool)
+	series := make([]core.ObservabilityMetricsSeries, 0)
+	// add reports whether the name was accepted, so a caller can count exactly what
+	// the list contains. Counting separately let a name that add() rejected — an
+	// empty or whitespace-only value — still increment a total, and those totals are
+	// the whole point of this change.
+	add := func(name string) bool {
+		name = strings.TrimSpace(name)
+		if name == "" || seen[name] {
+			return false
+		}
+		seen[name] = true
+		series = append(series, core.ObservabilityMetricsSeries{Metric: name})
+		return true
+	}
+
+	// Source 1: distinct values of the metric-name field. These are read from
+	// documents, so every name is one that actually exists.
+	var fromDocuments int
+	labelValuesResp, nameErr := services_server.ListMetricsSeriesLabelValues(
 		*nbRequestContext.Ctx, nbRequestContext.AccountId, provider, esMetricNameField,
 		map[string]any{"request": map[string]any{"metric_name": indexPattern}},
 	)
-	if err == nil && len(labelValuesResp.Values) > 0 {
-		series := make([]core.ObservabilityMetricsSeries, 0, len(labelValuesResp.Values))
+	if nameErr == nil {
 		for _, v := range labelValuesResp.Values {
-			series = append(series, core.ObservabilityMetricsSeries{Metric: v.Value})
+			if add(v.Value) {
+				fromDocuments++
+			}
 		}
-		return series, "name", nil
-	}
-	if err != nil {
-		nbRequestContext.Ctx.GetLogger().Info("metrics: ES name-field lookup failed, falling back to mapping field paths",
-			"index", indexPattern, "error", err.Error())
+	} else {
+		nbRequestContext.Ctx.GetLogger().Info("metrics: ES name-field lookup failed, continuing with mapping field paths",
+			"index", indexPattern, "error", nameErr.Error())
 	}
 
-	// Beats-family: the numeric field paths are the metric names.
-	fieldsResp, ferr := services_server.ListMetricsSeriesLabels(
+	// Source 2: numeric field paths from the index MAPPING. For Beats-family
+	// documents the metric's identity IS its field path, so these are real metric
+	// names — but a mapping declares what an index may hold, not what it does.
+	// Measured on dev: metricbeat-8.19.11 declares 4306 numeric fields and 79 have
+	// ever held a value, so 98% of this source is names for data that does not
+	// exist. That is where `activemq.broker.connections.count` came from on a
+	// cluster running no ActiveMQ, and an agent chased it because we listed it.
+	var fromMapping int
+	fieldsResp, fieldsErr := services_server.ListMetricsSeriesLabels(
 		*nbRequestContext.Ctx, nbRequestContext.AccountId, provider, indexPattern)
-	if ferr != nil {
-		if err != nil {
-			return nil, "", err
+	if fieldsErr == nil {
+		for _, l := range fieldsResp.Labels {
+			t, _ := l.Attributes["type"].(string)
+			if !esNumericFieldTypes[t] {
+				continue
+			}
+			if add(l.Label) {
+				fromMapping++
+			}
 		}
-		return nil, "", ferr
+	} else {
+		// Logged even when the name lookup succeeded: the result is then a partial
+		// answer, and silence about the half that failed is how a partial answer gets
+		// read as a complete one.
+		nbRequestContext.Ctx.GetLogger().Info("metrics: ES mapping-field lookup failed, continuing with name-field results",
+			"index", indexPattern, "error", fieldsErr.Error())
 	}
-	series := make([]core.ObservabilityMetricsSeries, 0, len(fieldsResp.Labels))
-	for _, l := range fieldsResp.Labels {
-		t, _ := l.Attributes["type"].(string)
-		if esNumericFieldTypes[t] {
-			series = append(series, core.ObservabilityMetricsSeries{Metric: l.Label})
+
+	if len(series) == 0 {
+		// Both sources empty. Surface whichever error explains it rather than an
+		// empty list, which reads as "this environment has no metrics".
+		if nameErr != nil {
+			return nil, "", nameErr
+		}
+		if fieldsErr != nil {
+			return nil, "", fieldsErr
 		}
 	}
-	return series, "numeric field paths", nil
+
+	return series, esDiscoveryProvenance(fromDocuments, fromMapping), nil
+}
+
+// esDiscoveryProvenance describes where a metric-name list came from, so the caller
+// can weigh it. Names read from documents are facts; names read from the index mapping
+// are possibilities, and presenting the two as one list is what lets an agent spend an
+// investigation on metrics that have never been collected.
+func esDiscoveryProvenance(fromDocuments, fromMapping int) string {
+	switch {
+	case fromDocuments > 0 && fromMapping > 0:
+		return fmt.Sprintf("%d read from documents, %d declared in the index mapping (those may have no data)",
+			fromDocuments, fromMapping)
+	case fromDocuments > 0:
+		return fmt.Sprintf("%d read from documents", fromDocuments)
+	case fromMapping > 0:
+		return fmt.Sprintf("%d declared in the index mapping — these may have no data; "+
+			"confirm a metric exists before concluding anything from its absence", fromMapping)
+	default:
+		return "none found"
+	}
 }
 
 func (m MetricsListTool) Call(nbRequestContext core.NbToolContext, input core.NBToolCallRequest) (core.NBToolResponse, error) {
@@ -777,6 +771,9 @@ func (m MetricsListTool) Call(nbRequestContext core.NbToolContext, input core.NB
 	}
 
 	var metricsResponse core.ObservabilityMetricsSeriesResponse
+	// esProvenance records whether the metric names below were read from documents or
+	// from the index mapping. Empty for non-ES providers.
+	var esProvenance string
 
 	// esQueryIsIndexPattern records whether the caller's input was consumed as an index
 	// pattern rather than as a search keyword, so the keyword filter below knows whether
@@ -820,8 +817,9 @@ func (m MetricsListTool) Call(nbRequestContext core.NbToolContext, input core.NB
 				Status: core.NBToolResponseStatusError,
 			}, nil
 		}
-		nbRequestContext.Ctx.GetLogger().Info("metrics: resolved ES metric identity field",
-			"index", indexPattern, "identity_field", identityField, "num_metrics", len(series))
+		nbRequestContext.Ctx.GetLogger().Info("metrics: resolved ES metric names",
+			"index", indexPattern, "provenance", identityField, "num_metrics", len(series))
+		esProvenance = identityField
 		metricsResponse = core.ObservabilityMetricsSeriesResponse{Series: series}
 	} else {
 		var err error
@@ -894,6 +892,13 @@ func (m MetricsListTool) Call(nbRequestContext core.NbToolContext, input core.NB
 	}
 
 	responseData := string(dataResponse)
+	// State where these names came from. A list mixing names read from documents with
+	// names read from an index mapping looks like one set of facts; on dev that
+	// mapping contributes 98% names for data that has never been collected, and an
+	// agent cannot tell which is which unless we say so.
+	if esProvenance != "" {
+		responseData = fmt.Sprintf("Metric names: %s.\n\n%s", esProvenance, responseData)
+	}
 	// Distinguish "nothing matched your keyword" from "we could not read this index".
 	// The latter is handled above as an error; saying so here keeps the caller from
 	// reading a legitimately-empty filter result as an absence of metrics.
@@ -1192,15 +1197,23 @@ func (m ListMetricsLabelsTool) Call(nbRequestContext core.NbToolContext, input c
 		provider = m.Provider
 	}
 
-	seriesName := query
-	if strings.EqualFold(provider, "ES") {
-		idxPattern := getESMetricIndexPattern(nbRequestContext, m.DefaultIndex)
-		if idxPattern != "" && !strings.Contains(query, "*") && !strings.Contains(query, "?") {
-			seriesName = idxPattern
+	labelsResponse, err := services_server.ListMetricsSeriesLabels(*nbRequestContext.Ctx, nbRequestContext.AccountId, provider, query)
+
+	// On Elasticsearch the input is an index, but the model sometimes passes a metric
+	// name instead. That used to be detected by "no wildcard in it" and swapped for the
+	// configured index BEFORE asking — which also swapped every exact index name,
+	// including remote-cluster ones (`cluster:index`), and returned the configured
+	// index's fields labelled as the requested index's. Ask for what was requested
+	// first, fall back only when it cannot be read, and say that a fallback happened.
+	var fallbackNote string
+	if err != nil && strings.EqualFold(provider, "ES") {
+		if idxPattern := getESMetricIndexPattern(nbRequestContext, m.DefaultIndex); idxPattern != "" && idxPattern != query {
+			if fallback, fallbackErr := services_server.ListMetricsSeriesLabels(*nbRequestContext.Ctx, nbRequestContext.AccountId, provider, idxPattern); fallbackErr == nil {
+				fallbackNote = fmt.Sprintf("%q could not be read as an index (%v). These are the fields of the configured metrics index %q instead.", query, err, idxPattern)
+				labelsResponse, err = fallback, nil
+			}
 		}
 	}
-
-	labelsResponse, err := services_server.ListMetricsSeriesLabels(*nbRequestContext.Ctx, nbRequestContext.AccountId, provider, seriesName)
 	if err != nil {
 		nbRequestContext.Ctx.GetLogger().Error("unable to fetch metrics labels", "error", err.Error())
 		return core.NBToolResponse{
@@ -1209,7 +1222,11 @@ func (m ListMetricsLabelsTool) Call(nbRequestContext core.NbToolContext, input c
 		}, err
 	}
 
-	dataResponse, err := common.MarshalJson(labelsResponse)
+	var payload any = labelsResponse
+	if fallbackNote != "" {
+		payload = map[string]any{"note": fallbackNote, "labels": labelsResponse.Labels}
+	}
+	dataResponse, err := common.MarshalJson(payload)
 	if err != nil {
 		nbRequestContext.Ctx.GetLogger().Error("metrics: unable to marshal final data", "error", err.Error())
 		return core.NBToolResponse{
@@ -1259,11 +1276,14 @@ func (m ListMetricsLabelValuesTool) GetType() core.NBToolType {
 
 func (m ListMetricsLabelValuesTool) Description() string {
 	return `Returns the actual VALUES a label takes in this environment (metrics_labels_list returns label NAMES only).
-		Usage:
-		* Input: label (required, e.g. 'instance', 'node', 'pod'); filter (optional substring to narrow high-cardinality labels); metric (optional, narrows to one metric family on providers that support it).
+		Arguments are JSON, never a query string. Each argument is its own key:
+		{"label": "instance", "filter": "worker", "metric": "node_cpu_seconds_total"}
+		* label    (required) a single field name, e.g. 'instance', 'node', 'pod'. No spaces, no '&' or '='.
+		* filter   (optional) case-insensitive substring narrowing the values. Use it for high-cardinality labels; do NOT append it to 'label'.
+		* metric   (optional) narrows to one metric family on Prometheus. IGNORED on Elasticsearch, where the index is resolved from the integration config — do not pass an index here.
 		* Output: the list of values for that label, capped and reported as truncated when the cap is hit.
 
-		Purpose: Use this when a query returns no data for a resource you can name, to find out how that resource is actually spelled. Example: a node is known as 'worker-1' but node_* metrics are labelled by 'instance' holding an IP:port — call metrics_label_values(label="instance") to see the real values instead of guessing another label name.`
+		Purpose: Use this when a query returns no data for a resource you can name, to find out how that resource is actually spelled. Example: a node is known as 'worker-1' but node_* metrics are labelled by 'instance' holding an IP:port — look up the values of 'instance' instead of guessing another label name.`
 }
 
 func (m ListMetricsLabelValuesTool) InputSchema() core.ToolSchema {
@@ -1276,15 +1296,51 @@ func (m ListMetricsLabelValuesTool) InputSchema() core.ToolSchema {
 			},
 			"filter": {
 				Type:        core.ToolSchemaTypeString,
-				Description: "Optional case-insensitive substring to narrow the values. Strongly recommended for high-cardinality labels like 'instance' or 'pod'.",
+				Description: "Optional case-insensitive substring to narrow the values. Strongly recommended for high-cardinality labels like 'instance' or 'pod'. Pass it as this argument — appending '&filter=...' to 'label' is rejected.",
 			},
 			"metric": {
 				Type:        core.ToolSchemaTypeString,
-				Description: "Optional metric name to scope the lookup to one family. Honoured by providers that support it; Prometheus returns values across all metrics.",
+				Description: "Optional metric name scoping the lookup to one family on Prometheus. Ignored on Elasticsearch, where the index comes from the integration config — passing an index or a metric name here has no effect.",
 			},
 		},
 		Required: []string{"label"},
 	}
+}
+
+// sanitizeMetricsArg strips the wrapping a planner sometimes emits around an
+// argument value — escapes, backticks and surrounding quotes. Quotes matter most:
+// on Elasticsearch a quoted value reaches the cluster as an index name, and
+// `no such index [\"aws.rds.cpu.total.pct\"]` is the result.
+func sanitizeMetricsArg(v string) string {
+	v = strings.ReplaceAll(v, "\\", "")
+	v = strings.ReplaceAll(v, "`", "")
+	return strings.TrimSpace(strings.Trim(strings.TrimSpace(v), `"'`))
+}
+
+// validateLabelArg rejects a `label` that is not a single field name.
+//
+// Observed 2026-08-26: the planner passed
+// {"label":"kubernetes.pod.name&filter=api-preprod"} — query-string syntax packed
+// into a JSON value, because `filter` is a separate argument it did not reach for.
+// The mangled name matched no field, which used to return an empty success, so the
+// agent concluded the label did not exist and looked for a different one instead of
+// fixing the call. Naming the right argument in the error ends that loop.
+func validateLabelArg(label string) error {
+	if idx := strings.IndexAny(label, "&?="); idx >= 0 {
+		hint := ""
+		if amp := strings.Index(label, "&"); amp >= 0 {
+			if name, value, found := strings.Cut(label[amp+1:], "="); found {
+				hint = fmt.Sprintf(` Pass it as its own argument instead: {"label": %q, %q: %q}.`,
+					label[:amp], strings.TrimSpace(name), strings.TrimSpace(value))
+			}
+		}
+		return fmt.Errorf("'label' must be a single field name, got %q — that looks like query-string syntax.%s"+
+			" This tool takes JSON arguments, not a URL", label, hint)
+	}
+	if strings.ContainsAny(label, " \t\n") {
+		return fmt.Errorf("'label' must be a single field name with no whitespace, got %q", label)
+	}
+	return nil
 }
 
 // filterAndCapLabelValues drops empties, applies the case-insensitive substring
@@ -1318,9 +1374,19 @@ func (m ListMetricsLabelValuesTool) Call(nbRequestContext core.NbToolContext, in
 		// Some planners pass a single required arg in the bare command instead.
 		label = strings.TrimSpace(input.Command)
 	}
-	label = strings.ReplaceAll(strings.ReplaceAll(label, "\\", ""), "`", "")
-	filter := strings.TrimSpace(argString(input, "filter"))
-	metric := strings.TrimSpace(argString(input, "metric"))
+	label = sanitizeMetricsArg(label)
+	// filter and metric were previously passed through raw. An LLM-supplied
+	// `"aws.rds.cpu.total.pct"` — quotes included — reached Elasticsearch as the
+	// index name and produced `no such index [\"aws.rds.cpu.total.pct\"]`.
+	filter := sanitizeMetricsArg(argString(input, "filter"))
+	metric := sanitizeMetricsArg(argString(input, "metric"))
+
+	if err := validateLabelArg(label); err != nil {
+		return core.NBToolResponse{
+			Data:   "Error: " + err.Error(),
+			Status: core.NBToolResponseStatusError,
+		}, nil
+	}
 
 	if label == "" {
 		return core.NBToolResponse{
@@ -1351,14 +1417,21 @@ func (m ListMetricsLabelValuesTool) Call(nbRequestContext core.NbToolContext, in
 		metricsLabelValuesCache.Delete(cacheKey)
 	}
 
+	// `metric_name` carries two different things depending on provider: a metric name
+	// on Prometheus and friends, but on Elasticsearch it IS the index to search
+	// (elasticsearch_saas_metrics.go: `index, _ = req.Request["metric_name"]`). The
+	// order below therefore matters: letting a caller-supplied `metric` win on ES
+	// replaces the index with a metric name and the query dies as
+	// `index_not_found_exception: no such index [aws.rds.cpu.total.pct]`. Reproduced
+	// on dev account 25f42d26 on 2026-08-26. ListMetricsLabelsTool already resolves
+	// this the same way; this tool was the outlier.
 	var extraRequest []map[string]any
-	if metric != "" {
-		extraRequest = append(extraRequest, map[string]any{"request": map[string]any{"metric_name": metric}})
-	} else if strings.EqualFold(provider, "ES") {
-		idxPattern := getESMetricIndexPattern(nbRequestContext, m.DefaultIndex)
-		if idxPattern != "" {
+	if strings.EqualFold(provider, "ES") {
+		if idxPattern := getESMetricIndexPattern(nbRequestContext, m.DefaultIndex); idxPattern != "" {
 			extraRequest = append(extraRequest, map[string]any{"request": map[string]any{"metric_name": idxPattern}})
 		}
+	} else if metric != "" {
+		extraRequest = append(extraRequest, map[string]any{"request": map[string]any{"metric_name": metric}})
 	}
 
 	valuesResponse, err := services_server.ListMetricsSeriesLabelValues(
@@ -1374,15 +1447,30 @@ func (m ListMetricsLabelValuesTool) Call(nbRequestContext core.NbToolContext, in
 
 	values, matched, truncated := filterAndCapLabelValues(valuesResponse.Values, filter)
 
-	if matched == 0 {
-		hint := fmt.Sprintf("No values found for label %q.", label)
-		if filter != "" {
-			hint += fmt.Sprintf(" No value contains %q — retry without the filter to see the naming scheme, or the resource may be labelled under a different label.", filter)
-		} else {
-			hint += " The label may not exist in this environment. Call metrics_labels_list on the metric to see which labels it actually carries."
-		}
+	// The label itself resolved to nothing. That is a failed lookup — the label does
+	// not exist here, or the argument was malformed — not an answer about the
+	// environment. Returning Success made those indistinguishable from "this label
+	// exists and is empty": on 2026-08-26 a mangled label and a genuinely absent one
+	// both came back `200 []`, so the agent went hunting for a different label name
+	// instead of correcting its own call.
+	if len(valuesResponse.Values) == 0 {
 		return core.NBToolResponse{
-			Data:   hint,
+			Data: fmt.Sprintf("Error: label %q returned no values — it does not exist in this environment. "+
+				"Call %s to list the labels that do exist before retrying. "+
+				"Check also that %q is a single field name and not a query string.",
+				label, ToolMetricsLabelsList, label),
+			Status: core.NBToolResponseStatusError,
+		}, nil
+	}
+
+	// The label exists; the filter excluded everything. That IS an answer about the
+	// environment, so it stays a success — the caller learns the resource is not
+	// named that way.
+	if matched == 0 {
+		return core.NBToolResponse{
+			Data: fmt.Sprintf("Label %q exists with %d value(s), but none contains %q. "+
+				"Retry without the filter to see the naming scheme.",
+				label, len(valuesResponse.Values), filter),
 			Status: core.NBToolResponseStatusSuccess,
 		}, nil
 	}
@@ -1525,4 +1613,53 @@ func getESMetricIndexPattern(nbRequestContext core.NbToolContext, defaultIndex s
 		}
 	}
 	return ""
+}
+
+// metricsDiscoveryUsesConfiguredProvider selects integration-backed discovery.
+// Agent-backed defaults (including cloud CLI fallbacks) discover Prometheus
+// metrics. EE execution independently uses QueryMetrics for every provider.
+func metricsDiscoveryUsesConfiguredProvider(provider services_server.ObservabilityProvider) bool {
+	if strings.EqualFold(strings.TrimSpace(provider.IntegrationSource), "agent") {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(provider.Provider)) {
+	case "", "prometheus":
+		return false
+	}
+	return true
+}
+
+// MetricsDiscoveryProvider resolves which provider the metric-discovery tools
+// (metrics_list, the label tools, metrics_series_match) should enumerate for an
+// account.
+//
+// PrometheusAgent is the fallback for every backend without a dedicated agent, so
+// the literal "prometheus" its tools were built with is a default, not a fact. On a
+// CubeAPM or OpenObserve account it made those tools ask the api-server to
+// enumerate PROMETHEUS metrics — a provider that account has not configured — so
+// discovery came back empty and the agent fell back to guessing metric names from
+// its Kubernetes priors (container_http_requests_total, istio_requests_total),
+// which match nothing and read as "this service reports no metrics".
+//
+// Returns "prometheus" unchanged for the agent-backed default, the cloud-CLI
+// fallbacks and a user-configured Prometheus. This helper only selects discovery;
+// EE execution already resolves the provider through the services-server.
+func MetricsDiscoveryProvider(accountId string) string {
+	provider, err := GetMetricsProvider(accountId)
+	if err != nil {
+		slog.Warn("metrics: could not resolve provider for discovery, defaulting to prometheus",
+			"accountId", accountId, "error", err)
+		return "prometheus"
+	}
+	return metricsDiscoveryProviderFor(provider)
+}
+
+// metricsDiscoveryProviderFor is the decision MetricsDiscoveryProvider makes once
+// the account's provider is known, split out so it can be exercised for backends
+// no test environment has to be wired up to.
+func metricsDiscoveryProviderFor(provider services_server.ObservabilityProvider) string {
+	if metricsDiscoveryUsesConfiguredProvider(provider) {
+		return strings.TrimSpace(provider.Provider)
+	}
+	return "prometheus"
 }

@@ -2,6 +2,7 @@ package core
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	toolcore "nudgebee/llm/tools/core"
@@ -248,4 +249,130 @@ func TestMergeToolResponseMetadata_FallsBackHardWhenMetadataIsNil(t *testing.T) 
 	})
 	assert.Error(t, err, "no Metadata to fall back to + AD marshal-fail must surface an error")
 	assert.Nil(t, blob)
+}
+
+func TestMergeToolResponseMetadataWithAction_EmptyInputRemainsNil(t *testing.T) {
+	blob, err := mergeToolResponseMetadataWithAction(nil, nil, NBAgentPlannerToolAction{})
+	assert.NoError(t, err)
+	assert.Nil(t, blob, "single-action calls without telemetry must preserve NULL metadata")
+}
+
+func TestMergeToolResponseMetadataWithAction_PersistsExecutionBatch(t *testing.T) {
+	action := NBAgentPlannerToolAction{
+		PlannerIteration:          2,
+		ExecutionBatchID:          "batch-1",
+		ExecutionMode:             executionModeParallelDispatch,
+		ExecutionBatchSize:        3,
+		ExecutionParallelismLimit: 2,
+	}
+	blob, err := mergeToolResponseMetadataWithAction(&toolcore.NBToolResponseMetadata{
+		ExecutionDurationMs: 125,
+	}, map[string]any{
+		"execution_batch_id": "tool-supplied-value",
+		"custom_metric":      "kept",
+	}, action)
+	assert.NoError(t, err)
+
+	var got map[string]any
+	assert.NoError(t, json.Unmarshal(blob, &got))
+	assert.Equal(t, "batch-1", got["execution_batch_id"], "executor metadata must override tool-supplied collisions")
+	assert.EqualValues(t, 2, got["planner_iteration"])
+	assert.Equal(t, executionModeParallelDispatch, got["execution_mode"])
+	assert.Equal(t, float64(3), got["execution_batch_size"])
+	assert.Equal(t, float64(2), got["execution_parallelism_limit"])
+	assert.Equal(t, float64(125), got["execution_duration_ms"])
+	assert.Equal(t, "kept", got["custom_metric"])
+}
+
+func TestMergeToolResponseMetadataWithAction_PersistsSingleToolIteration(t *testing.T) {
+	blob, err := mergeToolResponseMetadataWithAction(nil, nil, NBAgentPlannerToolAction{PlannerIteration: 3})
+	assert.NoError(t, err)
+
+	var got map[string]any
+	assert.NoError(t, json.Unmarshal(blob, &got))
+	assert.EqualValues(t, 3, got["planner_iteration"])
+	_, hasBatchID := got["execution_batch_id"]
+	assert.False(t, hasBatchID)
+}
+
+func TestMergeToolResponseMetadataWithAction_PersistsSequentialFallback(t *testing.T) {
+	action := NBAgentPlannerToolAction{
+		ExecutionBatchID:         "batch-2",
+		ExecutionMode:            executionModeSequentialDispatch,
+		ExecutionBatchSize:       4,
+		SequentialFallbackReason: "unresolved_tool_config",
+	}
+	blob, err := mergeToolResponseMetadataWithAction(nil, nil, action)
+	assert.NoError(t, err)
+
+	var got map[string]any
+	assert.NoError(t, json.Unmarshal(blob, &got))
+	assert.Equal(t, "batch-2", got["execution_batch_id"])
+	assert.Equal(t, executionModeSequentialDispatch, got["execution_mode"])
+	assert.Equal(t, float64(4), got["execution_batch_size"])
+	assert.Equal(t, "unresolved_tool_config", got["sequential_fallback_reason"])
+	_, hasLimit := got["execution_parallelism_limit"]
+	assert.False(t, hasLimit, "sequential batches must not advertise unused parallelism")
+}
+
+func TestMergeToolResponseMetadataWithAction_BadToolTelemetryKeepsExecutionBatch(t *testing.T) {
+	action := NBAgentPlannerToolAction{
+		ExecutionBatchID:   "batch-3",
+		ExecutionMode:      executionModeParallelDispatch,
+		ExecutionBatchSize: 2,
+	}
+	blob, err := mergeToolResponseMetadataWithAction(&toolcore.NBToolResponseMetadata{
+		ExecutionDurationMs: 50,
+	}, map[string]any{
+		"unmarshalable_ch": make(chan int),
+	}, action)
+	assert.NoError(t, err)
+
+	var got map[string]any
+	assert.NoError(t, json.Unmarshal(blob, &got))
+	assert.Equal(t, "batch-3", got["execution_batch_id"])
+	assert.Equal(t, executionModeParallelDispatch, got["execution_mode"])
+	assert.Equal(t, float64(2), got["execution_batch_size"])
+	assert.Equal(t, float64(50), got["execution_duration_ms"])
+	_, hasBadValue := got["unmarshalable_ch"]
+	assert.False(t, hasBadValue)
+}
+
+// TestSkillReferenceMetadata_SnippetBecomesContent pins the Additional Contexts
+// row for a chunked knowledge base. Without "content" the panel falls back to
+// the description — the same guidance sentence on every chunk of the document —
+// so a PDF's four figure rows all read identically and name no page.
+func TestSkillReferenceMetadata_SnippetBecomesContent(t *testing.T) {
+	ref := toolcore.NBToolResponseReference{
+		Text:        "pod_memory_reaching_limit",
+		Url:         "kb-1",
+		Description: "Reference: use as supporting information, not as a required procedure.",
+		Snippet:     "runbook.pdf — page 2, figure 1\nservices-server 1Gi 85.5% raise to 1536Mi (CAB-2291)",
+	}
+
+	got := skillReferenceMetadata(AgentReferenceKindKBDocument, "load_skills", ref)
+
+	assert.Equal(t, ref.Snippet, got["content"])
+	assert.Equal(t, ref.Description, got["description"])
+	assert.Equal(t, "load_skills", got["via"])
+	assert.Equal(t, AgentReferenceKindKBDocument, got["kind"])
+}
+
+// A reference with no retrieved text must not invent an empty content key: the
+// panel's COALESCE treats ” as present and would render a blank row.
+func TestSkillReferenceMetadata_NoSnippetLeavesContentUnset(t *testing.T) {
+	got := skillReferenceMetadata(AgentReferenceKindSkill, "search_skills",
+		toolcore.NBToolResponseReference{Text: "runbook", Url: "kb-2", Snippet: "   "})
+
+	_, ok := got["content"]
+	assert.False(t, ok, "empty snippet must not set content")
+}
+
+// The snippet is capped so one long chunk cannot bloat every reference row.
+func TestSkillReferenceMetadata_SnippetTruncated(t *testing.T) {
+	long := strings.Repeat("x", kbRefSnippetMaxChars+500)
+	got := skillReferenceMetadata(AgentReferenceKindKBDocument, "load_skills",
+		toolcore.NBToolResponseReference{Text: "big", Url: "kb-3", Snippet: long})
+
+	assert.LessOrEqual(t, len(got["content"].(string)), kbRefSnippetMaxChars)
 }

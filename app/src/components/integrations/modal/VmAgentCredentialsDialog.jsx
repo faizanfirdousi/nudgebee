@@ -106,7 +106,7 @@ const VmAgentCredentialsDialog = ({ open, onClose, accessKey, accessSecret }) =>
               sx={{
                 color: 'var(--ds-brand-200)',
                 fontSize: 'var(--ds-text-small)',
-                fontFamily: '"Roboto Mono", monospace',
+                fontFamily: ds.font.mono,
                 whiteSpace: 'pre-wrap',
                 wordBreak: 'break-all',
                 m: 0,
@@ -312,7 +312,7 @@ const VmAgentCredentialsDialog = ({ open, onClose, accessKey, accessSecret }) =>
       handleClose={onClose}
       title={
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 'var(--ds-space-1)' }}>
-          <Typography component='h2' variant='h6' fontWeight={600}>
+          <Typography component='h2' variant='h6' fontWeight={ds.weight.semibold}>
             Proxy Agent Credentials
           </Typography>
         </Box>

@@ -1,6 +1,7 @@
 package core
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
@@ -19,7 +20,10 @@ func registerMockMetastore(t *testing.T) sqlmock.Sqlmock {
 	t.Helper()
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = db.Close() })
+	t.Cleanup(func() {
+		common.RegisterDatabaseManagerHook(common.Metastore, nil)
+		_ = db.Close()
+	})
 	sqlxDB := sqlx.NewDb(db, "postgresql")
 	common.RegisterDatabaseManagerHook(common.Metastore, func() (*common.DatabaseManager, error) {
 		return &common.DatabaseManager{Db: sqlxDB}, nil
@@ -71,4 +75,24 @@ func TestListAllToolConfigs_IncludesTenantScopedIntegrations(t *testing.T) {
 	assert.Equal(t, "prod-pg", byType["postgresql"], "account-scoped integration must still be returned")
 	assert.Equal(t, "acme-workspace", byType["slack"],
 		"tenant-scoped integration (no integrations_cloud_accounts row) must be returned — #32019")
+}
+
+// registerUnavailableMetastore makes cache-only tests deterministic instead of
+// depending on a closed mock from another test or a real database connection.
+func registerUnavailableMetastore(t *testing.T) {
+	t.Helper()
+	common.RegisterDatabaseManagerHook(common.Metastore, func() (*common.DatabaseManager, error) {
+		return nil, errors.New("metastore unavailable in cache-only test")
+	})
+	t.Cleanup(func() { common.RegisterDatabaseManagerHook(common.Metastore, nil) })
+}
+
+func TestCurrentAccountConfig_DoesNotFallBackToOtherTenantAccounts(t *testing.T) {
+	configs := []ToolConfig{
+		{Name: "k8s-dev", Values: []ToolConfigValue{{Name: "id", Value: "active-1"}}},
+		{Name: "k8s-prod", Values: []ToolConfigValue{{Name: "id", Value: "active-2"}}},
+	}
+
+	assert.Nil(t, currentAccountConfig(configs, "inactive-current"))
+	assert.Equal(t, []ToolConfig{configs[1]}, currentAccountConfig(configs, "active-2"))
 }

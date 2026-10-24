@@ -32,11 +32,11 @@ import SettingsOutlinedIcon from '@mui/icons-material/SettingsOutlined';
 import 'reactflow/dist/style.css';
 import { ds } from 'src/utils/colors';
 import FilterDropdown from '@ui/FilterDropdown';
-import WidgetCard from '@ui/WidgetCard';
+import CloudProviderIcon from '@shared/icons/CloudIcon';
+import { Card } from '@ui/Card';
 import Loader from '@shared/Loader';
 import apiKubernetes1 from '@api1/kubernetes1';
 import LangTypeIcon from '@shared/icons/LangTypeIcon';
-import CloudProviderIcon from '@shared/icons/CloudIcon';
 import { toast as snackbar } from '@ui/Toast';
 import apiHome from '@api1/home';
 import { safeJSONParse, snakeToTitleCase } from 'src/utils/common';
@@ -49,7 +49,7 @@ import LogQueryBuilderAutocomplete, { PropertyFilterHelp } from '@components/k8s
 import EdgeDetails from '@components/k8s/details/EdgeDetails';
 import Datetime from '@shared/format/Datetime';
 import KGSettings from './KGSettings';
-import { parseUniqueKey, decodeFilterOptions, computeFilterOptionsClientSide } from './kgFilterCascade';
+import { parseUniqueKey, formatTypeBadge, decodeFilterOptions, computeFilterOptionsClientSide } from './kgFilterCascade';
 import { isTenantAdmin } from '@lib/auth';
 import PropTypes from 'prop-types';
 
@@ -69,7 +69,7 @@ const REACT_FLOW_PRO_OPTIONS = { hideAttribution: true };
 // filter state that the existing Apply flow already consumes.
 const KgFilterSectionHeader = ({ heading, count, onClear, info }) => (
   <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 'var(--ds-space-2)', minHeight: ds.space[5] }}>
-    <Typography sx={{ fontSize: 'var(--ds-text-small)', fontWeight: 500, color: 'var(--ds-gray-600)' }}>{heading} filter</Typography>
+    <Typography sx={{ fontSize: 'var(--ds-text-small)', fontWeight: ds.weight.medium, color: 'var(--ds-gray-600)' }}>{heading} filter</Typography>
     <Box sx={{ display: 'flex', alignItems: 'center', gap: 'var(--ds-space-2)' }}>
       {count > 1 && (
         <>
@@ -290,6 +290,10 @@ const AdaptiveServiceNode = memo(
   ({ data, isConnectable }) => {
     const isZoomedOut = useStore(zoomSelector);
     const borderColor = data.type === 'Workload' ? 'var(--ds-blue-500)' : 'var(--ds-green-400)';
+    // Where the node lives, in the same order as the Node dropdown's context chip:
+    // account/cluster first, then the K8s namespace (blank for cluster-scoped and non-K8s
+    // nodes). Carried in `title` too since .node-sub ellipsis-truncates at the card width.
+    const contextLine = [data.accountName, data.namespace].filter(Boolean).join(' · ');
 
     return (
       <div className={`service-node-wrapper ${isZoomedOut ? 'lod-dot' : 'lod-full'}`}>
@@ -308,7 +312,11 @@ const AdaptiveServiceNode = memo(
           <div className='node-content'>
             <div className='node-title'>{data.name}</div>
             <span className='node-sub'>{[data.subtitle, ROLE_BADGE_LABELS[data.role], data.location].filter(Boolean).join(' · ')}</span>
-            <span className='node-sub'>{data.accountName}</span>
+            {contextLine && (
+              <span className='node-sub' title={contextLine}>
+                {contextLine}
+              </span>
+            )}
           </div>
           <button
             className='info-btn'
@@ -344,6 +352,7 @@ const AdaptiveServiceNode = memo(
     prev.data.name === next.data.name &&
     prev.data.subtitle === next.data.subtitle &&
     prev.data.accountName === next.data.accountName &&
+    prev.data.namespace === next.data.namespace &&
     prev.data.location === next.data.location
 );
 AdaptiveServiceNode.displayName = 'AdaptiveServiceNode';
@@ -353,6 +362,7 @@ AdaptiveServiceNode.propTypes = {
     name: PropTypes.string,
     subtitle: PropTypes.string,
     accountName: PropTypes.string,
+    namespace: PropTypes.string,
     type: PropTypes.string,
     subType: PropTypes.string,
     role: PropTypes.string,
@@ -571,7 +581,7 @@ const BreadcrumbTooltipContent = memo(({ node }) => {
             fontSize: 'var(--ds-text-caption)',
             color: 'var(--ds-gray-300)',
             wordBreak: 'break-all',
-            fontFamily: 'monospace',
+            fontFamily: ds.font.mono,
           }}
         >
           {node.uniqueKey || node.label}
@@ -645,20 +655,30 @@ const useGraphBuilder = (rawData, onInfoClick, accMap, onFocusClick) => {
       return { initialNodes: [], initialEdges: [] };
     }
 
-    // 1. Create Nodes (slim response: n.kind, n.name, n.account_id, n.logo_id — no n.properties)
+    // 1. Create Nodes (slim response: n.kind, n.name, n.account_id, n.logo_id, n.specific_type — no n.properties)
     const initialNodes = rawData.nodes.map((n) => {
-      const accName = accMap.get(n.account_id) || n.account_id;
+      // Identity nodes — UserAccount (PagerDuty/GitHub/GitLab/Nudgebee-internal user)
+      // and UserGroup (GitHub/GitLab/PagerDuty team, or a Nudgebee user_groups row) —
+      // are tenant-scoped, not cloud-account-scoped: their account_id is the tenant id
+      // itself, which accMap never resolves and which is meaningless to show per-node
+      // in a view already scoped to one tenant. Suppress it there instead of falling
+      // back to the raw UUID; show the specific source system (e.g. "PagerDuty User",
+      // "Nudgebee Group") in place of the generic "UserAccount"/"UserGroup" subtitle instead.
+      const isIdentityNode = n.kind === 'UserAccount' || n.kind === 'UserGroup';
+      const accName = isIdentityNode ? '' : accMap.get(n.account_id) || n.account_id;
+      const subtitle = isIdentityNode && n.specific_type ? humanizeNodeType(n.specific_type) : n.kind;
       return {
         id: n.id,
         type: 'serviceNode',
         data: {
           name: n.name,
           type: n.kind,
-          subtitle: n.kind,
+          subtitle,
           borderColor: n.kind === 'Workload' ? 'var(--ds-blue-500)' : 'var(--ds-green-400)',
           subType: n.logo_id,
           role: n.role, // datastore facet: 'database' | 'cache' | 'messagequeue' (in-cluster datastores)
           location: n.location, // region/zone/AZ for cloud resources; disambiguates same-named nodes (e.g. "default" subnets)
+          namespace: n.namespace, // K8s namespace; the k8s analogue of location, which k8s nodes leave blank
           id: n.id,
           properties: { node_id: n.id },
           accountId: n.account_id,
@@ -695,14 +715,25 @@ const useGraphBuilder = (rawData, onInfoClick, accMap, onFocusClick) => {
   }, [rawData, onInfoClick, accMap]);
 };
 
-// Cloud providers we render a real logo for. `external` (and anything else)
-// deliberately gets no icon — CloudProviderIcon falls back to the AWS logo for
-// unknown providers, which would be misleading on an ExternalService row.
+// Renders the cloud-provider icon shown in each Account filter group header.
+const renderAccountGroupIcon = (provider) => <CloudProviderIcon cloud_provider={provider} width='14px' height='14px' />;
+
+// The selectable leaves for a given node_type: its known specific_types, or (when none are
+// known yet — no ontology data, or not backfilled) a single leaf identical to the node_type
+// itself, so every node type stays selectable and accounted for either way.
 function getNodeTypeLeaves(nodeType, specificTypesByNodeType) {
   const specificTypes = specificTypesByNodeType?.[nodeType];
   return specificTypes?.length ? specificTypes : [nodeType];
 }
 
+// Builds the grouped Node Type filter options: one leaf per specific_type, grouped by its
+// broad node_type. A node_type whose only leaf is identical to itself (no ontology mapping,
+// or the AWS/GCP/Azure specific_type extractors' own fallback-to-node_type default) has
+// nothing to drill into, so it's left ungrouped rather than rendered as a group header with
+// one child of the same name — FilterDropdown buckets ungrouped options under "Other".
+// Real leaves also carry `searchText: nodeType` so the dropdown's search matches on the broad
+// (ontological) type too — e.g. searching "compute" surfaces EC2Instance/GCEInstance/etc. even
+// though none of those specific-type labels themselves contain "compute".
 function buildNodeTypeOptions(nodeTypes, specificTypesByNodeType) {
   return (nodeTypes || []).flatMap((nodeType) => {
     const leaves = getNodeTypeLeaves(nodeType, specificTypesByNodeType);
@@ -715,6 +746,16 @@ function buildNodeTypeOptions(nodeTypes, specificTypesByNodeType) {
   });
 }
 
+// Translates the flat set of selected Node Type filter leaf values (specific_types, or a bare
+// node_type when it has no breakdown) back into the two independent backend filter arrays.
+// A group with every leaf selected collapses to its broad node_type (matches pre-nesting
+// behavior and tolerates nodes whose specific_type hasn't been backfilled yet); a group with
+// only some leaves selected is sent as specific_types instead. The two arrays must never both
+// reference the same group, since the backend ANDs node_types and specific_types together.
+// `nodeTypes` must be the same full node_type list `buildNodeTypeOptions` was called with, so
+// every group a leaf could belong to (even ones absent from `specificTypesByNodeType`) is
+// accounted for — otherwise a selected leaf whose node_type has no map entry would vanish from
+// both output arrays, silently turning a scoped selection into "no filter at all".
 function splitNodeTypeSelection(selectedValues, nodeTypes, specificTypesByNodeType) {
   const selectedSet = new Set(selectedValues || []);
   const resultNodeTypes = [];
@@ -723,49 +764,79 @@ function splitNodeTypeSelection(selectedValues, nodeTypes, specificTypesByNodeTy
     const groupLeaves = getNodeTypeLeaves(nodeType, specificTypesByNodeType);
     const selectedInGroup = groupLeaves.filter((leaf) => selectedSet.has(leaf));
     if (selectedInGroup.length === 0) return;
-    if (selectedInGroup.length === groupLeaves.length) resultNodeTypes.push(nodeType);
-    else resultSpecificTypes.push(...selectedInGroup);
+    if (selectedInGroup.length === groupLeaves.length) {
+      resultNodeTypes.push(nodeType);
+    } else {
+      resultSpecificTypes.push(...selectedInGroup);
+    }
   });
   return { nodeTypes: resultNodeTypes, specificTypes: resultSpecificTypes };
 }
 
-const KNOWN_CLOUD_PROVIDERS = new Set(['aws', 'k8s', 'gcp', 'azure']);
+// Cloud/identity providers we render a real logo for. `external` (Nudgebee's own
+// tenant-scoped identity nodes) and anything else deliberately gets no icon —
+// CloudProviderIcon falls back to the AWS logo for unknown providers, which
+// would be misleading on an ExternalService/identity row with no real source.
+const KNOWN_CLOUD_PROVIDERS = new Set(['aws', 'k8s', 'gcp', 'azure', 'github', 'gitlab', 'pagerduty']);
 
-// parseUniqueKey is imported from ./kgFilterCascade (shared with the client-side cascade).
+// parseUniqueKey and formatTypeBadge are imported from ./kgFilterCascade (shared with the
+// client-side cascade).
 
 // PascalCase NodeType → spaced label ("ServiceIdentity" → "Service Identity").
 // snakeToTitleCase only splits on '_', so it would leave these un-spaced.
 const humanizeNodeType = (nodeType) => (nodeType || '').replace(/([a-z])([A-Z])/g, '$1 $2');
 
 // Build a Node-dropdown option from a unique key + node id. Shapes the row as
-// [provider icon] [NodeType badge] <name>  <location · hierarchy chip> — see
-// FilterDropdown OptionItem (icon / badge / label / type slots). The node type
-// rides on the left `badge`; the right `type` chip holds the location/namespace
-// context (region · vpc for cloud, cluster · namespace for k8s). Showing both
-// lets an operator disambiguate same-named nodes across types and namespaces.
-// The full key is kept in `searchText` so search still matches
-// namespace/region/type, and `displayLabel` mirrors the legacy value for any
-// consumer that reads it.
-const buildNodeOption = (uniqueKey, id) => {
+// [provider icon] [NodeType badge] <name>  <cluster · location · hierarchy chip>
+// — see FilterDropdown OptionItem (icon / badge / label / type slots). The node
+// type rides on the left `badge`; the right `type` chip holds the
+// cluster/location/namespace context (region · vpc for cloud, cluster ·
+// namespace for k8s). Showing all of these lets an operator disambiguate
+// same-named nodes across accounts/clusters as well as types and namespaces —
+// e.g. two unrelated clusters both having a "nudgebee" namespace. clusterMap
+// (unique_key -> k8s cluster name, from FilterOptions.NodeClusterMap) supplies
+// the cluster name since it isn't part of the unique key for namespace-scoped
+// k8s resources. specificTypeMap (unique_key -> specific_type, from
+// FilterOptions.NodeSpecificTypeMap) lets the badge show the concrete source
+// (e.g. "PagerDuty User") instead of the generic NodeType (e.g. "User Account")
+// when one identity's rows across GitHub/PagerDuty/Nudgebee would otherwise be
+// indistinguishable. formatTypeBadge then drops that brand prefix on rows that
+// render the provider's icon — the icon carries the source, so the badge spends
+// its width on the resource kind ("Config Map", not "Kubernetes Config …").
+// The full key plus cluster name are kept in `searchText` so search still
+// matches namespace/region/type/cluster (including the un-stripped type), and
+// `displayLabel` mirrors the legacy value for any consumer that reads it.
+const buildNodeOption = (uniqueKey, id, clusterMap, specificTypeMap) => {
   const parsed = parseUniqueKey(uniqueKey);
+  const cluster = clusterMap?.[uniqueKey];
   if (!parsed) {
     return { label: uniqueKey, displayLabel: uniqueKey, value: id, searchText: uniqueKey };
   }
   const { provider, location, nodeType, hierarchy, name } = parsed;
-  const contextChip = [location, hierarchy].filter(Boolean).join(' · ');
+  const specificType = specificTypeMap?.[uniqueKey];
+  const contextChip = [cluster, location, hierarchy].filter(Boolean).join(' · ');
+  const hasIcon = KNOWN_CLOUD_PROVIDERS.has(provider);
   const option = {
     label: name || uniqueKey,
     displayLabel: uniqueKey,
     value: id,
-    badge: humanizeNodeType(nodeType),
+    badge: formatTypeBadge(specificType || nodeType, provider, hasIcon),
     type: contextChip,
-    // location/hierarchy are case-sensitive identifiers (k8s namespace, region,
-    // vpc/resource-group id) — keep their casing verbatim, don't title-case.
+    // cluster/location/hierarchy are case-sensitive identifiers (k8s cluster,
+    // namespace, region, vpc/resource-group id) — keep casing verbatim, don't title-case.
     typeTextTransform: 'none',
-    searchText: uniqueKey,
+    searchText: [uniqueKey, cluster].filter(Boolean).join(' '),
   };
-  if (KNOWN_CLOUD_PROVIDERS.has(provider)) {
-    option.icon = <CloudProviderIcon cloud_provider={provider} width='16px' height='16px' />;
+  if (hasIcon) {
+    // The icon is the only thing naming the provider now that the badge doesn't
+    // repeat it, so it needs an accessible name. That has to ride on a wrapper
+    // rather than SafeIcon's `alt`: SafeIcon returns a JSX `src` verbatim, so
+    // `alt` never reaches an element icon.
+    option.icon = (
+      <Box component='span' role='img' aria-label={provider} sx={{ display: 'inline-flex' }}>
+        <CloudProviderIcon cloud_provider={provider} width='16px' height='16px' />
+      </Box>
+    );
   }
   return option;
 };
@@ -804,7 +875,7 @@ FilterWithInfo.propTypes = {
   children: PropTypes.node.isRequired,
 };
 
-const ServiceMapContent = () => {
+const ServiceMapContent = ({ cardElevation }) => {
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
   const { fitView, getNodes, getEdges } = useReactFlow();
@@ -829,6 +900,8 @@ const ServiceMapContent = () => {
   const [kgFiltersReady, setKgFiltersReady] = useState(false);
   const [isFilterOptionsRefreshing, setIsFilterOptionsRefreshing] = useState(false);
   const initialKgFilterOptionsRef = useRef(null);
+  // Latest node_type -> specific_type breakdown, kept in a ref (not state) so the debounced
+  // filter-options request below can read it without retriggering its own effect.
   const nodeTypeGroupingRef = useRef({ nodeTypeList: [], specificTypesByNodeType: {} });
   const kgFiltersInitialized = useRef(false);
   const filterOptionsDebounceRef = useRef(null);
@@ -1066,10 +1139,18 @@ const ServiceMapContent = () => {
         setKgFilterOptions((prev) => ({
           ...prev,
           nodeTypes: initialKgFilterOptionsRef.current.nodeTypes,
+          nodeTypeList: initialKgFilterOptionsRef.current.nodeTypeList,
+          specificTypesByNodeType: initialKgFilterOptionsRef.current.specificTypesByNodeType,
           labelMap: initialKgFilterOptionsRef.current.labelMap,
           attributeMap: initialKgFilterOptionsRef.current.attributeMap,
           nodeIdMap: initialKgFilterOptionsRef.current.nodeIdMap,
+          nodeClusterMap: initialKgFilterOptionsRef.current.nodeClusterMap,
+          nodeSpecificTypeMap: initialKgFilterOptionsRef.current.nodeSpecificTypeMap,
         }));
+        nodeTypeGroupingRef.current = {
+          nodeTypeList: initialKgFilterOptionsRef.current.nodeTypeList || [],
+          specificTypesByNodeType: initialKgFilterOptionsRef.current.specificTypesByNodeType || {},
+        };
       }
       return;
     }
@@ -1104,7 +1185,9 @@ const ServiceMapContent = () => {
         nodeClusterMap: computed.nodeClusterMap,
         nodeSpecificTypeMap: computed.nodeSpecificTypeMap,
       };
-      if (!suppressNodeTypesUpdate) nodeTypeGroupingRef.current = { nodeTypeList, specificTypesByNodeType };
+      if (!suppressNodeTypesUpdate) {
+        nodeTypeGroupingRef.current = { nodeTypeList, specificTypesByNodeType };
+      }
       setKgFilterOptions((prev) => ({ ...prev, ...updates }));
       setIsFilterOptionsRefreshing(false);
     };
@@ -1172,12 +1255,19 @@ const ServiceMapContent = () => {
         if (parsedJson) attributeFilter = parsedJson;
       }
 
+      const { nodeTypes: broadNodeTypes, specificTypes } = splitNodeTypeSelection(
+        nTypes?.map((e) => e.value),
+        nodeTypeGroupingRef.current.nodeTypeList,
+        nodeTypeGroupingRef.current.specificTypesByNodeType
+      );
+
       apiKubernetes1
         .knowledgeGraph(
           {
             accountIds: acIds?.map((e) => e.value),
             nodeIds: nIds?.map((e) => e.value),
-            nodeTypes: nTypes?.map((e) => e.value),
+            nodeTypes: broadNodeTypes,
+            specificTypes,
             ...(nIds?.length > 0 ? { levels: lvl } : {}),
             ...(labelFilter?.length ? { labels: Object.fromEntries(labelFilter.map((x) => [x.key, x.value])) } : {}),
             ...(attributeFilter?.length ? { attributes: Object.fromEntries(attributeFilter.map((x) => [x.key, x.value])) } : {}),
@@ -1762,6 +1852,8 @@ const ServiceMapContent = () => {
   // nodes (cascading). Falls back to the full Stage-1 API list when no nodes are selected
   // or the graph hasn't loaded yet.
   const filterNodeOptions = useMemo(() => {
+    const clusterMap = kgFilterOptions?.nodeClusterMap;
+    const specificTypeMap = kgFilterOptions?.nodeSpecificTypeMap;
     if (draftNodes.length > 0 && adjacencyMap.size > 0) {
       const selectedIds = new Set(draftNodes.map((n) => n.value));
       const neighborIds = new Set();
@@ -1778,7 +1870,7 @@ const ServiceMapContent = () => {
         const node = uniqueServiceKeysMap.get(id);
         if (node) {
           // node.uniqueKey / node.label both hold the canonical unique key.
-          neighborOptions.push(buildNodeOption(node.uniqueKey || node.label, node.value));
+          neighborOptions.push(buildNodeOption(node.uniqueKey || node.label, node.value, clusterMap, specificTypeMap));
         }
       });
       return [...neighborOptions, ...draftNodes];
@@ -1787,11 +1879,18 @@ const ServiceMapContent = () => {
     // Default: full list from Stage-1 filter data.
     // Always include currently drafted nodes even if not returned by the filtered API response.
     const map = kgFilterOptions?.nodeIdMap || {};
-    const options = Object.entries(map).map(([uniqueKey, id]) => buildNodeOption(uniqueKey, id));
+    const options = Object.entries(map).map(([uniqueKey, id]) => buildNodeOption(uniqueKey, id, clusterMap, specificTypeMap));
     const optionValues = new Set(Object.values(map));
     const selectedNotInMap = (draftNodes || []).filter((sel) => !optionValues.has(sel.value));
     return [...options, ...selectedNotInMap];
-  }, [kgFilterOptions?.nodeIdMap, draftNodes, adjacencyMap, uniqueServiceKeysMap]);
+  }, [
+    kgFilterOptions?.nodeIdMap,
+    kgFilterOptions?.nodeClusterMap,
+    kgFilterOptions?.nodeSpecificTypeMap,
+    draftNodes,
+    adjacencyMap,
+    uniqueServiceKeysMap,
+  ]);
 
   // Node type options merged with any currently drafted types not returned by the API.
   const mergedNodeTypeOptions = useMemo(() => {
@@ -1811,13 +1910,26 @@ const ServiceMapContent = () => {
   const kgFilters = useMemo(() => {
     const labelArr = safeJSONParse(draftLabelFilters) || [];
     const attrArr = safeJSONParse(draftAttributeFilters) || [];
+    const { nodeTypes, specificTypes } = splitNodeTypeSelection(
+      (draftNodeTypes || []).map((e) => e.value),
+      kgFilterOptions?.nodeTypeList,
+      kgFilterOptions?.specificTypesByNodeType
+    );
     return {
       accountIds: (draftAccountIds || []).map((e) => e.value),
-      nodeTypes: (draftNodeTypes || []).map((e) => e.value),
+      nodeTypes,
+      specificTypes,
       labels: Array.isArray(labelArr) ? Object.fromEntries(labelArr.map((x) => [x.key, x.value])) : {},
       attributes: Array.isArray(attrArr) ? Object.fromEntries(attrArr.map((x) => [x.key, x.value])) : {},
     };
-  }, [draftAccountIds, draftNodeTypes, draftLabelFilters, draftAttributeFilters]);
+  }, [
+    draftAccountIds,
+    draftNodeTypes,
+    draftLabelFilters,
+    draftAttributeFilters,
+    kgFilterOptions?.nodeTypeList,
+    kgFilterOptions?.specificTypesByNodeType,
+  ]);
 
   // Update refs for path computation in handleInfoClick
   useEffect(() => {
@@ -2087,7 +2199,8 @@ const ServiceMapContent = () => {
         ?.map((acc) => ({
           label: acc.label || acc.account_name,
           value: acc.id || acc.value,
-        })) || accounts,
+          group: acc.cloud_provider || 'Other',
+        })) || [],
     [accounts, kgFilterOptions?.accountIds]
   );
 
@@ -2134,9 +2247,9 @@ const ServiceMapContent = () => {
       >
         {/* Collapsed rail — a slim strip with an expand control so the canvas can be broadened */}
         {isFilterCollapsed && (
-          <WidgetCard
+          <Card
+            elevation={cardElevation}
             sx={{
-              mt: 0,
               p: 'var(--ds-space-2)',
               display: 'flex',
               flexDirection: 'column',
@@ -2159,7 +2272,7 @@ const ServiceMapContent = () => {
             <Typography
               sx={{
                 fontSize: 'var(--ds-text-caption)',
-                fontFamily: 'Poppins',
+                fontFamily: ds.font.display,
                 color: 'var(--ds-gray-500)',
                 writingMode: 'vertical-rl',
                 transform: 'rotate(180deg)',
@@ -2168,15 +2281,15 @@ const ServiceMapContent = () => {
             >
               Filters
             </Typography>
-          </WidgetCard>
+          </Card>
         )}
 
         {/* Left Sidebar - Filters */}
         {!isFilterCollapsed && (
-          <WidgetCard
+          <Card
             id='kg-filter-panel'
+            elevation={cardElevation}
             sx={{
-              mt: 0,
               p: 'var(--ds-space-4)',
               display: 'flex',
               flexDirection: 'column',
@@ -2193,7 +2306,7 @@ const ServiceMapContent = () => {
               }}
             >
               <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 'var(--ds-space-1)' }}>
-                <Typography variant='subtitle1' sx={{ fontSize: 'var(--ds-text-title)', fontFamily: 'Poppins', color: ds.gray[700] }}>
+                <Typography variant='subtitle1' sx={{ fontSize: 'var(--ds-text-title)', fontFamily: ds.font.display, color: ds.gray[700] }}>
                   Filters
                 </Typography>
                 <Tooltip title='Hide filters'>
@@ -2213,19 +2326,19 @@ const ServiceMapContent = () => {
                 <Datetime
                   value={kgFilterOptions.lastSyncTime}
                   prefix='Last synced: '
-                  sxPrefix={{ fontSize: 'var(--ds-text-caption)', color: 'var(--ds-gray-400)', fontFamily: 'Poppins', mr: 'var(--ds-space-1)' }}
+                  sxPrefix={{ fontSize: 'var(--ds-text-caption)', color: 'var(--ds-gray-400)', fontFamily: ds.font.display, mr: 'var(--ds-space-1)' }}
                   sxPrefixSecondary={false}
                   sx={{
                     fontSize: 'var(--ds-text-caption)',
                     fontWeight: 'var(--ds-font-weight-semibold)',
                     color: 'var(--ds-gray-500)',
-                    fontFamily: 'Poppins',
+                    fontFamily: ds.font.display,
                   }}
                   sxSuffix={{
                     fontSize: 'var(--ds-text-caption)',
                     fontWeight: 'var(--ds-font-weight-semibold)',
                     color: 'var(--ds-gray-500)',
-                    fontFamily: 'Poppins',
+                    fontFamily: ds.font.display,
                   }}
                   sxSecondary={false}
                   sxSuffixSecondary={false}
@@ -2249,14 +2362,17 @@ const ServiceMapContent = () => {
                   value={draftAccountIds}
                   onSelect={(e) => setDraftAccountIds(e.target.value)}
                   multiple
+                  grouped
+                  groupIcon={renderAccountGroupIcon}
                   width='100%'
                 />
               </FilterWithInfo>
               <FilterWithInfo
                 info={
                   <InfoTip title='Node Type'>
-                    Restrict the graph to specific resource kinds — e.g. Workload, Service, EC2 Instance, Route Table, VPC. Select one or more, and
-                    combine with Account to focus on a slice of your infrastructure.
+                    Restrict the graph to specific resource kinds — e.g. Workload, Service, EC2 Instance, Route Table, VPC. Expand a type to pick
+                    specific sub-types (e.g. only EC2 Instance within Cloud Resource). Select one or more, and combine with Account to focus on a
+                    slice of your infrastructure.
                   </InfoTip>
                 }
               >
@@ -2267,6 +2383,7 @@ const ServiceMapContent = () => {
                   value={draftNodeTypes}
                   onSelect={(e) => setDraftNodeTypes(e.target.value)}
                   multiple
+                  grouped
                   isOptionsLoading={isFilterLoading || isFilterOptionsRefreshing}
                   width='100%'
                 />
@@ -2278,20 +2395,22 @@ const ServiceMapContent = () => {
                     chosen Level.
                     <Box
                       component='ul'
-                      sx={{ m: 'var(--ds-space-2) 0 0', pl: 'var(--ds-space-4)', display: 'flex', flexDirection: 'column', gap: '2px' }}
+                      sx={{ m: 'var(--ds-space-2) 0 0', pl: 'var(--ds-space-4)', display: 'flex', flexDirection: 'column', gap: ds.space[0] }}
                     >
-                      <li>Cloud provider icon (AWS / GCP / Azure / K8s)</li>
                       <li>
-                        <b>Left blue badge</b> — the node&apos;s type (e.g. Route Table)
+                        <b>Leading icon</b> — the source it came from (AWS / GCP / Azure / K8s / GitHub / …)
+                      </li>
+                      <li>
+                        <b>Left blue badge</b> — the node&apos;s type (e.g. Route Table, Config Map)
                       </li>
                       <li>
                         <b>Middle</b> — the node&apos;s name
                       </li>
                       <li>
-                        <b>Right grey chip</b> — its location: namespace for Kubernetes, region · VPC for cloud
+                        <b>Right grey chip</b> — its location: cluster · namespace for Kubernetes, region · VPC for cloud
                       </li>
                     </Box>
-                    <Box sx={{ mt: 'var(--ds-space-2)' }}>Type-ahead matches name, namespace, region and type.</Box>
+                    <Box sx={{ mt: 'var(--ds-space-2)' }}>Type-ahead matches name, cluster, namespace, region and type.</Box>
                   </InfoTip>
                 }
               >
@@ -2317,8 +2436,9 @@ const ServiceMapContent = () => {
                   // Rows pack a left type badge + name + right location/vpc chip;
                   // the narrow sidebar trigger width crushes the name to a few
                   // chars. Widen the menu (it left-anchors and extends over the
-                  // canvas) so the name stays readable — mirrors KgNodePicker.
-                  popoverWidth='520px'
+                  // canvas) so same-named nodes stay distinguishable by the tail
+                  // of their name — mirrors KgNodePicker.
+                  popoverWidth='640px'
                 />
               </FilterWithInfo>
               <FilterWithInfo
@@ -2404,7 +2524,7 @@ const ServiceMapContent = () => {
                 Clear All
               </Button>
             </Box>
-          </WidgetCard>
+          </Card>
         )}
 
         {/* Right Side - Graph */}
@@ -2589,7 +2709,7 @@ const ServiceMapContent = () => {
                       sx={{
                         fontSize: 'var(--ds-text-heading)',
                         fontWeight: 'var(--ds-font-weight-semibold)',
-                        fontFamily: 'Poppins',
+                        fontFamily: ds.font.display,
                         color: ds.gray[700],
                       }}
                     >
@@ -2673,7 +2793,7 @@ const ServiceMapContent = () => {
                       sx={{
                         fontSize: 'var(--ds-text-heading)',
                         fontWeight: 'var(--ds-font-weight-semibold)',
-                        fontFamily: 'Poppins',
+                        fontFamily: ds.font.display,
                         color: ds.gray[700],
                       }}
                     >
@@ -2744,7 +2864,7 @@ const ServiceMapContent = () => {
                       sx={{
                         fontSize: 'var(--ds-text-heading)',
                         fontWeight: 'var(--ds-font-weight-semibold)',
-                        fontFamily: 'Poppins',
+                        fontFamily: ds.font.display,
                         color: ds.gray[700],
                       }}
                     >
@@ -2826,10 +2946,16 @@ const ServiceMapContent = () => {
   );
 };
 
-export default function KnowledgeGraphServiceMapWrapper() {
+export default function KnowledgeGraphServiceMapWrapper({ cardElevation = 'raised' }) {
   return (
     <ReactFlowProvider>
-      <ServiceMapContent />
+      <ServiceMapContent cardElevation={cardElevation} />
     </ReactFlowProvider>
   );
 }
+
+KnowledgeGraphServiceMapWrapper.propTypes = {
+  // Card elevation for the filter panel: 'flat' when mounted inside a modal (b-Cortex),
+  // where a raised shadow would stack on the modal surface; 'raised' on a page (Troubleshoot).
+  cardElevation: PropTypes.oneOf(['raised', 'flat']),
+};

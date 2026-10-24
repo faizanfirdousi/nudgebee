@@ -18,11 +18,17 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Optional
+from typing import NamedTuple, Optional
 
-from sqlalchemy import func
+from sqlalchemy import func, text
 
 from benchmark_server.models.benchmark_run import BenchmarkRun, BenchmarkTestResult
+from llm.agents.common.eval_markers import (
+    METRIC_FAILED,
+    PLANNER_METRIC_FAILED,
+    QUALITY_METRIC_FAILED,
+    SIMILARITY_METRIC_FAILED,
+)
 from benchmark_server.utils.db_utils import get_db
 
 logger = logging.getLogger(__name__)
@@ -292,6 +298,133 @@ def _test_status_from_conversation(conv_status: str):
     return "running"  # PENDING, IN_PROGRESS, unknown → still in flight
 
 
+# --- Duration ---------------------------------------------------------------
+# A test's ``duration_seconds`` is ALWAYS the llm-server's own span for the
+# turn, read back from ``llm_conversation_messages``: MIN(created_at) →
+# MAX(responded_at) over the conversation's ``generation`` rows, minus any
+# stretch the agent spent parked on a followup waiting for a human answer.
+#
+# Wall-clocking the benchmark process instead charged the model under test for
+# fixture setup, poll lag, RAGAS judging and write-approval waits — one 33s
+# test measured 597s because a human took nine minutes to click "yes".
+#
+# ``llm_conversations.updated_at`` is NOT usable here: post-answer bookkeeping
+# agents (session_extractor, context_memories_extractions) bump it seconds
+# after the answer was handed to the caller. And ``latency_seconds`` on
+# llm_conversation_token_usage must never be summed — agents run concurrently,
+# so the calls overlap and the sum exceeds the elapsed time.
+_ANSWER_DURATION_SQL = text("""
+    WITH gen AS (
+        SELECT MIN(created_at) AS started,
+               MAX(COALESCE(responded_at, updated_at)) AS answered
+        FROM llm_conversation_messages
+        WHERE conversation_id = :cid AND message_type = 'generation'
+    ),
+    -- Union of followup waits, not their sum: parallel agents can post
+    -- confirmation panels whose waits overlap, and summing double-subtracts.
+    -- Same gaps-and-islands merge llm-server uses for tool time.
+    spans AS (
+        SELECT created_at, responded_at,
+            CASE WHEN created_at > MAX(responded_at) OVER (
+                    ORDER BY created_at, responded_at
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
+                THEN 1 ELSE 0 END AS is_new_span
+        FROM llm_conversation_messages
+        WHERE conversation_id = :cid AND message_type = 'followup'
+          AND responded_at IS NOT NULL
+    ),
+    islands AS (
+        SELECT created_at, responded_at,
+               SUM(is_new_span) OVER (ORDER BY created_at, responded_at) AS island
+        FROM spans
+    ),
+    waited AS (
+        SELECT COALESCE(SUM(EXTRACT(EPOCH FROM (span_end - span_start))), 0) AS seconds
+        FROM (
+            SELECT MIN(created_at) AS span_start, MAX(responded_at) AS span_end
+            FROM islands GROUP BY island
+        ) merged
+    )
+    SELECT GREATEST(
+        EXTRACT(EPOCH FROM (gen.answered - gen.started)) - waited.seconds, 0
+    ) AS seconds,
+    waited.seconds AS followup_wait_seconds
+    FROM gen, waited
+    WHERE gen.started IS NOT NULL AND gen.answered IS NOT NULL
+""")
+
+
+class AnswerTiming(NamedTuple):
+    """Both halves of a turn, from one pass over the message rows.
+
+    ``duration_seconds`` is the agent's own answer time; ``followup_wait_seconds``
+    is how long it sat parked on followups waiting for a human. They are reported
+    separately rather than as one number because a slow model and a slow reviewer
+    are different problems.
+    """
+
+    duration_seconds: float
+    followup_wait_seconds: float
+
+
+# Statuses a test never leaves. A row in one of these must carry a real
+# duration, whichever path finished it (orchestrator, followup handler or
+# reconciler) — a hardcoded 0 used to be possible on the followup path.
+_TERMINAL_STATUSES = ("pass", "fail", "error", "timeout")
+
+
+def answer_timing(conversation_id) -> Optional[AnswerTiming]:
+    """The agent's answer time and followup wait, or None if not derivable.
+
+    ``conversation_id`` is ``llm_conversations.id`` (a test row's
+    ``conversation_id`` column) — NOT ``polling_conversation_id``, which holds
+    the session_id.
+
+    Runs on its own short-lived session so a query failure can never poison a
+    caller's open transaction.
+
+    Total by construction: every caller invokes this from inside its own
+    try/except, where an escaping exception costs a stored result row (or, in
+    the reconciler, aborts the whole sweep). Session acquisition is inside the
+    guard too — ``get_db`` cannot raise today, but it lives in another module
+    and only has to start connecting eagerly once for this to silently drop
+    durations.
+    """
+    if not conversation_id:
+        return None
+    try:
+        cid = str(uuid.UUID(str(conversation_id)))
+    except (ValueError, AttributeError, TypeError):
+        # Not a conversation UUID (blank, or a session_id passed by mistake).
+        return None
+    db = None
+    try:
+        db = get_db()
+        if not db:
+            return None
+        row = db.execute(_ANSWER_DURATION_SQL, {"cid": cid}).fetchone()
+        if not row or row[0] is None:
+            return None
+        return AnswerTiming(round(float(row[0]), 2), round(float(row[1] or 0.0), 2))
+    except Exception:
+        logger.exception("duration: query failed for conversation %s", conversation_id)
+        return None
+    finally:
+        if db:
+            try:
+                db.close()
+            except Exception:
+                logger.exception("duration: session close failed")
+
+
+def _stamp_answer_duration(tr, conversation_id) -> None:
+    """Set a terminal row's timings from its conversation, when derivable."""
+    timing = answer_timing(conversation_id)
+    if timing is not None:
+        tr.duration_seconds = timing.duration_seconds
+        tr.followup_wait_seconds = timing.followup_wait_seconds
+
+
 def _hard_timeout_sec() -> int:
     """Optional hard ceiling (seconds) on how long a test may stay non-terminal
     before the reconciler gives up and marks it ``timeout``. Default 0 = OFF, so
@@ -397,6 +530,32 @@ def _run_after_test_teardown(ctx: dict) -> None:
         )
 
 
+def _queue_verdict_row(tr, convo_id: str) -> tuple:
+    """Mark a reconciler-finalized row "pending" and build its judge context.
+
+    The trace is fetched by the background worker, not here, so the poller
+    doesn't stall on it. The setup script isn't stored on the row, so this
+    path judges without it.
+    """
+    tr.verdict_status = "pending"
+    tr.verdict_result = None
+    tr.verdict_error = None
+    context = {
+        "test_id": tr.test_id,
+        "query": tr.query or "",
+        "expected_answer": tr.expected_answer or "",
+        "actual_answer": tr.actual_answer or "",
+        "tool_names": tr.tool_names or [],
+        "tool_calls_total": tr.tool_calls_total or 0,
+        "tool_calls_successful": tr.tool_calls_successful or 0,
+        "error_message": tr.error_message or "",
+        "error_category": tr.error_category or "",
+        "status": tr.status,
+        "tags": tr.tags or [],
+    }
+    return tr.test_index, convo_id, context
+
+
 def reconcile_waiting_tests(  # noqa: C901
     run_id: str, nudge_complete: bool = True
 ) -> dict:
@@ -433,6 +592,7 @@ def reconcile_waiting_tests(  # noqa: C901
     # seconds; don't hold the txn open for them). One entry per test the
     # reconciler finalizes that still has a live scenario.
     to_teardown = []
+    to_judge = []
     db = get_db()
     if not db:
         return outcome
@@ -504,6 +664,7 @@ def reconcile_waiting_tests(  # noqa: C901
                 tr.status = "pass" if answer else "fail"
                 tr.actual_answer = answer or tr.actual_answer or ""
                 tr.followup_request = None
+                _stamp_answer_duration(tr, convo_id)
                 if not answer:
                     tr.error_message = (
                         tr.error_message or "Empty response after reconciliation"
@@ -512,6 +673,7 @@ def reconcile_waiting_tests(  # noqa: C901
                 outcome["completed"] += 1
                 if tr.teardown_ctx:
                     to_teardown.append(tr.teardown_ctx)
+                to_judge.append(_queue_verdict_row(tr, convo_id))
                 _fevent(
                     "reconciled",
                     run_id=run_id,
@@ -527,6 +689,7 @@ def reconcile_waiting_tests(  # noqa: C901
                 # FAILED / KILLED / TERMINATED.
                 tr.status = "fail"
                 tr.followup_request = None
+                _stamp_answer_duration(tr, convo_id)
                 tr.error_message = result.error_message or (
                     f"conversation {(result.status or '').upper()}"
                 )
@@ -534,6 +697,7 @@ def reconcile_waiting_tests(  # noqa: C901
                 outcome["failed"] += 1
                 if tr.teardown_ctx:
                     to_teardown.append(tr.teardown_ctx)
+                to_judge.append(_queue_verdict_row(tr, convo_id))
                 _fevent(
                     "reconciled",
                     run_id=run_id,
@@ -572,6 +736,7 @@ def reconcile_waiting_tests(  # noqa: C901
             if hard_timeout_sec > 0 and _waiting_age_sec(tr) > hard_timeout_sec:
                 tr.status = "timeout"
                 tr.followup_request = None
+                _stamp_answer_duration(tr, convo_id)
                 tr.error_message = tr.error_message or (
                     f"Non-terminal for >{int(hard_timeout_sec)}s "
                     f"(conversation {(result.status or '').upper()})"
@@ -602,6 +767,12 @@ def reconcile_waiting_tests(  # noqa: C901
     # DB session is closed so a slow after_test (kubectl) never holds the txn.
     for ctx in to_teardown:
         _run_after_test_teardown(ctx)
+
+    if to_judge:
+        from llm.agents.common.verdict_judge import submit_verdict
+
+        for test_index, convo_id, context in to_judge:
+            submit_verdict(run_id, test_index, convo_id, context, account_id=account_id)
 
     # Skip the nudge when called from inside complete_run — that path runs
     # reconcile as a precursor to its own completion check, so a recursive
@@ -833,6 +1004,7 @@ def _sweeper_loop():
                     reconcile_waiting_tests(rid)
                 except Exception:
                     logger.exception("sweeper: reconcile failed for %s", rid)
+            clear_pending_verdicts()
         except Exception:
             logger.exception("sweeper: iteration crashed")
         # Responsive to stop signal without tight loop.
@@ -1377,6 +1549,9 @@ def rerun_tests(run_id: str, test_indices: list[int]) -> dict:
                 BenchmarkTestResult.planner_relevancy: 0.0,
                 BenchmarkTestResult.score_reason: None,
                 BenchmarkTestResult.execution_trace: None,
+                BenchmarkTestResult.verdict_status: None,
+                BenchmarkTestResult.verdict_result: None,
+                BenchmarkTestResult.verdict_error: None,
                 BenchmarkTestResult.followup_request: None,
                 BenchmarkTestResult.duration_seconds: 0.0,
                 BenchmarkTestResult.setup_duration: 0.0,
@@ -1661,6 +1836,27 @@ def _get_model_info(run: BenchmarkRun, field: str) -> list:
     return sorted(values)
 
 
+def _metric_avg(
+    scorable_results: list[BenchmarkTestResult], attr: str, failed_marker: str
+) -> float:
+    # A judge crash records the failure marker in score_reason and a 0 score.
+    # That 0 is a scoring artifact, not an assessment — averaging it in
+    # misreports the agent, so those rows are excluded from this metric's mean
+    # (they still count for every other metric). Shared by the dashboard
+    # summary and the report assembly so the two cannot disagree.
+    vals = []
+    for r in scorable_results:
+        score = getattr(r, attr) or 0.0
+        if not score and failed_marker in (r.score_reason or ""):
+            continue
+        vals.append(score)
+    return round(sum(vals) / len(vals), 2) if vals else 0.0
+
+
+def _judge_failures(scorable_results: list[BenchmarkTestResult]) -> int:
+    return sum(1 for r in scorable_results if METRIC_FAILED in (r.score_reason or ""))
+
+
 def _get_test_summary(run: BenchmarkRun) -> dict:
     """Compute test result counts from the relationship."""
     results = run.test_results or []
@@ -1695,32 +1891,16 @@ def _get_test_summary(run: BenchmarkRun) -> dict:
             r.status == "error" and (r.error_category or "") in INFRA_ERROR_CATEGORIES
         )
     ]
-    avg_similarity = (
-        round(
-            sum(r.answer_similarity or 0 for r in scorable_results)
-            / len(scorable_results),
-            2,
-        )
-        if scorable_results
-        else 0
+
+    avg_similarity = _metric_avg(
+        scorable_results, "answer_similarity", SIMILARITY_METRIC_FAILED
     )
-    avg_relevancy = (
-        round(
-            sum(r.answer_relevancy or 0 for r in scorable_results)
-            / len(scorable_results),
-            2,
-        )
-        if scorable_results
-        else 0
+    avg_relevancy = _metric_avg(
+        scorable_results, "answer_relevancy", QUALITY_METRIC_FAILED
     )
-    avg_planner = (
-        round(
-            sum(r.planner_relevancy or 0 for r in scorable_results)
-            / len(scorable_results),
-            2,
-        )
-        if scorable_results
-        else 0
+    judge_failures = _judge_failures(scorable_results)
+    avg_planner = _metric_avg(
+        scorable_results, "planner_relevancy", PLANNER_METRIC_FAILED
     )
     overall_accuracy = (
         round((avg_similarity + avg_relevancy) / 2, 2) if scorable_results else 0
@@ -1736,6 +1916,9 @@ def _get_test_summary(run: BenchmarkRun) -> dict:
         "avg_similarity": avg_similarity,
         "avg_relevancy": avg_relevancy,
         "avg_planner": avg_planner,
+        # Non-zero means some scores are missing, not that the agent scored
+        # low — a judge-config failure can silently lose a whole run this way.
+        "judge_failures": judge_failures,
     }
 
 
@@ -1772,7 +1955,11 @@ def _get_test_results_list(run: BenchmarkRun) -> list:
                 "answer_relevancy": r.answer_relevancy or 0.0,
                 "planner_relevancy": r.planner_relevancy or 0.0,
                 "score_reason": r.score_reason or "",
+                "verdict_status": r.verdict_status,
+                "verdict_result": r.verdict_result,
+                "verdict_error": r.verdict_error or "",
                 "duration_seconds": r.duration_seconds or 0.0,
+                "followup_wait_seconds": r.followup_wait_seconds,
                 "cost": r.cost or 0.0,
                 "total_tokens": r.total_tokens or 0,
                 "tool_calls_total": r.tool_calls_total or 0,
@@ -1824,6 +2011,23 @@ def store_test_result(run_id: str, result: dict):
             .first()
         )
 
+        # Duration is read back from the conversation, never wall-clocked by the
+        # caller (see _ANSWER_DURATION_SQL). Doing it here covers every terminal
+        # path — orchestrator, followup handler, pytest runners — so a stored
+        # duration always means the same thing and can never be a stopwatch
+        # number or a hardcoded 0.
+        status = result.get("status") or (tr.status if tr else "")
+        if status in _TERMINAL_STATUSES:
+            timing = answer_timing(
+                result.get("conversation_id") or (tr.conversation_id if tr else "")
+            )
+            if timing is not None:
+                result = {
+                    **result,
+                    "duration_seconds": timing.duration_seconds,
+                    "followup_wait_seconds": timing.followup_wait_seconds,
+                }
+
         if tr:
             # Update existing row
             new_status = result.get("status", tr.status)
@@ -1841,7 +2045,13 @@ def store_test_result(run_id: str, result: dict):
             tr.planner_relevancy = result.get("planner_relevancy", tr.planner_relevancy)
             tr.score_reason = result.get("score_reason", tr.score_reason)
             tr.execution_trace = result.get("execution_trace", tr.execution_trace)
+            tr.verdict_status = result.get("verdict_status", tr.verdict_status)
+            tr.verdict_result = result.get("verdict_result", tr.verdict_result)
+            tr.verdict_error = result.get("verdict_error", tr.verdict_error)
             tr.duration_seconds = result.get("duration_seconds", tr.duration_seconds)
+            tr.followup_wait_seconds = result.get(
+                "followup_wait_seconds", tr.followup_wait_seconds
+            )
             tr.setup_duration = result.get("setup_duration", tr.setup_duration)
             tr.llm_duration = result.get("llm_duration", tr.llm_duration)
             tr.teardown_duration = result.get("teardown_duration", tr.teardown_duration)
@@ -1874,6 +2084,9 @@ def store_test_result(run_id: str, result: dict):
                     tr.polling_conversation_id = None
                 tr.score_reason = None
                 tr.execution_trace = None
+                tr.verdict_status = None
+                tr.verdict_result = None
+                tr.verdict_error = None
                 tr.error_message = ""
                 tr.error_category = ""
                 tr.actual_answer = ""
@@ -1882,6 +2095,7 @@ def store_test_result(run_id: str, result: dict):
                 tr.answer_relevancy = 0.0
                 tr.planner_relevancy = 0.0
                 tr.duration_seconds = 0.0
+                tr.followup_wait_seconds = None
                 tr.setup_duration = 0.0
                 tr.llm_duration = 0.0
                 tr.teardown_duration = 0.0
@@ -1915,7 +2129,11 @@ def store_test_result(run_id: str, result: dict):
                 planner_relevancy=result.get("planner_relevancy", 0.0),
                 score_reason=result.get("score_reason", ""),
                 execution_trace=result.get("execution_trace", ""),
+                verdict_status=result.get("verdict_status"),
+                verdict_result=result.get("verdict_result"),
+                verdict_error=result.get("verdict_error"),
                 duration_seconds=result.get("duration_seconds", 0.0),
+                followup_wait_seconds=result.get("followup_wait_seconds"),
                 setup_duration=result.get("setup_duration", 0.0),
                 llm_duration=result.get("llm_duration", 0.0),
                 teardown_duration=result.get("teardown_duration", 0.0),
@@ -1980,6 +2198,75 @@ def get_test_followup_data(run_id: str, test_index: int) -> dict:
         db.close()
 
 
+def set_verdict(
+    run_id: str, test_index: int, conversation_id: str, fields: dict
+) -> None:
+    """Write a background verdict onto its test row.
+
+    Matched on conversation_id too: if the test was retried while the judge
+    ran, the row now belongs to a new attempt and the stale verdict is dropped.
+    """
+    db = get_db()
+    if not db:
+        return
+    try:
+        updated = (
+            db.query(BenchmarkTestResult)
+            .filter(
+                BenchmarkTestResult.run_id == run_id,
+                BenchmarkTestResult.test_index == test_index,
+                BenchmarkTestResult.conversation_id == conversation_id,
+            )
+            .update(fields, synchronize_session=False)
+        )
+        db.commit()
+        if not updated:
+            logger.info(
+                "verdict for run %s index %d dropped: row was retried",
+                run_id,
+                test_index,
+            )
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "Failed to store verdict for run %s index %d", run_id, test_index
+        )
+    finally:
+        db.close()
+
+
+def clear_pending_verdicts(stale_minutes: int = 10) -> None:
+    """Un-stick rows whose background judge call died (server restart, hung call).
+
+    Only rows pending for longer than any live judge call takes, so a verdict
+    still in flight on another worker is left alone. They go back to "not
+    judged"; /re-evaluate fills them in. Called from the periodic sweeper.
+    """
+    db = get_db()
+    if not db:
+        return
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(
+        minutes=stale_minutes
+    )
+    try:
+        cleared = (
+            db.query(BenchmarkTestResult)
+            .filter(
+                BenchmarkTestResult.verdict_status == "pending",
+                BenchmarkTestResult.updated_at < cutoff,
+            )
+            .update({"verdict_status": None}, synchronize_session=False)
+        )
+        db.commit()
+        if cleared:
+            logger.info("Cleared %d stale pending verdict(s)", cleared)
+    except Exception:
+        db.rollback()
+        logger.exception("Failed to clear stale pending verdicts")
+    finally:
+        db.close()
+
+
 def update_test_result_scores(
     run_id: str,
     test_index: int,
@@ -1988,6 +2275,7 @@ def update_test_result_scores(
     planner_relevancy: float = None,
     score_reason: str = None,
     execution_trace: str = None,
+    verdict: dict = None,
     **kwargs,
 ):
     """Update RAGAS scores and optional token/model metrics for a test result.
@@ -2022,6 +2310,10 @@ def update_test_result_scores(
                 tr.score_reason = score_reason
             if execution_trace is not None:
                 tr.execution_trace = execution_trace
+            # Written as a set (None included) so a new verdict clears an old
+            # error and vice versa.
+            for field, val in (verdict or {}).items():
+                setattr(tr, field, val)
 
             # Token and model metrics from re-evaluation
             _TOKEN_FIELDS = {
@@ -2097,6 +2389,9 @@ def _assemble_report(db, run: BenchmarkRun) -> dict:
             "score_reason": r.score_reason or "",
             "execution_trace": r.execution_trace or "",
             "duration_seconds": r.duration_seconds or 0.0,
+            # None (not 0) for rows recorded before this was tracked, so a
+            # reader can tell "waited on nobody" from "we don't know".
+            "followup_wait_seconds": r.followup_wait_seconds,
             "cost": r.cost or 0.0,
             "total_tokens": r.total_tokens or 0,
             "input_tokens": r.input_tokens or 0,
@@ -2110,6 +2405,9 @@ def _assemble_report(db, run: BenchmarkRun) -> dict:
             "tags": r.tags or [],
             "error_message": r.error_message or "",
             "error_category": r.error_category or "",
+            # LLM session_id — same handle the run-detail page uses to build
+            # an "open this conversation" link (see _get_test_results_list).
+            "session_id": r.polling_conversation_id or "",
         }
         details.append(detail)
 
@@ -2170,9 +2468,13 @@ def _assemble_report(db, run: BenchmarkRun) -> dict:
             return data[-1]
         return data[f] + (k - f) * (data[c] - data[f])
 
-    avg_sim = round(sum(r.answer_similarity or 0 for r in scorable_results) / n, 2)
-    avg_rel = round(sum(r.answer_relevancy or 0 for r in scorable_results) / n, 2)
-    avg_planner = round(sum(r.planner_relevancy or 0 for r in scorable_results) / n, 2)
+    avg_sim = _metric_avg(
+        scorable_results, "answer_similarity", SIMILARITY_METRIC_FAILED
+    )
+    avg_rel = _metric_avg(scorable_results, "answer_relevancy", QUALITY_METRIC_FAILED)
+    avg_planner = _metric_avg(
+        scorable_results, "planner_relevancy", PLANNER_METRIC_FAILED
+    )
     overall_acc = round((avg_sim + avg_rel) / 2, 2)
 
     avg_cache = 0.0
@@ -2187,6 +2489,7 @@ def _assemble_report(db, run: BenchmarkRun) -> dict:
         "overall_accuracy": overall_acc,
         "answer_similarity": avg_sim,
         "answer_relevancy": avg_rel,
+        "judge_failures": _judge_failures(scorable_results),
         "planner_relevancy": avg_planner,
         "latency": {
             "total_seconds": round(
@@ -2280,6 +2583,7 @@ def _assemble_report(db, run: BenchmarkRun) -> dict:
             "run_id": run.run_id,
             "agent": run.agent,
             "run_name": run.run_name or "",
+            "account_id": run.account_id or "",
             "total_queries": n,
             "model_names": sorted(all_model_names),
             "model_providers": sorted(all_model_providers),

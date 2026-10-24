@@ -22,9 +22,8 @@ import { Modal } from '@ui/Modal';
 import apiHome from '@api1/home';
 import TicketLink from '@shared/links/TicketLink';
 import { Link as CustomLink } from '@ui/Link';
-import EmptyData from '@shared/EmptyData';
+import { EmptyState } from '@ui/EmptyState';
 import Link from 'next/link';
-import { DataNotAvailable } from '@assets';
 import { useNubiGlobalChat } from '@context/NubiGlobalChatContext';
 import { buildNubiOptimizePrompt } from 'src/utils/nubiPromptBuilder';
 import { latestUpdatedAt } from 'src/utils/common';
@@ -32,7 +31,7 @@ import { getNubiIconUrl, useTenantBranding } from '@hooks/useTenantBranding';
 import CustomTooltip from '@ui/Tooltip';
 import SafeIcon from '@shared/icons/SafeIcon';
 
-import WidgetCard from '@ui/WidgetCard';
+import { Card } from '@ui/Card';
 import { ListingLayout } from '@ui/ListingLayout';
 import { Stat } from '@ui/Stat';
 import { CostCallout } from '@ui/CostCallout';
@@ -531,11 +530,11 @@ const KubernetesPVCRightSizing = ({ enabledSummary = true, enabledFilters = true
 
   if (!isOptimisePage && !selectedCluster?.agent?.connection_status?.prometheusConnection) {
     return (
-      <WidgetCard id='pvc-right-sizing' sx={{ mt: 0, mb: 0 }}>
-        <EmptyData
-          img={DataNotAvailable}
-          heading='Agent Not Connected'
-          subHeading='Prometheus is not connected for this cluster. Connect an agent to start monitoring.'
+      <Card id='pvc-right-sizing' sx={{ padding: 'var(--ds-space-4) var(--ds-space-5)' }}>
+        <EmptyState
+          illustration='first-time'
+          title='Agent Not Connected'
+          description='Prometheus is not connected for this cluster. Connect an agent to start monitoring.'
         >
           <Typography sx={{ fontSize: 'var(--ds-text-body)', color: ds.gray[600], mt: 'var(--ds-space-2)' }}>
             Check the{' '}
@@ -544,8 +543,8 @@ const KubernetesPVCRightSizing = ({ enabledSummary = true, enabledFilters = true
             </Link>{' '}
             page for connection details.
           </Typography>
-        </EmptyData>
-      </WidgetCard>
+        </EmptyState>
+      </Card>
     );
   }
 
@@ -582,15 +581,15 @@ const KubernetesPVCRightSizing = ({ enabledSummary = true, enabledFilters = true
           mt={2}
           mb={2}
         >
-          <WidgetCard sx={{ flex: 1, minWidth: 0, mt: 0, padding: `${ds.space[3]} ${ds.space[4]}` }}>
+          <Card size='sm' sx={{ flex: 1, minWidth: 0 }}>
             <Stat
               size='md'
               label='Total Recommendations'
               info={{ tooltip: 'Active PVC right-sizing recommendations across all namespaces' }}
               value={Number.isFinite(totalRecommendationsCount) ? totalRecommendationsCount.toLocaleString() : totalRecommendationsCount ?? '—'}
             />
-          </WidgetCard>
-          <WidgetCard sx={{ flex: 1, minWidth: 0, mt: 0, padding: `${ds.space[3]} ${ds.space[4]}` }}>
+          </Card>
+          <Card size='sm' sx={{ flex: 1, minWidth: 0 }}>
             <Stat
               size='md'
               label='Savings Potential'
@@ -603,7 +602,7 @@ const KubernetesPVCRightSizing = ({ enabledSummary = true, enabledFilters = true
                 )
               }
             />
-          </WidgetCard>
+          </Card>
         </Box>
       )}
 

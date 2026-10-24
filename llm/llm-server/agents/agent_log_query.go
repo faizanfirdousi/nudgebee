@@ -20,7 +20,7 @@ const LogQueryAgentName = "log_query"
 // ESLogAgent/elastic_search_query/elastic_search_execute trio, both removed once
 // this action took over), it does not need a dedicated prompt/tool pair per
 // backend: it reuses the exact canonical query-generation prompt
-// FetchLogsAgentV2 uses for the full investigation flow (generateCanonicalLogQuery),
+// FetchLogsAgent uses for the full investigation flow (generateCanonicalLogQuery),
 // then resolves the canonical where-clause to provider-native query TEXT via
 // GetLogsQuery/logs_get_query — a preview-only resolution, not a real query
 // execution. This endpoint's job is only to fill in the query bar; running the
@@ -34,6 +34,7 @@ type LogQueryAgent struct {
 	accountId         string
 	provider          services_server.ObservabilityProvider
 	requestedProvider string
+	requestedIndex    string
 }
 
 // NewLogQueryAgent resolves the account's log provider for this request.
@@ -42,11 +43,20 @@ type LogQueryAgent struct {
 // default — e.g. an account configured with both Loki and Pinot integrations
 // must generate against whichever one is selected, not silently fall back to
 // whatever the account's default happens to be. Empty behaves exactly like
-// the account-default resolution used elsewhere (FetchLogsAgentV2, etc).
-func NewLogQueryAgent(accountId, requestedProvider string) *LogQueryAgent {
+// the account-default resolution used elsewhere (FetchLogsAgent, etc).
+//
+// requestedIndex optionally pins generation to a specific Elasticsearch index
+// (the logs tab's "Select an Index" dropdown). Elasticsearch field sets are
+// per-index, so the selection has to reach label discovery, not just the final
+// query: overwriting the resolved provider's DefaultIndex is what makes
+// fetchLabelsAndIndices → QueryLogLabels scope its field lookup to the selected
+// index, so the generator is shown the fields that actually exist there instead
+// of the account default's. Ignored for backends with no index concept (Loki,
+// Pinot, …), which have no DefaultIndex to speak of.
+func NewLogQueryAgent(accountId, requestedProvider, requestedIndex string) *LogQueryAgent {
 	provider, err := tools.GetLogProviderWithOverride(accountId, requestedProvider)
 	// Empty provider (or unresolved) means no services-server log backend —
-	// Execute rejects those accounts outright, same as FetchLogsAgentV2. An
+	// Execute rejects those accounts outright, same as FetchLogsAgent. An
 	// override that failed to resolve is deliberately NOT normalized away here
 	// — Execute uses requestedProvider to report a specific "not configured"
 	// error instead of the generic "no log backend configured" message.
@@ -56,7 +66,10 @@ func NewLogQueryAgent(accountId, requestedProvider string) *LogQueryAgent {
 	if err != nil {
 		provider = services_server.ObservabilityProvider{}
 	}
-	return &LogQueryAgent{accountId: accountId, provider: provider, requestedProvider: requestedProvider}
+	if requestedIndex != "" && tools.IsESLogProvider(provider.Provider) {
+		provider.DefaultIndex = requestedIndex
+	}
+	return &LogQueryAgent{accountId: accountId, provider: provider, requestedProvider: requestedProvider, requestedIndex: requestedIndex}
 }
 
 func (l *LogQueryAgent) GetName() string { return LogQueryAgentName }
@@ -81,6 +94,10 @@ func (l *LogQueryAgent) GetPlannerType() core.AgentPlannerType {
 	return core.AgentPlannerTypeCustom
 }
 
+func (l *LogQueryAgent) GetKnowledgeMode() core.AgentKnowledgeMode {
+	return core.AgentKnowledgeAutoChunks
+}
+
 // logQueryResult is the ai_generate_log_query response envelope. It is a typed
 // struct, not a map[string]string — json.Marshal preserves field declaration
 // order for a struct regardless of key name, whereas the old LokiAgent response
@@ -90,12 +107,18 @@ func (l *LogQueryAgent) GetPlannerType() core.AgentPlannerType {
 type logQueryResult struct {
 	Query    string `json:"query"`
 	Provider string `json:"provider"`
+	// Index is the Elasticsearch index the query was generated against — the
+	// caller's own selection when it pinned one, otherwise whatever the
+	// generator picked or the account default it fell back to. Lets the logs
+	// tab show which index the query in the bar will actually run against.
+	// Empty for backends with no index concept.
+	Index string `json:"index,omitempty"`
 }
 
 // Execute generates a canonical log query from the user's question and resolves
 // it to provider-native query text via GetLogsQuery/logs_get_query — a preview
-// resolution, not a real execution against the backend (see the ES/index caveat
-// on buildCanonicalTimeConfigs). Datadog and empty/k8s-only accounts are
+// resolution, not a real execution against the backend (see effectiveIndex for
+// how the ES index is settled). Datadog and empty/k8s-only accounts are
 // rejected outright — neither has a canonical query path today (Datadog stays
 // on its bespoke facet-syntax chain; k8s-only accounts have no query language to
 // generate against).
@@ -123,6 +146,11 @@ func (l *LogQueryAgent) Execute(ctx *security.RequestContext, request core.NBAge
 		return errorResponse(l.GetName(), fmt.Errorf("parsing canonical query: %w", err)), nil
 	}
 
+	index := l.effectiveIndex(queryBuilder.Index)
+	if index != "" {
+		configs["index"] = index
+	}
+
 	query, err := tools.GetLogsQueryPreview(ctx, l.accountId, l.provider, queryBuilder.Where, configs)
 	if err != nil {
 		return errorResponse(l.GetName(), fmt.Errorf("logs_get_query: %w", err)), nil
@@ -137,6 +165,7 @@ func (l *LogQueryAgent) Execute(ctx *security.RequestContext, request core.NBAge
 	result := logQueryResult{
 		Query:    query,
 		Provider: l.provider.Provider,
+		Index:    index,
 	}
 	data, err := common.MarshalJson(result)
 	if err != nil {
@@ -148,6 +177,25 @@ func (l *LogQueryAgent) Execute(ctx *security.RequestContext, request core.NBAge
 		Response:  []string{string(data)},
 		Status:    core.ConversationStatusCompleted,
 	}, nil
+}
+
+// effectiveIndex resolves which Elasticsearch index the query is generated
+// against, given the index the generator chose (if any). The caller's explicit
+// selection is a hard pin, not a hint: the dropdown is what the user sees, so
+// the generator must not be able to silently redirect the query to a different
+// index than the one on screen. Falling back to the provider's DefaultIndex
+// when neither is set mirrors executeFetchLogsCanonical — without it, a
+// generated query that (correctly, per the prompt's own "omit index to use the
+// account default" instruction) carries no index would resolve unscoped here
+// while the real execution path resolved it to the account default.
+func (l *LogQueryAgent) effectiveIndex(generatedIndex string) string {
+	if l.requestedIndex != "" && tools.IsESLogProvider(l.provider.Provider) {
+		return l.requestedIndex
+	}
+	if generatedIndex != "" {
+		return generatedIndex
+	}
+	return l.provider.DefaultIndex
 }
 
 // buildCanonicalTimeConfigs parses the LLM-generated canonical query JSON into

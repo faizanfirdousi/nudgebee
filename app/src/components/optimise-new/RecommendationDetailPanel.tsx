@@ -1,4 +1,6 @@
-import { Box, Typography, Divider, Tooltip } from '@mui/material';
+import { Box, Typography } from '@mui/material';
+import { Divider } from '@ui/Divider';
+import Tooltip from '@ui/Tooltip';
 import CloseIcon from '@mui/icons-material/Close';
 import LinkIcon from '@mui/icons-material/Link';
 import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined';
@@ -20,7 +22,9 @@ import Currency from '@shared/format/Currency';
 import Datetime from '@shared/format/Datetime';
 import recommendationApi from '@api1/recommendation';
 import { daysSinceLong, dismissalLabel, getResourceDisplayName } from './utils';
+import { splitSavings } from './rightSizingData';
 import CommandExecutionHistory from '@components/cloudaccount/CommandExecutionHistory';
+import { useRightSizingTrend } from '@hooks/useRightSizingTrend';
 
 // Severity → DS Label tone (mirrors the summary list mapping).
 const SEVERITY_TONE: Record<string, LabelTone> = {
@@ -50,7 +54,7 @@ interface RecommendationDetailPanelProps {
   open: boolean;
   onClose: () => void;
   recommendation: any;
-  accounts?: Record<string, { name: string; cloud_provider: string; account_access?: string }>;
+  accounts?: Record<string, { name: string; cloud_provider: string; account_access?: string; agentConnected?: boolean }>;
   initialTab?: number;
   onCreateTicket?: (rec: any) => void;
   onDismiss?: (rec: any) => void;
@@ -202,6 +206,11 @@ const RecommendationDetailPanel = ({
     }
   }, [open, initialTab]);
 
+  // One fetch of the usage trend for both tabs: the Details tab draws it
+  // compact under the change, the Evidence tab in full. Non-right-sizing
+  // recommendations never fetch.
+  const trend = useRightSizingTrend(recommendation);
+
   if (!recommendation) return null;
 
   const rec = recommendation;
@@ -211,6 +220,8 @@ const RecommendationDetailPanel = ({
   const category = rec.category || '';
   const ruleName = rec.rule_name || '';
   const savings = rec.estimated_savings || 0;
+  const split = ruleName === 'pod_right_sizing' ? splitSavings(rec.recommendation) : null;
+  const mixed = Boolean(split && Math.round(split.gross) >= 1 && Math.round(split.cost) >= 1);
   const status = rec.status || 'Open';
   const namespace = rec.resource_k8s_namespace || '';
   const accountName = accounts[rec.account_id]?.name || '';
@@ -278,7 +289,7 @@ const RecommendationDetailPanel = ({
               onClick={onClose}
               id='detail-panel-close'
             />
-            {savings !== 0 && (
+            {(savings !== 0 || mixed) && (
               <Box sx={{ textAlign: 'right' }}>
                 <Typography
                   sx={{
@@ -290,7 +301,10 @@ const RecommendationDetailPanel = ({
                     letterSpacing: '0.04em',
                   }}
                 >
-                  Projected Savings
+                  {/* A negative estimated_savings is a cost increase, not a saving.
+                      The figure below is already rendered as an absolute value, so
+                      only the label distinguishes the two directions. */}
+                  {mixed ? 'Net cost impact' : savings > 0 ? 'Projected Savings' : 'Additional Cost'}
                 </Typography>
                 <Box sx={{ display: 'flex', alignItems: 'baseline', justifyContent: 'flex-end', gap: ds.space[1], mt: ds.space[0] }}>
                   <Currency
@@ -300,13 +314,26 @@ const RecommendationDetailPanel = ({
                     sx={{
                       fontSize: ds.text.title,
                       fontWeight: ds.weight.semibold,
-                      color: savings > 0 ? ds.green[600] : ds.red[600],
+                      color: mixed && Math.round(Math.abs(savings)) < 1 ? ds.gray[700] : savings > 0 ? ds.green[600] : ds.red[600],
                     }}
                   />
                   <Box component='span' sx={{ fontSize: ds.text.caption, color: ds.gray[400], fontWeight: ds.weight.medium }}>
                     /mo
                   </Box>
                 </Box>
+                {mixed && split && (
+                  <Typography sx={{ fontSize: ds.text.caption, mt: ds.space[0], whiteSpace: 'nowrap' }}>
+                    <Box component='span' sx={{ color: ds.green[600], fontWeight: ds.weight.medium }}>
+                      saves ${Math.round(split.gross)}
+                    </Box>
+                    <Box component='span' sx={{ color: ds.gray[400] }}>
+                      {' · '}
+                    </Box>
+                    <Box component='span' sx={{ color: ds.red[600], fontWeight: ds.weight.medium }}>
+                      costs ${Math.round(split.cost)} more
+                    </Box>
+                  </Typography>
+                )}
               </Box>
             )}
           </Box>
@@ -338,6 +365,7 @@ const RecommendationDetailPanel = ({
         <Box sx={{ flex: 1, overflow: 'auto', display: activeTab === 0 ? 'block' : 'none' }}>
           <DetailsPanel
             fullRecommendation={rec}
+            trend={trend}
             accounts={accounts}
             onViewEvidence={() => setActiveTab(1)}
             onMitigationExecuted={() => setPrevHistoryRefreshKey((k) => k + 1)}
@@ -346,6 +374,7 @@ const RecommendationDetailPanel = ({
 
         <Box sx={{ flex: 1, overflow: 'auto', display: activeTab === 1 ? 'block' : 'none' }}>
           <EvidencePanel
+            trend={trend}
             recommendation={rec.recommendation}
             category={category}
             ruleName={ruleName}
@@ -456,6 +485,7 @@ const RecommendationDetailPanel = ({
         <ActionBar
           fullRecommendation={rec}
           provider={accounts[rec.account_id]?.cloud_provider}
+          agentConnected={accounts[rec.account_id]?.agentConnected}
           onCreateTicket={onCreateTicket}
           onDismiss={onDismiss}
           onResolve={onResolve}

@@ -1,7 +1,16 @@
-import apiTrace from '@api1/kubernetes/trace';
+import apiTrace, { type TraceWhereClause } from '@api1/kubernetes/trace';
 import { formatDurationInTrace } from 'src/utils/common';
 import type { PanelQueryResult } from '@api1/dashboards';
-import { findTable, type EntityFilter, type EntityQueryDraft, type EntityTable } from './entityQuery';
+import {
+  coerceFilterValue,
+  filterableColumns,
+  findTable,
+  operatorTakesValue,
+  type EntityFilter,
+  type EntityQueryDraft,
+  type EntityTable,
+} from './entityQuery';
+import { narrowTraceWhere, type ViewerFilter } from './panelViewerFilters';
 
 /**
  * Runs a traces panel through the traces service (`/rpc/traces`) rather than
@@ -12,9 +21,13 @@ import { findTable, type EntityFilter, type EntityQueryDraft, type EntityTable }
  * ClickHouse source, the span-vs-root-span views. Going around it worked only
  * for accounts whose defaults happened to be right.
  *
- * The cost is that filters are NAMED parameters, not a free where clause, so
- * the builder offers exactly the columns these two calls accept — see
- * `filterable` in entityQuery.ts.
+ * Filters travel as a WHERE CLAUSE, not as the traces API's named parameters.
+ * Those parameters each hard-code an operator — `span_name` is always `_eq`,
+ * `resource` always `_like '%…%'`, `duration_ns` always `_gte` — so routing the
+ * builder through them meant the operator an author picked was read, shown, and
+ * then thrown away: "Span name is not X" ran as `span_name = X`. The store
+ * (both providers) accepts the full operator set, so the clause is built here
+ * and merged in by the API layer.
  */
 
 /** Fields `traces_grouping_v3` returns. The selection is fixed, unlike spans. */
@@ -35,107 +48,45 @@ const GROUPING_FIELDS = [
   'max_latency',
 ];
 
-/** One filter row, reduced to the named parameter the traces API expects. */
-interface TraceFilterParams {
-  namespace: string[];
-  workload: string[];
-  destinationNamespace: string[];
-  destinationWorkload: string[];
-  destinationName: string;
-  selectedHttpStatus: string | string[];
-  selectedHttpSpan: string;
-  selectedStatusCode: string;
-  resource: string;
-  duration: number | null;
-  traceSource: string;
-  traceId: string | string[];
-}
-
-function emptyParams(): TraceFilterParams {
-  return {
-    namespace: [],
-    workload: [],
-    destinationNamespace: [],
-    destinationWorkload: [],
-    destinationName: '',
-    selectedHttpStatus: '',
-    selectedHttpSpan: '',
-    selectedStatusCode: '',
-    resource: '',
-    duration: null,
-    traceSource: '',
-    traceId: '',
-  };
-}
-
-/** Splits a filter value into the list form the `_in` parameters take. */
-function asList(value: string): string[] {
-  return value
-    .split(',')
-    .map((v) => v.trim())
-    .filter(Boolean);
-}
-
 /**
- * Maps the builder's filter rows onto the traces API's named parameters.
+ * Compiles the builder's filter rows into the traces store's where clause.
  *
- * Unmappable rows are reported rather than dropped silently — the builder only
- * offers filterable columns, so a leftover means the two lists drifted.
+ * Every row keeps the operator the author picked. Rows are AND-ed, including
+ * two rows on the same column (`duration_ns ≥ 1ms` and `duration_ns ≤ 5ms`
+ * become one range), because the clause nests per column then per operator.
+ *
+ * That nesting has one slot per column and operator, so a second row with the
+ * SAME column and operator has nowhere to go and replaces the first. It is
+ * reported as `overwritten` rather than lost quietly: two "matches pattern"
+ * rows used to run as only the last one, which reads as an OR that half works.
+ *
+ * A column the table does not mark filterable is reported rather than dropped
+ * silently — the builder only offers filterable columns, so a leftover means a
+ * stored panel names a column that has since stopped being one.
  */
-export function toTraceParams(filters: EntityFilter[]): { params: TraceFilterParams; unsupported: string[] } {
-  const params = emptyParams();
+export function toTraceWhere(table: EntityTable, filters: EntityFilter[]): { where: TraceWhereClause; unsupported: string[]; overwritten: string[] } {
+  const where: TraceWhereClause = {};
   const unsupported: string[] = [];
+  const overwritten: string[] = [];
+  const filterable = new Set(filterableColumns(table).map((c) => c.name));
 
   for (const filter of filters) {
-    const value = filter.value.trim();
-    if (!value) continue;
-    switch (filter.column) {
-      case 'workload_namespace':
-        params.namespace = asList(value);
-        break;
-      case 'workload_name':
-        params.workload = asList(value);
-        break;
-      case 'destination_workload_namespace':
-        params.destinationNamespace = asList(value);
-        break;
-      case 'destination_workload_name':
-        params.destinationWorkload = asList(value);
-        break;
-      case 'destination_name':
-        params.destinationName = value;
-        break;
-      case 'http_status_code':
-        params.selectedHttpStatus = asList(value).length > 1 ? asList(value) : value;
-        break;
-      case 'span_name':
-        params.selectedHttpSpan = value;
-        break;
-      case 'status_code':
-        params.selectedStatusCode = value;
-        break;
-      case 'resource':
-        // The API wraps this in %…% itself.
-        params.resource = value;
-        break;
-      case 'duration_ns': {
-        // `Number(value) || null` folded a legitimate 0 into "no filter", since
-        // 0 is falsy — a duration filter of 0 asked for everything instead.
-        const duration = Number(value);
-        params.duration = Number.isFinite(duration) ? duration : null;
-        break;
-      }
-      case 'trace_source':
-        params.traceSource = value;
-        break;
-      case 'trace_id':
-        params.traceId = asList(value).length > 1 ? asList(value) : value;
-        break;
-      default:
-        unsupported.push(filter.column);
+    if (!filter.column || !filter.operator) continue;
+    if (!filterable.has(filter.column)) {
+      unsupported.push(filter.column);
+      continue;
     }
+    // An unfinished row is not a filter on the empty string.
+    if (operatorTakesValue(filter.operator) && filter.value.trim() === '') continue;
+    const value = coerceFilterValue(table, filter);
+    const earlier = where[filter.column]?.[filter.operator];
+    // The same filter twice loses nothing; only a DIFFERENT value replaces one.
+    if (earlier !== undefined && JSON.stringify(earlier) !== JSON.stringify(value) && !overwritten.includes(filter.column)) {
+      overwritten.push(filter.column);
+    }
+    where[filter.column] = { ...where[filter.column], [filter.operator]: value };
   }
-  return { params, unsupported };
+  return { where, unsupported, overwritten };
 }
 
 export interface TracePanelResult extends PanelQueryResult {
@@ -148,6 +99,8 @@ export interface TracePanelResult extends PanelQueryResult {
   column_names: string[];
   /** Filters the traces API cannot express, if the builder ever offers one. */
   unsupported: string[];
+  /** Columns where a later filter replaced an earlier one — see toTraceWhere. */
+  overwritten: string[];
 }
 
 export type ColumnKind = 'time' | 'text';
@@ -182,65 +135,85 @@ export function normaliseTraceTimestamp(value: unknown): string {
  * traces panel resolves to exactly one, auto-selected or picked in the panel's
  * Account filter.
  */
-export async function runTracePanel(draft: EntityQueryDraft, accountId: string, startMs: number, endMs: number): Promise<TracePanelResult> {
+export async function runTracePanel(
+  draft: EntityQueryDraft,
+  accountId: string,
+  startMs: number,
+  endMs: number,
+  viewerFilters: ViewerFilter[] = []
+): Promise<TracePanelResult> {
   const table = findTable(draft.table);
-  const { params, unsupported } = toTraceParams(draft.filters);
+  const { where, unsupported, overwritten } = toTraceWhere(table, draft.filters);
   // The API parses these back with `new Date(x).getTime()`.
   const startDate = new Date(startMs).toISOString();
   const endDate = new Date(endMs).toISOString();
   const sortOrder = draft.sortDesc ? 'desc' : 'asc';
-  const columns = draft.columns.filter((name) => table.columns.some((c) => c.name === name));
+  const columns = draft.columns.filter((name) => table.columns.some((c) => c.name === name && !c.filterOnly));
+  const grouping = draft.table === 'traces_groupings_v2';
 
-  if (draft.table === 'traces_groupings_v2') {
+  // The viewer's filters and the author's leave nothing in common: answer that
+  // here, since the only clause that says so would be read as "every row".
+  if (!narrowTraceWhere(where, viewerFilters)) {
+    const shown = grouping ? columns.filter((name) => GROUPING_FIELDS.includes(name)) : columns;
+    return { ...toResult(table, shown, []), unsupported, overwritten };
+  }
+
+  if (grouping) {
+    // Every named parameter is passed empty: the filters are all in `where`.
+    // '' rather than [] on the four list parameters is deliberate — the grouping
+    // call branches on Array.isArray with no length check, so an empty array
+    // still emits `_in: []`. ClickHouse folds that to `true`, but Elasticsearch
+    // turns it into a terms query against nothing and the panel comes back empty.
     const response = await apiTrace.traceGroupV2(
       accountId,
-      params.namespace,
-      params.workload,
-      params.destinationNamespace,
-      params.destinationWorkload,
-      params.destinationName,
+      '',
+      '',
+      '',
+      '',
+      '',
       draft.limit,
       0,
       startDate,
       endDate,
-      Array.isArray(params.selectedHttpStatus) ? params.selectedHttpStatus[0] || '' : params.selectedHttpStatus,
-      params.resource,
+      '',
+      '',
       '',
       draft.sortColumn,
-      sortOrder
+      sortOrder,
+      undefined,
+      where
     );
     // The grouping call returns a fixed field list, so a column the builder
     // offers but the response omits would render as a blank column.
     const selected = columns.filter((name) => GROUPING_FIELDS.includes(name));
-    return { ...toResult(table, selected, response?.traces_grouping_v3 || []), unsupported };
+    return { ...toResult(table, selected, response?.traces_grouping_v3 || []), unsupported, overwritten };
   }
 
   const response = await apiTrace.traceV2({
     accountId,
-    namespace: params.namespace,
-    workload: params.workload,
-    destinationNamespace: params.destinationNamespace,
-    destinationWorkload: params.destinationWorkload,
-    destinationName: params.destinationName,
+    namespace: [],
+    workload: [],
+    destinationNamespace: [],
+    destinationWorkload: [],
+    destinationName: '',
     limit: draft.limit,
     offset: 0,
     startDate,
     endDate,
-    selectedHttpStatus: params.selectedHttpStatus,
-    selectedHttpSpan: params.selectedHttpSpan,
-    resource: params.resource,
-    duration: params.duration,
+    selectedHttpStatus: '',
+    selectedHttpSpan: '',
+    resource: '',
+    duration: null,
     sortCol: draft.sortColumn,
     sortOrder,
     header: '',
-    selectedStatusCode: params.selectedStatusCode,
-    traceSource: params.traceSource,
-    traceId: params.traceId,
+    selectedStatusCode: '',
+    where,
     // Only the columns the panel shows: `cols` is spliced straight into the
     // GraphQL selection, so asking for fewer fetches less.
     cols: columns,
   });
-  return { ...toResult(table, columns, response?.traces_list || []), unsupported };
+  return { ...toResult(table, columns, response?.traces_list || []), unsupported, overwritten };
 }
 
 /**

@@ -1,18 +1,15 @@
-import json
 import logging
-import re
 import time
 from typing import Dict, Optional
 
-from rag.core.types import Document, LLM
+from rag.core.types import Document
 
-from rag.core.embeddings.generator import get_llm
-from rag.core.llm import circuit_breaker
-from rag.core.llm.prompts import get_prompt_for_module
 from rag.core.utils.db_query import get_live_kb_collection_names, get_tenant_id_for_account
 from rag.qdrant.client import list_collections_optimized
+from rag.core.llm import local_reranker
+from rag.core.llm import ranking
+from rag.core.monitoring.audit import RetrievalTrace, TraceCandidate
 from utils.config import Config
-from utils.shared import get_provider_name
 
 logger = logging.getLogger(__name__)
 
@@ -71,13 +68,12 @@ def _drop_dead_kb_collections(collections, account_id, tenant_id):
     live_names = get_live_kb_collection_names(account_id, tenant_id)
     if live_names is None:
         logger.warning(
-            "Could not resolve live knowledge bases for account %s / tenant %s - "
-            "searching all %d matched collections",
+            "Could not resolve live knowledge bases for account %s / tenant %s - " "excluding %d KB-backed collections",
             account_id,
             tenant_id,
-            len(collections),
+            len(kb_backed),
         )
-        return [collection.name for collection in collections]
+        return [collection.name for collection in collections if collection.name not in kb_backed]
 
     kept, dropped = [], []
     for collection in collections:
@@ -91,7 +87,9 @@ def _drop_dead_kb_collections(collections, account_id, tenant_id):
     return kept
 
 
-def _filter_collections_for_module_and_account(collections, module, account_id, collection_name, tenant_id=None):
+def _filter_collections_for_module_and_account(
+    collections, module, account_id, collection_name, tenant_id=None, restrict_to_collection=False
+):
     """Filter collections by module + visibility scope.
 
     A collection is included when its ``module`` tag matches AND at least one
@@ -107,8 +105,15 @@ def _filter_collections_for_module_and_account(collections, module, account_id, 
     account in the tenant without listing every account on the collection.
 
     Visible is not the same as live: a matched collection is dropped again by
-    ``_drop_dead_kb_collections`` when its knowledge base is gone. An explicitly
-    requested ``collection_name`` bypasses both passes — the caller named it.
+    ``_drop_dead_kb_collections`` when its knowledge base is unavailable. An
+    explicitly requested collection may bypass the module tag, but never the
+    visibility scope or live-KB gate.
+
+    ``restrict_to_collection`` inverts that last rule: instead of ADDING the
+    named collection to the discovered set, it narrows the search down to it.
+    The narrowing intersects with what was already visible, so a caller can
+    only restrict to a collection it could already have searched — naming
+    another tenant's collection yields an empty search, never a targeted read.
     """
     matched = []
     for collection in collections:
@@ -116,7 +121,8 @@ def _filter_collections_for_module_and_account(collections, module, account_id, 
         if not metadata:
             continue
 
-        if metadata.get("module") != module:
+        explicit = collection.name == collection_name and not restrict_to_collection
+        if metadata.get("module") != module and not explicit:
             continue
 
         is_matching_account = metadata.get("account") == account_id if account_id else False
@@ -129,13 +135,72 @@ def _filter_collections_for_module_and_account(collections, module, account_id, 
             matched.append(collection)
 
     collection_names = _drop_dead_kb_collections(matched, account_id, tenant_id)
-    if collection_name and collection_name not in collection_names:
-        collection_names.append(collection_name)
+    if collection_name and restrict_to_collection:
+        if collection_name in collection_names:
+            return [collection_name]
+        logger.info(
+            "Restricted search requested for collection %s, which is not visible to account %s / tenant %s - "
+            "returning no collections",
+            collection_name,
+            account_id,
+            tenant_id,
+        )
+        return []
     return collection_names
 
 
+def _collection_scope(metadata):
+    """Classify a collection from its own metadata, not from its name.
+
+    Qdrant collection metadata is the authority on what a collection holds:
+
+    - ``account == "global"``     -> shared content with no knowledge-base row
+      (NudgeBee product docs). Callers must not expect to attribute it to a KB.
+    - ``source == "user_kb"``     -> a manual knowledge base
+    - ``source in (confluence, servicenow, ...)`` -> a synced integration KB
+    - ``module``                  -> which subsystem owns it (knowledge_base,
+      prometheus, logs, ...), so non-KB agent collections are distinguishable.
+
+    Returned verbatim to the caller so llm-server does not have to re-derive any
+    of this by parsing collection names or matching document text.
+    """
+    metadata = metadata or {}
+    scope = "account"
+    if metadata.get("account") == "global":
+        scope = "global"
+    elif metadata.get("tenant_id"):
+        scope = "tenant"
+    return {
+        "collection_scope": scope,
+        "collection_module": metadata.get("module") or "",
+        "collection_source": metadata.get("source") or "",
+    }
+
+
+def _collection_classification(collection, tenant_id):
+    """Full classification of a collection: scope plus whether it is KB-backed.
+
+    ``collection_kb_backed`` is the field callers must branch on. It reuses
+    ``_is_kb_backed_collection`` - the same predicate ``_drop_dead_kb_collections``
+    trusts - so "does an llm_knowledgebases row exist for this?" has ONE answer in
+    the system. Three kinds of collection are NOT KB-backed and can never be
+    attributed to a knowledge base: the global product-docs collection, the
+    tenant-level user KB, and legacy per-account collections renamed from
+    ``<account_id>_docs``. Callers that demand a KB row for those drop content
+    that is legitimately un-owned.
+    """
+    out = _collection_scope(collection.metadata or {})
+    out["collection_kb_backed"] = _is_kb_backed_collection(collection, tenant_id)
+    return out
+
+
 def _retrieve_documents_from_collections(
-    collection_names, query, min_results, account_id, metadata_filter: Optional[Dict] = None
+    collection_names,
+    query,
+    min_results,
+    account_id,
+    metadata_filter: Optional[Dict] = None,
+    collection_metadata: Optional[Dict] = None,
 ):
     """
     Retrieves documents from collections by directly calling search logic.
@@ -151,13 +216,148 @@ def _retrieve_documents_from_collections(
 
     # Reconstruct the Document objects
     all_docs = []
+    collection_metadata = collection_metadata or {}
     for item in serializable_results:
-        doc = Document(page_content=item["page_content"], metadata=item["metadata"])
+        md = item["metadata"] or {}
+        # Attach the owning collection's classification so the caller can tell a
+        # global collection from a KB-backed one without guessing.
+        source_collection = md.get("collection")
+        if source_collection in collection_metadata:
+            md = {**md, **collection_metadata[source_collection]}
+        doc = Document(page_content=item["page_content"], metadata=md)
         score = item["score"]
         all_docs.append((doc, score))
 
     logger.info(f"Search complete: retrieved {len(all_docs)} total documents.")
     return all_docs
+
+
+def _scorer_version() -> str:
+    """Describe the scoring configuration, derived from it rather than declared.
+
+    Composed from the settings that actually decide a score, so changing any of
+    them changes this string on its own. A hand-maintained version label goes
+    stale silently and makes two different configurations indistinguishable in
+    the trace, which is the one thing the trace exists to prevent.
+    """
+    return (
+        f"emb={Config.embeddings_model_id};"
+        f"rr={Config.reranker_model}/{Config.reranker_max_length}/{Config.reranker_max_doc_chars};"
+        f"score=w{Config.ranked_similarity_weight:.2f};"
+        f"limit={Config.ranked_limit}"
+    )
+
+
+def _ranked_documents(query, similar_docs_flat, no_of_results, token_usage, trace):
+    """Score every candidate, group chunks into documents, return the best N.
+
+    No filtering: a per-query normalised blend cannot carry an absolute
+    relevance decision, because its top candidate scores 1.0 whether or not
+    anything relevant was found. The caller decides.
+    """
+    pool_size = max(no_of_results * 2, Config.reranking_max_docs)
+    pool = similar_docs_flat[:pool_size]
+
+    started = time.monotonic()
+    scores, ok = local_reranker.score_documents(query, pool)
+    score_ms = int((time.monotonic() - started) * 1000)
+    if not ok:
+        # Same contract as the threshold path: an unscored list is not a ranked
+        # one, and returning it unranked is what previously put six irrelevant
+        # documents into a prompt.
+        logger.warning("Reranking unavailable — returning no documents rather than unranked ones")
+        if trace is not None:
+            trace.fallback_reason = "rerank_unavailable"
+            trace.n_retrieved = len(pool)
+            trace.n_injected = 0
+            trace.score_ms = score_ms
+        return [], token_usage, trace
+
+    scored_chunks = [(doc, sim, scores[i]) for i, (doc, sim) in enumerate(pool)]
+    ranked = ranking.rank_documents(
+        scored_chunks, limit=Config.ranked_limit, similarity_weight=Config.ranked_similarity_weight
+    )
+
+    if trace is not None:
+        trace.scorer_version = _scorer_version()
+        trace.requested_k = no_of_results
+        trace.n_retrieved = len(pool)
+        trace.n_injected = len(ranked)
+        trace.score_ms = score_ms
+        blended = ranking.blend(scored_chunks, Config.ranked_similarity_weight)
+        # The chunk that won each returned document's slot, by identity — several
+        # chunks of one document can tie on score, and only one of them was
+        # actually sent.
+        winners = {id(r.document) for r in ranked}
+        order = {r.parent_id: i for i, r in enumerate(ranked)}
+        for index, (doc, sim, rr) in enumerate(scored_chunks):
+            key = ranking.parent_key(doc)
+            title, url = _candidate_identity(doc)
+            if id(doc) in winners:
+                # This chunk represented its document in the response.
+                status, rank_out = "returned", order.get(key)
+            elif key in order:
+                # Its document was returned, but through a better chunk of the
+                # same document. Distinct from being dropped on relevance: the
+                # text did reach the caller, this passage did not.
+                status, rank_out = "dropped_sibling", None
+            else:
+                status, rank_out = "dropped_rank", None
+            trace.candidates.append(
+                TraceCandidate(
+                    rank_in=index,
+                    rank_out=rank_out,
+                    ref=key,
+                    chunk=doc.page_content or "",
+                    status=status,
+                    sim=sim,
+                    rr=rr,
+                    # Recorded for every candidate, not only the survivors, so
+                    # "how close was what we dropped" is answerable.
+                    weighted=blended[index],
+                    title=title,
+                    url=url,
+                )
+            )
+
+    logger.info(
+        f"Ranked {len(pool)} chunks into {len(ranked)} documents " f"(limit={Config.ranked_limit}, score_ms={score_ms})"
+    )
+    return [(_with_retrieval_metadata(r, rank), r.weighted) for rank, r in enumerate(ranked)], token_usage, trace
+
+
+def _with_retrieval_metadata(ranked, rank):
+    """Attach the per-signal scores to the document the caller receives.
+
+    The caller needs the similarity and cross-encoder scores separately, not only
+    the blend they were combined into — it is judging these candidates and the
+    two signals disagree in ways the single number hides. Carrying them on the
+    document's metadata keeps the ``(document, score)`` shape every existing
+    caller unpacks, rather than forking the return type by mode.
+
+    The metadata dict is copied rather than mutated: it comes from the Qdrant
+    payload, and the collection metadata cache hands out shared objects.
+    """
+    document = ranked.document
+    metadata = dict(document.metadata or {})
+    metadata["retrieval"] = {
+        "rank": rank,
+        "parent_id": ranked.parent_id,
+        "similarity": round(float(ranked.similarity), 4),
+        "reranker_score": round(float(ranked.reranker_score), 4),
+        "weighted": round(float(ranked.weighted), 4),
+        "n_chunks": ranked.n_chunks,
+    }
+    document.metadata = metadata
+    return document
+
+
+def _candidate_identity(document) -> tuple[str | None, str | None]:
+    """The document's title and link, for naming it to a reader."""
+    metadata = getattr(document, "metadata", None) or {}
+    title = metadata.get("title") or None
+    url = metadata.get("url") or None
+    return (str(title) if title else None, str(url) if url else None)
 
 
 def get_matching_documents(
@@ -169,10 +369,14 @@ def get_matching_documents(
     metadata_filter: Optional[Dict] = None,
     use_reranking: bool = False,
     tenant_id: Optional[str] = None,
+    restrict_to_collection: bool = False,
+    trace: Optional[RetrievalTrace] = None,
 ):
     """
     Returns:
-        tuple: (documents, token_usage_metadata) where token_usage_metadata contains LLM usage info
+        tuple: (documents, token_usage_metadata, trace) where token_usage_metadata
+        contains LLM usage info and trace records every candidate that was scored,
+        returned or dropped. trace is None when the caller did not ask for one.
     """
     # Resolve tenant_id lazily from the account when the caller didn't supply
     # one — keeps tenant-scoped integration collections (Confluence, ServiceNow)
@@ -187,199 +391,113 @@ def get_matching_documents(
 
     token_usage: dict = {}
 
+    if trace is not None:
+        # Set here rather than in the ranking helper so it survives every exit —
+        # the no-collections, empty, reranker-down and exception paths all
+        # returned rows with no k at all, which reads as "no search happened".
+        trace.requested_k = no_of_results
+
     try:
         # Find relevant collections
         logger.info(f"Listing collections for module {module}, account {account_id}, tenant {tenant_id}")
         collections = list_collections_optimized()
         collection_names = _filter_collections_for_module_and_account(
-            collections, module, account_id, collection_name, tenant_id=tenant_id
+            collections,
+            module,
+            account_id,
+            collection_name,
+            tenant_id=tenant_id,
+            restrict_to_collection=restrict_to_collection,
         )
         logger.info(
             f"Found {len(collection_names)} collections for module {module}, account {account_id}, "
             f"tenant {tenant_id}, collections: {collection_names}"
         )
         if not collection_names:
-            return [], {}
+            # No collection was visible to this account/tenant. Distinct from a
+            # search that ran and found nothing, and the trace has to say which:
+            # this is usually a scoping or eligibility problem, not a relevance one.
+            if trace is not None:
+                trace.fallback_reason = "no_collections"
+                trace.n_retrieved = 0
+                trace.n_injected = 0
+            return [], {}, trace
 
         # Retrieve documents from collections using multiprocessing
         logger.info(f"Retrieving documents from collections: {collection_names}")
         similar_docs_flat = _retrieve_documents_from_collections(
-            collection_names, query, no_of_results, account_id, metadata_filter
+            collection_names,
+            query,
+            no_of_results,
+            account_id,
+            metadata_filter,
+            collection_metadata={c.name: _collection_classification(c, tenant_id) for c in collections},
         )
         if not similar_docs_flat:
-            return [], {}
+            # Collections were searched and returned nothing — an unreachable
+            # Qdrant looks identical to an empty index from here, so record that
+            # retrieval came back empty rather than leaving a blank row.
+            if trace is not None:
+                trace.fallback_reason = "rag_empty"
+                trace.n_retrieved = 0
+                trace.n_injected = 0
+            return [], {}, trace
 
         # Sort by relevance score
         similar_docs_flat.sort(key=lambda x: x[1], reverse=True)
 
+        if use_reranking and Config.ranked_mode:
+            return _ranked_documents(query, similar_docs_flat, no_of_results, token_usage, trace)
+
         if use_reranking:
-            # Cap docs sent to LLM to reduce input tokens and latency.
-            # Only send the top candidates by similarity for reranking.
+            # Cap docs sent to the reranker to bound latency.
             max_docs_for_reranking = max(no_of_results * 2, Config.reranking_max_docs)
             docs_for_reranking = similar_docs_flat[:max_docs_for_reranking]
             if len(similar_docs_flat) > max_docs_for_reranking:
-                logger.info(f"Capping docs for LLM reranking: {len(similar_docs_flat)} -> {max_docs_for_reranking}")
+                logger.info(f"Capping docs for reranking: {len(similar_docs_flat)} -> {max_docs_for_reranking}")
 
-            llm = get_llm(account_id)
-            docs_reranked, token_usage = rerank_with_llm(query, module, docs_for_reranking, llm)
+            docs_reranked, ok = local_reranker.rerank(query, docs_for_reranking)
+            if not ok:
+                # Fail closed. Returning the unranked list here is what shipped
+                # six irrelevant documents into a prompt: retrieval always
+                # yields its nearest k, and without a working relevance score
+                # nothing downstream can tell a good hit from a bad one.
+                logger.warning("Reranking unavailable — returning no documents rather than unranked ones")
+                if trace is not None:
+                    trace.fallback_reason = "rerank_unavailable"
+                    trace.n_retrieved = len(similar_docs_flat)
+                    trace.n_injected = 0
+                return [], token_usage, trace
         else:
-            logger.info("Skipping LLM reranking (use_reranking=False)")
+            logger.info("Skipping reranking (use_reranking=False)")
             docs_reranked = similar_docs_flat
 
-        logger.info(f"Request complete - Returned {len(docs_reranked[:no_of_results])} docs")
-        return docs_reranked[:no_of_results], token_usage
+        returned = docs_reranked[:no_of_results]
+        if trace is not None:
+            # The unranked path serves callers that ask for no reranking, and it
+            # was writing a row carrying only the query — no counts, no
+            # candidates, indistinguishable from a search that never ran.
+            trace.n_retrieved = len(similar_docs_flat)
+            trace.n_injected = len(returned)
+            kept = {id(doc) for doc, _ in returned}
+            for index, (doc, sim) in enumerate(docs_reranked):
+                title, url = _candidate_identity(doc)
+                trace.candidates.append(
+                    TraceCandidate(
+                        rank_in=index,
+                        rank_out=index if id(doc) in kept else None,
+                        ref=ranking.parent_key(doc),
+                        chunk=doc.page_content or "",
+                        status="returned" if id(doc) in kept else "dropped_rank",
+                        sim=sim,
+                        title=title,
+                        url=url,
+                    )
+                )
+        logger.info(f"Request complete - Returned {len(returned)} docs")
+        return returned, token_usage, trace
     except Exception as e:
         logger.error(f"Error in get_matching_documents: {str(e)}")
-        return [], token_usage
-
-
-def parse_ranking(response: str) -> list[float]:
-    """
-    Extracts the relevance scores from the LLM response in dict format.
-    The response should be a JSON object where keys are string indices and values are floats.
-    Returns a list of floats ordered by index.
-    """
-    try:
-        # Remove any extra text before/after the JSON dict
-        match = re.search(r"\{.*}", response, re.DOTALL)
-        if not match:
-            logger.warning("No JSON object found in the response.")
-            return []
-
-        json_obj = json.loads(match.group(0))
-
-        if isinstance(json_obj, dict) and all(isinstance(v, (int, float)) for v in json_obj.values()):
-            # Sort by int keys to maintain order
-            return [float(json_obj[str(i)]) for i in sorted(map(int, json_obj.keys()))]
-
-        logger.warning("Parsed JSON object is not a valid dictionary of scores.")
-        return []
-    except Exception as e:
-        logger.warning(f"Error parsing JSON response: {e}")
-        return []
-
-
-def _adjust_scores_to_match_docs(scores: list, num_docs: int) -> list:
-    """Adjust scores list to match the number of documents."""
-    if isinstance(scores, list) and len(scores) != num_docs:
-        logger.info("Adjusting the response to match the number of documents")
-        scores.extend([0] * (num_docs - len(scores)))
-    elif not isinstance(scores, list):
-        scores = [0] * num_docs
-    logger.info(f"Adjusted scores: {scores}")
-    return scores
-
-
-def _calculate_weighted_scores(docs: list, scores: list) -> list:
-    """Calculate weighted scores combining similarity and LLM scores."""
-    similarity_scores = [doc[1] for doc in docs]
-    logger.info(f"Similarity scores: {similarity_scores}")
-    logger.info(f"LLM scores: {scores}")
-
-    # Calculate final scores with weight of 0.4 for similarity and 0.6 for LLM
-    weighted_scores = [0.4 * sim + 0.6 * score for sim, score in zip(similarity_scores, scores)]
-    logger.info(f"Final weighted scores: {weighted_scores}")
-
-    scored_docs = [(docs[i], score) for i, score in enumerate(weighted_scores) if isinstance(score, (float, int))]
-    logger.info(
-        "Document ranking results: "
-        f"{' | '.join([f'DocumentId: {doc[0].id} , Score: {score}' for doc, score in scored_docs])}"
-    )
-
-    return sorted(scored_docs, key=lambda x: -x[1])
-
-
-def _apply_threshold_filter(ranked_docs: list, threshold: float) -> list:
-    """Apply threshold filtering to remove low-scoring documents."""
-    if threshold <= 0:
-        return ranked_docs
-
-    original_count = len(ranked_docs)
-    filtered_docs = [doc_score for doc_score in ranked_docs if doc_score[1] >= threshold]
-    filtered_count = len(filtered_docs)
-
-    logger.info(
-        f"Threshold filtering applied: Removed {original_count - filtered_count} documents with scores below "
-        f"{threshold} (kept {filtered_count} out of {original_count} documents)"
-    )
-
-    return filtered_docs
-
-
-def rerank_with_llm(user_question: str, module: str | None, docs: list, llm: LLM) -> tuple[list, dict]:
-    """
-    Given a user question and a list of documents, ask the LLM to rank them
-    in order of relevance and return the re-ordered list along with token usage metadata.
-
-    Returns:
-        tuple: (ranked_documents, token_usage_metadata)
-    """
-    logger.info(f"Reranking documents with LLM for module {module} and question: {user_question}")
-    prompt_template = get_prompt_for_module(module)
-    formatted_docs = "\n".join([f"[{i}] {doc[0].page_content}" for i, doc in enumerate(docs)])
-    llm_input = prompt_template.format(question=user_question, documents=formatted_docs)
-
-    # Initialize token usage metadata
-    token_usage = {
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "llm_provider": get_provider_name(llm.__class__.__name__),
-        "llm_model": llm.model,
-        "content_length": 0,
-        "stop_reason": "FinishReasonStop",
-    }
-
-    # Fail fast if the per-pod breaker is open — the endpoint is known not-ready, so skip
-    # the LLM call and return the docs unranked rather than hanging on client retries.
-    cb_provider = get_provider_name(llm.__class__.__name__)
-    cb_model = llm.model
-    if circuit_breaker.is_open(cb_provider, cb_model):
-        logger.warning("rerank: circuit open for %s/%s — skipping LLM rerank", cb_provider, cb_model)
-        token_usage["request_status"] = "circuit_open"
-        return docs, token_usage
-
-    start_time = time.time()
-
-    try:
-        result = llm.generate(llm_input)
-        circuit_breaker.record_success(cb_provider, cb_model)
-        latency = time.time() - start_time
-
-        response_content = result.text
-        token_usage["input_tokens"] = result.input_tokens
-        token_usage["output_tokens"] = result.output_tokens
-        token_usage["content_length"] = len(response_content)
-        token_usage["latency_seconds"] = latency
-        token_usage["request_status"] = "success"
-
-        # Clean and parse the response
-        response_content = re.sub(r"\s+", " ", response_content)
-        scores = parse_ranking(response_content)
-
-        if not isinstance(scores, list) or len(scores) != len(docs):
-            logger.warning(f"LLM response is not a valid list: {response_content}")
-            scores = _adjust_scores_to_match_docs(scores, len(docs))
-
-        # If all scores are 0.0, return the original order
-        if all(score == 0 for score in scores):
-            return docs, token_usage
-
-        # Calculate weighted scores and rank documents
-        ranked_docs_with_scores = _calculate_weighted_scores(docs, scores)
-
-        # Apply threshold filtering
-        ranked_docs_with_scores = _apply_threshold_filter(ranked_docs_with_scores, Config.ranking_threshold)
-
-        logger.info(
-            f"[TokenUsage] Rerank LLM call - input: {token_usage['input_tokens']},"
-            f" output: {token_usage['output_tokens']}"
-        )
-        return [(doc[0], score) for doc, score in ranked_docs_with_scores], token_usage
-
-    except Exception as e:
-        if circuit_breaker.is_tripping_error(e):
-            circuit_breaker.record_failure(cb_provider, cb_model)
-        logger.warning(f"LLM failed to rank documents: {e}, using original order")
-        token_usage["request_status"] = "failure"
-        token_usage["error_message"] = str(e)
-        return docs, token_usage
+        if trace is not None:
+            trace.fallback_reason = "error"
+        return [], token_usage, trace

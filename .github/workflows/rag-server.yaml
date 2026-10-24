@@ -12,8 +12,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   app-build:
@@ -21,12 +21,12 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -44,15 +44,13 @@ jobs:
       - name: Install dependencies with uv
         working-directory: ./llm/rag-server
         run: |
-          # Verify and install from lock file first
-          uv pip install --system -r uv.lock
-          
-          # Install in editable mode with all extras for testing and linting
-          uv pip install --system -e ".[dev,test]"
+          # Sync the project env to uv.lock exactly (no re-resolve), with
+          # dev/test extras for linting and testing.
+          uv sync --frozen --all-extras
 
       - name: Run linters
         working-directory: ./llm/rag-server
         run: |
-          black --check .
-          flake8 .
-          mypy ./**/*.py --namespace-packages
+          uv run black --check .
+          uv run flake8 .
+          uv run mypy ./**/*.py --namespace-packages

@@ -11,6 +11,91 @@ import (
 	"time"
 )
 
+// namespaceOpaqueDependencyTypes are dependency types whose target is genuinely
+// outside the cluster's DNS namespace model — a database host, a message broker
+// topic, a raw address. They never carry a Kubernetes namespace.
+//
+// Deliberately NOT including "http_client": that is an HTTP call to a host that
+// emitted no spans of its own, which is very often an in-cluster service that
+// simply isn't instrumented, and it is resolved by the caller's DNS search path
+// like any other.
+var namespaceOpaqueDependencyTypes = map[string]bool{
+	"messaging_system": true,
+	"net_peer":         true,
+	"db_connection":    true,
+	"http_external":    true,
+	"external_address": true,
+	"ip_address":       true,
+}
+
+// resolveEndpointNamespace determines the namespace of a dependency endpoint that
+// the spans identified by bare name only (a destination_name, an http.host, a
+// caller attribute). peerNamespace is the namespace of the endpoint on the other
+// side of the dependency, which is always known.
+//
+// The rules follow Kubernetes DNS resolution, because that is what the workload
+// itself did when it made the call:
+//
+//  1. Database hosts, broker topics and raw addresses have no namespace at all.
+//     Checked first so a bare-named Kafka topic never inherits one, and so the
+//     consumer inversion (topic → service, source and target swapped) cannot
+//     stamp the local service's namespace onto the topic.
+//  2. A service of that name observed in the peer's own namespace: both the
+//     DNS-correct answer and one corroborated by an actual observation.
+//  3. A dotted name is an FQDN or an outside host. The caller's namespace search
+//     path does not apply to it, so it is never defaulted to the peer's namespace.
+//  4. A bare single-label name is resolved by Kubernetes within the caller's own
+//     namespace (the ndots:5 search path). A call to "notification-server" from a
+//     pod in "nudgebee" therefore means nudgebee/notification-server — it can
+//     never mean another namespace's copy, even if that is the only one observed.
+//     Adopting that other copy is precisely the cross-namespace edge this
+//     function exists to prevent.
+//
+// Returns the namespace and the Kind the endpoint should be identified by.
+func (t *TraceServiceMapBuilder) resolveEndpointNamespace(
+	name, peerNamespace, depType string,
+	serviceStats map[string]*serviceMetrics,
+	nsIndex map[string]*nsTracker,
+	externalServices map[string]*ExternalServiceInfo,
+) (namespace, kind string) {
+	if name == "" {
+		return "", "ExternalService"
+	}
+
+	_, observedInPeerNamespace := serviceStats[serviceKey(peerNamespace, name)]
+
+	// 1. Namespace-opaque targets. An observed service in the peer's own namespace
+	//    still wins, so a service that merely looks external is not misfiled.
+	if namespaceOpaqueDependencyTypes[depType] && !observedInPeerNamespace {
+		return "", "ExternalService"
+	}
+
+	// 2. Observed sibling in the peer's namespace.
+	if peerNamespace != "" && observedInPeerNamespace {
+		return peerNamespace, applicationKindFor(peerNamespace)
+	}
+
+	// Is this name unambiguous across namespaces? O(1) via the precomputed index.
+	sole := nsIndex[name]
+
+	// 3. FQDN or outside host — not subject to the caller's search path.
+	if strings.Contains(name, ".") {
+		if sole.isSole() {
+			return sole.sole, applicationKindFor(sole.sole)
+		}
+		return "", "ExternalService"
+	}
+
+	// 4. Bare single-label name: the caller's own namespace, always.
+	if peerNamespace != "" {
+		return peerNamespace, applicationKindFor(peerNamespace)
+	}
+	if sole.isSole() {
+		return sole.sole, applicationKindFor(sole.sole)
+	}
+	return "", "Service"
+}
+
 // buildServiceLinks creates Link objects for a service's dependencies
 func (t *TraceServiceMapBuilder) buildServiceLinks(dependencyMap map[string]*ServiceDependency, serviceStats map[string]*serviceMetrics, externalServices map[string]*ExternalServiceInfo, serviceName, namespace string, durationMinutes float64, earliestTime, latestTime time.Time, isUpstream bool) interface{} {
 	var links interface{}
@@ -30,12 +115,19 @@ func (t *TraceServiceMapBuilder) buildServiceLinks(dependencyMap map[string]*Ser
 
 		// CORRECT: Upstream = services I call (my dependencies, I am the source)
 		// Downstream = services calling me (my consumers, I am the target)
-		if isUpstream && dep.Source == serviceName {
+		//
+		// Both name AND namespace must match. Matching on name alone means two
+		// same-named services in different namespaces each absorb the other's
+		// links, which is the cross-namespace edge this whole path exists to avoid.
+		var targetNamespace string
+		if isUpstream && dep.Source == serviceName && dep.SourceNamespace == namespace {
 			shouldInclude = true
 			targetName = dep.Target // Services I call (my dependencies)
-		} else if !isUpstream && dep.Target == serviceName {
+			targetNamespace = dep.TargetNamespace
+		} else if !isUpstream && dep.Target == serviceName && dep.TargetNamespace == namespace {
 			shouldInclude = true
 			targetName = dep.Source // Services calling me (my consumers)
+			targetNamespace = dep.SourceNamespace
 		}
 
 		if !shouldInclude {
@@ -47,15 +139,19 @@ func (t *TraceServiceMapBuilder) buildServiceLinks(dependencyMap map[string]*Ser
 		dep.ErrorRate = float64(dep.ErrorCount) / float64(dep.CallCount) * 100
 		reqPerMin := float64(dep.CallCount) / durationMinutes
 
-		// Look up the target service's namespace and determine if it's external
-		targetNamespace := namespace // fallback to source namespace if not found
-		targetKind := "Service"
-		if targetStats, exists := serviceStats[targetName]; exists {
-			targetNamespace = targetStats.Namespace
-		} else if _, exists := externalServices[targetName]; exists {
-			// This is an external service
-			targetNamespace = ""
-			targetKind = "ExternalService"
+		// The peer namespace was resolved once, after both dependency passes
+		// completed, and is carried on the dependency itself. The old name-only
+		// serviceStats[targetName] lookup here is exactly what stamped a
+		// same-named service from an unrelated namespace onto this link.
+		//
+		// Kind must agree with how the peer's own application is built
+		// (applicationKindFor), or a consumer keying on Kind+Namespace+Name will
+		// miss the application and fall back to minting an external service.
+		targetKind := applicationKindFor(targetNamespace)
+		if targetNamespace == "" {
+			if _, isExternal := externalServices[targetName]; isExternal {
+				targetKind = "ExternalService"
+			}
 		}
 
 		link := UpstreamLink{
@@ -163,26 +259,28 @@ func (t *TraceServiceMapBuilder) updateDependency(dep *ServiceDependency, span T
 }
 
 // createNewDependency creates a new ServiceDependency
-func (t *TraceServiceMapBuilder) createNewDependency(source, target string, span TraceSpan, attrs *SpanAttributes, duration float64, isError bool) *ServiceDependency {
+func (t *TraceServiceMapBuilder) createNewDependency(source, sourceNamespace, target, targetNamespace string, span TraceSpan, attrs *SpanAttributes, duration float64, isError bool) *ServiceDependency {
 	protocol := t.inferProtocol(span, attrs)
 	depType := t.detectDependencyType(span, attrs)
 
 	dep := &ServiceDependency{
-		Source:         source,
-		Target:         target,
-		CallCount:      1,
-		TotalDuration:  duration,
-		ErrorCount:     0,
-		Protocol:       protocol,
-		Environment:    attrs.DeploymentEnv,
-		TraceIds:       []string{span.TraceID},
-		FailedTraceIds: []string{},
-		Operations:     make(map[string]int64),
-		StatusCodes:    make(map[int]int64),
-		ErrorTypes:     make(map[string]int64),
-		DependencyType: depType,
-		OriginalTarget: target,
-		SampleSpanID:   span.SpanID,
+		Source:          source,
+		SourceNamespace: sourceNamespace,
+		Target:          target,
+		TargetNamespace: targetNamespace,
+		CallCount:       1,
+		TotalDuration:   duration,
+		ErrorCount:      0,
+		Protocol:        protocol,
+		Environment:     attrs.DeploymentEnv,
+		TraceIds:        []string{span.TraceID},
+		FailedTraceIds:  []string{},
+		Operations:      make(map[string]int64),
+		StatusCodes:     make(map[int]int64),
+		ErrorTypes:      make(map[string]int64),
+		DependencyType:  depType,
+		OriginalTarget:  target,
+		SampleSpanID:    span.SpanID,
 	}
 
 	dep.Operations[span.SpanName] = 1
@@ -793,7 +891,13 @@ func (t *TraceServiceMapBuilder) filterAndExtractAttributes(rawAttrs map[string]
 // detectApplicationType intelligently detects application type based on telemetry data.
 // The returned TypeEvidence records the span and matched attribute that produced the
 // type, so a misclassification can be traced back to the exact span that caused it.
-func (t *TraceServiceMapBuilder) detectApplicationType(span TraceSpan, attrs *SpanAttributes, rawAttrs map[string]string, labels map[string]string) (string, *TypeEvidence) {
+//
+// The third return value, *UncertainMatch, is populated when a confidence
+// guard (below) excluded a pattern that would otherwise have matched — even
+// though no type is returned in that case, the near-miss is worth capturing
+// for later review (see core.RecordUncertainClassification). It's only
+// surfaced if nothing more confident is found anywhere else in the function.
+func (t *TraceServiceMapBuilder) detectApplicationType(span TraceSpan, attrs *SpanAttributes, rawAttrs map[string]string, labels map[string]string) (string, *TypeEvidence, *UncertainMatch) {
 	// NOTE: db.system and messaging.system indicate what the service is CONNECTING TO, not what the service itself is
 	// Prioritize language/runtime detection over infrastructure attributes
 
@@ -805,6 +909,16 @@ func (t *TraceServiceMapBuilder) detectApplicationType(span TraceSpan, attrs *Sp
 			Timestamp:    span.Timestamp,
 			MatchedKey:   matchedKey,
 			MatchedValue: matchedValue,
+		}
+	}
+
+	var uncertain *UncertainMatch
+	captureUncertain := func(reasonCode, matchedKey, matchedValue string) {
+		if uncertain == nil {
+			uncertain = &UncertainMatch{
+				TypeEvidence: *evidence(matchedKey, matchedValue),
+				ReasonCode:   reasonCode,
+			}
 		}
 	}
 
@@ -821,19 +935,19 @@ func (t *TraceServiceMapBuilder) detectApplicationType(span TraceSpan, attrs *Sp
 	if sdkLang, ok := labels["telemetry.sdk.language"]; ok && sdkLang != "" {
 		switch strings.ToLower(sdkLang) {
 		case "java":
-			return "java", evidence("telemetry.sdk.language", sdkLang)
+			return "java", evidence("telemetry.sdk.language", sdkLang), nil
 		case "python":
-			return "python", evidence("telemetry.sdk.language", sdkLang)
+			return "python", evidence("telemetry.sdk.language", sdkLang), nil
 		case "javascript", "nodejs", "node":
-			return "nodejs", evidence("telemetry.sdk.language", sdkLang)
+			return "nodejs", evidence("telemetry.sdk.language", sdkLang), nil
 		case "go", "golang":
-			return "golang", evidence("telemetry.sdk.language", sdkLang)
+			return "golang", evidence("telemetry.sdk.language", sdkLang), nil
 		case "dotnet", "csharp", "c#":
-			return "dotnet", evidence("telemetry.sdk.language", sdkLang)
+			return "dotnet", evidence("telemetry.sdk.language", sdkLang), nil
 		case "php":
-			return "php", evidence("telemetry.sdk.language", sdkLang)
+			return "php", evidence("telemetry.sdk.language", sdkLang), nil
 		case "ruby":
-			return "ruby", evidence("telemetry.sdk.language", sdkLang)
+			return "ruby", evidence("telemetry.sdk.language", sdkLang), nil
 		}
 	}
 
@@ -841,19 +955,19 @@ func (t *TraceServiceMapBuilder) detectApplicationType(span TraceSpan, attrs *Sp
 	if runtimeName, ok := labels["process.runtime.name"]; ok && runtimeName != "" {
 		switch strings.ToLower(runtimeName) {
 		case "node", "nodejs":
-			return "nodejs", evidence("process.runtime.name", runtimeName)
+			return "nodejs", evidence("process.runtime.name", runtimeName), nil
 		case "python":
-			return "python", evidence("process.runtime.name", runtimeName)
+			return "python", evidence("process.runtime.name", runtimeName), nil
 		case "go":
-			return "golang", evidence("process.runtime.name", runtimeName)
+			return "golang", evidence("process.runtime.name", runtimeName), nil
 		case "java":
-			return "java", evidence("process.runtime.name", runtimeName)
+			return "java", evidence("process.runtime.name", runtimeName), nil
 		case "dotnet", ".net":
-			return "dotnet", evidence("process.runtime.name", runtimeName)
+			return "dotnet", evidence("process.runtime.name", runtimeName), nil
 		case "php":
-			return "php", evidence("process.runtime.name", runtimeName)
+			return "php", evidence("process.runtime.name", runtimeName), nil
 		case "ruby":
-			return "ruby", evidence("process.runtime.name", runtimeName)
+			return "ruby", evidence("process.runtime.name", runtimeName), nil
 		}
 	}
 
@@ -862,19 +976,19 @@ func (t *TraceServiceMapBuilder) detectApplicationType(span TraceSpan, attrs *Sp
 	if language != "" {
 		switch strings.ToLower(language) {
 		case "java":
-			return "java", evidence("language", language)
+			return "java", evidence("language", language), nil
 		case "python":
-			return "python", evidence("language", language)
+			return "python", evidence("language", language), nil
 		case "javascript", "nodejs", "node":
-			return "nodejs", evidence("language", language)
+			return "nodejs", evidence("language", language), nil
 		case "go", "golang":
-			return "golang", evidence("language", language)
+			return "golang", evidence("language", language), nil
 		case "dotnet", "csharp", "c#":
-			return "dotnet", evidence("language", language)
+			return "dotnet", evidence("language", language), nil
 		case "php":
-			return "php", evidence("language", language)
+			return "php", evidence("language", language), nil
 		case "ruby":
-			return "ruby", evidence("language", language)
+			return "ruby", evidence("language", language), nil
 		}
 	}
 
@@ -887,18 +1001,24 @@ func (t *TraceServiceMapBuilder) detectApplicationType(span TraceSpan, attrs *Sp
 		if strings.Contains(serviceName, msgSystem) {
 			switch msgSystem {
 			case "kafka":
-				return "kafka", evidence("messaging.system", msgSystem)
+				return "kafka", evidence("messaging.system", msgSystem), nil
 			case "rabbitmq":
-				return "rabbitmq", evidence("messaging.system", msgSystem)
+				return "rabbitmq", evidence("messaging.system", msgSystem), nil
 			case "activemq":
-				return "activemq", evidence("messaging.system", msgSystem)
+				return "activemq", evidence("messaging.system", msgSystem), nil
 			case "nats":
-				return "nats", evidence("messaging.system", msgSystem)
+				return "nats", evidence("messaging.system", msgSystem), nil
 			case "pulsar":
-				return "pulsar", evidence("messaging.system", msgSystem)
+				return "pulsar", evidence("messaging.system", msgSystem), nil
 			case "rocketmq":
-				return "rocketmq", evidence("messaging.system", msgSystem)
+				return "rocketmq", evidence("messaging.system", msgSystem), nil
 			}
+		} else {
+			// messaging.system is present but doesn't match this service's own
+			// name — near-miss: the service USES this messaging system, but
+			// that's not evidence of its own identity. Worth reviewing later
+			// rather than silently discarding.
+			captureUncertain("messaging_system_name_mismatch", "messaging.system", msgSystem)
 		}
 	}
 
@@ -917,7 +1037,7 @@ func (t *TraceServiceMapBuilder) detectApplicationType(span TraceSpan, attrs *Sp
 
 	for pattern, appType := range dbPatterns {
 		if strings.Contains(serviceName, pattern) {
-			return appType, evidence("service_name", pattern)
+			return appType, evidence("service_name", pattern), nil
 		}
 	}
 
@@ -942,7 +1062,7 @@ func (t *TraceServiceMapBuilder) detectApplicationType(span TraceSpan, attrs *Sp
 
 	for pattern, appType := range patterns {
 		if strings.Contains(serviceName, pattern) {
-			return appType, evidence("service_name", pattern)
+			return appType, evidence("service_name", pattern), nil
 		}
 	}
 
@@ -956,30 +1076,80 @@ func (t *TraceServiceMapBuilder) detectApplicationType(span TraceSpan, attrs *Sp
 	// alongside CLIENT/PRODUCER because consuming from a queue is just as much
 	// an outbound interaction with an external system as producing to one —
 	// neither describes the consuming service's own identity.
+	//
+	// span.kind isn't always populated (observed in live data: a real service's
+	// "rabbitmq.consume" spans carried no span.kind at all, so the check above
+	// never excluded them). When kind is absent, a span name still carrying an
+	// operation verb (consume/process/receive/send/produce/publish — the same
+	// vocabulary isConsumerOperation uses to infer message-flow direction) is
+	// self-describing an interaction, not an identity, and must not be trusted
+	// either — unless kind is definitively SERVER, meaning this service really
+	// is the one being addressed as the destination.
 	spanName := strings.ToLower(span.SpanName)
-	if !strings.EqualFold(attrs.SpanKind, "CLIENT") && !strings.EqualFold(attrs.SpanKind, "PRODUCER") && !strings.EqualFold(attrs.SpanKind, "CONSUMER") {
+	isOutboundKind := strings.EqualFold(attrs.SpanKind, "CLIENT") ||
+		strings.EqualFold(attrs.SpanKind, "PRODUCER") ||
+		strings.EqualFold(attrs.SpanKind, "CONSUMER")
+	isServerKind := strings.EqualFold(attrs.SpanKind, "SERVER")
+	looksLikeOperation := strings.Contains(spanName, "consume") || strings.Contains(spanName, "process") ||
+		strings.Contains(spanName, "receive") || strings.Contains(spanName, "send") ||
+		strings.Contains(spanName, "produce") || strings.Contains(spanName, "publish")
+
+	if !isOutboundKind && (isServerKind || !looksLikeOperation) {
+		matchedSpanNamePattern := ""
+		matchedSpanNameType := ""
 		for pattern, appType := range patterns {
 			if strings.Contains(spanName, pattern) {
-				return appType, evidence("span_name", pattern)
+				matchedSpanNamePattern = pattern
+				matchedSpanNameType = appType
+				break
+			}
+		}
+		if matchedSpanNameType != "" {
+			return matchedSpanNameType, evidence("span_name", matchedSpanNamePattern), nil
+		}
+	} else {
+		// The span name was not trusted as an identity signal — either the span
+		// describes an outbound call (CLIENT/PRODUCER/CONSUMER), or its name
+		// carries an operation verb with no SERVER kind to confirm this service
+		// is the destination. Either way the name describes the operation being
+		// invoked, not this service's own identity. Still worth recording as a
+		// near-miss if the name happens to match a known pattern, since that's
+		// exactly the signal that would otherwise silently vanish. The two
+		// guards get distinct reason codes so a review row says which one fired.
+		reasonCode := "operation_verb_span_name"
+		if isOutboundKind {
+			reasonCode = "outbound_span_kind"
+		}
+		for pattern := range patterns {
+			if strings.Contains(spanName, pattern) {
+				captureUncertain(reasonCode, "span_name", pattern)
+				break
 			}
 		}
 	}
 
 	// AWS Service detection
 	if strings.Contains(serviceName, "rds") || strings.Contains(serviceName, "aws-rds") {
-		return "aws-rds", evidence("service_name", "rds")
+		return "aws-rds", evidence("service_name", "rds"), nil
 	}
 	if strings.Contains(serviceName, "elasticache") || strings.Contains(serviceName, "aws-elasticache") {
-		return "aws-elasticache", evidence("service_name", "elasticache")
+		return "aws-elasticache", evidence("service_name", "elasticache"), nil
 	}
 
 	// Protocol-based detection as fallback
 	if attrs.HTTPStatusCode > 0 || strings.Contains(spanName, "http") {
 		// This is likely an HTTP service, determine language if possible
-		return t.detectHTTPServiceType(span, labels, rawAttrs)
+		httpType, httpEvidence := t.detectHTTPServiceType(span, labels, rawAttrs)
+		if httpType != "" {
+			// Confident classification found here (e.g. via http.server_name
+			// matching nginx/envoy) — any near-miss captured earlier in this
+			// call must not be surfaced, per the function's own contract.
+			return httpType, httpEvidence, nil
+		}
+		return httpType, httpEvidence, uncertain
 	}
 
-	return "", nil // Unknown
+	return "", nil, uncertain // Unknown, but may still carry a near-miss
 }
 
 // detectHTTPServiceType tries to detect the application type for HTTP services
@@ -1248,12 +1418,10 @@ func (t *TraceServiceMapBuilder) buildExternalServiceDownstreams(dependencyMap m
 		if targetName == externalServiceName {
 			// This service depends on our external service
 			sourceName := dep.Source
-			sourceNamespace := ""
-
-			// Look up the source service's namespace
-			if sourceStats, exists := serviceStats[sourceName]; exists {
-				sourceNamespace = sourceStats.Namespace
-			}
+			// The dependency already carries its source namespace, resolved once
+			// after both passes. The old name-keyed serviceStats lookup here
+			// returned whichever namespace's copy was reached first.
+			sourceNamespace := dep.SourceNamespace
 
 			// Calculate metrics
 			dep.AvgDuration = dep.TotalDuration / float64(dep.CallCount) / t.config.NanosecondsToMilliseconds
@@ -1446,20 +1614,25 @@ func ExtractServiceNameFromUpstreamId(upstreamId string) string {
 	return ""
 }
 
-// ParseUpstreamId parses upstream ID format and returns name and kind
+// ParseUpstreamId parses upstream ID format and returns namespace, name and kind.
 // Format: "namespace:Kind:name" (e.g., ":Service:my-service" or "default:ExternalService:redis")
-func ParseUpstreamId(id string) (name, kind string) {
+//
+// The namespace is returned, not discarded: callers resolving the link to a real
+// service need it to tell two same-named services in different namespaces apart.
+// An empty namespace is a legitimate answer (external services, non-K8s workloads)
+// and means "unknown", not "default".
+func ParseUpstreamId(id string) (namespace, name, kind string) {
 	parts := strings.Split(id, ":")
 	if len(parts) >= 3 {
 		// Format: namespace:Kind:name
-		return parts[2], parts[1]
+		return parts[0], parts[2], parts[1]
 	}
 	if len(parts) == 2 {
 		// Format: Kind:name (no namespace)
-		return parts[1], parts[0]
+		return "", parts[1], parts[0]
 	}
 	// Single value, assume it's just the name
-	return id, "Service"
+	return "", id, "Service"
 }
 
 // extractK8sMetadataFromSpans extracts K8s infrastructure metadata from the spans

@@ -6,7 +6,7 @@ import Chart from '@ui/Chart';
 import { ListingLayout } from '@ui/ListingLayout';
 import FilterDropdown from '@ui/FilterDropdown';
 import DownloadButton from '@shared/buttons/DownloadButton';
-import { Grid, Alert, AlertTitle, Typography } from '@mui/material';
+import { Box, Grid, Typography } from '@mui/material';
 import { ds } from 'src/utils/colors';
 import apiUser from '@api1/user';
 import apiKubernetes from '@api1/kubernetes';
@@ -17,11 +17,20 @@ import Datetime from '@shared/format/Datetime';
 import { prettifyName } from 'src/utils/common';
 import SyncIcon from '@mui/icons-material/Sync';
 import { Button as DsButton } from '@ui/Button';
+import { Banner, type BannerTone } from '@ui/Banner';
 import { hasWriteAccess } from '@lib/auth';
 import useTriggerAnomaly from '@hooks/useTriggerAnomaly';
 import { formatInsight, getSeverityColor, AnomalyInsight } from '@lib/anomalyInsights';
+import { anomalyFingerprint } from '@lib/eventFingerprint';
 import KubernetesLogs from './KubernetesLogs';
 import KubernetesTracesListing from './KubernetesTracesListing';
+
+const BANNER_TONE: Record<ReturnType<typeof getSeverityColor>, BannerTone> = {
+  error: 'critical',
+  warning: 'warning',
+  info: 'info',
+  success: 'success',
+};
 
 export const DrilldownChartComponent: React.FC<{ value: any; chartId?: string }> = ({ value, chartId }) => {
   let data: any = {};
@@ -315,13 +324,18 @@ export const DrilldownChartComponent: React.FC<{ value: any; chartId?: string }>
             Detected Anomalies ({insights.length})
           </Typography>
           {insights.map((insight: AnomalyInsight) => (
-            <Alert key={insight.timestamp} severity={getSeverityColor(insight.severity)} sx={{ mb: ds.space[2] }}>
-              <AlertTitle sx={{ display: 'flex', alignItems: 'baseline', gap: ds.space[2], flexWrap: 'wrap', fontSize: 'var(--ds-text-body)' }}>
-                <Datetime value={insight.timestamp} />
-                <strong>{insight.severity.toUpperCase()}</strong>
-              </AlertTitle>
-              {formatInsight(insight, value.anomaly_type)}
-            </Alert>
+            <Box key={insight.timestamp} sx={{ mb: ds.space[2] }}>
+              <Banner
+                tone={BANNER_TONE[getSeverityColor(insight.severity)]}
+                title={
+                  <Box component='span' sx={{ display: 'flex', alignItems: 'baseline', gap: ds.space[2], flexWrap: 'wrap' }}>
+                    <Datetime value={insight.timestamp} />
+                    <strong>{insight.severity.toUpperCase()}</strong>
+                  </Box>
+                }
+                message={formatInsight(insight, value.anomaly_type)}
+              />
+            </Box>
           ))}
         </Grid>
       )}
@@ -363,6 +377,7 @@ export const KubernetesAnomalyTable = ({ accountId, filterData }: { accountId: s
   }, [router.query]);
 
   useEffect(() => {
+    let cancelled = false;
     setLoading(true);
     setData([]);
 
@@ -377,10 +392,11 @@ export const KubernetesAnomalyTable = ({ accountId, filterData }: { accountId: s
     apiKubernetes1
       .listK8sAnomaliesData(query)
       .then((res) => {
+        if (cancelled) return;
         const anomaliesData = res?.data?.data?.anomalies_list_v2?.rows || [];
         const findingIds: any = [];
         const tableData = anomaliesData.map((item: any) => {
-          findingIds.push(item.id);
+          findingIds.push(anomalyFingerprint(item.account_id, item.anomaly_type, item.name, item.namespace));
           return [
             { text: item.namespace, drilldownQuery: item },
             { text: item.name },
@@ -400,8 +416,11 @@ export const KubernetesAnomalyTable = ({ accountId, filterData }: { accountId: s
         setFindingIds(findingIds);
       })
       .finally(() => {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       });
+    return () => {
+      cancelled = true;
+    };
   }, [accountId, currentPage, recordsPerPage]);
 
   useEffect(() => {
@@ -425,7 +444,7 @@ export const KubernetesAnomalyTable = ({ accountId, filterData }: { accountId: s
               continue;
             }
             const event = eventsData.find((event: any) => {
-              return event.finding_id === item.id;
+              return event.finding_id === anomalyFingerprint(item.account_id, item.anomaly_type, item.name, item.namespace);
             });
 
             if (event) {

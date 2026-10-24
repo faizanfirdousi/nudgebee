@@ -8,9 +8,11 @@ import (
 	"html/template"
 	"log/slog"
 	"nudgebee/collector/cloud/common"
+	"nudgebee/collector/cloud/kgnotify"
 	"nudgebee/collector/cloud/providers" // Assuming config is needed for AWS provider instantiation
 	"reflect"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -244,15 +246,26 @@ func (p *TemplatedEventBridgeProcessor) Eligible(ev EventBridgeEvent) bool {
 	return false
 }
 
+// CloudTrailLookupQuery is one CloudTrail LookupEvents query: an
+// AttributeKey/AttributeValue pair (CloudTrail's API allows only one per
+// call) plus an optional client-side EventName allow-list, since
+// LookupEvents has no EventName-list filter of its own.
+type CloudTrailLookupQuery struct {
+	AttributeKey   string   `json:"AttributeKey"`
+	AttributeValue string   `json:"AttributeValue"`
+	EventNames     []string `json:"event_names,omitempty"`
+}
+
 // GetCloudTrailEventsActionParams defines parameters for the aws_get_cloudtrail_events action.
 type GetCloudTrailEventsActionParams struct {
 	StartTimeOffset string `json:"start_time_offset,omitempty"` // e.g., "-15m", "-1h"
 	EndTimeOffset   string `json:"end_time_offset,omitempty"`   // e.g., "+5m", "0m"
 	Region          string `json:"region,omitempty"`            // AWS Region (defaults to event region)
-	// LookupAttributes is a list of key-value pairs to filter events.
-	// Keys should match cloudtrail.LookupAttributeKey constants (e.g., "EventSource", "EventName").
-	LookupAttributes []map[string]string `json:"lookup_attributes,omitempty"` // List of {AttributeKey: "...", AttributeValue: "..."}
-	MaxResults       int64               `json:"max_results,omitempty"`       // Max number of events to return (defaults to 100)
+	// LookupAttributes is a list of CloudTrail lookup queries. CloudTrail's
+	// LookupEvents accepts only one attribute per call, so each entry runs
+	// as its own call; results across all entries are merged and deduped by EventId.
+	LookupAttributes []CloudTrailLookupQuery `json:"lookup_attributes,omitempty"`
+	MaxResults       int64                   `json:"max_results,omitempty"` // Max total events returned across all queries (capped at 50, the API max)
 }
 
 // UpdateCloudResourceActionParams defines parameters for updating cloud_resourses table
@@ -297,7 +310,7 @@ func NewTemplatedEventBridgeProcessor(rules EventRuleSet, api awsProviderAPI) *T
 			func(pCtx providers.CloudProviderContext, ev EventBridgeEvent, acc providers.Account) {
 				pCtx.GetLogger().Info("eventprocessor: trailing-fire of deduped rule",
 					"ruleName", rule.Name, "eventId", ev.ID)
-				p.executeActionsOnlyRule(pCtx, rule, ev, acc, p.prepareTemplateData(ev))
+				p.executeActionsOnlyRule(pCtx, rule, ev, acc, p.prepareTemplateData(pCtx, ev, acc))
 			},
 		)
 	}
@@ -621,6 +634,133 @@ func (p *TemplatedEventBridgeProcessor) renderTemplateValue(ctx providers.CloudP
 				}
 				return current
 			},
+			// pickFailingContainer returns the container most likely responsible for a
+			// task stop. The state-change payload's containers[] carries no role
+			// information at all — container 0 is often a sidecar (see
+			// ECS_Task_Stopped_Unexpectedly_EventBridge's filter comment), and a
+			// sidecar routinely shows its own non-zero exitCode (SIGKILL/SIGTERM) as
+			// collateral damage when ECS tears down the task after the essential
+			// container fails — exitCode alone can't tell "crashed" from "was killed".
+			//
+			// Optional second argument: taskDefContainerDefs, the task definition's
+			// real ContainerDefinitions (as fetched into TaskDefContainerDefs by
+			// prepareTemplateData). When present, this is the actual authoritative
+			// signal — each container's Essential flag, set by whoever wrote the task
+			// definition — and takes priority: among containers showing a failure
+			// signal (non-zero exitCode or non-empty reason), the one marked
+			// Essential wins over array order or exitCode value. Without task-def
+			// data (fetch failed, or a non-ECS event), falls back to: first non-zero
+			// exitCode, else first non-empty reason, else containers[0].
+			"pickFailingContainer": func(containers any, taskDefContainerDefsArg ...any) map[string]any {
+				list, ok := containers.([]any)
+				if !ok || len(list) == 0 {
+					return map[string]any{}
+				}
+
+				essentialByName := map[string]bool{}
+				if len(taskDefContainerDefsArg) > 0 {
+					if cds, ok := taskDefContainerDefsArg[0].([]any); ok {
+						for _, c := range cds {
+							cm, ok := c.(map[string]any)
+							if !ok {
+								continue
+							}
+							name, _ := cm["Name"].(string)
+							essential, _ := cm["Essential"].(bool)
+							if name != "" {
+								essentialByName[name] = essential
+							}
+						}
+					}
+				}
+
+				var failing []map[string]any
+				var reasonMatch map[string]any
+				for _, c := range list {
+					cm, ok := c.(map[string]any)
+					if !ok {
+						continue
+					}
+					hasFailureSignal := false
+					if ec, exists := cm["exitCode"]; exists {
+						if f, isNum := anyToFloat64(ec); isNum && f != 0 {
+							hasFailureSignal = true
+						}
+					}
+					if r, exists := cm["reason"]; exists && r != nil && fmt.Sprintf("%v", r) != "" {
+						hasFailureSignal = true
+						if reasonMatch == nil {
+							reasonMatch = cm
+						}
+					}
+					if hasFailureSignal {
+						failing = append(failing, cm)
+					}
+				}
+
+				// Prefer a failing container the task definition marks Essential —
+				// the real "this one matters" signal, not a guess from exit codes.
+				if len(essentialByName) > 0 {
+					for _, cm := range failing {
+						name, _ := cm["name"].(string)
+						if essentialByName[name] {
+							return cm
+						}
+					}
+				}
+
+				// No task-def data, or none of the failing containers is marked
+				// Essential: fall back to the original exitCode/reason heuristic.
+				for _, cm := range failing {
+					if ec, exists := cm["exitCode"]; exists {
+						if f, isNum := anyToFloat64(ec); isNum && f != 0 {
+							return cm
+						}
+					}
+				}
+				if reasonMatch != nil {
+					return reasonMatch
+				}
+				if first, ok := list[0].(map[string]any); ok {
+					return first
+				}
+				return map[string]any{}
+			},
+			// streamPrefixForContainer returns one container's real awslogs-stream-prefix
+			// from the task definition's ContainerDefinitions (TaskDefContainerDefs,
+			// already fetched by prepareTemplateData — no new AWS call here), matched
+			// by exact name. Returns "" if not found, not awslogs, or task-def data is
+			// unavailable — callers should fall back to a literal "ecs" guess in that
+			// case, same spirit as the log-group fallback.
+			"streamPrefixForContainer": func(taskDefContainerDefs any, containerName string) string {
+				cds, ok := taskDefContainerDefs.([]any)
+				if !ok {
+					return ""
+				}
+				for _, c := range cds {
+					cm, ok := c.(map[string]any)
+					if !ok {
+						continue
+					}
+					if name, _ := cm["Name"].(string); name != containerName {
+						continue
+					}
+					logConfig, ok := cm["LogConfiguration"].(map[string]any)
+					if !ok {
+						return ""
+					}
+					if driver, _ := logConfig["LogDriver"].(string); driver != "awslogs" {
+						return ""
+					}
+					options, ok := logConfig["Options"].(map[string]any)
+					if !ok {
+						return ""
+					}
+					prefix, _ := options["awslogs-stream-prefix"].(string)
+					return prefix
+				}
+				return ""
+			},
 			// dimensionsToNameValueJson converts CloudWatch dimensions to a consistent JSON array format.
 			// Handles both EventBridge map format {"Key": "Value"} and CloudWatch API array format [{"Name": "Key", "Value": "Value"}].
 			"dimensionsToNameValueJson": func(v any) (template.HTML, error) {
@@ -645,6 +785,37 @@ func (p *TemplatedEventBridgeProcessor) renderTemplateValue(ctx providers.CloudP
 					return "[]", err
 				}
 				return template.HTML(b), nil
+			},
+			// alarmNamespace/alarmMetricName/alarmDimension read the namespace,
+			// metric name and dimensions of a CloudWatch alarm from
+			// detail.configuration.metrics[].metricStat.metric — the real shape of a
+			// CloudWatch Alarm State Change EventBridge event (there is no top-level
+			// configuration.namespace/metricName/dimensions field). Use in place of a
+			// {{ range $dim := (index .Detail "configuration" "dimensions") }} loop,
+			// which reads a path that doesn't exist on real events.
+			"alarmNamespace": func(detail map[string]any) string {
+				metric, _ := findAlarmMetricStat(detail)["metric"].(map[string]any)
+				ns, _ := metric["namespace"].(string)
+				return ns
+			},
+			"alarmMetricName": func(detail map[string]any) string {
+				metric, _ := findAlarmMetricStat(detail)["metric"].(map[string]any)
+				name, _ := metric["name"].(string)
+				return name
+			},
+			"alarmDimension": func(detail map[string]any, dimensionName string) string {
+				metric, _ := findAlarmMetricStat(detail)["metric"].(map[string]any)
+				dims, _ := metric["dimensions"].(map[string]any)
+				// Case-insensitive: EventBridge sometimes sends the same dimension
+				// under different casings (e.g. "LoadBalancer" vs "loadBalancer"),
+				// same quirk extractAlarmMetricDetails already guards against.
+				target := strings.ToLower(strings.TrimSpace(dimensionName))
+				for k, v := range dims {
+					if strings.ToLower(strings.TrimSpace(k)) == target {
+						return fmt.Sprintf("%v", v)
+					}
+				}
+				return ""
 			},
 		}
 		tmpl, err := template.New(fieldName).Funcs(funcMap).Parse(templateStr)
@@ -980,6 +1151,20 @@ func (p *TemplatedEventBridgeProcessor) executeAction(
 		if err != nil {
 			return nil, fmt.Errorf("eventprocessor: parsing time offsets for aws_get_metric: %w", err)
 		}
+
+		// Never query coarser than the alarm evaluated. A 60s alarm that fired on
+		// a 99.9% datapoint, queried at the rule's default 300s period, comes back
+		// as a ~33% five-minute bucket — below its own 40% threshold — so the
+		// evidence card contradicts the alarm it is meant to explain.
+		if alarmPeriod := extractAlarmEvaluation(ebEvent).PeriodSeconds; alarmPeriod > 0 &&
+			(params.PeriodSeconds <= 0 || alarmPeriod < params.PeriodSeconds) {
+			if int64(endTime.Sub(startTime).Seconds())/alarmPeriod <= maxMetricDatapoints {
+				logger.Info("eventprocessor: narrowing metric period to the alarm evaluation period",
+					"rulePeriodSeconds", params.PeriodSeconds, "alarmPeriodSeconds", alarmPeriod)
+				params.PeriodSeconds = alarmPeriod
+			}
+		}
+
 		metricQuery := providers.QueryMetricsRequest{
 			ServiceName:     params.Namespace,
 			MetricNamespace: params.Namespace, // Pass CW namespace directly so getAwsCloudwatchMetrics uses it as-is
@@ -991,6 +1176,28 @@ func (p *TemplatedEventBridgeProcessor) executeAction(
 			EndDate:         &endTime,
 			Region:          ebEvent.Region,
 		}
+
+		// A metric-math alarm's real value is an expression over several
+		// sub-metrics, which Namespace/MetricName above can't represent (each
+		// only ever holds one metric). Decode the whole array here instead and,
+		// only if an expression is actually present, hand it to the provider so
+		// it can build the multi-query GetMetricData call CloudWatch needs to
+		// evaluate it. Plain single-metric alarms have no "expression" entry, so
+		// this stays empty and the fields set above are used exactly as today.
+		if params.MetricsJSON != "" {
+			var entries []providers.CloudWatchMetricEntry
+			if err := common.UnmarshalJson([]byte(params.MetricsJSON), &entries); err != nil {
+				logger.Warn("eventprocessor: failed to parse metrics_json, falling back to single-metric evidence", "error", err)
+			} else {
+				for _, e := range entries {
+					if e.Expression != "" {
+						metricQuery.MetricQueries = entries
+						break
+					}
+				}
+			}
+		}
+
 		return p.awsAPI.QueryMetrices(pCtx, awsAccount, metricQuery)
 
 	case "aws_get_log":
@@ -1031,6 +1238,17 @@ func (p *TemplatedEventBridgeProcessor) executeAction(
 				return nil, fmt.Errorf("eventprocessor: failed to auto-discover log group name from task definition '%s' for service '%s' (action: %s)", taskDefArn, params.ServiceName, actionDef.Name)
 			}
 			logger.Info("eventprocessor: auto-discovered log group name", "logGroupName", actualLogGroupName, "service", params.ServiceName)
+		} else if params.TaskDefinitionArn != "" && params.ContainerName != "" {
+			logger.Info("eventprocessor: discovering log group for specific container",
+				"taskDefinitionArn", params.TaskDefinitionArn, "containerName", params.ContainerName)
+			taskDefDetails, errTd := p.awsAPI.GetECSTaskDefinitionDetails(pCtx, awsAccount, ebEvent.Region, params.TaskDefinitionArn)
+			if errTd != nil {
+				logger.Warn("eventprocessor: failed to describe task definition for container log group lookup, using fallback log_group_name",
+					"error", errTd, "taskDefinitionArn", params.TaskDefinitionArn, "action", actionDef.Name)
+			} else if realGroup := parseLogGroupForContainerFromTaskDefMeta(taskDefDetails.Meta, params.ContainerName); realGroup != "" {
+				actualLogGroupName = realGroup
+				logger.Info("eventprocessor: found real log group for container", "logGroupName", realGroup, "containerName", params.ContainerName)
+			}
 		} else if actualLogGroupName == "" {
 			// If auto-discovery is NOT requested and LogGroupName is empty, it's an error.
 			return nil, fmt.Errorf("eventprocessor: aws_get_log action '%s' requires either a non-empty log_group_name or auto_detect_log_group=true (with cluster_name and service_name)", actionDef.Name)
@@ -1080,14 +1298,17 @@ func (p *TemplatedEventBridgeProcessor) executeAction(
 					}
 					current = val
 				} else if s, ok := current.(struct {
-					Event  map[string]any
-					Detail map[string]any
+					Event                map[string]any
+					Detail               map[string]any
+					TaskDefContainerDefs []any
 				}); ok { // Specific handling for top-level templateData struct
 					switch key {
 					case "Event":
 						current = s.Event
 					case "Detail":
 						current = s.Detail
+					case "TaskDefContainerDefs":
+						current = s.TaskDefContainerDefs
 					default:
 						// Accessing a field not named Event or Detail on the root templateData struct
 						// This case should ideally not happen if paths are well-defined.
@@ -1353,67 +1574,87 @@ func (p *TemplatedEventBridgeProcessor) executeAction(
 			}
 			return fmt.Sprintf("RunningCountLow alarm created for %s/%s (desired: %d)", clusterName, serviceName, desiredCount), nil
 
-		case "aws_get_cloudtrail_events":
-			paramsCT := GetCloudTrailEventsActionParams{}
-			if err := mapToStruct(renderedParams, &paramsCT); err != nil {
-				return nil, fmt.Errorf("eventprocessor: parsing aws_get_cloudtrail_events params for action '%s': %w", actionDef.Name, err)
-			}
-
-			region := paramsCT.Region
-			if region == "" {
-				region = ebEvent.Region // Default to event region
-			}
-
-			startTimeCT, endTimeCT, err := parseTimeOffsets(ebEvent.Time, paramsCT.StartTimeOffset, paramsCT.EndTimeOffset)
-			if err != nil {
-				return nil, fmt.Errorf("eventprocessor: parsing time offsets for aws_get_cloudtrail_events: %w", err)
-			}
-
-			maxResults := paramsCT.MaxResults
-			if maxResults == 0 {
-				maxResults = 100 // Default limit for CloudTrail lookup
-			}
-
-			lookupAttributes := []trailtypes.LookupAttribute{}
-			for _, attrMap := range paramsCT.LookupAttributes {
-				key, keyOk := attrMap["AttributeKey"]
-				value, valueOk := attrMap["AttributeValue"]
-				if keyOk && valueOk && key != "" {
-					lookupAttributes = append(lookupAttributes, trailtypes.LookupAttribute{
-						AttributeKey:   trailtypes.LookupAttributeKey(key),
-						AttributeValue: ptr.String(value),
-					})
-				} else {
-					logger.Warn("eventprocessor: skipping invalid lookup_attribute in params for aws_get_cloudtrail_events", "attribute", attrMap)
-				}
-			}
-
-			// Default to ReadOnly=false unless explicitly overridden
-			readOnlyFilterExists := false
-			for _, attr := range lookupAttributes {
-				if attr.AttributeKey == trailtypes.LookupAttributeKeyReadOnly { // Using string literal as per previous fix
-					readOnlyFilterExists = true
-					break
-				}
-			}
-			if !readOnlyFilterExists {
-				lookupAttributes = append(lookupAttributes, trailtypes.LookupAttribute{AttributeKey: trailtypes.LookupAttributeKeyReadOnly, AttributeValue: ptr.String("false")})
-			}
-
-			cloudtrailEvents, err := p.awsAPI.LookupCloudTrailEvents(pCtx, awsAccount, region, &cloudtrail.LookupEventsInput{
-				StartTime:        ptr.Time(startTimeCT),
-				EndTime:          ptr.Time(endTimeCT),
-				LookupAttributes: lookupAttributes,
-				MaxResults:       ptr.Int32(int32(maxResults)),
-			})
-			if err != nil {
-				return nil, fmt.Errorf("eventprocessor: failed to lookup cloudtrail events for action '%s': %w", actionDef.Name, err)
-			}
-			return cloudtrailEvents, nil
-
 		default:
 			return nil, fmt.Errorf("eventprocessor: unsupported alarm_type '%s' for aws_create_alarm action", alarmType)
 		}
+
+	case "aws_get_cloudtrail_events":
+		paramsCT := GetCloudTrailEventsActionParams{}
+		if err := mapToStruct(renderedParams, &paramsCT); err != nil {
+			return nil, fmt.Errorf("eventprocessor: parsing aws_get_cloudtrail_events params for action '%s': %w", actionDef.Name, err)
+		}
+
+		region := paramsCT.Region
+		if region == "" {
+			region = ebEvent.Region // Default to event region
+		}
+
+		startTimeCT, endTimeCT, err := parseTimeOffsets(ebEvent.Time, paramsCT.StartTimeOffset, paramsCT.EndTimeOffset)
+		if err != nil {
+			return nil, fmt.Errorf("eventprocessor: parsing time offsets for aws_get_cloudtrail_events: %w", err)
+		}
+
+		maxResults := paramsCT.MaxResults
+		if maxResults <= 0 || maxResults > 50 {
+			maxResults = 50 // LookupEvents caps MaxResults at 50
+		}
+
+		if len(paramsCT.LookupAttributes) == 0 {
+			return nil, fmt.Errorf("eventprocessor: aws_get_cloudtrail_events requires at least one lookup_attributes entry for action '%s'", actionDef.Name)
+		}
+
+		// CloudTrail's LookupEvents accepts only one LookupAttribute per call,
+		// so each configured query runs as its own call. Results are merged,
+		// deduped by EventId, an optional per-query EventName allow-list is
+		// applied client-side, and read-only (non-mutating) events are
+		// dropped, matching the prior single-call ReadOnly=false default.
+		seen := map[string]bool{}
+		var merged []trailtypes.Event
+		for _, q := range paramsCT.LookupAttributes {
+			if q.AttributeKey == "" || q.AttributeValue == "" {
+				logger.Warn("eventprocessor: skipping invalid lookup_attributes entry for aws_get_cloudtrail_events", "entry", q)
+				continue
+			}
+			events, err := p.awsAPI.LookupCloudTrailEvents(pCtx, awsAccount, region, &cloudtrail.LookupEventsInput{
+				StartTime: ptr.Time(startTimeCT),
+				EndTime:   ptr.Time(endTimeCT),
+				LookupAttributes: []trailtypes.LookupAttribute{
+					{AttributeKey: trailtypes.LookupAttributeKey(q.AttributeKey), AttributeValue: ptr.String(q.AttributeValue)},
+				},
+				MaxResults: ptr.Int32(int32(maxResults)),
+			})
+			if err != nil {
+				return nil, fmt.Errorf("eventprocessor: failed to lookup cloudtrail events for action '%s' (%s=%s): %w", actionDef.Name, q.AttributeKey, q.AttributeValue, err)
+			}
+
+			allowedNames := map[string]bool{}
+			for _, n := range q.EventNames {
+				allowedNames[n] = true
+			}
+			for _, ev := range events {
+				if len(allowedNames) > 0 && !allowedNames[ptr.ToString(ev.EventName)] {
+					continue
+				}
+				if ptr.ToString(ev.ReadOnly) == "true" {
+					continue
+				}
+				id := ptr.ToString(ev.EventId)
+				if id != "" && seen[id] {
+					continue
+				}
+				seen[id] = true
+				merged = append(merged, ev)
+			}
+		}
+
+		sort.Slice(merged, func(i, j int) bool {
+			return ptr.ToTime(merged[i].EventTime).After(ptr.ToTime(merged[j].EventTime))
+		})
+		if len(merged) > int(maxResults) {
+			merged = merged[:maxResults]
+		}
+
+		return merged, nil
 
 	case "update_cloud_resource":
 		logger.Info("eventprocessor: executing update_cloud_resource action", "actionName", actionDef.Name, "renderedParams", renderedParams)
@@ -1428,6 +1669,36 @@ func (p *TemplatedEventBridgeProcessor) executeAction(
 	default:
 		return nil, fmt.Errorf("eventprocessor: unsupported action type: %s", actionDef.Type)
 	}
+}
+
+// resolveResourceIdentity decides the (resourse_id, external_resource_id) pair a
+// realtime-updated resource is stored under.
+//
+// The bulk sync (account.StoreResources) writes every resource as
+// resourse_id = <the provider's own resource id> and external_resource_id =
+// common.BuildExternalResourceId(...). This path used to store the action's lookup
+// key as resourse_id and the raw ARN as external_resource_id, so the two writers
+// disagreed and neither unique index on cloud_resourses matched. For ECS tasks —
+// where the lookup key is a full task ARN because GetResourcesByIds parses the
+// cluster out of it — the sync inserted a second row beside this one. Elsewhere
+// (EC2, RDS, …) resourse_id happened to agree, so the two rows collapsed into one
+// whose external_resource_id the two reconcile steps then rewrote past each other.
+// Deriving both fields from the provider's own id, through the same helper the sync
+// uses, makes the writers land on one row by construction.
+//
+// canonicalId is empty when the live lookup failed or found nothing (typically a
+// delete event). There is then nothing canonical to derive from, so the previous
+// behaviour is kept rather than running BuildExternalResourceId over a lookup key
+// that may itself be an ARN — that would produce a doubly-prefixed pseudo-ARN.
+func resolveResourceIdentity(
+	canonicalId, lookupKey, arn string,
+	accountNumber, region, serviceName, resourceType string,
+) (resourceId, externalResourceId string) {
+	if canonicalId == "" {
+		return lookupKey, arn
+	}
+	return canonicalId, common.BuildExternalResourceId(
+		"AWS", accountNumber, region, serviceName, resourceType, canonicalId, "")
 }
 
 // updateCloudResource updates a resource in the cloud_resourses table based on EventBridge event
@@ -1446,13 +1717,16 @@ func (p *TemplatedEventBridgeProcessor) updateCloudResource(
 		"newStatus", params.NewStatus,
 		"accountNumber", awsAccount.AccountNumber)
 
-	// Get account metadata (UUID) from cache
-	accountID, tenantID, found := GetAccountMetadata(awsAccount.AccountNumber)
+	// The account UUID is already on the resolved account; only its tenant needs
+	// looking up, keyed by that UUID so two tenants sharing one AWS account
+	// number cannot be attributed to each other.
+	accountID := awsAccount.ID
+	tenantID, found := GetAccountTenant(accountID)
 	if !found {
-		logger.Error("eventprocessor: account metadata not found in cache", "accountNumber", awsAccount.AccountNumber)
-		return nil, fmt.Errorf("eventprocessor: account metadata not found in cache for account %s", awsAccount.AccountNumber)
+		logger.Error("eventprocessor: account tenant not found in cache", "accountId", accountID, "accountNumber", awsAccount.AccountNumber)
+		return nil, fmt.Errorf("eventprocessor: account tenant not found in cache for account %s", awsAccount.AccountNumber)
 	}
-	logger.Info("eventprocessor: found account metadata", "accountID", accountID, "tenantID", tenantID)
+	logger.Info("eventprocessor: resolved account tenant", "accountID", accountID, "tenantID", tenantID)
 
 	// Get database manager
 	dbms, err := common.GetDatabaseManager(common.Metastore)
@@ -1476,6 +1750,12 @@ func (p *TemplatedEventBridgeProcessor) updateCloudResource(
 	var resourceType string
 	var resourceTags = "{}"
 	var resourceMeta = "{}"
+	// canonicalId is the provider's own resource id, set only when the live lookup
+	// below succeeds. params.ResourceId is the AWS *lookup key* and is not always the
+	// same string: the ECS task rule passes a full task ARN because GetResourcesByIds
+	// parses the cluster out of it. Storing the lookup key as resourse_id is what made
+	// this path disagree with the bulk sync — see the comment above resourceIdentity.
+	var canonicalId string
 
 	cloudProvider, ok := providers.GetProvider("AWS")
 	if ok {
@@ -1521,6 +1801,7 @@ func (p *TemplatedEventBridgeProcessor) updateCloudResource(
 			resourceArn = resource.Arn
 			resourceName = resource.Name
 			resourceType = resource.Type // Use the actual type from AWS, not from params
+			canonicalId = resource.Id    // Same reason as type: trust the provider, not the params
 
 			if len(resource.Tags) > 0 {
 				tagsJsonBytes, err := common.MarshalJson(resource.Tags)
@@ -1557,6 +1838,10 @@ func (p *TemplatedEventBridgeProcessor) updateCloudResource(
 	if resourceType == "" {
 		resourceType = params.ResourceType
 	}
+
+	resourceIdentity, resourceErid := resolveResourceIdentity(
+		canonicalId, params.ResourceId, resourceArn,
+		awsAccount.AccountNumber, params.Region, params.ServiceName, resourceType)
 
 	// Build UPSERT query (INSERT...ON CONFLICT...DO UPDATE)
 	args := []any{}
@@ -1629,8 +1914,8 @@ func (p *TemplatedEventBridgeProcessor) updateCloudResource(
 		tenantID,
 		accountID,
 		"AWS", // cloud_provider - required NOT NULL field
-		params.ResourceId,
-		resourceArn, // external_resource_id - use ARN from fetched resource
+		resourceIdentity,
+		resourceErid, // external_resource_id - canonical, matches the bulk sync
 		params.ServiceName,
 		params.Region,
 		resourceType,  // Use actual type from AWS API
@@ -1665,13 +1950,13 @@ func (p *TemplatedEventBridgeProcessor) updateCloudResource(
 		fmt.Sprintf("name = $%d", argIndex+1),
 		fmt.Sprintf("type = $%d", argIndex+2),
 		fmt.Sprintf("arn = $%d", argIndex+3),
-		fmt.Sprintf("external_resource_id = $%d", argIndex+4), // Update ARN if we get it later
+		fmt.Sprintf("external_resource_id = $%d", argIndex+4), // Canonical identity, may firm up once the lookup succeeds
 		fmt.Sprintf("tags = $%d::jsonb", argIndex+5),
 		fmt.Sprintf("resourse_id = $%d", argIndex+6),
 		fmt.Sprintf("service_name = $%d", argIndex+7),
 		fmt.Sprintf("region = $%d", argIndex+8),
 	}
-	args = append(args, now, resourceName, resourceType, resourceArn, resourceArn, resourceTags, params.ResourceId, params.ServiceName, params.Region)
+	args = append(args, now, resourceName, resourceType, resourceArn, resourceErid, resourceTags, resourceIdentity, params.ServiceName, params.Region)
 	argIndex += 9
 
 	// Update status if provided - with timestamp check to prevent out-of-order updates
@@ -1730,10 +2015,31 @@ func (p *TemplatedEventBridgeProcessor) updateCloudResource(
 	// Pre-reconcile: if a row exists with the same natural key (account, resourse_id, type, region, service_name)
 	// but a different external_resource_id, update its external_resource_id so the ON CONFLICT below catches it.
 	// This prevents "duplicate key violates unique constraint cloud_resourses_account_resourse_service_type_region_key".
+	//
+	// The NOT EXISTS guard mirrors account.reconcileExternalResourceIds: BuildExternalResourceId
+	// is a lossy normalization, so two rows distinct under the natural key can want the same
+	// external_resource_id. Without the guard this UPDATE can violate the unique index on
+	// (account, external_resource_id) — and the error is swallowed here, which would leave the
+	// upsert below to fail on the natural key instead. If another row already holds the
+	// canonical id, do nothing: the ON CONFLICT will land on that row.
+	//
+	// Failure here stays non-fatal — the upsert below is still worth attempting — but it
+	// is logged, because this is the step that keeps the two unique indexes from
+	// disagreeing. A silent failure here surfaces later as a confusing natural-key
+	// violation on the upsert, with nothing pointing back to the real cause.
 	reconcileQuery := `UPDATE cloud_resourses SET external_resource_id = $1
 		WHERE account = $2 AND resourse_id = $3 AND type = $4 AND region = $5 AND service_name = $6
-		AND (external_resource_id IS NULL OR external_resource_id != $1)`
-	_, _ = dbms.Exec(reconcileQuery, resourceArn, accountID, params.ResourceId, resourceType, params.Region, params.ServiceName)
+		AND (external_resource_id IS NULL OR external_resource_id != $1)
+		AND NOT EXISTS (
+			SELECT 1 FROM cloud_resourses existing
+			WHERE existing.account = $2 AND existing.external_resource_id = $1
+		)`
+	if _, reconcileErr := dbms.Exec(reconcileQuery, resourceErid, accountID, resourceIdentity, resourceType, params.Region, params.ServiceName); reconcileErr != nil {
+		logger.Warn("eventprocessor: pre-reconcile of external_resource_id failed, continuing to upsert",
+			"error", reconcileErr,
+			"resourceId", resourceIdentity,
+			"externalResourceId", resourceErid)
+	}
 
 	// Construct UPSERT query with RETURNING xmax to detect INSERT vs UPDATE
 	upsertQuery := fmt.Sprintf(
@@ -1771,16 +2077,25 @@ func (p *TemplatedEventBridgeProcessor) updateCloudResource(
 	// No post-INSERT UPDATE needed - all data is already in the initial INSERT
 	// because we fetched resource details BEFORE the UPSERT
 
+	// Report the identity the row was actually stored under, which is not always the
+	// lookup key the action was called with.
 	logger.Info("eventprocessor: resource upserted successfully",
 		"operation", operation,
-		"resourceId", params.ResourceId,
+		"resourceId", resourceIdentity,
+		"lookupKey", params.ResourceId,
+		"externalResourceId", resourceErid,
 		"newStatus", finalStatus,
 		"xmax", xmax)
+
+	// Update this resource's knowledge-graph node. The api-server re-reads the
+	// row, so the op is only a hint; a resource it has no node for yet makes it
+	// rebuild the account.
+	kgnotify.PublishResourceUpdate(pCtx.GetContext(), tenantID, accountID, resourceIdentity, kgnotify.OpFor(finalStatus != "Deleted"))
 
 	return map[string]any{
 		"operation":    operation,
 		"was_insert":   wasInsert,
-		"resource_id":  params.ResourceId,
+		"resource_id":  resourceIdentity,
 		"service_name": params.ServiceName,
 		"new_status":   finalStatus,
 	}, nil
@@ -1790,21 +2105,66 @@ func (p *TemplatedEventBridgeProcessor) updateCloudResource(
 // This assumes the Meta field contains the unmarshalled DescribeTaskDefinitionOutput or a relevant subset.
 func parseLogGroupFromTaskDefMeta(meta map[string]any) string {
 	// Navigate the structure: containerDefinitions -> logConfiguration -> options -> awslogs-group
-	if containerDefsVal, ok := meta["ContainerDefinitions"]; ok {
-		if containerDefs, ok := containerDefsVal.([]any); ok && len(containerDefs) > 0 {
-			// Assuming the first container definition is representative or the one with awslogs config
-			if containerDef, ok := containerDefs[0].(map[string]any); ok {
-				if logConfig, ok := containerDef["LogConfiguration"].(map[string]any); ok {
-					if options, ok := logConfig["Options"].(map[string]any); ok {
-						if awslogsGroup, ok := options["awslogs-group"].(string); ok && awslogsGroup != "" {
-							return awslogsGroup
-						}
-					}
-				}
-			}
+	//
+	// Scan every container definition rather than only the first. A task whose
+	// first container is a sidecar without an awslogs driver (proxy, init,
+	// otel-collector) reported "failed to auto-discover log group name" and the
+	// event got no logs at all, even though a later container declared the group.
+	containerDefs, ok := meta["ContainerDefinitions"].([]any)
+	if !ok {
+		return "" // Log group not found in the expected structure
+	}
+	for _, containerDefVal := range containerDefs {
+		containerDef, ok := containerDefVal.(map[string]any)
+		if !ok {
+			continue
+		}
+		logConfig, ok := containerDef["LogConfiguration"].(map[string]any)
+		if !ok {
+			continue
+		}
+		options, ok := logConfig["Options"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if awslogsGroup, ok := options["awslogs-group"].(string); ok && awslogsGroup != "" {
+			return awslogsGroup
 		}
 	}
 	return "" // Log group not found in the expected structure
+}
+
+// parseLogGroupForContainerFromTaskDefMeta finds one specific container's awslogs-group by
+// exact name match, unlike parseLogGroupFromTaskDefMeta's "first container with an awslogs
+// driver wins" — which can't distinguish a sidecar's log group from the failed container's.
+func parseLogGroupForContainerFromTaskDefMeta(meta map[string]any, containerName string) string {
+	containerDefs, ok := meta["ContainerDefinitions"].([]any)
+	if !ok {
+		return ""
+	}
+	for _, cdVal := range containerDefs {
+		cd, ok := cdVal.(map[string]any)
+		if !ok {
+			continue
+		}
+		if name, _ := cd["Name"].(string); name != containerName {
+			continue
+		}
+		logConfig, ok := cd["LogConfiguration"].(map[string]any)
+		if !ok {
+			return ""
+		}
+		if driver, _ := logConfig["LogDriver"].(string); driver != "awslogs" {
+			return ""
+		}
+		options, ok := logConfig["Options"].(map[string]any)
+		if !ok {
+			return ""
+		}
+		group, _ := options["awslogs-group"].(string)
+		return group
+	}
+	return ""
 }
 
 // mapToStruct converts a map to a struct using JSON tags.
@@ -1831,9 +2191,35 @@ func parseTimeOffsets(eventTime time.Time, startOffsetStr, endOffsetStr string) 
 	return startTime, endTime, nil
 }
 
+// findAlarmMetricStat locates the first CloudWatch alarm metric data query
+// (detail.configuration.metrics[].metricStat) that carries a MetricStat,
+// skipping metric-math expression-only entries. Real CloudWatch Alarm State
+// Change events always nest namespace/name/dimensions here — there is no
+// top-level configuration.namespace/metricName/dimensions field, even for
+// alarms created via the "classic" single-metric PutMetricAlarm params (AWS
+// normalizes every alarm into the metrics[] shape for the notification).
+// Shared by extractAlarmMetricDetails and the alarmNamespace/alarmMetricName/
+// alarmDimension*/template functions so every runbook rule reads the same path.
+func findAlarmMetricStat(detail map[string]any) map[string]any {
+	config, _ := detail["configuration"].(map[string]any)
+	if config == nil {
+		return nil
+	}
+	metrics, _ := config["metrics"].([]any)
+	for _, metricRaw := range metrics {
+		metric, _ := metricRaw.(map[string]any)
+		if metric == nil {
+			continue
+		}
+		if metricStat, _ := metric["metricStat"].(map[string]any); metricStat != nil {
+			return metricStat
+		}
+	}
+	return nil
+}
+
 // extractAlarmMetricDetails extracts CloudWatch metric dimensions and statistic
-// from an EventBridge CloudWatch Alarm State Change event. It navigates to
-// detail.configuration.metrics[].metricStat and returns:
+// from an EventBridge CloudWatch Alarm State Change event and returns:
 //   - dimensions as []map[string]string{{"Name": k, "Value": v}} for GetMetricData
 //   - statistic string (e.g. "Sum", "Average", "Maximum")
 func extractAlarmMetricDetails(ebEvent EventBridgeEvent) ([]map[string]string, string) {
@@ -1841,55 +2227,36 @@ func extractAlarmMetricDetails(ebEvent EventBridgeEvent) ([]map[string]string, s
 	if err := common.UnmarshalJson(ebEvent.Detail, &detail); err != nil {
 		return nil, ""
 	}
-	config, _ := detail["configuration"].(map[string]any)
-	if config == nil {
-		return nil, ""
-	}
-	metrics, _ := config["metrics"].([]any)
-	if len(metrics) == 0 {
+	metricStat := findAlarmMetricStat(detail)
+	if metricStat == nil {
 		return nil, ""
 	}
 
-	// Find the first metric that has metricStat (skip math expressions which only have "expression")
-	for _, metricRaw := range metrics {
-		metric, _ := metricRaw.(map[string]any)
-		if metric == nil {
-			continue
-		}
-		metricStat, _ := metric["metricStat"].(map[string]any)
-		if metricStat == nil {
-			continue
-		}
+	stat, _ := metricStat["stat"].(string)
 
-		// Extract statistic
-		stat, _ := metricStat["stat"].(string)
-
-		// Extract dimensions
-		innerMetric, _ := metricStat["metric"].(map[string]any)
-		if innerMetric == nil {
-			return nil, stat
-		}
-		dims, _ := innerMetric["dimensions"].(map[string]any)
-		if len(dims) == 0 {
-			return nil, stat
-		}
-		// Deduplicate dimensions — EventBridge sometimes sends both "LoadBalancer" and
-		// "loadBalancer" with the same value. Keep only unique values by lowercased key.
-		seen := make(map[string]bool, len(dims))
-		var result []map[string]string
-		for k, v := range dims {
-			lower := strings.ToLower(k)
-			if seen[lower] {
-				continue
-			}
-			seen[lower] = true
-			if vStr, ok := v.(string); ok {
-				result = append(result, map[string]string{"Name": k, "Value": vStr})
-			}
-		}
-		return result, stat
+	innerMetric, _ := metricStat["metric"].(map[string]any)
+	if innerMetric == nil {
+		return nil, stat
 	}
-	return nil, ""
+	dims, _ := innerMetric["dimensions"].(map[string]any)
+	if len(dims) == 0 {
+		return nil, stat
+	}
+	// Deduplicate dimensions — EventBridge sometimes sends both "LoadBalancer" and
+	// "loadBalancer" with the same value. Keep only unique values by lowercased key.
+	seen := make(map[string]bool, len(dims))
+	var result []map[string]string
+	for k, v := range dims {
+		lower := strings.ToLower(k)
+		if seen[lower] {
+			continue
+		}
+		seen[lower] = true
+		if vStr, ok := v.(string); ok {
+			result = append(result, map[string]string{"Name": k, "Value": vStr})
+		}
+	}
+	return result, stat
 }
 
 // toLowerCamelCase converts a string to lowerCamelCase.
@@ -2024,7 +2391,17 @@ func normalizeMapKeys(inputMap map[string]any) map[string]any {
 
 // prepareTemplateData creates the data structure to be used by Go templates.
 // It uses original key names from the JSON.
-func (p *TemplatedEventBridgeProcessor) prepareTemplateData(ebEvent EventBridgeEvent) any {
+//
+// For ECS Task State Change events, it also fetches the task definition once
+// up front and exposes its ContainerDefinitions (raw, PascalCase — the AWS SDK
+// shape) as TaskDefContainerDefs, so pickFailingContainer can prefer a failing
+// container marked Essential over guessing from exitCode/reason alone. This
+// runs before any rule's event_template fields render, so title/fingerprint/
+// description see the same Essential-aware selection the log action does.
+// A fetch failure (or a non-ECS event with no taskDefinitionArn) degrades
+// gracefully: TaskDefContainerDefs stays nil, and pickFailingContainer falls
+// back to its exitCode/reason-only heuristic.
+func (p *TemplatedEventBridgeProcessor) prepareTemplateData(ctx providers.CloudProviderContext, ebEvent EventBridgeEvent, account providers.Account) any {
 	var detailData map[string]any
 	if err := common.UnmarshalJson(ebEvent.Detail, &detailData); err != nil {
 		slog.Error("failed to unmarshal ebEvent.Detail", "error", err, "data", slog.AnyValue(ebEvent))
@@ -2043,12 +2420,25 @@ func (p *TemplatedEventBridgeProcessor) prepareTemplateData(ebEvent EventBridgeE
 		}
 	}
 
+	var taskDefContainerDefs []any
+	if taskDefArn, _ := detailData["taskDefinitionArn"].(string); taskDefArn != "" && ctx != nil && p.awsAPI != nil {
+		resource, errTd := p.awsAPI.GetECSTaskDefinitionDetails(ctx, account, ebEvent.Region, taskDefArn)
+		if errTd != nil {
+			slog.Warn("prepareTemplateData: failed to fetch task definition for essential-container detection, falling back to exitCode/reason heuristic",
+				"error", errTd, "taskDefinitionArn", taskDefArn)
+		} else if cds, ok := resource.Meta["ContainerDefinitions"].([]any); ok {
+			taskDefContainerDefs = cds
+		}
+	}
+
 	return struct {
-		Event  map[string]any
-		Detail map[string]any
+		Event                map[string]any
+		Detail               map[string]any
+		TaskDefContainerDefs []any
 	}{
-		Event:  normalizeMapKeys(eventMap),
-		Detail: normalizeMapKeys(detailData),
+		Event:                normalizeMapKeys(eventMap),
+		Detail:               normalizeMapKeys(detailData),
+		TaskDefContainerDefs: taskDefContainerDefs,
 	}
 }
 
@@ -2056,7 +2446,7 @@ func (p *TemplatedEventBridgeProcessor) prepareTemplateData(ebEvent EventBridgeE
 // It collects all matching rules, executes their actions, and returns the last matched event.
 func (p *TemplatedEventBridgeProcessor) Process(ctx providers.CloudProviderContext, ebEvent EventBridgeEvent, account providers.Account) (providers.Event, error) {
 	logger := ctx.GetLogger()
-	templateData := p.prepareTemplateData(ebEvent)
+	templateData := p.prepareTemplateData(ctx, ebEvent, account)
 
 	var matchedRuleNames []string
 	var lastMatchedEvent providers.Event
@@ -2213,8 +2603,9 @@ func (p *TemplatedEventBridgeProcessor) Process(ctx providers.CloudProviderConte
 		// Store the parsed detail as Raw event data
 		// Type assert templateData to access its 'Detail' field.
 		if actualTemplateData, ok := templateData.(struct {
-			Event  map[string]any
-			Detail map[string]any
+			Event                map[string]any
+			Detail               map[string]any
+			TaskDefContainerDefs []any
 		}); ok {
 			provEvent.Raw = actualTemplateData.Detail
 		} else {
@@ -2239,35 +2630,33 @@ func (p *TemplatedEventBridgeProcessor) Process(ctx providers.CloudProviderConte
 				} else {
 					actionLogger.Error("eventprocessor: failed to execute action", "error", err)
 				}
+				// A failed action contributes no evidence. Storing err.Error()
+				// as the card body turned every failure into an evidence entry
+				// reading "eventprocessor: action target resource not found:
+				// ..." on the event page — the resource-missing branch above
+				// even logs "skipping action" while the card was appended
+				// anyway. The logger already carries the action name, type and
+				// full error, which is where a failure belongs.
+				continue
+			}
+			actionResultJson, jsonErr := common.MarshalJson(actionResult)
+			if jsonErr != nil {
+				actionLogger.Error("eventprocessor: failed to marshal action result to JSON", "error", jsonErr)
 				provEvent.AdditionalContext = append(provEvent.AdditionalContext, providers.EventEvidence{
 					Type:    providers.EventEvidenceTypeText,
-					Insight: []string{fmt.Sprintf("Error executing action: %s", actionDef.Name)},
-					Data:    err.Error(),
+					Insight: []string{fmt.Sprintf("Error marshalling result for action: %s", actionDef.Name)},
+					Data:    fmt.Sprintf("Original result: %+v, Marshalling error: %s", actionResult, jsonErr.Error()),
+				})
+			} else {
+				provEvent.AdditionalContext = append(provEvent.AdditionalContext, providers.EventEvidence{
+					Type:    providers.EventEvidenceTypeJson,
+					Insight: buildActionEvidenceInsight(ebEvent, actionDef, actionResult),
+					Data:    string(actionResultJson),
 					AdditionalInfo: map[string]string{
 						"action_name": actionDef.Name,
 						"action_type": actionDef.Type,
 					},
 				})
-			} else {
-				actionResultJson, jsonErr := common.MarshalJson(actionResult)
-				if jsonErr != nil {
-					actionLogger.Error("eventprocessor: failed to marshal action result to JSON", "error", jsonErr)
-					provEvent.AdditionalContext = append(provEvent.AdditionalContext, providers.EventEvidence{
-						Type:    providers.EventEvidenceTypeText,
-						Insight: []string{fmt.Sprintf("Error marshalling result for action: %s", actionDef.Name)},
-						Data:    fmt.Sprintf("Original result: %+v, Marshalling error: %s", actionResult, jsonErr.Error()),
-					})
-				} else {
-					provEvent.AdditionalContext = append(provEvent.AdditionalContext, providers.EventEvidence{
-						Type:    providers.EventEvidenceTypeJson,
-						Insight: []string{actionDef.Name, actionDef.Description},
-						Data:    string(actionResultJson),
-						AdditionalInfo: map[string]string{
-							"action_name": actionDef.Name,
-							"action_type": actionDef.Type,
-						},
-					})
-				}
 			}
 		}
 

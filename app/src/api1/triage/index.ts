@@ -396,21 +396,6 @@ mutation EventGetDuplicates($event_id: String!) {
 }
 `;
 
-// Query to check if an event is a recurrence of a previously resolved event
-// A recurrence is when: first_event_id = event_id (it's first in its chain) AND previous_event_id != event_id (has ref to old chain)
-export const EVENT_GET_RECURRENCE_INFO = `
-query EventGetRecurrenceInfo($event_id: String!) {
-  event_get_recurrence_info(event_id: $event_id) {
-    data {
-      event_id
-      first_event_id
-      previous_event_id
-      occurrence_number
-    }
-  }
-}
-`;
-
 export const EVENT_GET_DUPLICATE_SUGGESTIONS = `
 mutation EventGetDuplicateSuggestions($event_id: String!) {
   event_get_duplicate_suggestions(event_id: $event_id) {
@@ -887,13 +872,20 @@ export const NB_STATUS_OPTIONS = [
   // ACKNOWLEDGED and INVESTIGATING removed from UI but kept in backend for backwards compatibility
 ];
 
+/** Info tooltip on the Triage Score column. Deliberately brand-neutral — it
+ *  describes the score, and naming the product added nothing but a white-label
+ *  leak on partner tenants. Shared so the four tables that show the column
+ *  cannot drift apart. */
+export const TRIAGE_SCORE_INFO =
+  'Triage Score is a context-aware triage score/level, computed using multiple signals beyond raw thresholds such as service criticality, customer/user impact, recurrence frequency, dependency (upstream/downstream) blast radius, and the nature of the service/workload.';
+
 export const TRIAGE_STATUS_TOOLTIPS: Record<string, string> = {
   OPEN: 'No triage done yet. Awaiting review.',
   ACTION_REQUIRED: 'Triaged. Waiting on action from your team.',
   SNOOZED: 'Events paused temporarily. Will resume after the set duration.',
   SUPPRESSED: 'Events from this issue will not trigger alerts.',
-  DROPPED: 'Issue dismissed and excluded from NudgeBee.',
-  DUPLICATE: 'Automatically identified as a duplicate by NudgeBee.',
+  DROPPED: 'Issue dismissed and excluded from triage.',
+  DUPLICATE: 'Automatically identified as a duplicate.',
   RESOLVED: 'Issue has been resolved.',
 };
 
@@ -1268,37 +1260,6 @@ const apiTriage = {
   },
 
   /**
-   * Get recurrence info for an event
-   * Returns info about previous chain if this event is a recurrence of a resolved event
-   */
-  async getRecurrenceInfo(eventId: string): Promise<RecurrenceInfo | null> {
-    try {
-      const response = await queryGraphQL(EVENT_GET_RECURRENCE_INFO, 'EventGetRecurrenceInfo', {
-        event_id: eventId,
-      });
-      const data = response?.data?.data?.event_get_recurrence_info?.data?.[0];
-      if (!data) {
-        return null;
-      }
-
-      // Check if this is a recurrence: first_event_id = event_id AND previous_event_id != event_id
-      const isRecurrence = data.first_event_id === data.event_id && data.previous_event_id !== data.event_id;
-
-      if (!isRecurrence) {
-        return null;
-      }
-
-      return {
-        isRecurrence: true,
-        previousEventId: data.previous_event_id,
-      };
-    } catch (error) {
-      console.error('Failed to get recurrence info:', error);
-      return null;
-    }
-  },
-
-  /**
    * Get the available apply methods (direct / PR), risk, and a dry-run preview of the
    * rewritten rule for a cached threshold suggestion.
    */
@@ -1531,12 +1492,6 @@ export interface ListThresholdSuggestionsInput {
 export interface ListThresholdSuggestionsResponse {
   suggestions: ThresholdSuggestionItem[];
   total: number;
-}
-
-// Types for recurrence info
-export interface RecurrenceInfo {
-  isRecurrence: boolean;
-  previousEventId: string;
 }
 
 export default apiTriage;

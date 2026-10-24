@@ -261,6 +261,19 @@ var edgeUpsertCols = []string{
 	"source", "contributing_sources",
 }
 
+// edgeConflictCols is the unique constraint SaveEdges arbitrates on (migration
+// V578) — the natural key of an edge.
+//
+// EdgeIDFor hashes exactly these columns, which is what keeps the primary key
+// and this arbiter in agreement. Adding a column here without adding it to
+// EdgeIDFor reopens #38046: a row would then be able to miss the DO UPDATE arm
+// and still collide on knowledge_graph_edge_pkey. TestEdgeConflictColsMatchEdgeIDFor
+// pins the two together.
+var edgeConflictCols = []string{
+	"source_node_id", "destination_node_id", "relationship_type",
+	"cloud_account_id", "tenant_id",
+}
+
 // NewService creates a new knowledge graph service
 func NewService(ctx *security.RequestContext, logger *slog.Logger, dbManager *database.DatabaseManager) *Service {
 	if logger == nil {
@@ -571,6 +584,28 @@ func (s *Service) getActiveAccountsForTenant(ctx *security.RequestContext, tenan
 	return accounts, nil
 }
 
+// AccountRef is the minimal description of a cloud account that callers outside
+// the build need: its id and which provider it belongs to.
+type AccountRef struct {
+	ID            string
+	CloudProvider string
+}
+
+// ListActiveAccounts returns the tenant's active cloud accounts, optionally
+// restricted to accountIDs. It shares getActiveAccountsForTenant with the build,
+// so "active account" means the same thing to both.
+func (s *Service) ListActiveAccounts(ctx *security.RequestContext, tenantID string, accountIDs []string) ([]AccountRef, error) {
+	accounts, err := s.getActiveAccountsForTenant(ctx, tenantID, accountIDs)
+	if err != nil {
+		return nil, err
+	}
+	refs := make([]AccountRef, 0, len(accounts))
+	for _, a := range accounts {
+		refs = append(refs, AccountRef{ID: a.Id, CloudProvider: a.CloudProvider})
+	}
+	return refs, nil
+}
+
 // SourceCategory defines whether a source is account-specific or integration-specific
 type SourceCategory string
 
@@ -683,17 +718,34 @@ func (s *Service) BuildGraphs(ctx *security.RequestContext, req *BuildRequest) (
 		AccountMetadata: make([]AccountGraphMetadata, 0),
 	}
 
+	if req.Partial && len(req.AccountIDs) == 0 {
+		return nil, fmt.Errorf("partial build requires at least one account id")
+	}
+
 	// If no flow sources requested, default to all enabled registered flow sources.
 	// Done up-front so shouldIncrementSyncVersion and any logging below see the
 	// final set rather than an empty slice.
-	if len(req.FlowSources) == 0 {
-		req.FlowSources = s.defaultEnabledFlowSources()
+	//
+	// A partial build skips flow sources unless they were explicitly requested:
+	// flow sources observe traffic tenant-wide, so re-running them for one account
+	// costs a full tenant sweep for edges the hourly build refreshes anyway. Leaving
+	// the list empty also keeps successfulFlowSources empty, which makes the node
+	// sweep protect every flow-sourced row.
+	if !req.Partial {
+		if len(req.FlowSources) == 0 {
+			req.FlowSources = s.defaultEnabledFlowSources()
+		}
+		// Always-on flow sources (e.g. `manual`) get appended regardless of what
+		// the tenant filter said. This is the canonical injection point — every
+		// downstream check below (the Phase 2.5 gate, buildFlowRelationships, the
+		// "did flow sources successfully run?" tracking) sees the final list.
+		req.FlowSources = applyAlwaysOnFlowSources(req.FlowSources)
+	} else if len(req.FlowSources) > 0 {
+		// Partial build with flow sources explicitly requested: honour them, and
+		// still inject the always-on ones so the list means the same thing here as
+		// it does for a tenant-wide build.
+		req.FlowSources = applyAlwaysOnFlowSources(req.FlowSources)
 	}
-	// Always-on flow sources (e.g. `manual`) get appended regardless of what
-	// the tenant filter said. This is the canonical injection point — every
-	// downstream check below (the Phase 2.5 gate, buildFlowRelationships, the
-	// "did flow sources successfully run?" tracking) sees the final list.
-	req.FlowSources = applyAlwaysOnFlowSources(req.FlowSources)
 
 	// Fetch all active accounts for tenant
 	s.logger.Info("building knowledge graphs for all active accounts",
@@ -759,6 +811,16 @@ func (s *Service) BuildGraphs(ctx *security.RequestContext, req *BuildRequest) (
 	// from this list (because it errored or wasn't run) protects its rows from
 	// being tombstoned this cycle.
 	successfulFlowSources := make([]string, 0, len(req.FlowSources))
+
+	// Context nodes are the other accounts' active nodes, loaded from the database
+	// for a partial build so the cross-source enrichers and cross-account rules can
+	// still match against them. contextIDs is what keeps them out of SaveNodes.
+	var contextIDs map[string]struct{}
+
+	// Cross-source enrichers that ran to completion this build. Feeds the scoped
+	// edge sweep's ran-set: an enricher that did not run must not have its edges
+	// tombstoned.
+	ranEnrichers := make([]string, 0, len(s.crossSourceEnrichers))
 
 	// Unified graph to hold all nodes and edges from all accounts and sources
 	unifiedGraph := &Graph{
@@ -894,9 +956,19 @@ func (s *Service) BuildGraphs(ctx *security.RequestContext, req *BuildRequest) (
 	// integration's own ID (used purely as a dispatch/partition key — see
 	// TenantScopedSource).
 	// ========================================================================
-	s.logger.Info("Phase 1b: Building tenant-scoped integration graphs")
+	if req.Partial {
+		s.logger.Info("Phase 1b: skipped for partial build", "tenant_id", req.TenantID)
+	} else {
+		s.logger.Info("Phase 1b: Building tenant-scoped integration graphs")
+	}
 
 	for sourceName, source := range s.sources {
+		// Tenant-scoped integrations are configured per tenant, not per cloud
+		// account, so an account-scoped rebuild has nothing to say about them.
+		// They are skipped here and excluded from both sweeps below.
+		if req.Partial {
+			break
+		}
 		if s.getSourceCategory(sourceName) != SourceCategoryIntegration {
 			continue
 		}
@@ -982,6 +1054,29 @@ func (s *Service) BuildGraphs(ctx *security.RequestContext, req *BuildRequest) (
 	}
 
 	// ========================================================================
+	// PHASE 2.0: Load the rest of the tenant as read-only context (partial builds)
+	// The enrichers and cross-account rules below only ever look at the in-memory
+	// node slice, so without this a partial build would silently drop every edge
+	// that crosses out of the rebuilt accounts.
+	// ========================================================================
+	if req.Partial {
+		contextNodes, ids, err := s.loadContextNodes(req.TenantID, req.AccountIDs)
+		if err != nil {
+			// Fatal for a partial build: continuing would compute an edge set that
+			// looks complete but is missing every cross-account relationship, and the
+			// scoped sweep would then tombstone the real ones as stale.
+			return nil, fmt.Errorf("failed to load context nodes for partial build: %w", err)
+		}
+		contextIDs = ids
+		unifiedGraph.Nodes = append(unifiedGraph.Nodes, contextNodes...)
+		s.logger.Info("Phase 2.0: loaded context nodes for partial build",
+			"tenant_id", req.TenantID,
+			"scope_account_ids", req.AccountIDs,
+			"context_nodes", len(contextNodes),
+			"total_nodes", len(unifiedGraph.Nodes))
+	}
+
+	// ========================================================================
 	// PHASE 2.1: Cross-source enrichment (AWS LoadBalancer -> K8s)
 	// Runs after all infrastructure sources complete, before flow sources
 	// Enables cross-account matching between different source types
@@ -992,6 +1087,12 @@ func (s *Service) BuildGraphs(ctx *security.RequestContext, req *BuildRequest) (
 			"total_nodes", len(unifiedGraph.Nodes))
 
 		for _, enricher := range s.crossSourceEnrichers {
+			if req.Partial && tenantScopedEnricherNames[enricher.GetName()] {
+				s.logger.Info("skipping tenant-scoped enricher for partial build",
+					"enricher", enricher.GetName())
+				continue
+			}
+
 			startTime := time.Now()
 			enrichedNodes, enrichedEdges, err := enricher.EnrichCrossSources(
 				ctx,
@@ -1009,6 +1110,7 @@ func (s *Service) BuildGraphs(ctx *security.RequestContext, req *BuildRequest) (
 			newEdgeCount := len(enrichedEdges) - len(unifiedGraph.Edges)
 			unifiedGraph.Nodes = enrichedNodes
 			unifiedGraph.Edges = enrichedEdges
+			ranEnrichers = append(ranEnrichers, enricher.GetName())
 
 			s.logger.Info("cross-source enricher completed",
 				"enricher", enricher.GetName(),
@@ -1078,13 +1180,23 @@ func (s *Service) BuildGraphs(ctx *security.RequestContext, req *BuildRequest) (
 	var nodeIDMapping map[string]string
 	unifiedGraph.Nodes, nodeIDMapping = DeduplicateNodesWithIDMapping(unifiedGraph.Nodes)
 
-	// Update edge node references to use surviving node IDs after deduplication
+	// Update edge node references to use surviving node IDs after deduplication.
+	// Repointing an endpoint invalidates the edge's derived ID, so regenerate it
+	// here too — SaveEdges derives the persisted PK itself, but the in-memory ID
+	// is what DeduplicateEdges keys on downstream, and a stale one merges the
+	// wrong edges.
 	for _, edge := range unifiedGraph.Edges {
+		repointed := false
 		if newID, exists := nodeIDMapping[edge.SourceNodeID]; exists {
 			edge.SourceNodeID = newID
+			repointed = true
 		}
 		if newID, exists := nodeIDMapping[edge.DestinationNodeID]; exists {
 			edge.DestinationNodeID = newID
+			repointed = true
+		}
+		if repointed {
+			edge.ID = EdgeIDFor(edge.SourceNodeID, edge.DestinationNodeID, edge.RelationshipType, edge.CloudAccountID, edge.TenantID)
 		}
 	}
 
@@ -1140,6 +1252,16 @@ func (s *Service) BuildGraphs(ctx *security.RequestContext, req *BuildRequest) (
 	unifiedGraph.Nodes, unifiedGraph.Edges, _ = ResolveGCPManagedServiceCalls(
 		unifiedGraph.Nodes, unifiedGraph.Edges, s.logger,
 	)
+	// Phase 3.7: Drop CALLS edges that point back along a routing edge. Last of
+	// the rewriting passes on purpose — both 3.5 and 3.6 repoint CALLS edges, so
+	// running earlier would miss the ones they create. Once a load balancer's own
+	// addresses resolve onto the balancer, the backend's reply traffic becomes
+	// `backend --CALLS--> balancer` opposite the balancer's own ROUTES_TO, and a
+	// graph that says two things need each other cannot answer which way a
+	// failure travels.
+	unifiedGraph.Nodes, unifiedGraph.Edges, _ = DropResponseTrafficCalls(
+		unifiedGraph.Nodes, unifiedGraph.Edges, s.logger,
+	)
 	unifiedGraph.Edges = DeduplicateEdgesWithPriority(unifiedGraph.Edges)
 
 	// Calculate metadata for unified graph
@@ -1158,9 +1280,16 @@ func (s *Service) BuildGraphs(ctx *security.RequestContext, req *BuildRequest) (
 	// 	_ = os.WriteFile("nudgebee_graph.json", graphJSON, 0644)
 	// }
 
+	// Split out the nodes this build is allowed to persist. For a tenant-wide build
+	// contextIDs is empty and ownNodes is the whole slice; for a partial build the
+	// other accounts' context rows are withheld from SaveNodes (but still handed to
+	// SaveEdges as the endpoint universe — see saveGraphToDB).
+	ownNodes := splitOwnNodes(unifiedGraph.Nodes, contextIDs)
+	unifiedGraph.Edges = dropContextOnlyEdges(unifiedGraph.Edges, contextIDs)
+
 	// Save to database if requested
 	if req.SaveToDB {
-		nodesSaved, edgesSaved, err := s.saveGraphToDB(unifiedGraph, currentSyncVersion, s.logger)
+		nodesSaved, edgesSaved, err := s.saveGraphToDB(unifiedGraph, ownNodes, currentSyncVersion, s.logger)
 		if err != nil {
 			s.logger.Error("failed to save unified graph to database", "error", err)
 			response.Success = false
@@ -1190,7 +1319,7 @@ func (s *Service) BuildGraphs(ctx *security.RequestContext, req *BuildRequest) (
 			// Mark inactive nodes and update sync version if applicable
 			if shouldIncrement && filter != nil {
 				// Mark nodes that weren't updated in this sync as inactive
-				inactiveCount, err := s.markInactiveNodes(ctx, req.TenantID, req.AccountIDs, currentSyncVersion, req.Sources, successfulFlowSources)
+				inactiveCount, err := s.markInactiveNodes(ctx, req.TenantID, req.AccountIDs, currentSyncVersion, req.Sources, successfulFlowSources, !req.Partial)
 				if err != nil {
 					s.logger.Error("failed to mark inactive nodes", "error", err)
 					// Don't fail the entire operation, just log the error
@@ -1203,12 +1332,24 @@ func (s *Service) BuildGraphs(ctx *security.RequestContext, req *BuildRequest) (
 				// Mark infra edges that weren't re-stamped this sync as inactive.
 				// Behavioural edges (CALLS, PUBLISHES_TO, …) are excluded — they go
 				// through the time-based MarkStaleEdgesInactive sweep instead.
-				inactiveEdgeCount, err := s.markInactiveInfraEdges(req.TenantID, currentSyncVersion)
+				//
+				// A partial build sweeps only edges that (a) were stamped by a
+				// producer that actually ran and (b) belong to, or touch a node in,
+				// one of the rebuilt accounts. Anything else is left for the hourly
+				// tenant-wide build to reconcile.
+				var inactiveEdgeCount int64
+				if req.Partial {
+					ranSources := collectRanEdgeSources(response, ranEnrichers)
+					inactiveEdgeCount, err = s.markInactiveInfraEdgesScoped(req.TenantID, currentSyncVersion, req.AccountIDs, ranSources)
+				} else {
+					inactiveEdgeCount, err = s.markInactiveInfraEdges(req.TenantID, currentSyncVersion)
+				}
 				if err != nil {
 					s.logger.Error("failed to mark inactive infra edges", "error", err)
 				} else {
 					s.logger.Info("marked inactive infra edges",
 						"inactive_count", inactiveEdgeCount,
+						"partial", req.Partial,
 						"sync_version", currentSyncVersion)
 				}
 
@@ -1234,6 +1375,15 @@ func (s *Service) BuildGraphs(ctx *security.RequestContext, req *BuildRequest) (
 	// The graph for this tenant is now rebuilt — refresh the filter-options cache so
 	// the dropdown's unfiltered load stays fast. Best-effort; never fails the build.
 	s.refreshFilterOptionsCache(req.TenantID)
+
+	// Surface a failed build to the caller. Returning nil here let a graph that
+	// never reached the database be counted and logged as a success by both
+	// callers, which is why #38046 ran for 23 days without anyone noticing.
+	// Only the save and cross-account steps set Success=false; per-source and
+	// per-flow-source errors are only logged and stay non-fatal.
+	if !response.Success {
+		return response, fmt.Errorf("knowledge graph build failed: %s", response.Error)
+	}
 
 	return response, nil
 }
@@ -1466,6 +1616,15 @@ func (s *Service) SaveEdges(edges []*DbEdge, nodes []*DbNode, syncVersion int64)
 		// between the same nodes with different relationship types are distinct;
 		// omitting the type here merged them and silently dropped one before the
 		// upsert. (account is already encoded in the source/dest node UUIDs.)
+		//
+		// This key must stay a SUBSET of edgeConflictCols. Being a subset is what
+		// guarantees no two surviving rows share an ON CONFLICT arbiter row —
+		// otherwise Postgres raises "ON CONFLICT DO UPDATE command cannot affect
+		// row a second time" (21000). Since EdgeIDFor hashes a superset of this
+		// key, it also guarantees distinct survivors get distinct primary keys.
+		// Omitting cloud_account_id is therefore safe and deliberate: adding it
+		// would stop collapsing two accounts' variants of one edge and double
+		// those rows.
 		compositeKey := edge.SourceNodeID + ":" + edge.DestinationNodeID + ":" + string(edge.RelationshipType) + ":" + edge.TenantID
 
 		if existing, exists := edgeMap[compositeKey]; exists {
@@ -1496,10 +1655,19 @@ func (s *Service) SaveEdges(edges []*DbEdge, nodes []*DbNode, syncVersion int64)
 
 	now := time.Now().UTC()
 	for i, edge := range validEdges {
-		// Generate ID if not present
-		if edge.ID == "" {
-			edge.ID = uuid.New().String()
-		}
+		// Derive the primary key from the full natural key, unconditionally —
+		// never trust the ID a caller arrived with. `onConflict` below arbitrates
+		// on all five identity columns while the id most callers set hashes only
+		// three of them, so a caller-supplied id can collide on
+		// knowledge_graph_edge_pkey without ever reaching the DO UPDATE arm. That
+		// aborts the one transaction covering every edge and freezes the tenant's
+		// graph permanently (#38046). Deriving it here puts the invariant at the
+		// write boundary, where no source, enricher or rewrite pass can break it.
+		//
+		// Safe to place here: endpoints are final (resolved at the top of this
+		// loop's parent), dedup has already picked a survivor, and the row values
+		// below have not been assembled yet.
+		edge.ID = EdgeIDFor(edge.SourceNodeID, edge.DestinationNodeID, edge.RelationshipType, edge.CloudAccountID, edge.TenantID)
 
 		// Set timestamps if not present; normalize any upstream-supplied
 		// CreatedAt to UTC so a local-time value from a source doesn't get
@@ -1563,7 +1731,7 @@ func (s *Service) SaveEdges(edges []*DbEdge, nodes []*DbNode, syncVersion int64)
 	})
 
 	// Use database manager's bulk insert with conflict resolution
-	onConflict := []string{"source_node_id", "destination_node_id", "relationship_type", "cloud_account_id", "tenant_id"}
+	onConflict := edgeConflictCols
 	onConflictUpdate := []string{"updated_at", "properties", "is_active", "last_sync_version", "source", "contributing_sources"}
 
 	// `contributing_sources` must UNION the existing column with the incoming
@@ -1659,12 +1827,12 @@ func (s *Service) SaveNodes(nodes []*DbNode, syncVersion int64) error {
 
 	now := time.Now().UTC()
 	for i, node := range deduplicatedNodes {
-		// Generate ID if not present
+		// Generate ID if not present. Must go through NodeIDFor: this used to
+		// hash its own "key:account:tenant" variant, which no NodeIDFor caller
+		// could ever reproduce, so an id-less node got an id that looked
+		// deterministic but matched nothing.
 		if node.ID == "" {
-			// Generate deterministic ID based on unique_key, cloud_account_id, and tenant_id
-			// This ensures the same node always gets the same ID, preventing primary key conflicts
-			compositeKey := fmt.Sprintf("%s:%s:%s", node.UniqueKey, node.CloudAccountID, node.TenantID)
-			node.ID = uuid.NewSHA1(uuid.NameSpaceOID, []byte(compositeKey)).String()
+			node.ID = NodeIDFor(node.UniqueKey, node.TenantID, node.CloudAccountID)
 		}
 
 		// Set timestamps if not present; normalize any upstream-supplied
@@ -1764,31 +1932,42 @@ func (s *Service) SaveNodes(nodes []*DbNode, syncVersion int64) error {
 	return nil
 }
 
-func (s *Service) saveGraphToDB(graph *Graph, syncVersion int64, logger *slog.Logger) (int, int, error) {
+// saveGraphToDB persists a built graph.
+//
+// ownNodes is the subset of graph.Nodes this build has authority to write. For a
+// tenant-wide build it is graph.Nodes itself; for a partial build it excludes the
+// context nodes loaded from other accounts. The distinction matters twice over:
+// SaveNodes must not rewrite another account's rows, while SaveEdges must still
+// SEE those rows, because it drops any edge whose endpoints are not in the slice
+// it is given — passing only ownNodes there would silently discard every
+// cross-account edge this build just computed.
+func (s *Service) saveGraphToDB(graph *Graph, ownNodes []*DbNode, syncVersion int64, logger *slog.Logger) (int, int, error) {
 	logger.Info("Saving knowledge graph to database",
-		"nodes_count", len(graph.Nodes),
+		"nodes_count", len(ownNodes),
+		"context_nodes_count", len(graph.Nodes)-len(ownNodes),
 		"edges_count", len(graph.Edges),
 		"tenant_id", graph.TenantID,
 		"cloud_account_id", graph.CloudAccountID,
 		"sync_version", syncVersion)
 
 	// Save nodes first (now using DbNode directly)
-	if err := s.SaveNodes(graph.Nodes, syncVersion); err != nil {
+	if err := s.SaveNodes(ownNodes, syncVersion); err != nil {
 		logger.Error("Failed to save nodes to database", "error", err)
 		return 0, 0, err
 	}
 
-	// Save edges (now using DbEdge directly)
+	// Save edges (now using DbEdge directly). graph.Nodes — own + context — is the
+	// endpoint universe SaveEdges validates against.
 	if err := s.SaveEdges(graph.Edges, graph.Nodes, syncVersion); err != nil {
 		logger.Error("Failed to save edges to database", "error", err)
-		return len(graph.Nodes), 0, err
+		return len(ownNodes), 0, err
 	}
 
 	logger.Info("Successfully saved knowledge graph to database",
-		"nodes_saved", len(graph.Nodes),
+		"nodes_saved", len(ownNodes),
 		"edges_saved", len(graph.Edges))
 
-	return len(graph.Nodes), len(graph.Edges), nil
+	return len(ownNodes), len(graph.Edges), nil
 }
 
 // markInactiveNodes flips nodes to is_active = false when they weren't re-stamped
@@ -1801,6 +1980,13 @@ func (s *Service) saveGraphToDB(graph *Graph, syncVersion int64, logger *slog.Lo
 //     cycle. Non-infra flow-sourced rows (Service, ExternalService, etc.) are still
 //     protected. Rows from a flow source that errored this cycle are protected to
 //     avoid mass-tombstoning on transient failure.
+//
+// sweepTenantScoped controls whether the account filter also admits rows stamped
+// by tenant-scoped producers (identity/ownership/github/gitlab/pagerduty). A
+// tenant-wide build passes true: those producers ran, so their stale rows must be
+// swept even though their cloud_account_id is never a member of accountIDs
+// (#35519). A partial build passes false: it never ran them, so admitting their
+// rows would tombstone the entire integration and ownership layer.
 func (s *Service) markInactiveNodes(
 	ctx *security.RequestContext,
 	tenantID string,
@@ -1808,6 +1994,7 @@ func (s *Service) markInactiveNodes(
 	syncVersion int64,
 	sources []string,
 	successfulFlowSources []string,
+	sweepTenantScoped bool,
 ) (int64, error) {
 	query := `
 	UPDATE knowledge_graph_node
@@ -1863,12 +2050,19 @@ func (s *Service) markInactiveNodes(
 		// this exception their stale rows could never be tombstoned (#35519).
 		tenantScopedSources := []string{"identity", "ownership", "github", "gitlab", "pagerduty"}
 		accountIdx := len(args) + 1
-		tenantSourceIdx := len(args) + 2
-		query += fmt.Sprintf(` AND (
+		if sweepTenantScoped {
+			tenantSourceIdx := len(args) + 2
+			query += fmt.Sprintf(` AND (
 			cloud_account_id = ANY($%d::uuid[])
 			OR (properties->>'source') = ANY($%d::text[])
 		)`, accountIdx, tenantSourceIdx)
-		args = append(args, pq.Array(accountIDs), pq.Array(tenantScopedSources))
+			args = append(args, pq.Array(accountIDs), pq.Array(tenantScopedSources))
+		} else {
+			// Partial build: the tenant-scoped producers did not run, so their rows
+			// are protected rather than swept.
+			query += fmt.Sprintf(" AND cloud_account_id = ANY($%d::uuid[])", accountIdx)
+			args = append(args, pq.Array(accountIDs))
+		}
 	}
 
 	s.logger.Info("marking inactive nodes",
@@ -1876,7 +2070,8 @@ func (s *Service) markInactiveNodes(
 		"sync_version", syncVersion,
 		"sources", sources,
 		"account_ids", accountIDs,
-		"successful_flow_sources", successfulFlowSources)
+		"successful_flow_sources", successfulFlowSources,
+		"sweep_tenant_scoped", sweepTenantScoped)
 
 	result, err := s.dbManager.Exec(query, args...)
 	if err != nil {

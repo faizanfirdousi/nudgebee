@@ -18,7 +18,7 @@ import Datetime from '@shared/format/Datetime';
 import EmptyData from '@shared/EmptyData';
 import { DataNotAvailable } from '@assets';
 import MoreVertIcon from '@mui/icons-material/MoreVert';
-import NDialog from '@shared/modal/NDialog';
+import { Modal } from '@ui/Modal';
 import Text from '@shared/format/Text';
 import { toast as snackbar } from '@ui/Toast';
 import { hasWriteAccess } from '@lib/auth';
@@ -47,6 +47,11 @@ const RULE_TYPE_OPTIONS = [
 
 const STATUS_OPTIONS = ['Enabled', 'Disabled'];
 
+// router.query values are string | string[] | undefined — an array when the param
+// is repeated in the URL (?accountIds=a&accountIds=b). Normalise to a string[].
+const parseAccountIds = (raw: string | string[] | undefined): string[] =>
+  Array.isArray(raw) ? raw.filter(Boolean) : raw ? raw.split(',').filter(Boolean) : [];
+
 const renderAccountGroupIcon = (provider: string) => <CloudProviderIcon cloud_provider={provider} width='14px' height='14px' />;
 
 const TriageRulesManager: React.FC<TriageRulesManagerProps> = ({ accountId }) => {
@@ -59,7 +64,7 @@ const TriageRulesManager: React.FC<TriageRulesManagerProps> = ({ accountId }) =>
     selectedAccountId: accountId,
     isTroubleshootPage: isMultiAccountView,
     enableFilters: isMultiAccountView,
-    disabledFilters: ['workload', 'namespace', 'subjectType', 'aggregationKey', 'source'],
+    disabledFilters: ['workload', 'namespace', 'subjectType', 'aggregationKey', 'source', 'nbStatus'],
     resource_ids: [],
   }) as { accounts: AccountOption[] };
 
@@ -77,10 +82,7 @@ const TriageRulesManager: React.FC<TriageRulesManagerProps> = ({ accountId }) =>
   const [selectedStatus, setSelectedStatus] = useState<string>('');
   const [searchQuery, setSearchQuery] = useState('');
   const [includeSystemRules, setIncludeSystemRules] = useState(true);
-  const [selectedAccountFilter, setSelectedAccountFilter] = useState<string[]>(() => {
-    const raw = router.query.accountIds as string;
-    return raw ? raw.split(',').filter(Boolean) : [];
-  });
+  const [selectedAccountFilter, setSelectedAccountFilter] = useState<string[]>(() => parseAccountIds(router.query.accountIds));
 
   // System-rule visibility, Status, and name search are all filtered client-side. Status uses
   // each rule's *effective* status (a system rule disabled for this account via an override
@@ -104,9 +106,14 @@ const TriageRulesManager: React.FC<TriageRulesManagerProps> = ({ accountId }) =>
   const totalCount = filteredRules.length;
 
   useEffect(() => {
-    const raw = router.query.accountIds as string;
-    setSelectedAccountFilter(raw ? raw.split(',').filter(Boolean) : []);
-  }, [router.query.accountIds]);
+    if (!router.isReady) {
+      return;
+    }
+    const next = parseAccountIds(router.query.accountIds);
+    // Keep the previous reference when the list is unchanged so fetchRules
+    // (which depends on selectedAccountFilter) isn't invalidated into a redundant refetch.
+    setSelectedAccountFilter((prev) => (prev.length === next.length && prev.every((v, i) => v === next[i]) ? prev : next));
+  }, [router.isReady, router.query.accountIds]);
 
   // Modal state
   const [isRuleModalOpen, setIsRuleModalOpen] = useState(false);
@@ -236,7 +243,7 @@ const TriageRulesManager: React.FC<TriageRulesManagerProps> = ({ accountId }) =>
 
       if (result?.success) {
         // optimistic update already applied — no snackbar needed
-        console.log(`System rule "${rule.name || 'Unnamed'}" override toggled to ${newDisabledState ? 'disabled' : 'enabled'}`);
+        console.log('System rule override toggled', { rule: rule.name || 'Unnamed', state: newDisabledState ? 'disabled' : 'enabled' });
       } else {
         patchRule(rule.id, { is_overridden: previousOverriddenState }); // revert on failure response
         snackbar.error(result?.error || 'Failed to toggle system rule');
@@ -426,7 +433,7 @@ const TriageRulesManager: React.FC<TriageRulesManagerProps> = ({ accountId }) =>
       const result = await apiTriage.deleteTriageRule({ cloud_account_id: ruleAccountId, rule_id: rule.id, hard_delete: false });
       if (result?.success) {
         // optimistic update already applied — no snackbar needed
-        console.log(`Rule "${rule.name || 'Unnamed'}" disabled`);
+        console.log('Rule disabled', { rule: rule.name || 'Unnamed' });
       } else {
         patchRule(rule.id, { enabled: true }); // revert
         snackbar.error(result?.error || 'Failed to update rule');
@@ -512,15 +519,17 @@ const TriageRulesManager: React.FC<TriageRulesManagerProps> = ({ accountId }) =>
 
   return (
     <div>
-      <NDialog
-        buttonText='Delete'
+      <Modal
+        confirmText='Delete'
+        confirmTone='danger'
         handleClose={handleCloseDeleteDialog}
-        dialogTitle={`Delete rule "${ruleToDelete?.name || 'Unnamed'}"`}
-        handleSubmit={handleDeleteRule}
+        title={`Delete rule "${ruleToDelete?.name || 'Unnamed'}"`}
+        onConfirm={handleDeleteRule}
         open={deleteDialogOpen}
-        dialogContent='This action cannot be undone. The rule will be permanently deleted.'
-        additionalComponent={undefined}
-      />
+        width='md'
+      >
+        This action cannot be undone. The rule will be permanently deleted.
+      </Modal>
 
       <TriageRuleModal
         open={isRuleModalOpen}

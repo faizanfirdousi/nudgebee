@@ -29,6 +29,7 @@ const (
 	MetricKeyTrigger        = "trigger"
 	MetricKeyOutcome        = "outcome"
 	MetricKeyUnresolved     = "unresolved"
+	MetricKeyBaseSynced     = "base_synced"
 	MetricKeyResult         = "result"
 )
 
@@ -44,6 +45,10 @@ const (
 	MetricReasonLLMServerNotConfigured         = "llm_server_not_configured"
 	MetricReasonAIAnalysisPayloadMarshalFailed = "ai_analysis_payload_marshal_failed"
 	MetricReasonAIAnalysisQueuePublishFailed   = "ai_analysis_queue_publish_failed"
+	// Not a failure as such — the event was deliberately dropped because its
+	// cloud account is switched off. Shares the counter so the drop is visible
+	// next to the reasons events otherwise go unprocessed.
+	MetricReasonAccountDisabled = "account_disabled"
 
 	// Playbook action failure reasons
 	MetricReasonActionExecutionError  = "action_execution_error"
@@ -57,6 +62,8 @@ var (
 	metricsEventProcessingDuration  metric.Float64Histogram
 	metricsEventProcessingTotal     metric.Int64Counter
 	metricsEventProcessingFailed    metric.Int64Counter
+	metricsEventEnrichmentDuration  metric.Float64Histogram
+	metricsPlaybookBudgetExhausted  metric.Int64Counter
 	metricsPlaybookActionDuration   metric.Float64Histogram
 	metricsPlaybookActionTotal      metric.Int64Counter
 	metricsPlaybookActionFailed     metric.Int64Counter
@@ -136,6 +143,24 @@ func InitMetrics() {
 		meter,
 		"nb_services_event_processing",
 		"Total number of events processed",
+	)
+
+	// With async enrichment on, nb_services_event_processing_duration only covers the
+	// synchronous phase, so on its own it would show a healthy few milliseconds while
+	// the expensive playbook work merely moved elsewhere. This is where that work is
+	// now visible.
+	metricsEventEnrichmentDuration = mustCreateFloat64Histogram(
+		meter,
+		"nb_services_event_enrichment_duration",
+		"Duration of asynchronous event playbook enrichment",
+		"s",
+		eventProcessingBuckets,
+	)
+
+	metricsPlaybookBudgetExhausted = mustCreateInt64Counter(
+		meter,
+		"nb_services_playbook_budget_exhausted",
+		"Playbook runs that hit their deadline and returned partial evidence",
 	)
 
 	metricsEventProcessingFailed = mustCreateInt64Counter(
@@ -393,6 +418,29 @@ func MetricsEventProcessingDuration(ctx context.Context, duration float64, event
 	))
 }
 
+// MetricsEventEnrichmentDuration records how long asynchronous playbook enrichment
+// took for one event. outcome is "success", "partial" (deadline hit) or "error".
+func MetricsEventEnrichmentDuration(ctx context.Context, duration float64, eventSource, tenantId, accountId, outcome string) {
+	if metricsEventEnrichmentDuration == nil {
+		return
+	}
+	metricsEventEnrichmentDuration.Record(ctx, duration, metric.WithAttributes(
+		attribute.String(MetricKeyEventSource, eventSource),
+		attribute.String(MetricKeyTenantID, tenantId),
+		attribute.String(MetricKeyAccountID, accountId),
+		attribute.String("outcome", outcome),
+	))
+}
+
+// MetricsPlaybookBudgetExhausted counts playbook runs stopped by their deadline.
+// A rising rate means the enrichment budget is too small for the playbooks in use.
+func MetricsPlaybookBudgetExhausted(ctx context.Context) {
+	if metricsPlaybookBudgetExhausted == nil {
+		return
+	}
+	metricsPlaybookBudgetExhausted.Add(ctx, 1)
+}
+
 func MetricsEventProcessingTotal(ctx context.Context, eventSource, tenantId, accountId, status string) {
 	if metricsEventProcessingTotal == nil {
 		return
@@ -491,13 +539,17 @@ func MetricsPRFollowupDispatch(ctx context.Context, table, trigger string) {
 // "success", "no_op", or "failed". unresolved is true only for a no_op where the
 // agent had actionable input (review comments / CI failure) but couldn't apply a
 // change — the churn signal that is otherwise indistinguishable from "nothing to do".
-func MetricsPRFollowupOutcome(ctx context.Context, outcome string, unresolved bool) {
+// baseSynced is true when the run merged the PR's base branch into the PR branch
+// and pushed it (#36864), which separates base syncs from real comment/CI fixes —
+// most of them are "success" runs that never invoked the planner at all.
+func MetricsPRFollowupOutcome(ctx context.Context, outcome string, unresolved, baseSynced bool) {
 	if metricsPRFollowupOutcomeTotal == nil {
 		return
 	}
 	metricsPRFollowupOutcomeTotal.Add(ctx, 1, metric.WithAttributes(
 		attribute.String(MetricKeyOutcome, outcome),
 		attribute.Bool(MetricKeyUnresolved, unresolved),
+		attribute.Bool(MetricKeyBaseSynced, baseSynced),
 	))
 }
 

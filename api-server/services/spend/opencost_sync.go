@@ -121,6 +121,7 @@ const needsServerSideStampQuery = `
 		INNER JOIN agent a ON ca.id = a.cloud_account_id
 		WHERE ca.id = $1
 		  AND ca.cloud_provider = 'K8s'
+		  AND ca.status = 'active'
 		  AND a.type != 'proxy'
 		  AND (a.connection_status->>'opencostConnection') IS DISTINCT FROM 'true'
 		  AND NOT (COALESCE(a.connection_status, '{}'::jsonb) ? 'opencostServerSide')
@@ -241,6 +242,7 @@ const activeK8sAccountsQuery = `
 	FROM cloud_accounts ca
 	INNER JOIN agent a ON ca.id = a.cloud_account_id
 	WHERE ca.cloud_provider = 'K8s'
+	  AND ca.status = 'active'
 	  AND a.type != 'proxy'
 	  AND a.status = 'CONNECTED'
 	  AND a.last_connected_at > now() - interval '1 DAY'
@@ -257,6 +259,7 @@ const activeK8sAccountsByIdQuery = `
 	INNER JOIN agent a ON ca.id = a.cloud_account_id
 	WHERE ca.id = ANY($1::uuid[])
 	  AND ca.cloud_provider = 'K8s'
+	  AND ca.status = 'active'
 	  AND a.type != 'proxy'
 	  AND a.status = 'CONNECTED'
 	  AND a.last_connected_at > now() - interval '1 DAY'
@@ -323,9 +326,34 @@ func syncAccountSpends(ctx *security.RequestContext, client *http.Client, accoun
 		return false, fmt.Errorf("fetch pod allocation: %w", err)
 	}
 	if isEmptyAllocation(nodeData) && isEmptyAllocation(serviceData) {
-		ctx.GetLogger().Info("opencost spend sync: no allocations for window",
-			"account_id", accountId, "window", window)
-		return false, nil
+		// OpenCost reads each cluster's metrics through relay-server's /prometheus
+		// facade. A cluster whose agent has no prometheus_url configured — one that
+		// ships to Elasticsearch instead — has nothing there to read, so OpenCost
+		// returns empty for every window and the cluster shows no Kubernetes cost at
+		// all. Fall back to computing allocation from the inventory we already hold.
+		//
+		// Keyed off an empty result rather than a per-account setting on purpose: an
+		// account whose Prometheus works keeps the OpenCost numbers and never reaches
+		// this branch, so the fallback cannot regress anything that works today. A
+		// genuinely idle window computes to ~nothing here too, which is correct.
+		invNode, invService, invErr := buildInventoryAllocation(ctx, accountId, startDate, endDate, step)
+		if invErr != nil {
+			ctx.GetLogger().Error("opencost spend sync: inventory allocation failed",
+				"account_id", accountId, "window", window, "error", invErr)
+			return false, nil
+		}
+		if isEmptyAllocation(invNode) && isEmptyAllocation(invService) {
+			ctx.GetLogger().Info("opencost spend sync: no allocations for window",
+				"account_id", accountId, "window", window)
+			return false, nil
+		}
+		// Logged at WARN, not INFO: these numbers are requests-based and carry no
+		// storage, network or GPU cost, so a cluster silently switching to this path
+		// is something an operator should see rather than discover from a dip.
+		ctx.GetLogger().Warn("opencost spend sync: OpenCost returned nothing, using inventory-based allocation",
+			"account_id", accountId, "window", window,
+			"note", "requests-based; excludes storage, network egress, GPU and load balancer cost")
+		nodeData, serviceData = invNode, invService
 	}
 
 	if err := postOpenCostData(ctx, client, accountId, startDate, endDate, nodeData, serviceData); err != nil {

@@ -4,10 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"regexp"
+	"strings"
 	"testing"
 )
 
-const expectedBundledCount = 22
+const expectedBundledCount = 23
 
 var sha256Hex = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
@@ -54,10 +55,53 @@ func TestBundledSourceFetch(t *testing.T) {
 	}
 
 	// Spot-check a couple of known slugs from each seed migration.
-	for _, want := range []string{"rollout_restart_deployment", "investigate_rds_performance", "restart_cloud_sql_instance"} {
+	for _, want := range []string{"rollout_restart_deployment", "investigate_rds_performance", "restart_cloud_sql_instance", "application_diagnostic_check"} {
 		if !seen[want] {
 			t.Errorf("expected bundled template %q to be present", want)
 		}
+	}
+}
+
+// awsGlobalServices are AWS CLI services that are not region-scoped.
+var awsGlobalServices = map[string]bool{"iam": true, "route53": true, "organizations": true, "sts": true, "cloudfront": true, "s3": true, "s3api": true}
+
+// TestBundledAWSCommandsPassRegion guards against regional AWS CLI commands without
+// --region: the collector then runs them in the cloud account's default region, so
+// resources in any other region are reported as not found.
+func TestBundledAWSCommandsPassRegion(t *testing.T) {
+	bundle, err := NewBundledSource().Fetch(context.Background())
+	if err != nil {
+		t.Fatalf("bundled fetch failed: %v", err)
+	}
+	checked := 0
+	for _, tmpl := range bundle.Templates {
+		var def struct {
+			Tasks []struct {
+				ID     string         `json:"id"`
+				Type   string         `json:"type"`
+				Params map[string]any `json:"params"`
+			} `json:"tasks"`
+		}
+		if err := json.Unmarshal([]byte(tmpl.DefinitionJSON), &def); err != nil {
+			t.Fatalf("%s: definition is not valid JSON: %v", tmpl.Slug, err)
+		}
+		for _, task := range def.Tasks {
+			if task.Type != "cloud.aws.cli" {
+				continue
+			}
+			command, _ := task.Params["command"].(string)
+			fields := strings.Fields(command)
+			if len(fields) < 2 || fields[0] != "aws" || awsGlobalServices[fields[1]] {
+				continue
+			}
+			checked++
+			if !strings.Contains(command, "--region") {
+				t.Errorf("%s/%s: regional AWS command has no --region: %q", tmpl.Slug, task.ID, command)
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no cloud.aws.cli commands found; definition shape changed and this guard checks nothing")
 	}
 }
 

@@ -2,17 +2,16 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { Box, IconButton, Typography, Collapse } from '@mui/material';
 import { Input } from '@ui/Input';
 import { Button } from '@ui/Button';
-import { Close, Add, DragIndicator, Edit as EditIcon } from '@mui/icons-material';
+import { Close, Add, DragIndicator } from '@mui/icons-material';
 import { DurationField } from './advanced-config';
 import { Modal } from '@ui/Modal';
 import { FormCard, FormField } from '@shared/forms/FormComponents';
 import { Label } from '@ui/Label';
 import { ds } from 'src/utils/colors';
-import CodeMirror from '@uiw/react-codemirror';
-import { json } from '@codemirror/lang-json';
+import { CodeEditor } from '@ui/CodeEditor';
 import type { WorkflowSettings, WorkflowInput } from '@components/workflow/types';
 import { parseDurationToSeconds } from '@components/workflow/utils/taskUtils';
-import { DeleteIconRed } from '@assets';
+import { DeleteIconRed, EditIcon } from '@assets';
 import SafeIcon from '@shared/icons/SafeIcon';
 import { hasFeatureAccessForAccount } from '@lib/auth';
 
@@ -45,6 +44,7 @@ const defaultSettings: WorkflowSettings = {
   status: 'ACTIVE',
   description: '',
   aiInvocable: false,
+  aiAutoApprove: false,
   llmDescription: '',
 };
 
@@ -139,32 +139,15 @@ const JsonEditor: React.FC<{
 
   return (
     <Box>
-      <CodeMirror
+      <CodeEditor
         value={jsonString}
-        height='120px'
-        extensions={[json()]}
         onChange={handleChange}
-        theme={undefined}
-        basicSetup={{
-          lineNumbers: true,
-          foldGutter: false,
-          dropCursor: false,
-          allowMultipleSelections: false,
-          indentOnInput: true,
-          bracketMatching: true,
-          closeBrackets: true,
-        }}
-        style={{
-          border: error ? `1px solid ${ds.red[500]}` : `1px solid ${ds.gray[300]}`,
-          borderRadius: 'var(--ds-radius-md)',
-          fontSize: 'var(--ds-text-body)',
-        }}
+        language='json'
+        height='120px'
+        foldGutter={false}
+        showLanguageLabel={false}
+        error={error}
       />
-      {error && (
-        <Typography variant='body2' sx={{ color: 'var(--ds-red-500)', fontSize: 'var(--ds-text-small)', mt: 0.5 }}>
-          {error}
-        </Typography>
-      )}
     </Box>
   );
 };
@@ -300,11 +283,20 @@ const WorkflowSettingsModal: React.FC<WorkflowSettingsModalProps> = ({
 
   // Never leave the flag on once its preconditions stop holding — otherwise the
   // toggle would read as enabled while the server refuses every run.
+  //
+  // Auto-approve rides along: it modifies the invocation grant and the server
+  // rejects the pair where only auto-approve is set, so it can never outlive it.
   useEffect(() => {
     if (aiInvocableBlockedReason && settings.aiInvocable) {
-      setSettings((prev) => ({ ...prev, aiInvocable: false }));
+      setSettings((prev) => ({ ...prev, aiInvocable: false, aiAutoApprove: false }));
     }
   }, [aiInvocableBlockedReason, settings.aiInvocable]);
+
+  useEffect(() => {
+    if (!settings.aiInvocable && settings.aiAutoApprove) {
+      setSettings((prev) => ({ ...prev, aiAutoApprove: false }));
+    }
+  }, [settings.aiInvocable, settings.aiAutoApprove]);
   const [newInput, setNewInput] = useState<WorkflowInput>({ ...defaultInput });
   const [outputsJson, setOutputsJson] = useState('');
   const [newTag, setNewTag] = useState('');
@@ -669,7 +661,7 @@ const WorkflowSettingsModal: React.FC<WorkflowSettingsModalProps> = ({
                                 textOverflow: 'ellipsis',
                                 whiteSpace: 'nowrap',
                                 flexShrink: 1,
-                                fontFamily: 'monospace',
+                                fontFamily: ds.font.mono,
                               }}
                             >
                               <Typography component='span' sx={{ color: 'var(--ds-gray-400)', fontSize: 'var(--ds-text-small)' }}>
@@ -708,7 +700,7 @@ const WorkflowSettingsModal: React.FC<WorkflowSettingsModalProps> = ({
                                 size='xs'
                                 tooltip='Edit parameter'
                                 aria-label='Edit parameter'
-                                icon={<EditIcon sx={{ fontSize: 'var(--ds-text-title)' }} />}
+                                icon={<SafeIcon src={EditIcon} alt='edit' width={13} height={13} />}
                                 onClick={(e) => {
                                   e.stopPropagation();
                                   handleStartEdit(input);
@@ -1254,6 +1246,28 @@ const WorkflowSettingsModal: React.FC<WorkflowSettingsModalProps> = ({
             />
 
             <FormField
+              label='Run without asking the user to confirm'
+              description={
+                settings.aiInvocable
+                  ? 'Off by default: the assistant proposes the automation and waits for the user to say yes. Turn this on and it runs straight away, still using that user\u2019s own permissions \u2014 so only for automations that are safe to run unattended.'
+                  : 'Allow the assistant to run this automation first.'
+              }
+              value={settings.aiAutoApprove}
+              onChange={(e: any) => handleSettingChange('aiAutoApprove', Boolean(e?.target?.checked))}
+              fieldType='checkbox'
+              disabled={!settings.aiInvocable}
+              placeholder=''
+              minWidth='100%'
+              maxRows={1}
+              minRows={1}
+              maxLength={0}
+              limitTags={0}
+              options={[]}
+              onSelect={() => {}}
+              customRender={null}
+            />
+
+            <FormField
               label='Description for the AI'
               description='What this automation does and, more importantly, WHEN to use it. This is how the assistant decides whether it is the right one — e.g. "Restarts the payment consumers and drains the stuck queue. Use when payment-service pods are crashlooping with RabbitMQ timeouts."'
               value={settings.llmDescription}
@@ -1271,8 +1285,8 @@ const WorkflowSettingsModal: React.FC<WorkflowSettingsModalProps> = ({
             />
 
             <Typography variant='body2' sx={{ fontSize: 'var(--ds-text-small)', color: ds.gray[700] }}>
-              The description is published with the automation, so the assistant sees it after your next publish. Turning the toggle off takes effect
-              immediately.
+              The description is published with the automation, so the assistant sees it after your next publish. Turning either toggle off takes
+              effect immediately.
             </Typography>
           </FormCard>
         )}

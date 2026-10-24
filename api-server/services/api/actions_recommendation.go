@@ -1,13 +1,17 @@
 package api
 
 import (
+	"fmt"
 	"log/slog"
+	"nudgebee/services/account"
 	"nudgebee/services/audit"
 	"nudgebee/services/common"
 	"nudgebee/services/internal/database"
 	"nudgebee/services/recommendation"
 	"nudgebee/services/scan_orchestrator"
+	"nudgebee/services/security"
 	"nudgebee/services/vmpackage"
+	vmqueue "nudgebee/services/vmpackage/queue"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -171,6 +175,102 @@ func handleRecommendationAction(actionPayload *ActionRequest, c *gin.Context, tr
 		}
 
 		c.JSON(200, resp)
+		return
+	case "security_scan_vm_account":
+		var request vmpackage.ScanAccountRequest
+		var err error
+		if mlRequest["object"] == nil {
+			err = common.UnmarshalMapToStruct(mlRequest, &request)
+		} else {
+			err = common.UnmarshalMapToStruct(mlRequest["object"].(map[string]interface{}), &request)
+		}
+
+		if err != nil {
+			c.JSON(400, common.ErrorActionBadRequest(err.Error()))
+			return
+		}
+
+		ctx, err := buildContextFromPayload(c, actionPayload, tracer, meter, logger)
+		if err != nil {
+			c.JSON(400, common.ErrorActionBadRequest(err.Error()))
+			return
+		}
+
+		auditEvent := audit.Audit{
+			UserId:         ctx.GetSecurityContext().GetUserId(),
+			TenantId:       ctx.GetSecurityContext().GetTenantId(),
+			AccountId:      request.AccountId,
+			EventTime:      time.Now().UTC(),
+			EventCategory:  audit.EventCategoryRecommendation,
+			EventTarget:    request.AccountId,
+			EventType:      audit.EventTypeRecommendationApply,
+			EventState:     request,
+			EventPrevState: nil,
+			EventActor:     audit.EventActorUiService,
+			EventAction:    audit.EventActionCreate,
+			EventStatus:    audit.EventStatusSuccess,
+			EventAttr:      map[string]any{},
+		}
+
+		resp, err := scanVmAccount(ctx, request)
+		defer func() {
+			err := audit.CreateAudit(ctx, &audit.AuditRequest{Audits: []audit.Audit{auditEvent}})
+			if err != nil {
+				ctx.GetLogger().Error("failed to create audit event", "error", err)
+			}
+		}()
+		if err != nil {
+			c.JSON(400, common.ErrorActionBadRequest(err.Error()))
+			auditEvent.EventStatus = audit.EventStatusFailure
+			return
+		}
+
+		c.JSON(200, resp)
+		return
+	case "security_list_vm_scan_statuses":
+		var request vmpackage.ListScanStatusesRequest
+		var err error
+		if mlRequest["object"] == nil {
+			err = common.UnmarshalMapToStruct(mlRequest, &request)
+		} else if objMap, ok := mlRequest["object"].(map[string]interface{}); ok {
+			err = common.UnmarshalMapToStruct(objMap, &request)
+		} else {
+			c.JSON(400, common.ErrorActionBadRequest("invalid object format"))
+			return
+		}
+		if err != nil {
+			c.JSON(400, common.ErrorActionBadRequest(err.Error()))
+			return
+		}
+
+		ctx, err := buildContextFromPayload(c, actionPayload, tracer, meter, logger)
+		if err != nil {
+			c.JSON(400, common.ErrorActionBadRequest(err.Error()))
+			return
+		}
+		if !ctx.GetSecurityContext().HasAccountAccess(request.AccountId, security.SecurityAccessTypeRead) {
+			c.JSON(400, common.ErrorActionBadRequest("unauthorized"))
+			return
+		}
+
+		rows, err := vmpackage.ListScanStatusesForAccount(request.AccountId)
+		if err != nil {
+			c.JSON(400, common.ErrorActionBadRequest(err.Error()))
+			return
+		}
+		data := make([]map[string]any, 0, len(rows))
+		for _, r := range rows {
+			data = append(data, map[string]any{
+				"cloud_resource_id": r.CloudResourceID,
+				"status":            r.Status,
+				"error":             r.Error,
+				"package_count":     r.PackageCount,
+				"finding_count":     r.FindingCount,
+				"scanned_at":        r.ScannedAt,
+				"updated_at":        r.UpdatedAt,
+			})
+		}
+		c.JSON(200, vmpackage.ListScanStatusesResponse{Data: data})
 		return
 	case "recommendation_job_create":
 		var request recommendation.RecommendationJobCreateRequest
@@ -528,4 +628,70 @@ func handleRecommendationAction(actionPayload *ActionRequest, c *gin.Context, tr
 		c.JSON(400, common.ErrorActionBadRequest("invalid action name - "+actionPayload.Action.Name))
 		return
 	}
+}
+
+// scanVmAccount queues an on-demand scan for every discovery datasource that
+// runs in or targets req.AccountId — the manual-trigger counterpart to
+// cron.go's daily "VM Vulnerability Scan" job, scoped to one account instead
+// of every tenant. Lives in the api package (not vmpackage) because vmpackage/queue
+// already imports vmpackage (see consumer.go), so vmpackage importing
+// vmpackage/queue back would be a cycle; cron.go's handler is the existing
+// precedent for this same list-then-publish glue.
+func scanVmAccount(ctx *security.RequestContext, req vmpackage.ScanAccountRequest) (vmpackage.ScanAccountResponse, error) {
+	if !ctx.GetSecurityContext().HasAccountAccess(req.AccountId, security.SecurityAccessTypeCreate) {
+		return vmpackage.ScanAccountResponse{}, common.ErrorUnauthorized("unauthorized")
+	}
+
+	a, err := account.GetAccount(ctx, req.AccountId)
+	if err != nil {
+		ctx.GetLogger().Error("scanVmAccount: error getting account", "error", err)
+		return vmpackage.ScanAccountResponse{}, err
+	}
+	if a.Id == "" {
+		return vmpackage.ScanAccountResponse{}, fmt.Errorf("scanVmAccount: account not found - %s", req.AccountId)
+	}
+	if a.Tenant != ctx.GetSecurityContext().GetTenantId() {
+		return vmpackage.ScanAccountResponse{}, fmt.Errorf("scanVmAccount: account not found in tenant - %s", req.AccountId)
+	}
+
+	dbManager, err := database.GetDatabaseManager(database.Metastore)
+	if err != nil {
+		return vmpackage.ScanAccountResponse{}, err
+	}
+
+	datasources, ineligible, err := vmpackage.ListDiscoveryDatasourcesForAccount(dbManager, req.AccountId)
+	if err != nil {
+		return vmpackage.ScanAccountResponse{}, err
+	}
+	if len(datasources) == 0 {
+		if ineligible > 0 {
+			// An agent is connected (integration exists, enabled) but its
+			// labels haven't synced yet — a different problem than "no
+			// agent configured", and one a restart usually self-heals. See
+			// #38718: the old single error string sent users hunting for a
+			// nonexistent missing-integration problem.
+			return vmpackage.ScanAccountResponse{}, common.ErrorBadRequest(
+				"a discovery agent is connected but hasn't yet reported scan targets — try again shortly, or restart the proxy agent")
+		}
+		return vmpackage.ScanAccountResponse{}, common.ErrorBadRequest("no discovery agent is configured to scan this account")
+	}
+
+	queued, failed := 0, 0
+	for _, ds := range datasources {
+		if err := vmqueue.PublishVMScan(ctx.GetContext(), ds.IntegrationID, ds.TenantID, ds.AccountID, "manual"); err != nil {
+			ctx.GetLogger().Error("scanVmAccount: failed to publish vm scan", "integration_id", ds.IntegrationID, "error", err)
+			failed++
+			continue
+		}
+		queued++
+	}
+	ctx.GetLogger().Info("scanVmAccount: vm scan queued", "account_id", req.AccountId, "queued", queued, "failed", failed)
+
+	if queued == 0 {
+		return vmpackage.ScanAccountResponse{}, common.ErrorBadRequest(fmt.Sprintf("failed to queue a scan for any of the %d discovery datasource(s) configured for this account", len(datasources)))
+	}
+
+	return vmpackage.ScanAccountResponse{
+		Data: []map[string]any{{"account_id": req.AccountId, "status": "started", "datasources_queued": queued}},
+	}, nil
 }

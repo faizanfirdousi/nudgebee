@@ -1,6 +1,9 @@
-import { Grid, CircularProgress, Typography, RadioGroup, FormControlLabel, Radio, Alert, Link, Box, Collapse, IconButton } from '@mui/material';
-import { HelpOutline, ExpandMore, ExpandLess, InfoOutlined } from '@mui/icons-material';
+import { Grid, CircularProgress, Typography, RadioGroup, FormControlLabel, Radio, Box, IconButton } from '@mui/material';
+import { Banner } from '@ui/Banner';
+import { HelpOutline, InfoOutlined } from '@mui/icons-material';
 import Tooltip from '@ui/Tooltip';
+import { CollapsableCard } from '@ui/CollapsableCard';
+import { getBrandTitle } from '@hooks/useTenantBranding';
 import Tabs from '@shared/navigation/Tabs';
 import { ds } from 'src/utils/colors';
 import { Switch } from '@ui/Switch';
@@ -8,13 +11,14 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 import apiAccount from '@api1/account';
 import { Modal } from '@shared/modal';
 import { Input } from '@ui/Input';
-import { isK8sAccountNameValid } from 'src/utils/common';
+import { isK8sAccountNameValid, parseAwsRegions } from 'src/utils/common';
 import apiKubernetes1 from '@api1/kubernetes1';
 import { Button } from '@ui/Button';
 import { snackbar } from '@shared/snackbarService';
 import MarkDowns from '@shared/viewers/MarkDowns';
 import ValidationResultBanner from '@components/accounts/ValidationResultBanner';
-import { ACCOUNT_ENV_PROD, ACCOUNT_ENV_NON_PROD, DEFAULT_ACCOUNT_ENV } from '@shared/forms/AccountEnvToggle';
+import { ACCOUNT_ENV_PROD, ACCOUNT_ENV_NON_PROD, DEFAULT_ACCOUNT_ENV, accountEnvTooltip } from '@shared/forms/AccountEnvToggle';
+import { getIntegrationDescription } from '@lib/integrationDescriptions';
 
 const CF_INSTRUCTIONS = `### Step 1. Give Account Name
   ### Step 2. Click on Connect via AWS Console
@@ -25,15 +29,17 @@ const CF_INSTRUCTIONS = `### Step 1. Give Account Name
      - Once the CloudFormation stack is created, the account will be detected automatically.
      - No need to copy any values.`;
 
-const ROLE_INSTRUCTIONS = `### IAM Role ARN
-  Use this flow if you already have a cross-account IAM role that Nudgebee can assume.
+const roleInstructions = () => `### IAM Role ARN
+  Use this flow if you already have a cross-account IAM role that ${getBrandTitle()} can assume.
   The role must allow \`sts:AssumeRole\`, \`cur:DescribeReportDefinitions\`, and \`s3:GetBucketLocation\` / \`s3:ListBucket\` on the CUR bucket.
-  Click **Validate** before connecting — we will probe STS, Cost & Usage Report discovery, and CUR S3 access upfront.`;
+  Click **Validate** before connecting — we will probe STS, Cost & Usage Report discovery, and CUR S3 access upfront.
+  Only the STS check is required: without a usable CUR the account still connects, but cost data stays empty until you attach one via **Edit Billing Config**.`;
 
 const KEYS_INSTRUCTIONS = `### Access Keys
   Use this flow when you cannot grant a cross-account role (segregated billing accounts, dev/test, etc.).
   Create an IAM user with the same CUR + read-only permissions as the CloudFormation template, then paste the **Access Key ID** and **Secret Access Key** below.
-  Click **Validate** before connecting — we will probe STS, Cost & Usage Report discovery, and CUR S3 access upfront.`;
+  Click **Validate** before connecting — we will probe STS, Cost & Usage Report discovery, and CUR S3 access upfront.
+  Only the STS check is required: without a usable CUR the account still connects, but cost data stays empty until you attach one via **Edit Billing Config**.`;
 
 const POLL_INTERVAL_MS = 7000;
 const ROLE_ARN_REGEX = /^arn:aws:iam::\d{12}:role\/.+$/;
@@ -62,7 +68,6 @@ const OPTION_DESC_SX = {
 
 const AddAwsAccountModal = ({ open, onClose }) => {
   const [activeTab, setActiveTab] = useState(TAB_CLOUDFORMATION);
-  const [guideExpanded, setGuideExpanded] = useState(false);
   const [accountNameValue, setAccountNameValue] = useState('');
   const [accountEnvValue, setAccountEnvValue] = useState(DEFAULT_ACCOUNT_ENV);
   const [validationError, setValidationError] = useState({});
@@ -76,7 +81,7 @@ const AddAwsAccountModal = ({ open, onClose }) => {
   const [externalIdInput, setExternalIdInput] = useState('');
   const [accessKeyId, setAccessKeyId] = useState('');
   const [secretAccessKey, setSecretAccessKey] = useState('');
-  const [keysRegion, setKeysRegion] = useState('us-east-1');
+  const [regionsInput, setRegionsInput] = useState('');
   const [isValidating, setIsValidating] = useState(false);
   const [validationResult, setValidationResult] = useState(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -103,12 +108,11 @@ const AddAwsAccountModal = ({ open, onClose }) => {
     setExternalIdInput('');
     setAccessKeyId('');
     setSecretAccessKey('');
-    setKeysRegion('us-east-1');
+    setRegionsInput('');
     setIsSubmitting(false);
     setIsValidating(false);
     setValidationResult(null);
     setActiveTab(TAB_CLOUDFORMATION);
-    setGuideExpanded(false);
     stopPolling();
   }, [stopPolling]);
 
@@ -123,7 +127,7 @@ const AddAwsAccountModal = ({ open, onClose }) => {
   // submit through unverified.
   useEffect(() => {
     setValidationResult(null);
-  }, [activeTab, roleArn, externalIdInput, accessKeyId, secretAccessKey, keysRegion]);
+  }, [activeTab, roleArn, externalIdInput, accessKeyId, secretAccessKey, regionsInput]);
 
   const handleCloseModal = (wasSuccessful = false) => {
     resetForm();
@@ -186,6 +190,19 @@ const AddAwsAccountModal = ({ open, onClose }) => {
       });
   };
 
+  // CreateAccount returns a non-fatal `warning` when the account was created
+  // but something degraded — today, an AWS account with no usable CUR. Nothing
+  // surfaced this field before, so the equivalent Azure cost-management warning
+  // was silently dropped too.
+  const notifyCreateResult = (res, accountName) => {
+    const warning = res?.data?.data?.accounts_create?.warning;
+    if (warning) {
+      snackbar.warning(warning);
+      return;
+    }
+    snackbar.success(`AWS Account "${accountName}" connected successfully.`);
+  };
+
   const handleValidate = async () => {
     if (activeTab === TAB_ROLE_ARN) {
       if (!ROLE_ARN_REGEX.test(roleArn)) {
@@ -215,9 +232,13 @@ const AddAwsAccountModal = ({ open, onClose }) => {
       } else if (activeTab === TAB_ACCESS_KEYS) {
         payload.access_key = accessKeyId;
         payload.access_secret = secretAccessKey;
-        if (keysRegion) {
-          payload.region = keysRegion;
-        }
+      }
+      // Validation must bootstrap inside the allowlist: a role scoped with an
+      // aws:RequestedRegion condition denies every call made outside it, so
+      // validating from the us-east-1 default would fail on a working role.
+      const regions = parseAwsRegions(regionsInput);
+      if (regions.length > 0) {
+        payload.region = regions[0];
       }
       const result = await apiAccount.validateCloudCredentials(payload);
       setValidationResult(result || { success: false, errorMessage: 'Validation returned no result.' });
@@ -254,16 +275,17 @@ const AddAwsAccountModal = ({ open, onClose }) => {
     } else if (activeTab === TAB_ACCESS_KEYS) {
       payload.access_key = accessKeyId;
       payload.access_secret = secretAccessKey;
-      if (keysRegion) {
-        payload.region = keysRegion;
-      }
+    }
+    const regions = parseAwsRegions(regionsInput);
+    if (regions.length > 0) {
+      payload.regions = regions;
     }
 
     apiAccount
       .createAccount(payload)
       .then((res) => {
         if (res?.data?.status === 'SUCCESS') {
-          snackbar.success(`AWS Account "${accountNameValue}" connected successfully.`);
+          notifyCreateResult(res, accountNameValue);
           handleCloseModal(true);
         } else {
           snackbar.error(res?.data?.message || 'Failed to connect account');
@@ -295,7 +317,7 @@ const AddAwsAccountModal = ({ open, onClose }) => {
       })
       .then((res) => {
         if (res?.data?.status === 'SUCCESS') {
-          snackbar.success(`AWS Account "${accountNameValue}" connected successfully.`);
+          notifyCreateResult(res, accountNameValue);
           handleCloseModal(true);
         } else {
           snackbar.error(res?.data?.message || 'Failed to connect account');
@@ -334,7 +356,7 @@ const AddAwsAccountModal = ({ open, onClose }) => {
       return CF_INSTRUCTIONS;
     }
     if (activeTab === TAB_ROLE_ARN) {
-      return ROLE_INSTRUCTIONS;
+      return roleInstructions();
     }
     return KEYS_INSTRUCTIONS;
   };
@@ -358,9 +380,9 @@ const AddAwsAccountModal = ({ open, onClose }) => {
 
           {!showManualInput && isPolling && (
             <Grid item sx={{ mt: 1 }}>
-              <Link component='button' variant='body2' onClick={() => setShowManualInput(true)} sx={{ textDecoration: 'none' }}>
+              <Button tone='link' size='sm' onClick={() => setShowManualInput(true)}>
                 Having trouble? Connect manually using Role ARN
-              </Link>
+              </Button>
             </Grid>
           )}
 
@@ -453,22 +475,17 @@ const AddAwsAccountModal = ({ open, onClose }) => {
         />
       </Grid>
       <Grid item>
-        <Input
-          value={keysRegion}
-          size='sm'
-          id='aws-region'
-          label='AWS Region'
-          placeholder='us-east-1'
-          onChange={(value) => setKeysRegion(value.trim())}
-          disabled={isValidating || isSubmitting}
-          help='Region used to bootstrap the AWS SDK. CUR discovery always runs in us-east-1.'
-        />
-      </Grid>
-      <Grid item>
-        <Alert severity='info' sx={{ mt: 1 }}>
-          Access keys are stored encrypted at rest. Prefer the CloudFormation flow when possible — keys grant broader access and rotation is your
-          responsibility.
-        </Alert>
+        <Box sx={{ mt: 1 }}>
+          <Banner
+            tone='info'
+            message={
+              <>
+                Access keys are stored encrypted at rest. Prefer the CloudFormation flow when possible — keys grant broader access and rotation is
+                your responsibility.
+              </>
+            }
+          />
+        </Box>
       </Grid>
     </Grid>
   );
@@ -478,12 +495,17 @@ const AddAwsAccountModal = ({ open, onClose }) => {
       <ValidationResultBanner result={validationResult} />
 
       {validationResult?.success && validationResult?.cur?.reportName && (
-        <Alert severity='success' sx={{ mt: 1 }}>
-          <Typography variant='body2'>
-            Detected Cost &amp; Usage Report: <strong>{validationResult.cur.reportName}</strong> (bucket{' '}
-            <code>{validationResult.cur.bucketName}</code>, region <code>{validationResult.cur.region}</code>).
-          </Typography>
-        </Alert>
+        <Box sx={{ mt: 1 }}>
+          <Banner
+            tone='success'
+            message={
+              <Typography variant='body2'>
+                Detected Cost &amp; Usage Report: <strong>{validationResult.cur.reportName}</strong> (bucket{' '}
+                <code>{validationResult.cur.bucketName}</code>, region <code>{validationResult.cur.region}</code>).
+              </Typography>
+            }
+          />
+        </Box>
       )}
     </Grid>
   );
@@ -494,6 +516,7 @@ const AddAwsAccountModal = ({ open, onClose }) => {
       open={open}
       handleClose={isPolling || isSubmitting ? () => {} : () => handleCloseModal(false)}
       title={'Add AWS Account'}
+      subtitle={getIntegrationDescription('AWS')}
       loader={isSubmitting}
     >
       <Box sx={{ mb: 1, '& .MuiTab-root': { flex: 1, maxWidth: 'none' } }}>
@@ -519,54 +542,29 @@ const AddAwsAccountModal = ({ open, onClose }) => {
       </Box>
 
       {/* Collapsible Setup Guide — mirrors AddAzureAccountModal / AddGcpAccountModal */}
-      <Box sx={{ mb: ds.space[2] }}>
-        <Box
-          component='button'
-          type='button'
-          aria-expanded={guideExpanded}
-          sx={{
-            display: 'flex',
-            alignItems: 'center',
-            cursor: 'pointer',
-            gap: ds.space[1],
-            py: ds.space[2],
-            px: 0,
-            background: 'none',
-            border: 'none',
-            font: 'inherit',
-            color: 'inherit',
-            textAlign: 'left',
-          }}
-          onClick={() => setGuideExpanded(!guideExpanded)}
-        >
-          <HelpOutline sx={{ fontSize: 18, color: ds.gray[600] }} />
-          <Typography sx={{ fontSize: ds.text.body, color: ds.gray[600], fontWeight: ds.weight.medium }}>
-            Setup Guide — How to connect your AWS account
-          </Typography>
-          {guideExpanded ? <ExpandLess sx={{ fontSize: 18, color: ds.gray[600] }} /> : <ExpandMore sx={{ fontSize: 18, color: ds.gray[600] }} />}
-        </Box>
-        <Collapse in={guideExpanded}>
-          <Box
-            sx={{
-              mt: ds.space[2],
-              p: ds.space[4],
-              bgcolor: ds.background[200],
-              borderRadius: ds.radius.lg,
-              border: `1px solid ${ds.gray[300]}`,
-            }}
-          >
-            <MarkDowns
-              data={getInstructionsData()}
-              sx={{
-                maxHeight: ds.space.mul(1, 75),
-                overflowY: 'auto',
-                padding: '0px',
-                borderRadius: '0px',
-              }}
-            />
+      <CollapsableCard
+        defaultOpen={false}
+        elevation='flat'
+        sx={{ mb: ds.space[2] }}
+        header={
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: ds.space[1] }}>
+            <HelpOutline sx={{ fontSize: 18, color: ds.gray[600] }} />
+            <Typography sx={{ fontSize: ds.text.body, color: ds.gray[600], fontWeight: ds.weight.medium }}>
+              Setup Guide — How to connect your AWS account
+            </Typography>
           </Box>
-        </Collapse>
-      </Box>
+        }
+      >
+        <MarkDowns
+          data={getInstructionsData()}
+          sx={{
+            maxHeight: ds.space.mul(1, 75),
+            overflowY: 'auto',
+            padding: '0px',
+            borderRadius: '0px',
+          }}
+        />
+      </CollapsableCard>
 
       <Grid container>
         <Box sx={{ mt: 2, width: '100%' }}>
@@ -582,16 +580,32 @@ const AddAwsAccountModal = ({ open, onClose }) => {
           />
         </Box>
 
+        {/* Not offered on the CloudFormation tab: that flow creates the account from the
+            stack's callback rather than from this form, so a value typed here would be
+            silently dropped. The template it deploys grants ReadOnlyAccess with no region
+            condition anyway, which is the case this field exists to handle. */}
+        {activeTab !== TAB_CLOUDFORMATION && (
+          <Box sx={{ mt: 2, width: '100%' }}>
+            <Input
+              value={regionsInput}
+              size='sm'
+              id='aws-regions'
+              label='AWS Regions (optional)'
+              placeholder='ap-southeast-2, us-east-1'
+              onChange={setRegionsInput}
+              disabled={isValidating || isSubmitting}
+              help='Leave blank to discover regions automatically. Set this only if the IAM role is restricted to specific regions — an unlisted region is not monitored, and resources already found there are marked deleted.'
+            />
+          </Box>
+        )}
+
         <Grid item xs={12} sx={{ mt: 2, mb: 1 }}>
           <Box sx={{ border: `1px solid ${ds.gray[200]}`, borderRadius: ds.radius.lg, overflow: 'hidden' }}>
             <Box sx={OPTION_ROW_SX}>
               <Box>
                 <Box sx={{ display: 'flex', alignItems: 'center' }}>
                   <Typography variant='subtitle2'>Account Type</Typography>
-                  <Tooltip
-                    title='Determines how NudgeBee prioritises alerts, recommendations and incidents for this account. Production accounts are scored at full weight. You can change this anytime later.'
-                    placement='right'
-                  >
+                  <Tooltip title={accountEnvTooltip()} placement='right'>
                     <IconButton id='aws-account-env-info-btn' size='small' sx={{ p: 0.5 }}>
                       <InfoOutlined fontSize='small' />
                     </IconButton>
@@ -632,7 +646,7 @@ const AddAwsAccountModal = ({ open, onClose }) => {
                   <Box sx={{ display: 'flex', alignItems: 'center' }}>
                     <Typography variant='subtitle2'>SSM Parameter Store access</Typography>
                     <Tooltip
-                      title='Allows Nudgebee to read parameter values. Only enable if your parameters do not contain secrets.'
+                      title={`Allows ${getBrandTitle()} to read parameter values. Only enable if your parameters do not contain secrets.`}
                       placement='right'
                     >
                       <IconButton id='aws-ssm-info-btn' size='small' sx={{ p: 0.5 }}>
@@ -641,7 +655,7 @@ const AddAwsAccountModal = ({ open, onClose }) => {
                     </Tooltip>
                   </Box>
                   <Typography sx={OPTION_DESC_SX}>
-                    Allows Nudgebee to read parameter values. Only enable if your parameters do not contain secrets.
+                    {`Allows ${getBrandTitle()} to read parameter values. Only enable if your parameters do not contain secrets.`}
                   </Typography>
                 </Box>
                 <Switch
@@ -656,10 +670,17 @@ const AddAwsAccountModal = ({ open, onClose }) => {
           </Box>
 
           {accessMode === 'readonly' && (
-            <Alert severity='info' sx={{ mt: 1 }}>
-              Read-only mode does not grant write permissions to your AWS account. The following features will be unavailable: CloudWatch alarm
-              creation, EventBridge real-time event tracking, and automated recommendation actions.
-            </Alert>
+            <Box sx={{ mt: 1 }}>
+              <Banner
+                tone='info'
+                message={
+                  <>
+                    Read-only mode does not grant write permissions to your AWS account. The following features will be unavailable: CloudWatch alarm
+                    creation, EventBridge real-time event tracking, and automated recommendation actions.
+                  </>
+                }
+              />
+            </Box>
           )}
         </Grid>
 

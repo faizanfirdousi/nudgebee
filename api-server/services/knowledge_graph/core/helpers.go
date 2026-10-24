@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"nudgebee/services/internal/database"
 	"nudgebee/services/security"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -29,9 +30,41 @@ func NodeIDFor(uniqueKey, tenantID, cloudAccountID string) string {
 	return GenerateNodeID(uniqueKey + tenantID + cloudAccountID)
 }
 
-// GenerateEdgeID generates a unique ID for an edge based on source, destination, and relationship
+// GenerateEdgeID generates a unique ID for an edge based on source, destination, and relationship.
+//
+// Deprecated for anything that reaches the database: it hashes only three of the
+// five columns knowledge_graph_edge is keyed on, so two rows that the unique
+// constraint considers distinct can collide on the primary key. Use EdgeIDFor.
+// Still correct for synthetic, never-persisted edges (see pod_synthesizer.go).
 func GenerateEdgeID(sourceNodeID, destinationNodeID string, relationshipType RelationshipType) string {
 	key := fmt.Sprintf("%s->%s:%s", sourceNodeID, destinationNodeID, relationshipType)
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(key)).String()
+}
+
+// EdgeIDFor derives an edge's primary key from the FULL natural key that
+// knowledge_graph_edge's unique constraint is built on (migration V578):
+// (source_node_id, destination_node_id, relationship_type, cloud_account_id,
+// tenant_id). Because the PK is a function of exactly the ON CONFLICT tuple
+// SaveEdges arbitrates on, a primary-key collision now implies a natural-key
+// collision, which the upsert's DO UPDATE arm always absorbs.
+//
+// The rule this exists to enforce: anything that rewrites one of those five
+// columns on an edge — Go or SQL — MUST rewrite id along with it. Migration
+// V864 repointed source_node_id/destination_node_id without touching id, which
+// left primary keys squatting the value a later, correctly-built edge derives.
+// Those rows miss the conflict arm, fall through to a plain INSERT, and abort
+// the single transaction covering every edge — freezing a tenant's graph for
+// good. See issue #38046 (and #36139 for the node-side version).
+//
+// The "@" and "/" separators keep this hash space disjoint from
+// GenerateEdgeID's, so the two schemes can coexist on one table.
+func EdgeIDFor(sourceNodeID, destinationNodeID string, relationshipType RelationshipType, cloudAccountID, tenantID string) string {
+	// Concatenated rather than fmt.Sprintf'd: this runs once per edge per build,
+	// and Sprintf costs ~35% of the whole call (302ns/11 allocs vs 195ns/6).
+	// The separators are part of the hash — changing any of them re-keys every
+	// edge written from here on, so TestEdgeIDFor_KeyFormatIsStable pins the
+	// output.
+	key := sourceNodeID + "->" + destinationNodeID + ":" + string(relationshipType) + "@" + cloudAccountID + "/" + tenantID
 	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(key)).String()
 }
 
@@ -58,6 +91,19 @@ func CanonicalWorkloadKind(kind string) string {
 		return canonical
 	}
 	return kind
+}
+
+// CanonicalWorkloadKinds returns the canonical PascalCase Kubernetes kinds this
+// package normalizes to. sources/k8s checks it against the kinds it declares:
+// a kind here that k8s does not build would normalize observed traffic to a
+// specific_type no node carries.
+func CanonicalWorkloadKinds() []string {
+	out := make([]string, 0, len(canonicalWorkloadKinds))
+	for _, canonical := range canonicalWorkloadKinds {
+		out = append(out, canonical)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // NewNode creates a new node with generated ID and timestamps.
@@ -122,7 +168,7 @@ func NewEdge(sourceNodeID, destinationNodeID string, relationshipType Relationsh
 	properties map[string]interface{}, tenantID, cloudAccountID, source string) *DbEdge {
 	now := time.Now()
 	return &DbEdge{
-		ID:                GenerateEdgeID(sourceNodeID, destinationNodeID, relationshipType),
+		ID:                EdgeIDFor(sourceNodeID, destinationNodeID, relationshipType, cloudAccountID, tenantID),
 		SourceNodeID:      sourceNodeID,
 		DestinationNodeID: destinationNodeID,
 		RelationshipType:  relationshipType,
@@ -229,21 +275,22 @@ func DeduplicateEdges(edges []*DbEdge) []*DbEdge {
 type EdgeSourcePriority int
 
 const (
-	EdgePriority1 EdgeSourcePriority = 1 // Highest priority (k8s)
-	EdgePriority2 EdgeSourcePriority = 2 // manual (user-declared dependencies)
-	EdgePriority3 EdgeSourcePriority = 3 // aws
-	EdgePriority4 EdgeSourcePriority = 4 // ebpf
-	EdgePriority5 EdgeSourcePriority = 5 // traces
-	EdgePriority6 EdgeSourcePriority = 6 // datadog-apm
-	EdgePriority7 EdgeSourcePriority = 7 // newrelic-apm
-	EdgePriority8 EdgeSourcePriority = 8 // aws-vpc-flow (VPC Flow Logs — coarsest network observation: no L7, no latency, IP-derived)
-	EdgePriority9 EdgeSourcePriority = 9 // Lowest priority (unknown sources)
+	EdgePriority1  EdgeSourcePriority = 1  // Highest priority (k8s)
+	EdgePriority2  EdgeSourcePriority = 2  // manual (user-declared dependencies)
+	EdgePriority3  EdgeSourcePriority = 3  // aws
+	EdgePriority4  EdgeSourcePriority = 4  // ebpf
+	EdgePriority5  EdgeSourcePriority = 5  // traces
+	EdgePriority6  EdgeSourcePriority = 6  // datadog-apm
+	EdgePriority7  EdgeSourcePriority = 7  // newrelic-apm
+	EdgePriority8  EdgeSourcePriority = 8  // elastic-apm
+	EdgePriority9  EdgeSourcePriority = 9  // aws-vpc-flow (VPC Flow Logs — coarsest network observation: no L7, no latency, IP-derived)
+	EdgePriority10 EdgeSourcePriority = 10 // Lowest priority (unknown sources)
 )
 
 // Aliases for readability
 const (
 	EdgePriorityHighest = EdgePriority1
-	EdgePriorityLowest  = EdgePriority9
+	EdgePriorityLowest  = EdgePriority10
 )
 
 // edgeTypePriorities defines source priority for each edge type.
@@ -267,7 +314,8 @@ var edgeTypePriorities = map[RelationshipType]map[string]EdgeSourcePriority{
 		"gcp-cloud-traces": EdgePriority5, // GCP Cloud Trace (disjoint from K8s "traces" accounts)
 		"datadog-apm":      EdgePriority6, // External APM source (instrumentation-derived)
 		"newrelic-apm":     EdgePriority7, // External APM source (NRQL Span aggregation)
-		"aws-vpc-flow":     EdgePriority8, // VPC Flow Logs: sees cloud-managed edges others miss, but coarsest (no L7/latency) — loses to any richer source that corroborates
+		"elastic-apm":      EdgePriority8, // External APM source (Elastic APM service_destination metrics + parent.id join)
+		"aws-vpc-flow":     EdgePriority9, // VPC Flow Logs: sees cloud-managed edges others miss, but coarsest (no L7/latency) — loses to any richer source that corroborates
 	},
 	RelationshipResolvesTo: {
 		"k8s":              EdgePriority1, // K8s DNS resolution
@@ -724,6 +772,24 @@ func extractNodeLocation(properties map[string]interface{}) string {
 	return ""
 }
 
+// externalNamespaceSentinel is the placeholder the flow producers (eBPF, traces) stamp on
+// endpoints that live outside the cluster — it is not a real K8s namespace, so it must never
+// be surfaced as one.
+const externalNamespaceSentinel = "external"
+
+// extractNodeNamespace returns the K8s namespace of a namespaced resource, used by the UI as
+// the K8s counterpart of extractNodeLocation (K8s nodes have no region/zone, so their location
+// is blank). Returns "" for cluster-scoped resources (Cluster, Namespace, Node, PV), for
+// non-K8s nodes, and for the "external" sentinel the flow producers use for out-of-cluster
+// endpoints.
+func extractNodeNamespace(properties map[string]interface{}) string {
+	ns := getNodeProp(properties, "namespace")
+	if ns == externalNamespaceSentinel {
+		return ""
+	}
+	return ns
+}
+
 // knownLanguageLogoIDs are the language keys LangTypeIcon.jsx actually renders. Anything
 // outside this set is not a language — most commonly a non-language app.Type tag (e.g. "http",
 // "Service") that GetPrimaryLanguage falls back to returning verbatim when it can't classify it,
@@ -1034,6 +1100,7 @@ func ConvertKgNodeToKgNodeSlim(kgNode KgNode) KgNodeSlim {
 	role := ""
 	engine := ""
 	location := ""
+	namespace := ""
 	if kgNode.Properties != nil {
 		if nameVal, ok := kgNode.Properties["name"]; ok {
 			name = fmt.Sprintf("%v", nameVal)
@@ -1041,6 +1108,7 @@ func ConvertKgNodeToKgNodeSlim(kgNode KgNode) KgNodeSlim {
 		role = getNodeProp(kgNode.Properties, "role")
 		engine = getNodeProp(kgNode.Properties, "engine")
 		location = extractNodeLocation(kgNode.Properties)
+		namespace = extractNodeNamespace(kgNode.Properties)
 	}
 	return KgNodeSlim{
 		ID:           kgNode.ID,
@@ -1055,6 +1123,7 @@ func ConvertKgNodeToKgNodeSlim(kgNode KgNode) KgNodeSlim {
 		Role:         role,
 		Engine:       engine,
 		Location:     location,
+		Namespace:    namespace,
 	}
 }
 
@@ -1212,6 +1281,7 @@ func GetK8sAccountsForTenant(tenantID string, cloudAccountIDs []string) ([]K8sAc
 		FROM cloud_accounts ca
 		INNER JOIN agent a ON ca.id = a.cloud_account_id
 		WHERE ca.cloud_provider = 'K8s'
+		  AND ca.status = 'active'
 		  AND a.status = 'CONNECTED'
 		  AND ca.tenant = ?`
 

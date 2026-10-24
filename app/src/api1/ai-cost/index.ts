@@ -600,6 +600,31 @@ export async function aggregateAccountCostReport(
   return response?.data?.data?.ai_aggregate_account_cost_report?.data ?? null;
 }
 
+/** This tenant's configured AI Cost Daily Report send hour (0-23, UTC). */
+export interface AiCostReportSchedule {
+  send_hour_utc: number;
+}
+
+export async function getCostReportSchedule(signal?: AbortSignal): Promise<AiCostReportSchedule | null> {
+  const query = `mutation GetCostReportSchedule {
+    ai_get_cost_report_schedule(request: {}) {
+      data
+    }
+  }`;
+  const response = await queryGraphQL(query, 'GetCostReportSchedule', {}, undefined, signal);
+  return response?.data?.data?.ai_get_cost_report_schedule?.data ?? null;
+}
+
+export async function upsertCostReportSchedule(req: { sendHourUtc: number }, signal?: AbortSignal): Promise<AiCostReportSchedule | null> {
+  const query = `mutation UpsertCostReportSchedule($sendHourUtc: Int!) {
+    ai_upsert_cost_report_schedule(request: { send_hour_utc: $sendHourUtc }) {
+      data
+    }
+  }`;
+  const response = await queryGraphQL(query, 'UpsertCostReportSchedule', { sendHourUtc: req.sendHourUtc }, undefined, signal);
+  return response?.data?.data?.ai_upsert_cost_report_schedule?.data ?? null;
+}
+
 // ─── ai_list_agent_costs (Agents leaderboard) ──────────────────────────────────
 // Top agent INVOCATIONS across conversations, ranked by cost | latency | errors.
 // One row per invocation (same agent name recurs), each linked to its conversation.
@@ -1040,6 +1065,77 @@ function optSleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+/** Parse a stored cost_optimizer message into a ConversationOptimization, safely.
+ * The agent emits `findings: null` when it finds nothing, which an unchecked `as`
+ * cast let crash the Optimize tab (`data.findings.length`). Tolerates ```json
+ * fences / prose, coerces `findings` and the numeric fields to safe defaults, and
+ * returns null only for a foreign payload (no string `summary`) — treated by
+ * callers as "no prior analysis". Mirrors parsePromptAnalysis. */
+function parseConversationOptimization(raw: string): ConversationOptimization | null {
+  if (!raw) return null;
+  const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+  const str = (v: unknown): string => (typeof v === 'string' ? v : '');
+  const arr = <T>(v: unknown): T[] | undefined => (Array.isArray(v) ? (v as T[]) : undefined);
+
+  const tryParse = (s: string): ConversationOptimization | null => {
+    let o: unknown;
+    try {
+      o = JSON.parse(s);
+    } catch {
+      return null;
+    }
+    if (!o || typeof o !== 'object' || Array.isArray(o)) return null;
+    const r = o as Record<string, unknown>;
+    // Our payload carries a string `summary` + an array/null `findings`; reject the rest.
+    if (typeof r.summary !== 'string' || (r.findings != null && !Array.isArray(r.findings))) return null;
+
+    const findings: OptFinding[] = (arr<unknown>(r.findings) ?? [])
+      .filter((f): f is Record<string, unknown> => !!f && typeof f === 'object' && !Array.isArray(f))
+      .map((f, i) => {
+        const conf = f.confidence;
+        return {
+          ...(f as unknown as OptFinding),
+          id: str(f.id) || `f-${i}`,
+          type: (str(f.type) || 'model_downgrade') as OptFindingType,
+          title: str(f.title),
+          target: (f.target && typeof f.target === 'object' && !Array.isArray(f.target) ? f.target : { kind: 'unknown' }) as OptTarget,
+          evidence: str(f.evidence),
+          recommendation: str(f.recommendation),
+          current_cost_usd: num(f.current_cost_usd),
+          estimated_savings_usd: num(f.estimated_savings_usd),
+          estimated_savings_pct: num(f.estimated_savings_pct),
+          confidence: (conf === 'high' || conf === 'medium' || conf === 'low' ? conf : 'low') as OptFinding['confidence'],
+          supporting_evidence: arr<OptEvidenceFact>(f.supporting_evidence),
+          exemplars: arr<OptExemplar>(f.exemplars),
+          backing_agent_ids: arr<string>(f.backing_agent_ids),
+          overlaps_with: arr<string>(f.overlaps_with),
+        };
+      });
+
+    return {
+      conversation_id: str(r.conversation_id),
+      current_cost_usd: num(r.current_cost_usd),
+      total_potential_savings_usd: num(r.total_potential_savings_usd),
+      total_potential_savings_pct: num(r.total_potential_savings_pct),
+      summary: str(r.summary),
+      findings,
+      profile: (r.profile && typeof r.profile === 'object' && !Array.isArray(r.profile) ? r.profile : {}) as OptimizationProfile,
+    };
+  };
+
+  const direct = tryParse(raw.trim());
+  if (direct) return direct;
+  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced) {
+    const f = tryParse(fenced[1].trim());
+    if (f) return f;
+  }
+  const start = raw.indexOf('{');
+  const end = raw.lastIndexOf('}');
+  if (start >= 0 && end > start) return tryParse(raw.slice(start, end + 1));
+  return null;
+}
+
 // Runs the cost_optimizer agent through the chat/investigate path. The analysis is
 // a minutes-long LLM call, so we run it ASYNC and poll: the agent is hosted in a
 // real conversation (session = optimizer-<target>, source = "Optimize") — which
@@ -1103,13 +1199,7 @@ export async function generateConversationOptimization(
     if (baselineTs && (latest?.created_at ?? '') <= baselineTs) continue;
     const status = (latest?.status ?? '').toUpperCase();
     if (status === 'FAILED' || status === 'KILLED') throw new Error('Optimization failed');
-    if (status === 'COMPLETED' && latest?.response) {
-      try {
-        return JSON.parse(latest.response) as ConversationOptimization;
-      } catch {
-        return null; // completed but unparseable
-      }
-    }
+    if (status === 'COMPLETED' && latest?.response) return parseConversationOptimization(latest.response);
     // IN_PROGRESS / WAITING → keep polling
   }
   throw new Error('Optimization timed out — try again');
@@ -1142,11 +1232,8 @@ export async function getStoredConversationOptimization(
     .sort((a, b) => (a.created_at ?? '').localeCompare(b.created_at ?? ''));
   const latest = completed.pop();
   if (!latest?.response) return null;
-  try {
-    return { optimization: JSON.parse(latest.response) as ConversationOptimization, analyzedAt: latest.created_at ?? '' };
-  } catch {
-    return null;
-  }
+  const optimization = parseConversationOptimization(latest.response);
+  return optimization ? { optimization, analyzedAt: latest.created_at ?? '' } : null;
 }
 
 /** Existing per-conversation summary metrics (basic detail panel + per-model rollups). */

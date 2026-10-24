@@ -104,6 +104,15 @@ type NBQueryConfig struct {
 	// that the planner may strip when rewriting the step query.
 	OriginalUserQuery string `json:"original_user_query,omitempty"`
 
+	// SkipConversationHistory runs the turn without the conversation's earlier
+	// messages or distilled conversation memory. Automated event re-analysis
+	// reuses one conversation per fingerprint; with history loaded, the agent
+	// answered a new occurrence by rewording the previous occurrence's RCA
+	// without calling a tool. Stored in message_config so sub-agents and
+	// approval resumes of the same turn inherit it; never inherited by the
+	// conversation's next turn (see handleConversationRequest).
+	SkipConversationHistory bool `json:"skip_conversation_history,omitempty"`
+
 	// Tool infrastructure (managed by executor/planner)
 	ToolConfigs        map[string]string `json:"tool_configs,omitempty"`
 	ClientTools        []NBToolCommand   `json:"client_tools,omitempty"`
@@ -120,7 +129,7 @@ func (q NBQueryConfig) IsEmpty() bool {
 		q.CurrentCluster == "" && q.CurrentClusterId == "" && q.K8sOrchestratorMode == "" &&
 		q.LlmProvider == "" && q.LlmModelName == "" && len(q.LlmTierModels) == 0 && q.LlmConfigSource == "" && !q.LlmConfigReset && len(q.ToolConfigs) == 0 &&
 		len(q.ClientTools) == 0 && q.Capabilities.IsEmpty() && len(q.ToolConfirmations) == 0 &&
-		len(q.ToolConfigMetadata) == 0 && q.LogProviderOverride == ""
+		len(q.ToolConfigMetadata) == 0 && q.LogProviderOverride == "" && !q.SkipConversationHistory
 }
 
 // MergeFrom copies fields from src into q only when q's field is the zero value.
@@ -205,6 +214,9 @@ func (q *NBQueryConfig) MergeFrom(src NBQueryConfig) {
 	if q.LogProviderOverride == "" {
 		q.LogProviderOverride = src.LogProviderOverride
 	}
+	if !q.SkipConversationHistory {
+		q.SkipConversationHistory = src.SkipConversationHistory
+	}
 	if src.ToolConfigs != nil {
 		q.ToolConfigs = lo.Assign(src.ToolConfigs, q.ToolConfigs)
 	}
@@ -235,7 +247,15 @@ type NbToolContext struct {
 	Ctx            *security.RequestContext
 	ToolConfig     ToolConfig
 	ToolCallId     string
+	AccountContext string
 	AccountPrompt  string
+	// Source is the conversation source this tool call belongs to, as a plain
+	// string so tools/core stays free of the agents/core import. Empty means
+	// unknown. Tools use it to tell a live user's request, where asking or
+	// inferring from the user's own words is reasonable, from an unattended
+	// run where nobody is there to answer and a guess is silently wrong.
+	Source string
+
 	// SessionId is the top-level conversation session ID. Propagated from parent
 	// agents so sub-agents (e.g. agent_code_2) can pass it to external services
 	// like the workspace pod for conversation linking.
@@ -257,6 +277,11 @@ type NbToolContext struct {
 	KBPrestepContent  string
 	KBPrestepExecuted bool
 	KBReferences      any
+	// Knowledge policy is resolved once per top-level invocation and propagated
+	// through in-process delegation. Strings avoid a tools/core -> agents/core
+	// dependency; only framework code reads these fields.
+	KnowledgePolicy         string
+	KnowledgePolicyResolved bool
 	// Stats accumulates the DB/relay split for the in-flight tool call. A tool
 	// that records sets this on its local copy of the context at the top of
 	// Call(); because NbToolContext is passed by value the pointer — not the
@@ -277,7 +302,28 @@ func (tc NbToolContext) GoContext() context.Context {
 	return tc.Ctx.GetContext()
 }
 
-func NewNbToolContext(ctx *security.RequestContext, tool NBTool, accountId string, userId string, conversationId string, messageId string, agenId string, query string, history []llms.MessageContent, queryContext string, queryConfig NBQueryConfig, toolCallId string) NbToolContext {
+// userConversationSources are the sources with a person waiting on the answer.
+// Mirrors agents/core's isUserConversationSource, duplicated as strings because
+// tools/core cannot import agents/core.
+var userConversationSources = map[string]struct{}{
+	"UserInvestigation":    {},
+	"UserInvestigationCli": {},
+}
+
+// HasLiveUser reports whether someone is waiting on this tool call. False for
+// event analysis, automations and other unattended runs.
+func (c NbToolContext) HasLiveUser() bool {
+	_, ok := userConversationSources[c.Source]
+	return ok
+}
+
+func NewNbToolContext(ctx *security.RequestContext, tool NBTool, accountId string, userId string, conversationId string, messageId string, agenId string, query string, history []llms.MessageContent, queryContext string, queryConfig NBQueryConfig, toolCallId string, source ...string) NbToolContext {
+	// Variadic so the ~37 existing callers stay untouched; only the paths that
+	// know the conversation source pass it.
+	conversationSource := ""
+	if len(source) > 0 {
+		conversationSource = source[0]
+	}
 
 	toolConfigs := map[string]string{}
 	if queryConfig.ToolConfigs != nil {
@@ -318,6 +364,7 @@ func NewNbToolContext(ctx *security.RequestContext, tool NBTool, accountId strin
 		Ctx:            ctx,
 		ToolConfig:     toolConfig,
 		ToolCallId:     toolCallId,
+		Source:         conversationSource,
 	}
 	return toolContext
 }

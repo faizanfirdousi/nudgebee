@@ -1,3 +1,4 @@
+import dynamic from 'next/dynamic';
 import apiWorkflow from '@api1/workflow';
 import apiAskNudgebee from '@api1/ask-nudgebee';
 import apiUser from '@api1/user';
@@ -9,6 +10,7 @@ import Tooltip from '@ui/Tooltip';
 import Text from '@shared/format/Text';
 import Datetime from '@shared/format/Datetime';
 import { Label } from '@ui/Label';
+import { CodeBlock } from '@ui/CodeBlock';
 import { ListingLayout } from '@ui/ListingLayout';
 import { Button as DsButton } from '@ui/Button';
 import SearchInput from '@ui/SearchInput';
@@ -19,7 +21,7 @@ import CloudProviderIcon from '@shared/icons/CloudIcon';
 import ThreeDotsMenu from '@ui/ThreeDotsMenu';
 import { Modal } from '@ui/Modal';
 import { toast as snackbar } from '@ui/Toast';
-import { hasWriteAccess, hasPermission, missingPermissionMessage, hasFeatureAccess, getUserSession, getCurrentTenant } from '@lib/auth';
+import { hasWriteAccess, hasPermission, missingPermissionMessage, getUserSession, getCurrentTenant } from '@lib/auth';
 import { readPersistedFilters, writePersistedFilters } from '@hooks/usePersistedFilters';
 import { readPersistedAccounts, writePersistedAccounts } from './utils/accountFilterPersistence';
 import { parseHttpResponseBodyMessage } from 'src/utils/common';
@@ -29,9 +31,9 @@ import { getDefaultTriggerInputs, getWorkflowInputSchema, getPrimaryTriggerType 
 import AiGenerateWorkflowModal from './components/AiGenerateWorkflowModal';
 import ConfigurationManager from './ConfigurationManager';
 import CreateWorkflowOptionsModal from './components/CreateWorkflowOptionsModal';
-import CreateWorkflowFromCodeModal from './components/CreateWorkflowFromCodeModal';
 import WorkflowTemplatesModal from './components/WorkflowTemplatesModal';
 import { getAutomationToggleAction } from './automationMenu';
+import { buildWorkflowExportJson, buildWorkflowShareUrl, sanitizeWorkflowDefinitionForExport } from './workflowExport';
 import {
   manualTriggerIcon,
   SettingsIcon,
@@ -40,12 +42,18 @@ import {
   EventIconPurple,
   addIconWhite,
   EditIcon,
+  CopyIcon,
   CopyIconBlue,
   DeleteIconRed,
+  ShareIconBlue,
 } from '@assets';
 import { applyFiltersOnRouter } from '@lib/router';
 import SafeIcon from '@shared/icons/SafeIcon';
 import { Refresh, StopCircleOutlined, Visibility } from '@mui/icons-material';
+
+// CodeMirror plus its JSON/YAML language packs and js-yaml only matter once this
+// modal is opened; a static import puts all of it in the listing route's bundle.
+const CreateWorkflowFromCodeModal = dynamic(() => import('./components/CreateWorkflowFromCodeModal'), { ssr: false });
 
 // Icons for menu items
 const pauseIcon = require('@assets/m_block.svg');
@@ -112,6 +120,19 @@ const readAccountFilterFromQuery = (query: Record<string, any>): string[] => {
 
 const renderAccountGroupIcon = (provider: string) => <CloudProviderIcon cloud_provider={provider} width='14px' height='14px' />;
 
+// Multi-line tooltip content for the Created/Updated-by byline: name and
+// email, one per line — so two people sharing a display name are still
+// distinguishable on hover.
+const renderUserTooltip = (user?: { display_name?: string; username?: string } | null) => {
+  if (!user?.display_name) return null;
+  return (
+    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.25 }}>
+      <Text value={user.display_name} sx={{ fontSize: 'var(--ds-text-small)', fontWeight: 'var(--ds-font-weight-medium)' }} />
+      {!!user.username && <Text value={user.username} sx={{ fontSize: 'var(--ds-text-caption)', color: 'var(--ds-gray-500)' }} />}
+    </Box>
+  );
+};
+
 // Filters the user picked here, remembered across visits. The sidebar links
 // back to a bare /automation, so without this every return trip resets the
 // view. Same mechanism the troubleshoot Events table uses.
@@ -133,15 +154,16 @@ interface WorkflowActionsCellProps {
   accountId: string | undefined;
   onStop: (workflow: any) => void;
   onEdit: (workflowId: string, workflowAccountId: string) => void;
-  getMenuItems: (workflow: any) => { label: string; id: string; icon: any; disabled?: boolean }[];
+  getMenuItems: (workflow: any) => { label: string; id: string; action: string; icon: any; disabled?: boolean }[];
   onMenuClick: (menuItem: any, workflow: any) => void;
 }
 
 const WorkflowActionsCell: React.FC<WorkflowActionsCellProps> = ({ workflow, accountId, onStop, onEdit, getMenuItems, onMenuClick }) => {
   const liveStatuses = useContext(LiveExecutionStatusContext);
   if (!accountId) return <></>;
-  // Read-only users get a single "View" affordance that opens the workflow
-  // in execution-view mode. No Cancel / 3-dots, since they cannot mutate.
+  // Read-only users get a "View" affordance that opens the workflow in
+  // execution-view mode, plus a 3-dots menu carrying only the read-only
+  // share/export items (getMenuItems gates the mutating ones on write access).
   if (!hasWriteAccess(accountId)) {
     return (
       <Box sx={{ display: 'flex', justifyContent: 'flex-end', mr: 'var(--ds-space-2)', gap: 'var(--ds-space-1)' }}>
@@ -154,6 +176,13 @@ const WorkflowActionsCell: React.FC<WorkflowActionsCellProps> = ({ workflow, acc
         >
           View
         </DsButton>
+        <ThreeDotsMenu
+          id={`workflow-menu-${workflow.id}`}
+          sx={{ ...action.primary }}
+          menuItems={getMenuItems(workflow)}
+          data={workflow}
+          onMenuClick={onMenuClick}
+        />
       </Box>
     );
   }
@@ -272,8 +301,6 @@ const WorkflowListing: React.FC = () => {
   const [createWorkflowOptionsOpen, setCreateWorkflowOptionsOpen] = useState<boolean>(false);
   const [createFromCodeOpen, setCreateFromCodeOpen] = useState<boolean>(false);
   const [templateModalOpen, setTemplateModalOpen] = useState<boolean>(false);
-  const [aiFeatureEnabled, setAiFeatureEnabled] = useState<boolean>(false);
-  const [templateFeatureEnabled, setTemplateFeatureEnabled] = useState<boolean>(false);
   const [selectedWorkflow, setSelectedWorkflow] = useState<any>({ id: '', name: '' });
   const [triggerLoading, setTriggerLoading] = useState<boolean>(false);
   const router = useRouter();
@@ -443,50 +470,72 @@ const WorkflowListing: React.FC = () => {
     }
   };
 
-  const getMenuItems = (workflow: any): { label: string; id: string; icon: any; disabled?: boolean }[] => {
-    const MENU_ITEMS: { label: string; id: string; icon: any; disabled?: boolean }[] = [];
+  const getMenuItems = (workflow: any): { label: string; id: string; action: string; icon: any; disabled?: boolean }[] => {
+    const MENU_ITEMS: { label: string; id: string; action: string; icon: any; disabled?: boolean }[] = [];
     const isRunning = ['RUNNING', 'IN_PROGRESS'].includes(workflow?.last_execution_status?.toUpperCase());
 
     if (workflow?.account_id && hasWriteAccess(workflow.account_id)) {
       // Add trigger option for all workflows
       MENU_ITEMS.push({
         label: 'Manual run',
-        id: 'manual-run',
+        id: `workflow-row-action-manual-run-${workflow.id}`,
+        action: 'manual-run',
         icon: manualTriggerIcon,
         disabled: isRunning,
       });
 
       MENU_ITEMS.push({
         label: 'Duplicate',
-        id: 'duplicate',
+        id: `workflow-row-action-duplicate-${workflow.id}`,
+        action: 'duplicate',
         icon: CopyIconBlue,
       });
+    }
 
-      // Check if workflow has schedule trigger
-      const pauseResumeApplicable = workflow?.definition?.triggers?.some((trigger: any) => ['schedule', 'event', 'webhook'].includes(trigger.type));
+    // Share / export are read-only operations, so they sit outside the
+    // write-access gate — a read-only user's kebab carries only these two.
+    if (workflow?.account_id) {
+      MENU_ITEMS.push({
+        label: 'Copy Link',
+        id: `workflow-row-action-copy-link-${workflow.id}`,
+        action: 'copy-link',
+        icon: ShareIconBlue,
+      });
 
-      if (pauseResumeApplicable) {
-        // State-aware toggle (see getAutomationToggleAction): Active -> Pause,
-        // Paused -> Activate, anything else (e.g. INACTIVE) -> neither.
-        const toggleAction = getAutomationToggleAction(workflow.status);
-        if (toggleAction === 'pause') {
-          MENU_ITEMS.push({
-            label: 'Pause',
-            id: 'pause',
-            icon: pauseIcon,
-          });
-        } else if (toggleAction === 'activate') {
-          MENU_ITEMS.push({
-            label: 'Activate',
-            id: 'resume',
-            icon: playIcon,
-          });
-        }
+      MENU_ITEMS.push({
+        label: 'Copy JSON',
+        id: `workflow-row-action-copy-json-${workflow.id}`,
+        action: 'copy-json',
+        icon: CopyIcon,
+      });
+    }
+
+    if (workflow?.account_id && hasWriteAccess(workflow.account_id)) {
+      // State-aware toggle (see getAutomationToggleAction): Active -> Pause,
+      // Paused -> Activate, anything else (e.g. INACTIVE) -> neither. Status is
+      // the only input — deliberately not gated on trigger type, see
+      // automationMenu.ts.
+      const toggleAction = getAutomationToggleAction(workflow.status);
+      if (toggleAction === 'pause') {
+        MENU_ITEMS.push({
+          label: 'Pause',
+          id: `workflow-row-action-pause-${workflow.id}`,
+          action: 'pause',
+          icon: pauseIcon,
+        });
+      } else if (toggleAction === 'activate') {
+        MENU_ITEMS.push({
+          label: 'Activate',
+          id: `workflow-row-action-resume-${workflow.id}`,
+          action: 'resume',
+          icon: playIcon,
+        });
       }
 
       MENU_ITEMS.push({
         label: 'Delete',
-        id: 'delete',
+        id: `workflow-row-action-delete-${workflow.id}`,
+        action: 'delete',
         icon: DeleteIconRed,
       });
     }
@@ -495,7 +544,7 @@ const WorkflowListing: React.FC = () => {
   };
 
   const onMenuClick = (menuItem: any, workflow: any) => {
-    if (menuItem.id === 'delete') {
+    if (menuItem.action === 'delete') {
       setSelectedWorkflow(workflow);
       setDeleteCallers(null);
       setDeleteCallersLoading(true);
@@ -520,17 +569,66 @@ const WorkflowListing: React.FC = () => {
           }
         }
       })();
-    } else if (menuItem.id === 'pause') {
+    } else if (menuItem.action === 'pause') {
       setSelectedWorkflow(workflow);
       setPauseModalOpen(true);
-    } else if (menuItem.id === 'resume') {
+    } else if (menuItem.action === 'resume') {
       setSelectedWorkflow(workflow);
       setResumeModalOpen(true);
-    } else if (menuItem.id === 'manual-run') {
+    } else if (menuItem.action === 'manual-run') {
       setSelectedWorkflow(workflow);
       setTriggerModalOpen(true);
-    } else if (menuItem.id === 'duplicate') {
+    } else if (menuItem.action === 'duplicate') {
       handleDuplicateWorkflow(workflow);
+    } else if (menuItem.action === 'copy-link') {
+      handleCopyWorkflowLink(workflow);
+    } else if (menuItem.action === 'copy-json') {
+      handleCopyWorkflowJson(workflow);
+    }
+  };
+
+  const handleCopyWorkflowLink = (workflow: any) => {
+    if (!workflow?.account_id) {
+      snackbar.error('Account ID is required');
+      return;
+    }
+    const url = buildWorkflowShareUrl(window.location.origin, workflow.id, workflow.account_id);
+    navigator.clipboard
+      .writeText(url)
+      .then(() => snackbar.success('Automation link copied to clipboard'))
+      .catch((error) => {
+        console.error('Error copying workflow link:', error);
+        snackbar.error('Failed to copy link to clipboard');
+      });
+  };
+
+  const handleCopyWorkflowJson = async (workflow: any) => {
+    const workflowAccountId = workflow?.account_id;
+    if (!workflowAccountId) {
+      snackbar.error('Account ID is required');
+      return;
+    }
+
+    try {
+      // Fetch full workflow definition (listing query does not include tasks)
+      const fullWorkflowResponse: any = await apiWorkflow.getWorkflowById(workflowAccountId, workflow.id);
+      const fullWorkflowErrorMessage = parseHttpResponseBodyMessage(fullWorkflowResponse);
+      if (fullWorkflowErrorMessage) {
+        snackbar.error(fullWorkflowErrorMessage);
+        return;
+      }
+
+      const fullWorkflow = fullWorkflowResponse.data?.workflow_get;
+      if (!fullWorkflow?.definition) {
+        snackbar.error('Failed to fetch automation definition');
+        return;
+      }
+
+      await navigator.clipboard.writeText(buildWorkflowExportJson(fullWorkflow));
+      snackbar.success('Automation JSON copied to clipboard');
+    } catch (error) {
+      console.error('Error copying workflow JSON:', error);
+      snackbar.error(`Failed to copy JSON for "${workflow.name}"`);
     }
   };
 
@@ -772,39 +870,11 @@ const WorkflowListing: React.FC = () => {
         return;
       }
 
-      // Build create request with cloned definition
-      const clonedDefinition = JSON.parse(JSON.stringify(fullWorkflow.definition));
-
-      // Strip fields not accepted by WorkflowDefinitionTaskRequest (e.g. 'outputs')
-      const cleanTasks = (tasks: any[]) => {
-        if (!Array.isArray(tasks)) return;
-        for (const task of tasks) {
-          delete task.outputs;
-          // Recursively clean nested tasks (e.g. core.foreach)
-          if (Array.isArray(task.params?.tasks)) {
-            cleanTasks(task.params.tasks);
-          }
-        }
-      };
-      if (clonedDefinition.tasks) {
-        cleanTasks(clonedDefinition.tasks);
-      }
-
-      // Webhook triggers carry a system-managed secret and an internal.name
-      // bound to the source workflow's ID (the `wf-<id>-` shadow prefix on
-      // legacy rows). Strip both so the backend re-derives a fresh secret
-      // and re-binds the integration under the new workflow's ID, matching
-      // the contract enforced by enforceWebhookSecrets / normalizeWebhookTriggers.
-      if (Array.isArray(clonedDefinition.triggers)) {
-        for (const trigger of clonedDefinition.triggers) {
-          if (trigger?.type === 'webhook') {
-            if (trigger.params) {
-              delete trigger.params.secret;
-            }
-            delete trigger.internal;
-          }
-        }
-      }
+      // Build create request with a cloned definition, stripped of task
+      // `outputs` (not accepted by WorkflowDefinitionTaskRequest) and of the
+      // webhook secret / internal binding, so the backend re-derives a fresh
+      // secret and re-binds the integration under the new workflow's ID.
+      const clonedDefinition = sanitizeWorkflowDefinitionForExport(fullWorkflow.definition);
 
       const createRequest: WorkflowCreateRequest = {
         account_id: workflowAccountId,
@@ -1369,7 +1439,7 @@ const WorkflowListing: React.FC = () => {
                           sx={{ fontSize: 'var(--ds-text-caption)', color: 'var(--ds-brand-500)' }}
                         />
                         {workflow.created_by_user?.display_name && (
-                          <Tooltip title={workflow.created_by_user.display_name} arrow placement='top'>
+                          <Tooltip title={renderUserTooltip(workflow.created_by_user)} arrow placement='top'>
                             <span>
                               <Text
                                 value={`· ${workflow.created_by_user.display_name.split(' ')[0]}`}
@@ -1389,7 +1459,7 @@ const WorkflowListing: React.FC = () => {
                           sx={{ fontSize: 'var(--ds-text-caption)', color: 'var(--ds-brand-500)' }}
                         />
                         {workflow.updated_by_user?.display_name && (
-                          <Tooltip title={workflow.updated_by_user.display_name} arrow placement='top'>
+                          <Tooltip title={renderUserTooltip(workflow.updated_by_user)} arrow placement='top'>
                             <span>
                               <Text
                                 value={`· ${workflow.updated_by_user.display_name.split(' ')[0]}`}
@@ -1561,10 +1631,10 @@ const WorkflowListing: React.FC = () => {
       try {
         const response = await apiUser.listUsers({ status: 'active' });
         const users = response?.data || [];
-        const userNames = users
-          .map((user: any) => user.display_name)
-          .filter(Boolean)
-          .sort();
+        // Two users can share a display_name — the backend filter already matches
+        // every user with that name, so dedup here rather than listing the same
+        // name twice (which made picking either one highlight both as selected).
+        const userNames = Array.from(new Set<string>(users.map((user: any) => user?.display_name).filter(Boolean))).sort();
         setCreatedByOptions(['All', ...userNames]);
       } catch (error) {
         console.error('Error fetching active users:', error);
@@ -1614,20 +1684,6 @@ const WorkflowListing: React.FC = () => {
     const handle = setInterval(tick, WORKFLOW_LISTING_POLL_INTERVAL_MS);
     return () => clearInterval(handle);
   }, [listWorkflows]);
-
-  // Check AI workflow feature flag
-  useEffect(() => {
-    const checkAiFeatureAccess = async () => {
-      try {
-        const hasAccess = await hasFeatureAccess('WORKFLOWS');
-        setAiFeatureEnabled(hasAccess);
-      } catch (error) {
-        console.error('Error checking AI workflow feature access:', error);
-        setAiFeatureEnabled(false);
-      }
-    };
-    checkAiFeatureAccess();
-  }, []);
 
   // Accounts backing the Account filter, the Account column and the create
   // modal's picker. Non-blocking: the listing renders fine with raw ids if this
@@ -1717,20 +1773,6 @@ const WorkflowListing: React.FC = () => {
     const only = filtered.length === 1 ? filtered[0] : writableAccountOptions.length === 1 ? writableAccountOptions[0].value : '';
     setCreateAccountId(only);
   }, [writableAccountOptions, selectedAccounts, createAccountId]);
-
-  // Check workflow templates feature flag
-  useEffect(() => {
-    const checkTemplateFeatureAccess = async () => {
-      try {
-        const hasAccess = await hasFeatureAccess('WORKFLOW_TEMPLATES');
-        setTemplateFeatureEnabled(hasAccess);
-      } catch (error) {
-        console.error('Error checking workflow templates feature access:', error);
-        setTemplateFeatureEnabled(false);
-      }
-    };
-    checkTemplateFeatureAccess();
-  }, []);
 
   const tableHeaders = [
     { name: 'Name', width: '26%' },
@@ -1914,7 +1956,8 @@ const WorkflowListing: React.FC = () => {
                 ))}
               </Box>
               <Box sx={{ fontSize: 'var(--ds-text-caption)', color: 'var(--ds-gray-600)', mt: 1 }}>
-                Note: automations that pass <code>workflow_name</code> as a template (<code>{`{{ ... }}`}</code>) can&apos;t be detected here.
+                Note: automations that pass <CodeBlock inline code='workflow_name' /> as a template (<CodeBlock inline code={`{{ ... }}`} />)
+                can&apos;t be detected here.
               </Box>
             </Box>
           )}
@@ -1937,7 +1980,12 @@ const WorkflowListing: React.FC = () => {
             </Box>
           }
         >
-          <DialogContentText>Are you sure you want to pause this scheduled automation? It will stop executing until resumed.</DialogContentText>
+          {/* "Any … triggers" rather than "its triggers": the dialog is shown for every trigger
+              type, and a manual-only automation has none of the three. */}
+          <DialogContentText>
+            Are you sure you want to pause this automation? Any schedule, event or webhook triggers will stop firing until it is activated again. It
+            can still be run manually.
+          </DialogContentText>
         </Modal>
 
         <Modal
@@ -1958,7 +2006,7 @@ const WorkflowListing: React.FC = () => {
           }
         >
           <DialogContentText>
-            Are you sure you want to activate this scheduled automation? It will start executing according to its schedule.
+            Are you sure you want to activate this automation? Any schedule, event or webhook triggers will start firing again.
           </DialogContentText>
         </Modal>
 
@@ -1988,18 +2036,22 @@ const WorkflowListing: React.FC = () => {
           <DialogContentText>Are you sure you want to cancel the currently running execution? This action cannot be undone.</DialogContentText>
         </Modal>
 
-        <TriggerWorkflowModal
-          open={triggerModalOpen}
-          onClose={handleCloseTriggerModal}
-          workflowName={selectedWorkflow.name}
-          triggerType={getPrimaryTriggerType(selectedWorkflow)}
-          defaultInputs={getDefaultTriggerInputs(selectedWorkflow)}
-          inputSchema={getWorkflowInputSchema(selectedWorkflow)}
-          onTrigger={handleTriggerWorkflow}
-          loading={triggerLoading}
-          liveVersionNumber={selectedWorkflow.live_version_number}
-          liveVersionName={selectedWorkflow.live_version_name}
-        />
+        {/* Mounted only while open so each open seeds the inputs fresh. */}
+        {triggerModalOpen && (
+          <TriggerWorkflowModal
+            key={selectedWorkflow.id}
+            open={triggerModalOpen}
+            onClose={handleCloseTriggerModal}
+            workflowName={selectedWorkflow.name}
+            triggerType={getPrimaryTriggerType(selectedWorkflow)}
+            defaultInputs={getDefaultTriggerInputs(selectedWorkflow)}
+            inputSchema={getWorkflowInputSchema(selectedWorkflow)}
+            onTrigger={handleTriggerWorkflow}
+            loading={triggerLoading}
+            liveVersionNumber={selectedWorkflow.live_version_number}
+            liveVersionName={selectedWorkflow.live_version_name}
+          />
+        )}
 
         <AiGenerateWorkflowModal
           open={aiGenerateModalOpen}
@@ -2019,8 +2071,6 @@ const WorkflowListing: React.FC = () => {
           onUseTemplate={handleUseTemplate}
           onAskAI={handleAskAIFromOptions}
           onCreateFromCode={handleCreateFromCode}
-          aiFeatureEnabled={aiFeatureEnabled}
-          templateFeatureEnabled={templateFeatureEnabled}
           accountOptions={writableAccountOptions}
           selectedAccountId={createAccountId}
           onAccountChange={setCreateAccountId}

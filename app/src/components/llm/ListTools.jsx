@@ -10,9 +10,9 @@ import CustomTable from '@shared/tables/CustomTable';
 import { Label } from '@ui/Label';
 import Text from '@shared/format/Text';
 import CreateTool from './CreateTool';
+import OwnerTypeBadge from './common/OwnerTypeBadge';
 import { Modal } from '@ui/Modal';
 import { hasWriteAccess } from '@lib/auth';
-import { useTenantBranding } from '@hooks/useTenantBranding';
 import { PlusIcon, EditIcon, ErrorIcon, DeleteIconRed } from '@assets';
 import SafeIcon from '@shared/icons/SafeIcon';
 import { snakeToTitleCase } from 'src/utils/common';
@@ -36,9 +36,11 @@ const ListTools = ({ accountId, stickyTable = false }) => {
   // toolListTool routes empty account_id to ListToolsForTenant — system
   // tool catalog + custom tools across every account the caller can
   // read. The UI replaces NB-Tool-Type with an Account column, drops the
-  // per-account is_configured warning, and hides Create / Edit.
+  // per-account is_configured warning, and hides Create. Custom tools keep
+  // Edit / Delete: each row carries the account it belongs to (account_id),
+  // which those actions run against.
   const isTenantWide = !accountId;
-  const { baseTitle } = useTenantBranding();
+  const toolAccountId = (tool) => (isTenantWide ? tool?.account_id || '' : accountId);
   const [data, setData] = React.useState([]);
   const [originalData, setOriginalData] = React.useState([]);
   const [loading, setLoading] = React.useState(false);
@@ -115,7 +117,7 @@ const ListTools = ({ accountId, stickyTable = false }) => {
     }
     setIsDeleting(true);
     try {
-      const response = await apiAskNudgebee.deleteTool(accountId, toolToDelete.name);
+      const response = await apiAskNudgebee.deleteTool(toolAccountId(toolToDelete), toolToDelete.name);
       if (!(response?.data?.data?.ai_delete_tool?.data?.status === 'ok')) {
         snackbar.error('Failed to delete tool');
         return;
@@ -142,6 +144,30 @@ const ListTools = ({ accountId, stickyTable = false }) => {
         setAllTools(allTools);
         if (listToolsResponse.length > 0) {
           const tools = listToolsResponse.map((tool) => {
+            const rowAccountId = toolAccountId(tool);
+            const actionCell = {
+              component:
+                tool.type === 'custom' && tool.nb_tool_type == 'tool' && Boolean(rowAccountId) && hasWriteAccess(rowAccountId) ? (
+                  <Stack direction='row' alignItems='center' spacing={1}>
+                    <Button
+                      tone='secondary'
+                      size='xs'
+                      composition='icon-only'
+                      icon={<SafeIcon src={EditIcon} alt='edit' height={20} width={20} />}
+                      aria-label='Edit tool'
+                      onClick={() => handleEditTool(tool)}
+                    />
+                    <Button
+                      tone='secondary'
+                      size='xs'
+                      composition='icon-only'
+                      icon={<SafeIcon src={DeleteIconRed} alt='delete' height={20} width={20} />}
+                      aria-label='Delete tool'
+                      onClick={() => handleDeleteTool(tool)}
+                    />
+                  </Stack>
+                ) : null,
+            };
             return [
               {
                 component: (
@@ -156,25 +182,7 @@ const ListTools = ({ accountId, stickyTable = false }) => {
                         </Tooltip>
                       )}
                     </Box>
-                    <Box
-                      sx={{
-                        display: 'inline-flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        backgroundColor: tool.type === 'system' ? ds.blue[100] : ds.gray[100],
-                        color: tool.type === 'system' ? ds.blue[700] : ds.gray[600],
-                        fontSize: ds.text.caption,
-                        fontWeight: ds.weight.semibold,
-                        padding: '2px 6px',
-                        borderRadius: ds.radius.pill,
-                        border: `1px solid ${tool.type === 'system' ? ds.blue[200] : ds.gray[200]}`,
-                        textTransform: 'uppercase',
-                        letterSpacing: '0.5px',
-                        width: 'fit-content',
-                      }}
-                    >
-                      {tool.type === 'system' ? `${baseTitle} System` : 'User Created'}
-                    </Box>
+                    <OwnerTypeBadge type={tool.type} systemSuffix='System' userLabel='User Created' />
                   </Box>
                 ),
                 rawData: { name: tool.name, type: tool.type, status: tool.status },
@@ -185,42 +193,20 @@ const ListTools = ({ accountId, stickyTable = false }) => {
               {
                 component: <Label text={tool.status} />,
               },
-              // Tenant-wide swaps NB Tool Type + Actions for an Account
-              // column. Edit is per-account, so it's hidden alongside
-              // Create. System tools never have an account; show '—'.
+              // Tenant-wide swaps NB Tool Type for an Account column. System
+              // tools never have an account; show '—'.
               ...(isTenantWide
                 ? [
                     {
                       component: <Text value={tool.account_name || (tool.type === 'system' ? '—' : tool.account_id || '—')} />,
                     },
+                    actionCell,
                   ]
                 : [
                     {
                       text: <Label text={snakeToTitleCase(tool.nb_tool_type)} />,
                     },
-                    {
-                      component:
-                        tool.type === 'custom' && tool.nb_tool_type == 'tool' && hasWriteAccess(accountId) ? (
-                          <Stack direction='row' alignItems='center' spacing={1}>
-                            <Button
-                              tone='secondary'
-                              size='xs'
-                              composition='icon-only'
-                              icon={<SafeIcon src={EditIcon} alt='edit' height={20} width={20} />}
-                              aria-label='Edit tool'
-                              onClick={() => handleEditTool(tool)}
-                            />
-                            <Button
-                              tone='secondary'
-                              size='xs'
-                              composition='icon-only'
-                              icon={<SafeIcon src={DeleteIconRed} alt='delete' height={20} width={20} />}
-                              aria-label='Delete tool'
-                              onClick={() => handleDeleteTool(tool)}
-                            />
-                          </Stack>
-                        ) : null,
-                    },
+                    actionCell,
                   ]),
             ];
           });
@@ -249,7 +235,7 @@ const ListTools = ({ accountId, stickyTable = false }) => {
         title={editMode ? 'Edit Tool' : 'Add Tool'}
       >
         <CreateTool
-          accountId={accountId}
+          accountId={toolAccountId(selectedTool)}
           handleClose={(value) => {
             if (value == 'success') {
               listTools();
@@ -376,10 +362,11 @@ const ListTools = ({ accountId, stickyTable = false }) => {
             headers={
               isTenantWide
                 ? [
-                    { name: 'Name', width: '25%' },
-                    { name: 'Description', width: '45%' },
+                    { name: 'Name', width: '20%' },
+                    { name: 'Description', width: '40%' },
                     { name: 'Status', width: '15%' },
                     { name: 'Account', width: '15%' },
+                    { name: 'Actions', width: '10%' },
                   ]
                 : [
                     { name: 'Name', width: '20%' },

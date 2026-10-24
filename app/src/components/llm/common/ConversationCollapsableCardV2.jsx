@@ -22,6 +22,7 @@ function ConversationCollapsableCard({
   showFullText = false,
   textLength = false,
   headerActions = null,
+  expander = null,
 }) {
   // Per-type padding — extracted to a variable to keep the JSX clean (Sonar S3358).
   let cardPadding = `${ds.space[3]} ${ds.space[4]} ${ds.space[3]} ${ds.space[4]}`;
@@ -36,7 +37,7 @@ function ConversationCollapsableCard({
       id={id}
       sx={{
         background: (toolData.tool || toolData.type) === 'question' ? 'var(--ds-background-200)' : 'transparent',
-        fontFamily: toolData.type === 'response' && '"Poppins", sans-serif',
+        fontFamily: toolData.type === 'response' && ds.font.display,
         backgroundColor: (toolData.tool || toolData.type) === 'question' && 'var(--ds-background-200)',
         borderTop: 'none',
         borderBottom:
@@ -136,7 +137,7 @@ function ConversationCollapsableCard({
                   sx={{
                     fontSize: 'var(--ds-text-body-lg)',
                     color: 'var(--ds-gray-700)',
-                    fontFamily: toolData?.tool === 'question' || toolData?.type === 'question' ? '"Poppins", sans-serif' : 'Roboto',
+                    fontFamily: toolData?.tool === 'question' || toolData?.type === 'question' ? ds.font.display : 'Roboto',
                   }}
                 >
                   {text}
@@ -225,6 +226,7 @@ function ConversationCollapsableCard({
               }}
             >
               {headerActions}
+              {expander}
               {conversationCreatedAt && conversationUpdatedAt && !['planner', 'response'].includes(toolData.tool || toolData.type) && (
                 <Duration createdAt={conversationCreatedAt} updatedAt={conversationUpdatedAt} live={toolData.response_status === 'in_progress'} />
               )}
@@ -253,6 +255,7 @@ ConversationCollapsableCard.propTypes = {
   showFullText: PropTypes.bool,
   textLength: PropTypes.bool,
   headerActions: PropTypes.node,
+  expander: PropTypes.node,
 };
 
 export default ConversationCollapsableCard;

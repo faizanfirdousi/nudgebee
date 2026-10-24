@@ -43,14 +43,18 @@ import (
 // UnmarshalJSON captures the top-level key set into presentKeys so the
 // merge step can distinguish absent from null (a plain *bool zeroes both).
 type egressConfigRequest struct {
-	Mode    *string `json:"mode"`
-	Enabled *bool   `json:"enabled"`
+	Mode           *string `json:"mode"`
+	Enabled        *bool   `json:"enabled"`
+	EntropyEnabled *bool   `json:"entropy_enabled"`
 
 	// PII sibling detector (V827 backend + this action).
 	PIIEnabled            *bool     `json:"pii_enabled"`
 	PIIMode               *string   `json:"pii_mode"`
 	PIINerEnabled         *bool     `json:"pii_ner_enabled"`
 	PIIDisabledCategories *[]string `json:"pii_disabled_categories"`
+
+	// Agents skipping detection (V898) -> see TenantConfig.DisabledAgents.
+	DisabledAgents *[]string `json:"disabled_agents"`
 
 	presentKeys map[string]struct{} `json:"-"`
 }
@@ -116,6 +120,7 @@ const (
 	errorEgressInvalidPIIMode   = "egressfilter: pii_mode must be one of: detect, enforce (or null to inherit env default)"
 	errorEgressInvalidPIICatFmt = "egressfilter: pii_disabled_categories contains unknown value: %s (allowed: EMAIL, PERSON, PHONE, LOCATION)"
 	errorEgressTooManyPIICats   = "egressfilter: pii_disabled_categories exceeds max entries (8)"
+	errorEgressTooManyAgents    = "egressfilter: disabled_agents exceeds max entries (50)"
 	maxPIIDisabledCategoriesRPC = 8
 )
 
@@ -131,12 +136,15 @@ func egressConfigResponse(cfg *egressfilter.TenantConfig, mode egressfilter.Mode
 	// Nullable bools go out as JSON null when unset, so the UI can distinguish
 	// "inherit env" from "explicit false" without a second flag.
 	var (
-		piiEnabled    any = nil
-		piiNerEnabled any = nil
-		piiMode       string
-		piiCats       []string
+		piiEnabled     any = nil
+		piiNerEnabled  any = nil
+		piiMode        string
+		piiCats        []string
+		disabledAgents []string
+		entropyEnabled = config.Config.LlmServerEgressFilterEntropyEnabled
 	)
 	if cfg != nil {
+		entropyEnabled = cfg.EntropyEnabled
 		if cfg.PIIEnabled != nil {
 			piiEnabled = *cfg.PIIEnabled
 		}
@@ -145,13 +153,18 @@ func egressConfigResponse(cfg *egressfilter.TenantConfig, mode egressfilter.Mode
 		}
 		piiMode = cfg.PIIMode
 		piiCats = cfg.PIIDisabledCategories
+		disabledAgents = cfg.DisabledAgents
 	}
 	if piiCats == nil {
 		piiCats = []string{}
 	}
+	if disabledAgents == nil {
+		disabledAgents = []string{}
+	}
 	return gin.H{
 		"mode":            string(mode),
 		"enabled":         enabled,
+		"entropy_enabled": entropyEnabled,
 		"has_override":    hasOverride,
 		"custom_patterns": patterns,
 		// PII tenant values (nullable → inherit env when null).
@@ -159,6 +172,7 @@ func egressConfigResponse(cfg *egressfilter.TenantConfig, mode egressfilter.Mode
 		"pii_mode":                piiMode,
 		"pii_ner_enabled":         piiNerEnabled,
 		"pii_disabled_categories": piiCats,
+		"disabled_agents":         disabledAgents,
 		// Read-only platform context (from env), so the UI can explain when a
 		// tenant setting has no effect and render "Use platform default (X)"
 		// for tri-state overrides. Note: env_pii_enabled was removed
@@ -221,9 +235,10 @@ func patternsFromCfg(cfg *egressfilter.TenantConfig) []egressfilter.CustomRule {
 // has no override row yet.
 func defaultTenantConfig(tenantID uuid.UUID) *egressfilter.TenantConfig {
 	return &egressfilter.TenantConfig{
-		TenantID: tenantID,
-		Mode:     egressfilter.ParseMode(config.Config.LlmServerEgressFilterSecretsMode),
-		Enabled:  config.Config.LlmServerEgressFilterSecretsEnabled,
+		TenantID:       tenantID,
+		Mode:           egressfilter.ParseMode(config.Config.LlmServerEgressFilterSecretsMode),
+		Enabled:        config.Config.LlmServerEgressFilterSecretsEnabled,
+		EntropyEnabled: config.Config.LlmServerEgressFilterEntropyEnabled,
 	}
 }
 
@@ -504,6 +519,9 @@ func mergeEgressConfigUpdate(cfg *egressfilter.TenantConfig, request egressConfi
 	if request.Enabled != nil {
 		cfg.Enabled = *request.Enabled
 	}
+	if request.EntropyEnabled != nil {
+		cfg.EntropyEnabled = *request.EntropyEnabled
+	}
 	if request.isPresent("pii_enabled") {
 		cfg.PIIEnabled = request.PIIEnabled // nil = clear
 	}
@@ -519,6 +537,17 @@ func mergeEgressConfigUpdate(cfg *egressfilter.TenantConfig, request egressConfi
 				return errors.New(errorEgressInvalidPIIMode)
 			}
 			cfg.PIIMode = normalized
+		}
+	}
+	if request.isPresent("disabled_agents") {
+		if request.DisabledAgents == nil {
+			cfg.DisabledAgents = nil
+		} else {
+			normalized, err := parseEgressDisabledAgents(*request.DisabledAgents)
+			if err != nil {
+				return err
+			}
+			cfg.DisabledAgents = normalized
 		}
 	}
 	if request.isPresent("pii_disabled_categories") {
@@ -552,6 +581,35 @@ func parseEgressPIIMode(raw string) (string, bool) {
 // parseEgressPIICategories uppercases + dedupes + closed-set-validates the
 // input. Empty input → nil (cleared). Unknown category → error with the
 // allowed set in the message.
+// Trim, drop blanks, dedupe. Names are free-form -> no allowed-value check,
+// but the cap is enforced; matching is exact at read time.
+func parseEgressDisabledAgents(in []string) ([]string, error) {
+	if len(in) == 0 {
+		return nil, nil
+	}
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, raw := range in {
+		v := strings.TrimSpace(raw)
+		if v == "" {
+			continue
+		}
+		key := strings.ToLower(v)
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, v)
+	}
+	if len(out) == 0 {
+		return nil, nil // all-blank input -> nil, same as empty input
+	}
+	if len(out) > maxDisabledAgentsEntries {
+		return nil, errors.New(errorEgressTooManyAgents)
+	}
+	return out, nil
+}
+
 func parseEgressPIICategories(in []string) ([]string, error) {
 	if len(in) == 0 {
 		return nil, nil

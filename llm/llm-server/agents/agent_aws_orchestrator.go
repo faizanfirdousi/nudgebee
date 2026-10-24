@@ -50,7 +50,8 @@ func init() {
 // prompt (agent_aws_lean). Every specialist (databases, kubectl, aws_observability,
 // other clouds, github, tickets, …) is dropped from context and reached on-demand
 // via search_tools + delegate_agent. Everything else — including the answer
-// critique — runs through the same ReAct3 planner under the standard gates.
+// critique — runs through the runtime-selected ReAct planner under the standard
+// gates.
 type AwsOrchestratorAgent struct {
 	accountId string
 }
@@ -65,11 +66,11 @@ func newAwsOrchestratorAgent(accountId string) core.NBAgent {
 func (a *AwsOrchestratorAgent) GetName() string { return AgentAwsOrchestratorName }
 
 func (a *AwsOrchestratorAgent) GetNameAliases() []string {
-	return []string{"aws debug", "amazon_aws_debug", "aws_debug"}
+	return []string{"AWS Troubleshooter", "aws debug", "amazon_aws_debug", "aws_debug"}
 }
 
 func (a *AwsOrchestratorAgent) GetDescription() string {
-	return `Lean-loop AWS SRE/DevOps troubleshooting orchestrator: minimal principle-level prompt, direct aws_execute, specialists reached on-demand via search_tools + delegate_agent.`
+	return `Lean-loop AWS SRE/DevOps troubleshooting orchestrator: workspace-based AWS commands and local analysis with the normal approval flow, and specialists reached on-demand via search_tools + delegate_agent.`
 }
 
 func (a *AwsOrchestratorAgent) GetPlannerType() core.AgentPlannerType {
@@ -85,7 +86,7 @@ func (a *AwsOrchestratorAgent) IsWatchCapable() bool { return true }
 
 // NB: no CritiqueEnabled() method on purpose — the orchestrator does not
 // implement NBAgentReActPlannerCritiqueSupport, so critique is governed by the
-// standard gate (LlmServerReActCritiqueEnabled && top-level && investigation).
+// standard gate (top-level && investigation).
 
 func (a *AwsOrchestratorAgent) GetSupportedTools(ctx *security.RequestContext) []tocore.NBTool {
 	// Reduced cloud core (aws_execute + SDG + events + recommendations + delegate

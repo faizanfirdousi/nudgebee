@@ -341,6 +341,10 @@ describe('tryBypassGraphQL', () => {
 
   beforeEach(() => {
     process.env.SERVICE_API_SERVER_URL = 'http://test-api';
+    // Actions routed at llm-server (ai_create_agent, …) need their handler var
+    // resolvable too — an unset one is now a `handler_unresolved` short-circuit
+    // rather than a relative URL handed to the fetch mock.
+    process.env.LLM_SERVER_URL = 'http://test-llm';
   });
 
   afterEach(() => {
@@ -523,7 +527,7 @@ describe('tryBypassGraphQL', () => {
     }
     expect(result.body.errors?.[0].message).toBe('Handler URL unresolved for llm_gateway_list_rate_limits');
     // The variable name is the whole point of the fix: it must reach the server log.
-    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('missingEnv=LLM_GATEWAY_URL'));
+    expect(errorSpy).toHaveBeenCalledWith('%s', expect.stringContaining('missingEnv=LLM_GATEWAY_URL'));
     errorSpy.mockRestore();
   });
 
@@ -660,12 +664,43 @@ describe('tryBypassGraphQL', () => {
     expect((result.body.errors?.[0] as { extensions?: Record<string, unknown> } | undefined)?.extensions).not.toHaveProperty('internal');
   });
 
+  // The api-server can ship 200 + application/json + an EMPTY body: gin writes the
+  // Content-Type before json.Marshal runs, so a marshal failure (a NaN/+Inf metric
+  // sample was the case that surfaced this) leaves the header out and the body gone.
+  // That is the upstream failing, not the client failing to parse.
+  it('reports a 2xx with an empty JSON body as an upstream error, not a parse failure', async () => {
+    const fetchMock = jest.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => 'application/json' },
+      text: async () => '',
+    });
+    (global as { fetch: unknown }).fetch = fetchMock;
+
+    const result = await tryBypassGraphQL({
+      query: 'query A { integrations_list { items { id } } }',
+      variables: undefined,
+      jwt: adminJwt,
+      traceparent: 'tp',
+      requestId: 'rid',
+    });
+
+    expect(result.handled).toBe(true);
+    if (!result.handled) {
+      return;
+    }
+    const message = (result.body.errors?.[0] as { message: string }).message;
+    expect(message).toContain('empty body');
+    expect(message).not.toMatch(/parse failed/i);
+  });
+
   it('extracts the inner errors[0].message from graphql-style upstream bodies (HTTP 429 budget)', async () => {
     const fetchMock = jest.fn().mockResolvedValue({
       ok: false,
       status: 429,
       headers: { get: () => 'application/json' },
       json: async () => ({ errors: [{ message: 'budget: monthly budget limit exceeded for your organization' }] }),
+      text: async () => JSON.stringify({ errors: [{ message: 'budget: monthly budget limit exceeded for your organization' }] }),
     });
     (global as { fetch: unknown }).fetch = fetchMock;
 
@@ -693,6 +728,7 @@ describe('tryBypassGraphQL', () => {
       status: 503,
       headers: { get: () => 'application/json' },
       json: async () => ({}),
+      text: async () => JSON.stringify({}),
     });
     (global as { fetch: unknown }).fetch = fetchMock;
 
@@ -722,6 +758,7 @@ describe('tryBypassGraphQL', () => {
       status: 400,
       headers: { get: () => 'application/json' },
       json: async () => ({ message: innerMsg }),
+      text: async () => JSON.stringify({ message: innerMsg }),
     });
     (global as { fetch: unknown }).fetch = fetchMock;
 
@@ -750,6 +787,7 @@ describe('tryBypassGraphQL', () => {
       status: 400,
       headers: { get: () => 'application/json' },
       json: async () => [{ message: 'invalid account id' }],
+      text: async () => JSON.stringify([{ message: 'invalid account id' }]),
     });
     (global as { fetch: unknown }).fetch = fetchMock;
 
@@ -779,12 +817,14 @@ describe('tryBypassGraphQL', () => {
         status: 200,
         headers: { get: () => 'application/json' },
         json: async () => ({ items: [{ id: '1' }] }),
+        text: async () => JSON.stringify({ items: [{ id: '1' }] }),
       })
       .mockResolvedValueOnce({
         ok: true,
         status: 200,
         headers: { get: () => 'application/json' },
         json: async () => ({ items: [{ id: '2' }] }),
+        text: async () => JSON.stringify({ items: [{ id: '2' }] }),
       });
     (global as { fetch: unknown }).fetch = fetchMock;
 

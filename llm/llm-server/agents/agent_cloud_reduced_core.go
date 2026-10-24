@@ -32,7 +32,9 @@ func cloudLeanCoreToolNames(cliToolName string) []string {
 		TracesAgentName,
 		ServiceDependencyGraph,
 		EventsAgentName,
-		RecommendationsAgentName,
+		// Recommendation records via the raw SQL tool (one hop); finops below
+		// owns cost analysis, resolution history and writes.
+		tools.ToolRecommendationExecuteSql,
 		// websearch is preloaded so the model can ground cloud-specific
 		// error-message / API-version investigation questions ("what does
 		// gcloud error X mean", "which region supports Y service") without
@@ -45,6 +47,9 @@ func cloudLeanCoreToolNames(cliToolName string) []string {
 		// planner to search for it — without the mount the model hand-writes
 		// billing CLI calls instead. Same rationale as the k8s reduced core.
 		FinOpsAgentName,
+		// Unmentioned self-awareness questions arrive at the environment
+		// orchestrator. Mount Nubi so its description can route delegation.
+		NudgebeeAgentName,
 		DelegateAgentToolName,
 		SearchToolsToolName,
 		// search_skills preload preserved so the model can query knowledge bases

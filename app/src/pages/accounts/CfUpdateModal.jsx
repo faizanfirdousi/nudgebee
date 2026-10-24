@@ -1,4 +1,5 @@
-import { Grid, Typography, Alert } from '@mui/material';
+import { Box, Grid, Typography } from '@mui/material';
+import { Banner } from '@ui/Banner';
 import { Checkbox } from '@ui/Checkbox';
 import React, { useRef, useState } from 'react';
 import PropTypes from 'prop-types';
@@ -9,9 +10,9 @@ import MarkDowns from '@shared/viewers/MarkDowns';
 import apiKubernetes1 from '@api1/kubernetes1';
 import { getBrandTitle } from '@hooks/useTenantBranding';
 
-const CF_UPDATE_INSTRUCTIONS = `### Update CloudFormation Permissions
+const cfUpdateInstructions = () => `### Update CloudFormation Permissions
   ### Step 1. Review the options below
-   - Choose which permissions to enable for your Nudgebee integration.
+   - Choose which permissions to enable for your ${getBrandTitle()} integration.
   ### Step 2. Click "Open AWS Console"
    - It will open the CloudFormation stack update page.
    - The new template will be pre-selected.
@@ -85,17 +86,31 @@ const CfUpdateModal = ({ open, onClose, accountId }) => {
       {data && (
         <>
           {data.needs_update ? (
-            <Alert severity='info' sx={{ mx: 2, mt: 1 }}>
-              Stack <strong>{data.stack_name}</strong> is on v{data.template_version}. Latest version is v{data.latest_version}.
-            </Alert>
+            <Box sx={{ mx: 2, mt: 1 }}>
+              <Banner
+                tone='info'
+                message={
+                  <>
+                    Stack <strong>{data.stack_name}</strong> is on v{data.template_version}. Latest version is v{data.latest_version}.
+                  </>
+                }
+              />
+            </Box>
           ) : (
-            <Alert severity='success' sx={{ mx: 2, mt: 1 }}>
-              Stack <strong>{data.stack_name}</strong> is already on the latest version (v{data.latest_version}). You can still update parameter
-              settings below.
-            </Alert>
+            <Box sx={{ mx: 2, mt: 1 }}>
+              <Banner
+                tone='success'
+                message={
+                  <>
+                    Stack <strong>{data.stack_name}</strong> is already on the latest version (v{data.latest_version}). You can still update parameter
+                    settings below.
+                  </>
+                }
+              />
+            </Box>
           )}
 
-          <MarkDowns data={CF_UPDATE_INSTRUCTIONS} sx={{ width: 'auto' }} />
+          <MarkDowns data={cfUpdateInstructions()} sx={{ width: 'auto' }} />
 
           <Grid container spacing={1} px={3} mt={1}>
             <Grid item xs={12}>
@@ -105,8 +120,8 @@ const CfUpdateModal = ({ open, onClose, accountId }) => {
                 onChange={(next) => setSsmAccess(next)}
                 label={
                   <Typography variant='body2' component='span'>
-                    <strong>Enable SSM Parameter Store access</strong> — allows Nudgebee to read parameter values. Only enable if your parameters do
-                    not contain secrets.
+                    <strong>Enable SSM Parameter Store access</strong>
+                    {` — allows ${getBrandTitle()} to read parameter values. Only enable if your parameters do not contain secrets.`}
                   </Typography>
                 }
               />
@@ -125,13 +140,20 @@ const CfUpdateModal = ({ open, onClose, accountId }) => {
             </Grid>
           </Grid>
 
-          <Alert severity='warning' sx={{ mx: 2, mt: 2 }}>
-            When you reach <strong>Step 2 (Parameters)</strong> in AWS Console, set:
-            <br />
-            &bull; <strong>NudgebeeSsmAccess</strong> = <code>{ssmAccess ? 'enabled' : 'disabled'}</code>
-            <br />
-            &bull; <strong>NudgebeeAccessMode</strong> = <code>{readOnly ? 'readonly' : 'readwrite'}</code>
-          </Alert>
+          <Box sx={{ mx: 2, mt: 2 }}>
+            <Banner
+              tone='warning'
+              message={
+                <>
+                  When you reach <strong>Step 2 (Parameters)</strong> in AWS Console, set:
+                  <br />
+                  &bull; <strong>NudgebeeSsmAccess</strong> = <code>{ssmAccess ? 'enabled' : 'disabled'}</code>
+                  <br />
+                  &bull; <strong>NudgebeeAccessMode</strong> = <code>{readOnly ? 'readonly' : 'readwrite'}</code>
+                </>
+              }
+            />
+          </Box>
 
           <Grid container spacing={2} mt={1} mb={4} justifyContent='flex-end' sx={{ button: { minWidth: '140px' } }}>
             <Grid item>

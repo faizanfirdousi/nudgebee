@@ -1,4 +1,6 @@
-import { Grid, Typography, Box, Stepper, Step, StepLabel } from '@mui/material';
+import { Grid, Typography, Box } from '@mui/material';
+import { Stepper } from '@ui/Stepper';
+import { getBrandTitle } from '@hooks/useTenantBranding';
 import { Chip } from '@ui/Chip';
 import { Divider } from '@ui/Divider';
 import OpenInNewIcon from '@mui/icons-material/OpenInNew';
@@ -162,7 +164,7 @@ const AddAwsOrgModal = ({ open, onClose }) => {
               Set Organization Name
             </Typography>
             <Typography variant='body2' sx={{ color: ds.gray[400], fontSize: ds.text.small }}>
-              Enter a display name for your AWS Organization. This will be used to identify the organization in Nudgebee.
+              {`Enter a display name for your AWS Organization. This will be used to identify the organization in ${getBrandTitle()}.`}
             </Typography>
           </Box>
         </Grid>
@@ -278,7 +280,7 @@ const AddAwsOrgModal = ({ open, onClose }) => {
             overflowX: 'auto',
           }}
         >
-          <Typography variant='body2' sx={{ fontSize: ds.text.bodyLg, color: ds.background[100], fontFamily: 'monospace', wordBreak: 'break-all' }}>
+          <Typography variant='body2' sx={{ fontSize: ds.text.bodyLg, color: ds.background[100], fontFamily: ds.font.mono, wordBreak: 'break-all' }}>
             {verificationToken}
           </Typography>
 
@@ -320,7 +322,7 @@ const AddAwsOrgModal = ({ open, onClose }) => {
             overflowX: 'auto',
           }}
         >
-          <Typography variant='body2' sx={{ fontSize: ds.text.body, color: ds.background[100], fontFamily: 'monospace', wordBreak: 'break-all' }}>
+          <Typography variant='body2' sx={{ fontSize: ds.text.body, color: ds.background[100], fontFamily: ds.font.mono, wordBreak: 'break-all' }}>
             {templateUrl}
           </Typography>
 
@@ -375,7 +377,7 @@ const AddAwsOrgModal = ({ open, onClose }) => {
                 <Box
                   sx={{
                     flex: 1,
-                    fontFamily: 'monospace',
+                    fontFamily: ds.font.mono,
                     fontSize: ds.text.caption,
                     wordBreak: 'break-all',
                     mx: ds.space[2],
@@ -494,7 +496,7 @@ const AddAwsOrgModal = ({ open, onClose }) => {
                       '&:last-child': { borderRadius: `0 0 ${ds.radius.lg} ${ds.radius.lg}` },
                     }}
                   >
-                    <Box sx={{ fontFamily: 'monospace', fontSize: ds.text.small }}>{account.account_number}</Box>
+                    <Box sx={{ fontFamily: ds.font.mono, fontSize: ds.text.small }}>{account.account_number}</Box>
                     <Box>{account.account_name}</Box>
                     <Box>
                       <Chip
@@ -565,14 +567,14 @@ const AddAwsOrgModal = ({ open, onClose }) => {
     >
       <Box sx={{ px: ds.space[5] }}>
         <Box sx={{ mb: ds.space[5], mt: ds.space[4] }}>
-          <Stepper activeStep={step - 1} orientation='horizontal'>
-            <Step>
-              <StepLabel>Set Organization Name</StepLabel>
-            </Step>
-            <Step>
-              <StepLabel>Deploy StackSet</StepLabel>
-            </Step>
-          </Stepper>
+          <Stepper
+            steps={[
+              { id: 'name', label: 'Set Organization Name' },
+              { id: 'stackset', label: 'Deploy StackSet' },
+            ]}
+            current={step - 1}
+            orientation='horizontal'
+          />
         </Box>
 
         {step === 1 && renderStep1()}

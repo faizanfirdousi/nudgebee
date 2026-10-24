@@ -9,13 +9,6 @@ import (
 func init() {
 	RegisterAction("k8s_pod_log_enricher", &podLogAction{})
 	RegisterAction("k8s_resource", &k8sResourceAction{})
-	RegisterAction("k8s_pod_metric_enricher", &podMetricAction{})
-	RegisterAction("k8s_pod_cpu_metric_enricher", &podMetricAction{
-		autodetectResource: "cpu",
-	})
-	RegisterAction("k8s_pod_memory_metric_enricher", &podMetricAction{
-		autodetectResource: "memory",
-	})
 	RegisterAction("k8s_kubectl", &k8sKubectlAction{})
 	RegisterAction("notification_channel_join", &notificationChannelJoinAction{})
 	RegisterAction("notification_channel_message", &notificationChannelMessageAction{})
@@ -37,11 +30,8 @@ func init() {
 	// logs_enricher); the auto-discovery loop in eventrule/service.go invokes
 	// any registered action whose CanAutoExecute predicate matches the event.
 	RegisterAction("oom_killer_enricher", &oomKillerAction{})
-	RegisterAction("noisy_neighbours_enricher", &noisyNeighboursAction{})
-	RegisterAction("pod_node_metrics_enricher_memory", &podNodeMetricsAction{resourceType: "memory"})
 	RegisterAction("pod_enricher", &podEnricherAction{})
 	RegisterAction("resource_events_enricher", &resourceEventsAction{})
-	RegisterAction("impacted_services_enricher", &impactedServicesAction{})
 	RegisterAction("job_info_enricher", &jobInfoAction{})
 	RegisterAction("job_events_enricher", &jobEventsAction{})
 	RegisterAction("job_pod_enricher", &jobPodAction{})

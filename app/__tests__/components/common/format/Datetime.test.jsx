@@ -1,6 +1,6 @@
 import React from 'react';
 import { render, screen } from '@testing-library/react';
-import Datetime from '@shared/format/Datetime';
+import Datetime, { formatClock, formatClockCompact, formatTooltip } from '@shared/format/Datetime';
 
 jest.mock('@ui/Tooltip', () => ({
   __esModule: true,
@@ -39,6 +39,11 @@ describe('Datetime', () => {
     it('renders custom emptyValue when value is falsy', () => {
       render(<Datetime value={null} emptyValue='N/A' />);
       expect(screen.getByText('N/A')).toBeInTheDocument();
+    });
+
+    it('renders the placeholder for an unparseable value rather than a formatted NaN', () => {
+      render(<Datetime value='not-a-date' baseDate={BASE} showTooltip={false} />);
+      expect(screen.getByText('-')).toBeInTheDocument();
     });
   });
 
@@ -121,6 +126,34 @@ describe('Datetime', () => {
       expect(screen.getByText(/\d{2}-Jun/)).toBeInTheDocument();
       expect(screen.queryByText('ago')).not.toBeInTheDocument();
     });
+
+    it('carries the year when the date falls in an earlier year', () => {
+      // Without the year, a volume created in 2022 reads the same as one from
+      // this year, which is the whole point of showing an age. The day is left
+      // out of the assertion because the suite fixes no timezone.
+      render(<Datetime value={new Date('2022-03-14T09:00:00Z')} baseDate={BASE} showTooltip={false} />);
+      expect(screen.getByText(/-Mar-2022$/)).toBeInTheDocument();
+    });
+
+    it('leaves a date in the reference year without a year', () => {
+      render(<Datetime value={new Date('2024-03-14T09:00:00Z')} baseDate={BASE} showTooltip={false} />);
+      expect(screen.getByText(/^\d{2}-Mar$/)).toBeInTheDocument();
+    });
+
+    it('carries the year on a future date in a later year', () => {
+      render(<Datetime value={new Date('2025-03-14T09:00:00Z')} baseDate={BASE} showTooltip={false} />);
+      expect(screen.getByText(/-Mar-2025$/)).toBeInTheDocument();
+    });
+
+    it('carries the reference year when alwaysShowYear is set', () => {
+      render(<Datetime value={new Date('2024-03-14T09:00:00Z')} baseDate={BASE} showTooltip={false} alwaysShowYear />);
+      expect(screen.getByText(/-Mar-2024$/)).toBeInTheDocument();
+    });
+
+    it('keeps relative buckets under 3 days even with alwaysShowYear', () => {
+      render(<Datetime value={past(2 * ONE_DAY)} baseDate={BASE} showTooltip={false} alwaysShowYear />);
+      expect(screen.getByText('2d')).toBeInTheDocument();
+    });
   });
 
   // ─── relative time buckets (future) ────────────────────────────────────────
@@ -178,10 +211,17 @@ describe('Datetime', () => {
       expect(screen.queryByTestId('tooltip')).not.toBeInTheDocument();
     });
 
-    it('tooltip title follows "HH:MM TZ, DD-MMM" format', () => {
+    it('tooltip title follows "HH:MM TZ, DD-MMM-YYYY" format', () => {
       render(<Datetime value={past(30 * ONE_SEC)} baseDate={BASE} />);
       const title = screen.getByTestId('tooltip').getAttribute('data-title');
-      expect(title).toMatch(/^\d{2}:\d{2} .+, \d{2}-[A-Z][a-z]{2}$/);
+      expect(title).toMatch(/^\d{2}:\d{2} .+, \d{2}-[A-Z][a-z]{2}-\d{4}$/);
+    });
+
+    it('tooltip carries the year even while the label is still relative', () => {
+      // A "2d ago" label is the only other thing on screen; the hover is where
+      // the exact date, year included, has to be available.
+      render(<Datetime value={past(2 * ONE_DAY)} baseDate={BASE} />);
+      expect(screen.getByTestId('tooltip').getAttribute('data-title')).toMatch(/-Jun-2024$/);
     });
   });
 
@@ -197,5 +237,38 @@ describe('Datetime', () => {
       render(<Datetime value={past(30 * ONE_SEC)} baseDate={BASE} suffix='elapsed' showTooltip={false} />);
       expect(screen.getByText('elapsed')).toBeInTheDocument();
     });
+  });
+});
+
+describe('formatClock', () => {
+  it('reads an offset-less server timestamp as UTC', () => {
+    // 02:02 UTC — the shape the events table emits (column type `timestamp`).
+    expect(formatClock('2026-09-17 02:02:08')).toBe(formatTooltip(new Date('2026-09-17T02:02:08Z')));
+  });
+
+  it('leaves a value that already carries an offset alone', () => {
+    expect(formatClock('2026-09-17T02:02:08Z')).toBe(formatTooltip(new Date('2026-09-17T02:02:08Z')));
+  });
+
+  it('returns the empty value instead of a NaN date', () => {
+    expect(formatClock('garbage-not-a-date')).toBe('');
+    expect(formatClock(undefined)).toBe('');
+    expect(formatClock(null, '-')).toBe('-');
+  });
+});
+
+describe('formatClockCompact', () => {
+  it('fits the sidebar: day, month and time, no year in the current year', () => {
+    const thisYear = new Date().getFullYear();
+    expect(formatClockCompact(`${thisYear}-09-17 02:02:08`)).toMatch(/^17 Sep \d{2}:\d{2}$/);
+  });
+
+  it('carries the year when it is not the current one', () => {
+    expect(formatClockCompact('2019-01-05 12:00:00')).toMatch(/^05 Jan 2019 \d{2}:\d{2}$/);
+  });
+
+  it('is empty rather than NaN for a missing or broken value', () => {
+    expect(formatClockCompact(null)).toBe('');
+    expect(formatClockCompact('garbage-not-a-date')).toBe('');
   });
 });

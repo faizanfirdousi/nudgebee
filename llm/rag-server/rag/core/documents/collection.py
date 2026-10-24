@@ -1,11 +1,13 @@
 import logging
 from typing import List, Any
+from urllib.parse import unquote_plus, urlsplit
 
 import httpx
 from qdrant_client.http.exceptions import ResponseHandlingException
 
 from rag.qdrant.client import get_qdrant_client
 from rag.qdrant.client import list_collections_optimized
+from rag.core.documents import source_store
 
 logger = logging.getLogger(__name__)
 
@@ -406,3 +408,195 @@ def get_collection(collection_name: str, limit: int | None = None) -> dict | Non
             return None
         logger.error(f"Error getting collection {collection_name}: {e}")
         raise
+
+
+def _document_title(metadata: dict, content: str) -> str | None:
+    """Title for a stored document: metadata ``title`` (Confluence), else the
+    ``Title: ...`` first line the ServiceNow scraper prepends to the text, else
+    the page slug of a Confluence URL (pages scraped before ``title`` was stored)."""
+    title = metadata.get("title")
+    if isinstance(title, str) and title.strip():
+        return title.strip()
+    first_line = content.lstrip().split("\n", 1)[0]
+    if first_line.startswith("Title:"):
+        return first_line[len("Title:") :].strip() or None
+    url = _document_url(metadata)
+    if url:
+        # .../pages/<page_id>/<Page+Title>
+        segments = urlsplit(url).path.rstrip("/").split("/")
+        if len(segments) >= 3 and segments[-3] == "pages" and not segments[-1].isdigit():
+            return unquote_plus(segments[-1]).strip() or None
+    return None
+
+
+def _document_url(metadata: dict) -> str | None:
+    url = metadata.get("url")
+    return url if isinstance(url, str) and url.startswith(("http://", "https://")) else None
+
+
+def _point_metadata(payload: dict) -> dict:
+    # Points are upserted as {"page_content": ..., "metadata": {...}}.
+    metadata = payload.get("metadata")
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _parse_point_id(point_id: str) -> int | str:
+    return int(point_id) if point_id.isdigit() else point_id
+
+
+def _document_content(payload: dict) -> str:
+    """Full text of the source document. Chunked documents carry the whole
+    original text on every chunk as ``metadata.parent_content``."""
+    parent_content = _point_metadata(payload).get("parent_content")
+    if isinstance(parent_content, str) and parent_content:
+        return parent_content
+    content = payload.get("page_content")
+    return content if isinstance(content, str) else ""
+
+
+# Chunks read from Qdrant per scroll call, and the most chunks one listing
+# request reads before handing back a cursor (bounds request time on
+# collections with many chunks per document).
+_DOCUMENT_SCROLL_BATCH = 256
+_DOCUMENT_SCAN_LIMIT = 5000
+
+
+def _is_listed_point(payload: dict) -> bool:
+    """One entry per source document. Unchunked points are documents.
+
+    A chunked document (points sharing ``metadata.parent_id``) is listed through its first
+    chunk only, identified by ``metadata.chunk_index`` == 0. That is a plain marker written
+    at ingest; the older rule below — the chunk whose text opens ``metadata.parent_content``
+    — is kept for points indexed before it existed, and because it needs a full copy of the
+    document on every chunk, which is why new ingests do not write it.
+    """
+    metadata = _point_metadata(payload)
+    if not metadata.get("parent_id"):
+        return True
+    chunk_index = metadata.get("chunk_index")
+    if chunk_index is not None:
+        return bool(chunk_index == 0)
+    parent_content = metadata.get("parent_content")
+    chunk = payload.get("page_content")
+    if not isinstance(parent_content, str) or not isinstance(chunk, str):
+        return True
+    opening = chunk.strip()[:200]
+    if not opening:
+        # Every string starts with "", so a blank chunk would match any parent.
+        return not parent_content.strip()
+    return parent_content.lstrip().startswith(opening)
+
+
+def list_collection_documents(collection_name: str, limit: int = 50, offset: str | None = None) -> dict:
+    """
+    List one page of a collection's documents as title/link entries, without content.
+
+    Pages count documents, not chunks: chunks are scanned until ``limit``
+    documents are found, the collection ends, or ``_DOCUMENT_SCAN_LIMIT`` chunks
+    were read. ``next_offset`` is the Qdrant point to resume from; None means
+    there is nothing left.
+    """
+    client = get_qdrant_client()
+    cursor: Any = _parse_point_id(offset) if offset else None
+    items: list[dict] = []
+    scanned = 0
+    while cursor is not None or scanned == 0:
+        points, next_page = client.scroll(
+            collection_name=collection_name,
+            limit=_DOCUMENT_SCROLL_BATCH,
+            offset=cursor,
+            with_payload=True,
+            with_vectors=False,
+        )
+        cursor = next_page
+        for index, point in enumerate(points):
+            scanned += 1
+            payload = point.payload or {}
+            if not _is_listed_point(payload):
+                continue
+            metadata = _point_metadata(payload)
+            items.append(
+                {
+                    "id": str(point.id),
+                    "title": _document_title(metadata, _document_content(payload)),
+                    "url": _document_url(metadata),
+                    # The scraper's own id for the page: what a Fact/SOP mark is keyed on,
+                    # because unlike the point id it survives a re-sync.
+                    "source_id": _source_identifier(metadata),
+                }
+            )
+            if len(items) >= limit:
+                # Scroll offsets are inclusive: resume at the next unread point.
+                cursor = points[index + 1].id if index + 1 < len(points) else next_page
+                return {"items": items, "next_offset": str(cursor) if cursor is not None else None}
+        if not points or scanned >= _DOCUMENT_SCAN_LIMIT:
+            break
+    return {"items": items, "next_offset": str(cursor) if cursor is not None else None}
+
+
+# The metadata key each scrape stamps its document id on. Source storage keys every
+# document on that same id, so this is the join between an indexed point and its stored
+# source. A new scrape adds its key here. Public because search results must carry the
+# same keys (controllers/knowledge_document.py): llm-server keys a document's Fact/SOP
+# mark on them.
+SOURCE_ID_KEYS = ("source_id", "page_id", "sys_id")
+
+
+def _source_identifier(metadata: dict) -> str | None:
+    """The id this document was stored under, or None when the scrape stamped none."""
+    for key in SOURCE_ID_KEYS:
+        value = metadata.get(key)
+        # 0 is a legitimate id; "" and None are not. Truthiness alone would drop the
+        # first, and `is not None` alone would keep the second and look a blank id up.
+        if value is None or value == "":
+            continue
+        return str(value)
+    return None
+
+
+def get_collection_document(collection_name: str, point_id: str) -> dict | None:
+    """Return one document with its full content, or None when the point is gone
+    (point ids are content hashes, so a re-sync can replace them)."""
+    points = get_qdrant_client().retrieve(
+        collection_name=collection_name,
+        ids=[_parse_point_id(point_id)],
+        with_payload=True,
+        with_vectors=False,
+    )
+    if not points:
+        return None
+    payload = points[0].payload or {}
+    metadata = _point_metadata(payload)
+    content = _document_content(payload)
+    content_source = "indexed"
+
+    # A chunked document indexed after `parent_content` was dropped carries only this
+    # chunk's text — a page renders as the ~400 characters of its first fragment. The
+    # verbatim document lives in source storage, keyed by the id the chunk already
+    # carries, so prefer it and say plainly when it is missing.
+    # What the text is, so a reader is shown a rendered page rather than its markup.
+    # Anything we serve from the index has already been converted on the way in;
+    # only a stored source is still in the form the site returned it.
+    content_type = "text/markdown"
+
+    if metadata.get("parent_id") and not metadata.get("parent_content"):
+        source_id = _source_identifier(metadata)
+        stored = source_store.get_by_source_id(collection_name, source_id) if source_id else None
+        if stored and stored.get("content"):
+            content = stored["content"]
+            content_source = "source"
+            content_type = stored.get("content_type") or "text/html"
+        else:
+            content_source = "fragment"
+
+    return {
+        "id": str(points[0].id),
+        "title": _document_title(metadata, content),
+        "url": _document_url(metadata),
+        "source_id": _source_identifier(metadata),
+        "content": content,
+        # Which of the three the text above is, so a reader is never shown a fragment
+        # that looks like a whole document.
+        "content_source": content_source,
+        "content_type": content_type,
+    }

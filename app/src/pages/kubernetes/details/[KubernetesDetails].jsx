@@ -19,26 +19,78 @@ import { ToggleGroup } from '@ui/ToggleGroup';
 import { ds } from '@utils/colors';
 import Loader from '@shared/Loader';
 import { ListingLayout } from '@ui/ListingLayout';
+import FeatureDisabledEmptyState from '@shared/FeatureDisabledEmptyState';
 import { toast as snackbar } from '@ui/Toast';
 
 // Only one tab is visible at a time; lazy-load the rest to cut initial JS by ~70%.
-const KubernetesRightSizing = dynamic(() => import('@components/recommendations/KubernetesRightSizing'), { ssr: false });
-const KubernetesUnusedVolumes = dynamic(() => import('@components/recommendations/KubernetesUnusedVolumes'), { ssr: false });
-const KubernetesBestPractices = dynamic(() => import('@components/recommendations/KubernetesBestPractices'), { ssr: false });
-const KubernetesWorkloadsTable = dynamic(() => import('@components/k8s/details/KubernetesWorkloads'), { ssr: false });
-const KubernetesNodesTable = dynamic(() => import('@components/k8s/details/KubernetesNodes'), { ssr: false });
-const KubernetesPodsTable = dynamic(() => import('@components/k8s/details/KubernetesPods'), { ssr: false });
-const KubernetesNamespaceTable = dynamic(() => import('@components/k8s/details/KubernetesNamespace'), { ssr: false });
-const KubernetesAbandonedWorkloads = dynamic(() => import('@components/recommendations/KubernetesAbandonedWorkloads'), { ssr: false });
-const KubernetesPVCRightSizing = dynamic(() => import('@components/recommendations/KubernetesPVCRightSizing'), { ssr: false });
-const KubernetesReplicaRightSizing = dynamic(() => import('@components/recommendations/KubernetesReplicaRightSizing'), { ssr: false });
-const KubernetesSpotRecommendation = dynamic(() => import('@components/recommendations/KubernetesSpotRecommendation'), { ssr: false });
-const KubernetesSecurity = dynamic(() => import('@components/recommendations/KubernetesSecurity'), { ssr: false });
-const KubernetesLogsPattern = dynamic(() => import('@components/k8s/details/KubernetesLogsPattern'), { ssr: false });
-const KubernetesEventsTable = dynamic(() => import('@components/events/KubernetesEvents'), { ssr: false });
-const KubernetesApplicationApiFailure = dynamic(() => import('@components/events/KubernetesApplicationApiFailure'), { ssr: false });
-const KubernetesApplicationLogFailure = dynamic(() => import('@components/events/KubernetesApplicationLogFailure'), { ssr: false });
-const KubernetesGroupedEvents = dynamic(() => import('@components/events/KubernetesGroupedEvents'), { ssr: false });
+const KubernetesRightSizing = dynamic(() => import('@components/recommendations/KubernetesRightSizing'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesUnusedVolumes = dynamic(() => import('@components/recommendations/KubernetesUnusedVolumes'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesBestPractices = dynamic(() => import('@components/recommendations/KubernetesBestPractices'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesWorkloadsTable = dynamic(() => import('@components/k8s/details/KubernetesWorkloads'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesNodesTable = dynamic(() => import('@components/k8s/details/KubernetesNodes'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesPodsTable = dynamic(() => import('@components/k8s/details/KubernetesPods'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesNamespaceTable = dynamic(() => import('@components/k8s/details/KubernetesNamespace'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesAbandonedWorkloads = dynamic(() => import('@components/recommendations/KubernetesAbandonedWorkloads'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesPVCRightSizing = dynamic(() => import('@components/recommendations/KubernetesPVCRightSizing'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesReplicaRightSizing = dynamic(() => import('@components/recommendations/KubernetesReplicaRightSizing'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesSpotRecommendation = dynamic(() => import('@components/recommendations/KubernetesSpotRecommendation'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesSecurity = dynamic(() => import('@components/recommendations/KubernetesSecurity'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesLogsPattern = dynamic(() => import('@components/k8s/details/KubernetesLogsPattern'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesEventsTable = dynamic(() => import('@components/events/KubernetesEvents'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesApplicationApiFailure = dynamic(() => import('@components/events/KubernetesApplicationApiFailure'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesApplicationLogFailure = dynamic(() => import('@components/events/KubernetesApplicationLogFailure'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesGroupedEvents = dynamic(() => import('@components/events/KubernetesGroupedEvents'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
 import {
   BetaIcon,
   FullScreenIcon,
@@ -93,61 +145,158 @@ import {
   AnomalyIcon,
   SLOInspectionIcon,
   GrafanaIconBlue,
-  GithubIcon,
 } from '@assets';
 import PropTypes from 'prop-types';
 import apiKubernetes1 from '@api1/kubernetes1';
 import { Chip } from '@ui/Chip';
 import apiRecommendations from '@api1/recommendation';
-import EmptyData from '@shared/EmptyData';
-import WorkloadCriticalityManager from '@components/criticality/WorkloadCriticalityManager';
+import { EmptyState } from '@ui/EmptyState';
 import SafeIcon from '@shared/icons/SafeIcon';
 
-const KubernetesLogs = dynamic(() => import('@components/k8s/details/KubernetesLogs'), { ssr: false });
+const KubernetesLogs = dynamic(() => import('@components/k8s/details/KubernetesLogs'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
 const KubernetesSSLCertificateRecommendation = dynamic(() => import('@components/recommendations/KubernetesSSLCertificateRecommendation'), {
   ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
 });
-const KubernetesCisSecurityV2 = dynamic(() => import('@components/recommendations/KubernetesCisSecurityV2'), { ssr: false });
-const KubernetesHelmUpgradeRecommendation = dynamic(() => import('@components/recommendations/KubernetesHelmUpgradeRecommendation'), { ssr: false });
-const KubernetesPVCTable = dynamic(() => import('@components/k8s/details/KubernetesPVC'), { ssr: false });
-const KubernetesPVTable = dynamic(() => import('@components/k8s/details/KubernetesPV'), { ssr: false });
-const KubernetesServices = dynamic(() => import('@components/k8s/details/KubernetesServices'), { ssr: false });
-const KubernetesOptimizeSummary = dynamic(() => import('@components/recommendations/KubernetesOptimizeSummary'), { ssr: false });
-const KubernetesEventsSummary = dynamic(() => import('@components/events/KubernetesEventsSummary'), { ssr: false });
+const KubernetesCisSecurityV2 = dynamic(() => import('@components/recommendations/KubernetesCisSecurityV2'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesHelmUpgradeRecommendation = dynamic(() => import('@components/recommendations/KubernetesHelmUpgradeRecommendation'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesPVCTable = dynamic(() => import('@components/k8s/details/KubernetesPVC'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesPVTable = dynamic(() => import('@components/k8s/details/KubernetesPV'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesServices = dynamic(() => import('@components/k8s/details/KubernetesServices'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesOptimizeSummary = dynamic(() => import('@components/recommendations/KubernetesOptimizeSummary'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesEventsSummary = dynamic(() => import('@components/events/KubernetesEventsSummary'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
 const KubernetesNodesTrends = dynamic(() => import('@components/k8s/details/KubernetesNodesTrends').then((mod) => mod.KubernetesNodesTrends), {
   ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
 });
-const KubernetesNodeClass = dynamic(() => import('@components/k8s/details/KubernetesNodeClass'), { ssr: false });
-const KubernetesAutoScalerLogs = dynamic(() => import('@components/k8s/details/KubernetesAutoScalerLogs'), { ssr: false });
-const ClusterUpgradeFeature = dynamic(() => import('@components/k8s/ClusterUpgradeFeature'), { ssr: false });
-const KubernetesLogSensitiveInfo = dynamic(() => import('@components/k8s/details/KubernetesLogSensitiveInfo'), { ssr: false });
-const ListingRecommendationResolution = dynamic(() => import('@components/recommendations/ListingRecommendationResolution'), { ssr: false });
-const KubernetesAnomaly = dynamic(() => import('@components/k8s/details/KubernetesAnomaly'), { ssr: false });
-const DefaultAutoScaler = dynamic(() => import('@components/k8s/details/DefaultAutoScaler'), { ssr: false });
-const KubernetesAutoScalerNodePool = dynamic(() => import('@components/k8s/details/KubernetesAutoScalerNodePool'), { ssr: false });
-const KubernetesDbmsTable = dynamic(() => import('@components/k8s/details/KubernetesDbms'), { ssr: false });
-const KubernetesQueueTable = dynamic(() => import('@components/k8s/details/KubernetesQueue'), { ssr: false });
-const KubernetesGithubRunners = dynamic(() => import('@components/k8s/details/KubernetesGithubRunners'), { ssr: false });
-const KubernetesAlertManager = dynamic(() => import('@components/k8s/details/KubernetesAlertManager'), { ssr: false });
-const TriageRulesManager = dynamic(() => import('@components/triage/TriageRulesManager'), { ssr: false });
-const KubernetesTracesListing = dynamic(() => import('@components/k8s/details/KubernetesTracesListing'), { ssr: false });
-const KubernetesServiceMapWrapper = dynamic(() => import('@components/k8s/details/KubernetesServiceMap'), { ssr: false });
-const KubernetesTracesGroupListing = dynamic(() => import('@components/k8s/details/KubernetesTracesGroupListing'), { ssr: false });
-const KubernetesTracesCrossZoneListing = dynamic(() => import('@components/k8s/details/KubernetesTracesCrossZone'), { ssr: false });
-const KubernetesSLOConfigs = dynamic(() => import('@components/k8s/KubernetesSLOConfigs'), { ssr: false });
+const KubernetesNodeClass = dynamic(() => import('@components/k8s/details/KubernetesNodeClass'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesAutoScalerLogs = dynamic(() => import('@components/k8s/details/KubernetesAutoScalerLogs'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const ClusterUpgradeFeature = dynamic(() => import('@components/k8s/ClusterUpgradeFeature'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesLogSensitiveInfo = dynamic(() => import('@components/k8s/details/KubernetesLogSensitiveInfo'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const ListingRecommendationResolution = dynamic(() => import('@components/recommendations/ListingRecommendationResolution'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesAnomaly = dynamic(() => import('@components/k8s/details/KubernetesAnomaly'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const DefaultAutoScaler = dynamic(() => import('@components/k8s/details/DefaultAutoScaler'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesAutoScalerNodePool = dynamic(() => import('@components/k8s/details/KubernetesAutoScalerNodePool'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesDbmsTable = dynamic(() => import('@components/k8s/details/KubernetesDbms'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesQueueTable = dynamic(() => import('@components/k8s/details/KubernetesQueue'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesAlertManager = dynamic(() => import('@components/k8s/details/KubernetesAlertManager'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const TriageRulesManager = dynamic(() => import('@components/triage/TriageRulesManager'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const WorkloadCriticalityManager = dynamic(() => import('@components/criticality/WorkloadCriticalityManager'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesTracesListing = dynamic(() => import('@components/k8s/details/KubernetesTracesListing'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesServiceMapWrapper = dynamic(() => import('@components/k8s/details/KubernetesServiceMap'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesTracesGroupListing = dynamic(() => import('@components/k8s/details/KubernetesTracesGroupListing'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesTracesCrossZoneListing = dynamic(() => import('@components/k8s/details/KubernetesTracesCrossZone'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesSLOConfigs = dynamic(() => import('@components/k8s/KubernetesSLOConfigs'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
 const KubernetesClusterUpgradePlanner = dynamic(() => import('@components/k8s/clusterUpgradePlanner/KubernetesClusterUpgradePlanner'), {
   ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
 });
-const QueryMetrics = dynamic(() => import('@components/k8s/details/QueryMetrics'), { ssr: false });
-const KubernetesGroupedEventsTable = dynamic(() => import('@components/k8s/details/groupedevents/KubernetesGroupedEventsTable'), { ssr: false });
+const QueryMetrics = dynamic(() => import('@components/k8s/details/QueryMetrics'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesGroupedEventsTable = dynamic(() => import('@components/k8s/details/groupedevents/KubernetesGroupedEventsTable'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
 
 // Summary-tab widgets: only rendered on the default tab, behind the `clusterSummary` loader
 // gate (see render). 3 of the 4 pull chart.js — lazy-load them so chart.js is not in the
 // route's entry chunk.
-const KubernetesClusterSummary = dynamic(() => import('@components/k8s/KubernetesClusterSummary'), { ssr: false });
-const KubernetesClusterSummaryUtilization = dynamic(() => import('@components/k8s/KubernetesClusterSummaryUtilization'), { ssr: false });
-const KuberneteComputeSummary = dynamic(() => import('@components/k8s/KubernetesComputeSummary'), { ssr: false });
-const KuberneteUtilizationSummary = dynamic(() => import('@components/k8s/KuberneteUtilizationSummary'), { ssr: false });
+const KubernetesClusterSummary = dynamic(() => import('@components/k8s/KubernetesClusterSummary'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KubernetesClusterSummaryUtilization = dynamic(() => import('@components/k8s/KubernetesClusterSummaryUtilization'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KuberneteComputeSummary = dynamic(() => import('@components/k8s/KubernetesComputeSummary'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
+const KuberneteUtilizationSummary = dynamic(() => import('@components/k8s/KuberneteUtilizationSummary'), {
+  ssr: false,
+  loading: () => <Loader style={{ position: 'static', height: '60vh', width: '100%' }} />,
+});
 
 const GrafanaIframe = ({ accountId }) => {
   const iframeRef = useRef(null);
@@ -234,6 +383,8 @@ const SUBTAB_MODULE_OVERRIDES = {
   '4:trace-cross-zon': 'traces',
   '4:slo': 'slo',
 };
+
+const ANOMALY_FLAG_DISABLED_MESSAGE = 'The ANOMALY_DETECTION feature flag is not enabled for this tenant';
 
 const KubernetesDetails = () => {
   const router = useRouter();
@@ -348,7 +499,6 @@ const KubernetesDetails = () => {
         },
         { id: 'slo', text: 'SLO', value: 8, fragment: 'slo', icon: SLOInspectionIcon, tabName: 'Others' },
         { id: 'grafana', text: 'Grafana', value: 9, fragment: 'grafana', icon: GrafanaIconBlue, tabName: 'Others' },
-        { id: 'github-runners', text: 'GitHub Runners', value: 10, fragment: 'github-runners', icon: GithubIcon, tabName: 'Others' },
       ],
     },
     {
@@ -391,14 +541,18 @@ const KubernetesDetails = () => {
     },
   ]);
   const [aggregationKeyCount, setAggregationKeyCount] = useState({});
-  const [anomalyEnabled, setAnomalyEnabled] = useState(false);
+  // null = flag fetch still pending, so the anomaly surface renders nothing
+  // instead of flashing the "not enabled" state at flag-ON tenants.
+  const [anomalyEnabled, setAnomalyEnabled] = useState(null);
 
   // ANOMALY_DETECTION is an opt-in tenant feature and the backend is
   // fail-closed at every entry point (`tenant.IsFeatureEnabled` in
   // anomoly/service.go — batch cron, per-account trigger and the queue
   // consumer all bail), so for a tenant that never enabled it the Anomaly
   // sub-tab is a permanently empty table whose "Trigger" button only ever
-  // errors. Hide the tab instead.
+  // errors. Show the tab disabled with an explanatory tooltip (rather than
+  // hiding it) so the feature stays discoverable; a deep link onto it renders
+  // the same explanation in the body (issue #34894 TC3).
   // `hasFeatureAccessCached` is fail-closed too, so warm the cache first
   // (same warm-then-gate pattern as WatchedChannels.tsx).
   useEffect(() => {
@@ -412,7 +566,9 @@ const KubernetesDetails = () => {
           option.name === 'Troubleshoot'
             ? {
                 ...option,
-                tabOptions: option.tabOptions.map((tab) => (tab.id === 'anomaly' ? { ...tab, hidden: !enabled } : tab)),
+                tabOptions: option.tabOptions.map((tab) =>
+                  tab.id === 'anomaly' ? { ...tab, disabled: !enabled, disabledTooltip: enabled ? undefined : ANOMALY_FLAG_DISABLED_MESSAGE } : tab
+                ),
               }
             : option
         )
@@ -639,7 +795,7 @@ const KubernetesDetails = () => {
     } else if (selectedCluster?.agent?.connection_status?.karpenterEnabled) {
       return <KubernetesAutoScalerNodePool accountId={kubeId} />;
     } else {
-      return <EmptyData sx={{ textAlign: 'center' }} heading='Auto Scaler is NOT configured' subHeading='' />;
+      return <EmptyState illustration='first-time' title='Auto Scaler is NOT configured' />;
     }
   };
 
@@ -949,9 +1105,9 @@ const KubernetesDetails = () => {
                   {!selectedCluster?.agent?.connection_status?.autoScalerEnabled && !selectedCluster?.agent?.connection_status?.karpenterEnabled ? (
                     <ListingLayout>
                       <ListingLayout.Body>
-                        <EmptyData sx={{ textAlign: 'center' }} heading='Auto Scaler is NOT configured' subHeading=''>
+                        <EmptyState illustration='first-time' title='Auto Scaler is NOT configured'>
                           {renderingAutoscalerConfiguringSuggestion()}
-                        </EmptyData>
+                        </EmptyState>
                       </ListingLayout.Body>
                     </ListingLayout>
                   ) : (
@@ -1122,7 +1278,11 @@ const KubernetesDetails = () => {
                   stickyColumnIndex={'7'}
                 />
               )}
+              {selectedSubTab === 6 && anomalyEnabled === null && <Loader style={{ width: '100%' }} />}
               {selectedSubTab === 6 && anomalyEnabled && <KubernetesAnomaly accountId={kubeId} />}
+              {selectedSubTab === 6 && anomalyEnabled === false && (
+                <FeatureDisabledEmptyState id='anomaly-flag-disabled' title={ANOMALY_FLAG_DISABLED_MESSAGE} />
+              )}
               {selectedSubTab == 7 && <KubernetesGroupedEventsTable accountId={kubeId} groupEventType={'fingerprint'} isTroubleshootPage={false} />}
               {selectedSubTab == 8 && <TriageRulesManager accountId={kubeId} />}
               {selectedSubTab === 10 && <WorkloadCriticalityManager accountId={kubeId} />}
@@ -1161,7 +1321,6 @@ const KubernetesDetails = () => {
               {selectedSubTab == 7 && <KubernetesTracesCrossZoneListing accountId={kubeId} />}
               {selectedSubTab == 8 && <KubernetesSLOConfigs accountId={kubeId} />}
               {selectedSubTab == 9 && kubeId && hasReadAccess(kubeId) && <GrafanaIframe accountId={kubeId} />}
-              {selectedSubTab == 10 && <KubernetesGithubRunners accountId={kubeId} />}
             </>
           )}
           {[tabOptions[5].value].includes(selectedTab) && (

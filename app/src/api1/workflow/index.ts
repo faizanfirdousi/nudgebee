@@ -1,9 +1,11 @@
 import { queryGraphQL } from '@lib/HttpService';
+import { getBrandTitle, whenBrandingReady } from '@hooks/useTenantBranding';
 import type {
   WorkflowCreateRequest,
   WorkflowTriggerRequest,
   WorkflowUpdateRequest,
   WorkflowDryRunRequest,
+  CheckTriggerMatchRequest,
   WorkflowRetriggerRequest,
   WorkflowCancelRequest,
   WorkflowCompleteApprovalRequest,
@@ -126,6 +128,7 @@ query GetWorkflowById($accountId:String!, $workflowId:String!) {
     updated_by
     created_from_session_id
     ai_invocable
+    ai_auto_approve
     description
   }
 }
@@ -141,6 +144,7 @@ query ListWorkflows($accountIds:[String!], $status:String, $last_execution_statu
       created_at
       created_by_user {
         display_name
+        username
       }
       id
       created_from_session_id
@@ -154,6 +158,7 @@ query ListWorkflows($accountIds:[String!], $status:String, $last_execution_statu
       updated_at
       updated_by_user {
         display_name
+        username
       }
       last_execution_time
       last_execution_version
@@ -482,6 +487,18 @@ mutation triggerWorkflowDryrun($request: WorkflowDryrunRequest!) {
       status
       type
     }
+  }
+}
+`;
+
+export const CHECK_TRIGGER_MATCH = `
+query checkTriggerMatch($request: WorkflowCheckTriggerMatchRequest!) {
+  workflow_check_trigger_match(request: $request) {
+    matched
+    gate
+    reason
+    error
+    filter
   }
 }
 `;
@@ -834,7 +851,24 @@ const apiWorkflow = {
     try {
       const query = LIST_TASK_DEFINITIONS;
 
-      const response = await queryGraphQL(query, 'ListTaskDefinitions', {});
+      // A stalled branding fetch must not hold back the task list; fall back to the default title.
+      let brandingTimer: ReturnType<typeof setTimeout> | undefined;
+      const brandingReady = Promise.race([
+        whenBrandingReady(),
+        new Promise((resolve) => {
+          brandingTimer = setTimeout(resolve, 3000);
+        }),
+      ]);
+      const [response] = await Promise.all([queryGraphQL(query, 'ListTaskDefinitions', {}), brandingReady]).finally(() =>
+        clearTimeout(brandingTimer)
+      );
+      // runbook-server has no tenant branding. Task descriptions get copied into
+      // workflow node state, so brand them here once, after branding resolves.
+      const brandTitle = getBrandTitle();
+      response?.data?.data?.workflow_list_taskdefinitions?.tasks?.forEach((task: { description?: string }) => {
+        // Replacer function: a brand containing `$` must not be read as a replacement pattern
+        if (task.description) task.description = task.description.replace(/\bNudgebee\b/g, () => brandTitle);
+      });
       return {
         data: response?.data?.data,
         errors: response?.data?.errors,
@@ -999,6 +1033,21 @@ const apiWorkflow = {
       };
     } catch (error) {
       console.error('Failed to dry-run workflow:', error);
+      return error;
+    }
+  },
+  async checkTriggerMatch(request: CheckTriggerMatchRequest) {
+    try {
+      const query = CHECK_TRIGGER_MATCH;
+      const variables = { request };
+
+      const response = await queryGraphQL(query, 'checkTriggerMatch', variables);
+      return {
+        data: response?.data?.data,
+        errors: response?.data?.errors,
+      };
+    } catch (error) {
+      console.error('Failed to check trigger match:', error);
       return error;
     }
   },

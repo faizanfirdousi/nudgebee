@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"nudgebee/llm/common"
@@ -24,14 +25,30 @@ func init() {
 	})
 }
 
-type K8sResourceSearchTool struct{}
+type K8sResourceSearchTool struct {
+	// workspaceAccountID stays on the conversation's origin account while an
+	// explicit cluster changes the inventory and relay target for this call.
+	workspaceAccountID string
+	targetConfig       core.ToolConfig
+}
+
+// Accepted values for K8sResourceSearchRequest.SearchType. Kept in sync with the
+// `search_type` enum in InputSchema and the switch in processSearchRequest —
+// searchTypeSuggestions is the default an absent value resolves to.
+const (
+	searchTypeFuzzy       = "fuzzy"
+	searchTypeSuggestions = "suggestions"
+	searchTypeNamespace   = "namespace"
+	searchTypeLabel       = "label"
+)
 
 type K8sResourceSearchRequest struct {
 	ResourceName  string `json:"resource_name,omitempty"`
 	ResourceType  string `json:"resource_type,omitempty"`
 	Namespace     string `json:"namespace,omitempty"`
 	LabelSelector string `json:"label_selector,omitempty"`
-	SearchType    string `json:"search_type"` // "fuzzy", "suggestions", "namespace", "label"
+	SearchType    string `json:"search_type,omitempty"` // see searchType* consts; empty = suggestions
+	Cluster       string `json:"cluster,omitempty"`
 }
 
 type K8sResourceSearchResponse struct {
@@ -186,6 +203,20 @@ func (r K8sResourceSearchTool) GetType() core.NBToolType {
 	return core.NBToolTypeTool
 }
 
+// RequestedTarget lets the executor authorize an explicitly selected cluster
+// independently from the conversation account. Resource search is read-only,
+// but implementing the common contract keeps target handling consistent with
+// kubectl_execute and protects it if request classification changes later.
+func (r K8sResourceSearchTool) RequestedTarget(toolInput string) (string, error) {
+	req := core.ParseNBToolCallRequestFromInput(toolInput)
+	return RequestedResourceSearchCluster(req.Arguments), nil
+}
+
+func RequestedResourceSearchCluster(arguments map[string]any) string {
+	cluster, _ := arguments["cluster"].(string)
+	return strings.TrimSpace(cluster)
+}
+
 func (r K8sResourceSearchTool) Description() string {
 	return `Searches for Kubernetes resources using fuzzy matching and provides suggestions for resource discovery.
 
@@ -200,11 +231,13 @@ func (r K8sResourceSearchTool) Description() string {
 * resource_type (optional): Type of resource (pods, services, etc.)
 * namespace (optional): Namespace to search in
 * label_selector (optional): Kubernetes label selector, required when search_type is "label" (e.g. 'app=nginx,tier=frontend')
-* search_type: Type of search - one of "fuzzy", "suggestions", "namespace", or "label" ("label" requires label_selector)
+* search_type (optional): Type of search - one of "fuzzy", "suggestions", "namespace", or "label" ("label" requires label_selector). Defaults to "suggestions" when omitted.
+* cluster (optional): Connected Kubernetes cluster name. Omit to use the conversation's current cluster.
 
 **Examples:**
 * Fuzzy resource type: {"resource_type": "podss", "search_type": "fuzzy"}
 * App search: {"resource_name": "nginx", "namespace": "default", "search_type": "suggestions"} → Returns deployment + pods
+* App search, default type: {"resource_name": "nginx", "namespace": "default"} → same as "suggestions"
 * CRD discovery: {"resource_name": "my-custom-app", "namespace": "default", "search_type": "suggestions"}
 * Namespace discovery: {"namespace": "nudgebe", "search_type": "namespace"}
 
@@ -233,15 +266,95 @@ func (r K8sResourceSearchTool) InputSchema() core.ToolSchema {
 			},
 			"search_type": {
 				Type:        core.ToolSchemaTypeString,
-				Description: "Type of search: 'fuzzy', 'suggestions', 'namespace', or 'label'",
+				Description: "OPTIONAL. Type of search: 'fuzzy', 'suggestions', 'namespace', or 'label' ('label' requires label_selector). Defaults to 'suggestions'.",
+				Enum:        []any{searchTypeFuzzy, searchTypeSuggestions, searchTypeNamespace, searchTypeLabel},
+				Default:     searchTypeSuggestions,
+			},
+			"cluster": {
+				Type:        core.ToolSchemaTypeString,
+				Description: "Optional. Name of the connected Kubernetes cluster to search. Omit to use the conversation's current cluster.",
 			},
 		},
-		Required: []string{"search_type"},
+		// search_type is deliberately NOT required: processSearchRequest already
+		// routes an absent value to handleResourceSuggestions, so declaring it
+		// required only let pre-execution validation reject calls that would
+		// have succeeded (15 such rejections in 14 days on dev).
+		Required: []string{},
 	}
+}
+
+// NormalizeInputForSchemaValidation drops an explicitly-empty search_type before
+// the enum check sees it. Native tool-calling providers often emit every
+// declared property, filling the unset ones with "" rather than omitting them —
+// and "" is semantically "not specified", which processSearchRequest already
+// resolves to suggestions. Without this, adding the enum would have turned a
+// call that used to work into a "value  not in allowed enum" rejection, i.e.
+// swapped one pre-execution failure for another on the same tool. Call()
+// receives the original input and normalizes "" itself.
+func (r K8sResourceSearchTool) NormalizeInputForSchemaValidation(input string) string {
+	trimmed := strings.TrimSpace(input)
+	if !strings.HasPrefix(trimmed, "{") {
+		return input
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(trimmed), &parsed); err != nil || parsed == nil {
+		return input
+	}
+	v, exists := parsed["search_type"]
+	if !exists {
+		return input
+	}
+	s, isString := v.(string)
+	if !isString || strings.TrimSpace(s) != "" {
+		return input
+	}
+	delete(parsed, "search_type")
+	normalized, err := json.Marshal(parsed)
+	if err != nil {
+		return input
+	}
+	return string(normalized)
 }
 
 func (r K8sResourceSearchTool) Call(nbRequestContext core.NbToolContext, input core.NBToolCallRequest) (core.NBToolResponse, error) {
 	nbRequestContext.Ctx.GetLogger().Info("resource-search: executing tool call", "command", input.Command)
+
+	configName := nbRequestContext.ToolConfig.Name
+	requested := RequestedResourceSearchCluster(input.Arguments)
+	if requested == "" {
+		// Production callNbTool splits top-level fields into Arguments, while
+		// direct/internal callers may still pass the legacy raw JSON in Command.
+		// Support both without treating arbitrary shell/text as target syntax.
+		requested = RequestedResourceSearchCluster(core.ParseNBToolCallRequestFromInput(input.Command).Arguments)
+	}
+	target := nbRequestContext.ToolConfig
+	var err error
+	if requested != "" {
+		target, err = ResolveKubernetesTarget(nbRequestContext, nbRequestContext.ToolConfig, requested)
+		if err != nil {
+			return core.NBToolResponse{Data: err.Error(), Status: core.NBToolResponseStatusError}, err
+		}
+	}
+	targetAccountID := KubernetesTargetAccountID(target)
+	if targetAccountID == "" {
+		// Direct/internal callers historically supplied only AccountId. Preserve
+		// that default shape; an explicit target must always resolve to a concrete
+		// authorized connection above and can never use this fallback.
+		targetAccountID = nbRequestContext.AccountId
+		if requested == "" {
+			// Account-agent configs use the generic name "Agent" and carry no id.
+			// Recover the actual connected cluster config for provenance and relay
+			// targeting instead of exposing "Agent" as though it were a cluster.
+			target = resourceSearchTargetForAccount(nbRequestContext, targetAccountID)
+		}
+	}
+	originAccountID := nbRequestContext.AccountId
+	r.workspaceAccountID = originAccountID
+	if target.Name != "" {
+		r.targetConfig = target
+	}
+	nbRequestContext.AccountId = targetAccountID
+	nbRequestContext.ToolConfig = target
 
 	// Attach the accumulator before any downstream work. NbToolContext is copied
 	// by value into every helper and fan-out goroutine, but they all carry this
@@ -251,20 +364,64 @@ func (r K8sResourceSearchTool) Call(nbRequestContext core.NbToolContext, input c
 	nbRequestContext.Stats = stats
 
 	result, err := r.processSearchRequest(input.Command, nbRequestContext)
+	provenance := map[string]any{
+		"origin_account_id": originAccountID,
+		"target_account_id": targetAccountID,
+		"target_name":       target.Name,
+		"cluster_name":      target.Name,
+		"config_name":       configName,
+		"target_provider":   "kubernetes",
+	}
 	if err != nil {
 		return core.NBToolResponse{
-			Data:     err.Error(),
-			Status:   core.NBToolResponseStatusError,
-			Metadata: stats.ApplyTo(nil),
+			Data:              err.Error(),
+			Status:            core.NBToolResponseStatusError,
+			Metadata:          stats.ApplyTo(nil),
+			AdditionalDetails: provenance,
 		}, err
 	}
+	result = tagResourceSearchResult(result, target.Name, targetAccountID, configName)
 
 	return core.NBToolResponse{
-		Data:     result,
-		Type:     core.NBToolResponseTypeJson,
-		Status:   core.NBToolResponseStatusSuccess,
-		Metadata: stats.ApplyTo(nil),
+		Data:              result,
+		Type:              core.NBToolResponseTypeJson,
+		Status:            core.NBToolResponseStatusSuccess,
+		Metadata:          stats.ApplyTo(nil),
+		AdditionalDetails: provenance,
 	}, nil
+}
+
+func resourceSearchTargetForAccount(ctx core.NbToolContext, accountID string) core.ToolConfig {
+	targets, err := ListKubernetesTargets(ctx.Ctx, ctx.AccountId)
+	if err == nil {
+		for _, target := range targets {
+			if KubernetesTargetAccountID(target) == accountID {
+				return target
+			}
+		}
+	}
+	// An unresolved generic account-agent label is not a cluster name. Keep the
+	// concrete account id in provenance and leave the display name unknown.
+	return core.ToolConfig{}
+}
+
+func tagResourceSearchResult(result, targetName, targetAccountID, configName string) string {
+	var payload map[string]any
+	if err := common.UnmarshalJson([]byte(result), &payload); err != nil || payload == nil {
+		return result
+	}
+	payload["target"] = map[string]string{
+		"provider":     "kubernetes",
+		"name":         targetName,
+		"cluster_name": targetName,
+		"config_name":  configName,
+		"account_id":   targetAccountID,
+	}
+	tagged, err := common.MarshalJson(payload)
+	if err != nil {
+		return result
+	}
+	return string(tagged)
 }
 
 func (r K8sResourceSearchTool) sanitizeInput(input string, allowSpaces bool) string {
@@ -299,6 +456,7 @@ func (r K8sResourceSearchTool) processSearchRequest(input string, nbRequestConte
 	request.ResourceType = r.sanitizeInput(request.ResourceType, true) // Allow spaces for multi-type
 	request.Namespace = r.sanitizeInput(request.Namespace, false)
 	request.LabelSelector = r.sanitizeLabelSelector(request.LabelSelector)
+	request.Cluster = "" // target selection is handled from structured tool arguments in Call
 
 	// Fix for queries like "notifications pods" where the type is included in the name
 	if request.ResourceName != "" {
@@ -313,14 +471,24 @@ func (r K8sResourceSearchTool) processSearchRequest(input string, nbRequestConte
 		}
 	}
 
+	// An absent search_type resolves to suggestions — the schema documents that
+	// default and does not mark the field required, so this is a supported call
+	// shape rather than a fallback for malformed input.
+	if request.SearchType == "" {
+		request.SearchType = searchTypeSuggestions
+	}
+
 	switch request.SearchType {
-	case "fuzzy":
+	case searchTypeFuzzy:
 		return r.handleFuzzyResourceType(request)
-	case "namespace":
+	case searchTypeNamespace:
 		return r.handleNamespaceSearch(request, nbRequestContext)
-	case "label":
+	case searchTypeLabel:
 		return r.handleLabelSearch(request, nbRequestContext)
 	default:
+		// searchTypeSuggestions, plus any unrecognised value: the schema enum
+		// rejects unknown values before Call(), but stay permissive for callers
+		// that reach the tool with schema validation disabled.
 		return r.handleResourceSuggestions(request, nbRequestContext)
 	}
 }
@@ -435,12 +603,19 @@ func (r K8sResourceSearchTool) handleFuzzyResourceType(request K8sResourceSearch
 // Scoped to cloud_provider = 'K8s' and is_active = true: is_active is a PRESENCE
 // flag, so failing pods (CrashLoopBackOff/OOMKilled) are included — only deleted
 // resources and stale skeleton rows (is_active NULL) are excluded. Namespace and
-// live phase come from the meta JSONB. The caller applies any resource-type
-// filter; live kubectl remains the fallback when this returns empty.
-func (r K8sResourceSearchTool) searchDbForResources(resourceName, accountId string, nbRequestContext core.NbToolContext) []K8sResourceInfo {
+// live phase come from the meta JSONB. When the caller asked for a specific
+// namespace, the query is scoped to it too — some accounts have the same name
+// active in several namespaces at once (e.g. relay-server in 5), and without
+// this a namespace-scoped query still got every namespace's match back as one
+// ambiguous "multiple" result. The caller applies any resource-type filter;
+// live kubectl remains the fallback when this returns empty.
+func (r K8sResourceSearchTool) searchDbForResources(resourceName, namespace, accountId string, nbRequestContext core.NbToolContext) []K8sResourceInfo {
 	resourceName = strings.TrimSpace(resourceName)
 	if resourceName == "" {
 		return nil
+	}
+	if namespace == "--all-namespaces" {
+		namespace = ""
 	}
 
 	// Name variations so "orders api" also matches "orders-api" / "orders_api".
@@ -462,7 +637,7 @@ func (r K8sResourceSearchTool) searchDbForResources(resourceName, accountId stri
 	}
 
 	dbStart := time.Now()
-	found, err := r.queryK8sResourcesByName(accountId, patterns)
+	found, err := r.queryK8sResourcesByName(accountId, namespace, patterns)
 	// Render the statement the way a human would re-run it: the SQL text is a
 	// constant, so the patterns are the only informative part.
 	// Record the rows themselves, not a count: the whole point of the step list is
@@ -473,8 +648,12 @@ func (r K8sResourceSearchTool) searchDbForResources(resourceName, accountId stri
 	if rowsJSON, marshalErr := common.MarshalJson(found); marshalErr == nil {
 		dbOutput = fmt.Sprintf("%d row(s)\n%s", len(found), string(rowsJSON))
 	}
+	nsClause := ""
+	if namespace != "" {
+		nsClause = fmt.Sprintf(" AND meta->>'namespace' = '%s'", namespace)
+	}
 	nbRequestContext.Stats.RecordDB(
-		fmt.Sprintf("SELECT type, name, namespace, status FROM cloud_resourses WHERE account = %s AND cloud_provider = 'K8s' AND is_active = true AND (name ILIKE ANY %v OR resourse_id ILIKE ANY %v) ORDER BY name LIMIT 20", accountId, patterns, patterns),
+		fmt.Sprintf("SELECT type, name, namespace, status FROM cloud_resourses WHERE account = %s AND cloud_provider = 'K8s' AND is_active = true AND (name ILIKE ANY %v OR resourse_id ILIKE ANY %v)%s ORDER BY name LIMIT 20", accountId, patterns, patterns, nsClause),
 		dbOutput, err, time.Since(dbStart))
 	if err != nil {
 		// Soft failure — fall through to the live-kubectl fallback, but surface
@@ -485,6 +664,36 @@ func (r K8sResourceSearchTool) searchDbForResources(resourceName, accountId stri
 	}
 	nbRequestContext.Ctx.GetLogger().Info("resource_search: cloud_resourses lookup", "terms", variations, "account", accountId, "count", len(found))
 	return found
+}
+
+// buildResourceSearchDBQuery builds the cloud_resourses lookup statement and its
+// positional args, adding the namespace predicate only when namespace is
+// non-empty. Split out from queryK8sResourcesByName so the statement text and
+// argument list can be asserted directly in a unit test, without a live or
+// mocked database — common.GetDatabaseManager(Metastore) is a process-wide
+// singleton cached on first use for the life of the test binary, which makes
+// sqlmock-based tests of this SQL fragile against unrelated tests elsewhere in
+// the package touching the same DB manager.
+func buildResourceSearchDBQuery(accountId, namespace string, patterns []string) (string, []interface{}) {
+	query := `
+		SELECT type,
+		       name,
+		       COALESCE(meta->>'namespace', '') AS namespace,
+		       COALESCE(meta->>'status', '')    AS status
+		FROM cloud_resourses
+		WHERE account = $1
+		  AND cloud_provider = 'K8s'
+		  AND is_active = true
+		  AND (name ILIKE ANY($2) OR resourse_id ILIKE ANY($2))`
+	args := []interface{}{accountId, pq.Array(patterns)}
+	if namespace != "" {
+		query += ` AND meta->>'namespace' = $3`
+		args = append(args, namespace)
+	}
+	query += `
+		ORDER BY name
+		LIMIT 20`
+	return query, args
 }
 
 // queryK8sResourcesByName runs the scoped cloud_resourses lookup for every name
@@ -501,7 +710,12 @@ func (r K8sResourceSearchTool) searchDbForResources(resourceName, accountId stri
 // Both ILIKE branches must stay indexed: Postgres can only use indexes for an OR
 // when every branch has one, and an unindexed branch forces the full scan
 // regardless of the other index.
-func (r K8sResourceSearchTool) queryK8sResourcesByName(accountId string, patterns []string) ([]K8sResourceInfo, error) {
+//
+// The namespace predicate (only added when namespace is non-empty) is applied
+// inside the same WHERE clause, before ORDER BY/LIMIT — not as a Go-side filter
+// on the result — so a real match in the requested namespace can't be crowded
+// out of the top-20 by same-name matches in other namespaces.
+func (r K8sResourceSearchTool) queryK8sResourcesByName(accountId, namespace string, patterns []string) ([]K8sResourceInfo, error) {
 	if len(patterns) == 0 {
 		return nil, nil
 	}
@@ -510,20 +724,8 @@ func (r K8sResourceSearchTool) queryK8sResourcesByName(accountId string, pattern
 		return nil, err
 	}
 
-	const query = `
-		SELECT type,
-		       name,
-		       COALESCE(meta->>'namespace', '') AS namespace,
-		       COALESCE(meta->>'status', '')    AS status
-		FROM cloud_resourses
-		WHERE account = $1
-		  AND cloud_provider = 'K8s'
-		  AND is_active = true
-		  AND (name ILIKE ANY($2) OR resourse_id ILIKE ANY($2))
-		ORDER BY name
-		LIMIT 20`
-
-	rows, err := dbms.Db.Queryx(query, accountId, pq.Array(patterns))
+	query, args := buildResourceSearchDBQuery(accountId, namespace, patterns)
+	rows, err := dbms.Db.Queryx(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -640,7 +842,7 @@ func (r K8sResourceSearchTool) handleResourceSuggestions(request K8sResourceSear
 	// (a new pod is queryable within ~1s), scoped to this account (= this
 	// cluster). It's authoritative and fast, so live kubectl runs only as a
 	// fallback when the DB returns nothing.
-	resources = r.searchDbForResources(request.ResourceName, nbRequestContext.AccountId, nbRequestContext)
+	resources = r.searchDbForResources(request.ResourceName, namespace, nbRequestContext.AccountId, nbRequestContext)
 	if r.isSpecificResourceType(request.ResourceType) {
 		resources = r.filterResourcesByType(resources, request.ResourceType)
 	}
@@ -871,6 +1073,9 @@ func (r K8sResourceSearchTool) handleNamespaceSearch(request K8sResourceSearchRe
 		var namespaces []string
 		lines := strings.Split(output, "\n")
 		for _, line := range lines {
+			if isNonResourceOutputLine(line) {
+				continue
+			}
 			fields := strings.Fields(line)
 			if len(fields) > 0 {
 				namespaces = append(namespaces, fields[0])
@@ -1169,10 +1374,10 @@ func (r K8sResourceSearchTool) getCustomResourceTypes(nbRequestContext core.NbTo
 
 	lines := strings.Split(response, "\n")
 	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
+		if isNonResourceOutputLine(line) {
 			continue
 		}
+		line = strings.TrimSpace(line)
 
 		fields := strings.Fields(line)
 		if len(fields) >= 1 {
@@ -1419,8 +1624,50 @@ func (r K8sResourceSearchTool) isClusterWideResource(resourceType string) bool {
 	return k8sClusterWideResources[strings.ToLower(resourceType)]
 }
 
+// isNonResourceOutputLine reports whether line is a kubectl status message,
+// error, warning, or table header rather than an actual resource entry.
+func isNonResourceOutputLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return true
+	}
+	lower := strings.ToLower(trimmed)
+	// "No resources found..." always contains spaces (K8s resource names cannot contain spaces).
+	if strings.HasPrefix(lower, "no resources found") {
+		return true
+	}
+	// Kubectl error/warning messages have colons or multi-word phrases ("error: ...", "error from server", "warning: ...").
+	// Using specific prefixes avoids false-matching valid K8s resources named "error" or "warning",
+	// which would start with "error " or "warning " due to kubectl column spacing padding.
+	if strings.HasPrefix(lower, "error:") ||
+		strings.HasPrefix(lower, "error from server") ||
+		strings.HasPrefix(lower, "warning:") {
+		return true
+	}
+	fields := strings.Fields(trimmed)
+	// Check for table header rows:
+	// - Single-namespace: "NAME READY STATUS...", "NAME DATA AGE", "NAME SCHEDULE ... AGE"
+	// - All-namespaces:   "NAMESPACE NAME READY STATUS..."
+	// Standard kubectl get headers begin with NAME and end with AGE.
+	if len(fields) >= 2 {
+		first := fields[0]
+		second := fields[1]
+		last := fields[len(fields)-1]
+		if strings.EqualFold(first, "name") && (strings.EqualFold(second, "ready") || strings.EqualFold(second, "status") || strings.EqualFold(second, "type") || strings.EqualFold(last, "age")) {
+			return true
+		}
+		if strings.EqualFold(first, "namespace") && strings.EqualFold(second, "name") {
+			return true
+		}
+	}
+	return false
+}
+
 // parseGenericResourceLine parses a generic kubectl output line
 func (r K8sResourceSearchTool) parseGenericResourceLine(line, resourceType, namespace string, isAllNamespaces bool) *K8sResourceInfo {
+	if isNonResourceOutputLine(line) {
+		return nil
+	}
 	fields := strings.Fields(line)
 	if len(fields) < 1 {
 		return nil
@@ -1468,30 +1715,50 @@ func (r K8sResourceSearchTool) executeKubectlCommand(command string, nbRequestCo
 		command = "kubectl " + command
 	}
 
+	// Same workspace-pod path as shell_execute/kubectl_execute, so resource
+	// search no longer needs its own relay dispatch. validateKubectlCommandAccess
+	// must still run here: it's normally enforced by ExecuteContainerJob's
+	// RelayJobKubectl branch, which this call bypasses.
+	if err := validateKubectlCommandAccess(command); err != nil {
+		nbRequestContext.Ctx.GetLogger().Error("resource-search: kubectl command rejected", "error", err.Error(), "command", command)
+		return ""
+	}
+
 	relayStart := time.Now()
-	response, err := ExecuteContainerJob(nbRequestContext, RelayJobKubectl, command, nbRequestContext.AccountId, map[string]any{}, false)
-	nbRequestContext.Stats.RecordRelay(command, fmt.Sprintf("%v", response), err, time.Since(relayStart))
+	// wm (tool_shell.go) is the package-wide WorkspaceManager; reuse it rather than
+	// constructing a new http.Client per call — resource_search fans out into many
+	// of these in one tool invocation.
+	workspaceAccountID := r.workspaceAccountID
+	if workspaceAccountID == "" {
+		workspaceAccountID = nbRequestContext.AccountId
+	}
+	env := map[string]string{}
+	if r.targetConfig.Name != "" {
+		var envErr error
+		env, envErr = KubernetesTargetEnv(nbRequestContext, r.targetConfig)
+		if envErr != nil {
+			nbRequestContext.Stats.RecordRelay(command, "", envErr, time.Since(relayStart))
+			nbRequestContext.Ctx.GetLogger().Error("resource-search: target environment rejected", "error", envErr.Error(), "command", command)
+			return ""
+		}
+	}
+	response, err := wm.ExecuteOrLazyCreate(nbRequestContext.Ctx, workspaceAccountID, nbRequestContext.ConversationId, command, env)
+	if err != nil && isNoMatchExit(err, command) {
+		// grep exiting 1 with no matches is normal Unix semantics, not a relay
+		// failure — record it as a successful empty result so the conversation
+		// trace doesn't show a false [ERROR] for every unmatched search term
+		// (same reclassification tool_shell.go's Call() already does; see
+		// isNoMatchExit for the full rationale).
+		nbRequestContext.Stats.RecordRelay(command, response, nil, time.Since(relayStart))
+		return response
+	}
+	nbRequestContext.Stats.RecordRelay(command, response, err, time.Since(relayStart))
 	if err != nil {
 		nbRequestContext.Ctx.GetLogger().Error("resource-search: kubectl command failed", "error", err.Error(), "command", command)
 		return ""
 	}
 
-	// ExecuteApiCall returns a JSON string with format {"stdout": "actual_output"}
-	if responseStr, ok := response.(string); ok {
-		var responseObj map[string]any
-		if err := common.UnmarshalJson([]byte(responseStr), &responseObj); err == nil {
-			if stdout, exists := responseObj["stdout"]; exists {
-				if stdoutStr, ok := stdout.(string); ok {
-					return stdoutStr
-				}
-			}
-		}
-		nbRequestContext.Ctx.GetLogger().Error("resource-search: failed to parse kubectl response JSON", "response", responseStr)
-		return ""
-	}
-
-	nbRequestContext.Ctx.GetLogger().Error("resource-search: unexpected response type", "response_type", fmt.Sprintf("%T", response), "response", response)
-	return ""
+	return response
 }
 
 // executeKubectlAndParseResources executes kubectl and parses the result into resource info
@@ -1532,6 +1799,9 @@ func (r K8sResourceSearchTool) executeKubectlAndParseResources(command, resource
 
 // parsePodLine parses a kubectl get pods output line
 func (r K8sResourceSearchTool) parsePodLine(line, namespace string, isAllNamespaces bool) *K8sResourceInfo {
+	if isNonResourceOutputLine(line) {
+		return nil
+	}
 	fields := strings.Fields(line)
 	if len(fields) < 3 {
 		return nil
@@ -1565,6 +1835,9 @@ func (r K8sResourceSearchTool) parsePodLine(line, namespace string, isAllNamespa
 
 // parseDeploymentLine parses a kubectl get deployments output line
 func (r K8sResourceSearchTool) parseDeploymentLine(line, namespace string, isAllNamespaces bool) *K8sResourceInfo {
+	if isNonResourceOutputLine(line) {
+		return nil
+	}
 	fields := strings.Fields(line)
 	if len(fields) < 4 {
 		return nil
@@ -1598,6 +1871,9 @@ func (r K8sResourceSearchTool) parseDeploymentLine(line, namespace string, isAll
 
 // parseAllResourceLine parses a kubectl get all output line
 func (r K8sResourceSearchTool) parseAllResourceLine(line, namespace string, isAllNamespaces bool) *K8sResourceInfo {
+	if isNonResourceOutputLine(line) {
+		return nil
+	}
 	fields := strings.Fields(line)
 	if len(fields) < 1 {
 		return nil
@@ -1915,13 +2191,22 @@ func GetCurrentK8sAccountState(accountId string, limit int) map[string][]string 
 
 	// Cache the result
 	if cachedBytes, err := common.MarshalJson(response); err == nil {
-		_ = common.CacheSet(core.CacheNamespaceLlmToolConfig, cacheKey, cachedBytes, common.CacheSetWithExpiration(30*time.Minute))
+		_ = common.CacheSet(core.CacheNamespaceLlmToolConfig, cacheKey, cachedBytes,
+			common.CacheSetWithExpiration(30*time.Minute),
+			common.CacheSetWithTags(core.ToolConfigAccountTag(accountId)))
 	}
 
 	return response
 }
 
-func GetCurrentOtelHosts(accountId string) map[string]string {
+// GetCurrentOtelHosts discovers the OTel-reporting hosts for an account. ctx is
+// required: the query goes to services-server, which needs the caller's security
+// context. A nil ctx yields no hosts rather than a panic — the hosts only enrich a
+// prompt, so losing them must never fail the request that asked for it.
+func GetCurrentOtelHosts(ctx *security.RequestContext, accountId string) map[string]string {
+	if ctx == nil {
+		return map[string]string{}
+	}
 	discoveryQuery := `sum by (host.name, host.ip) (system.memory.utilization{host.name!=""})`
 	toolProm := PrometheusExecuteTool{}
 
@@ -1929,6 +2214,7 @@ func GetCurrentOtelHosts(accountId string) map[string]string {
 	startTime := endTime.Add(-1 * time.Hour)
 
 	response, err := toolProm.executePromQl(core.NbToolContext{
+		Ctx:       ctx,
 		AccountId: accountId,
 	}, discoveryQuery, accountId, map[string]any{
 		"end_time":   endTime.UTC().Format(time.RFC3339),

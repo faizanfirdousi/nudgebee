@@ -114,6 +114,16 @@ func HandleFollowupAndResumeV2(ctx *security.RequestContext, req NBAgentRequest)
 	lock := acquireConversationLock(req.ConversationId)
 	defer releaseConversationLock(req.ConversationId, lock)
 
+	return resumeFollowupLocked(ctx, req)
+}
+
+// resumeFollowupLocked is the body of HandleFollowupAndResumeV2, minus lock
+// acquisition — callers must already hold acquireConversationLock(req.ConversationId).
+// Extracted so TrySkipAndContinueFollowup (followup_skip_continue.go) can run
+// its own sibling check and this same resume logic under a single lock
+// acquisition, instead of two separate lock windows that would either race
+// or (if naively re-locked) deadlock against sync.Mutex's non-reentrancy.
+func resumeFollowupLocked(ctx *security.RequestContext, req NBAgentRequest) (NBAgentResponse, error) {
 	logger := ctx.GetLogger()
 	logger.Info("resume_v2: handling followup",
 		"conversation_id", req.ConversationId,
@@ -131,6 +141,13 @@ func HandleFollowupAndResumeV2(ctx *security.RequestContext, req NBAgentRequest)
 		return NBAgentResponse{}, fmt.Errorf("resume_v2: agent %s not found", req.AgentId)
 	}
 	agent := agents[0]
+	// Cross-account guard — see agentBelongsToAccount's doc comment
+	// (followup.go). Same "not found" error as the zero-results case above,
+	// deliberately, and checked before the ancestor-walk below so a
+	// cross-account agentId can't even reach that logic.
+	if !agentBelongsToAccount(agent, req.AccountId) {
+		return NBAgentResponse{}, fmt.Errorf("resume_v2: agent %s not found", req.AgentId)
+	}
 
 	// If the loaded agent's implementation isn't registered — the case for
 	// sub-agents constructed on-the-fly by tool wrappers (delegate_agent's
@@ -372,21 +389,7 @@ func runAgentResumeV2(ctx *security.RequestContext, req NBAgentRequest, agent Co
 	// (previousQuery). So the sequence is: answer → stored as response →
 	// refine uses it as config → refine replaces Query → planner sees
 	// original task. We must not short-circuit this sequence.
-	resumeReq := NBAgentRequest{
-		Query:                 req.Query,
-		AccountId:             req.AccountId,
-		UserId:                req.UserId,
-		ConversationId:        req.ConversationId,
-		MessageId:             req.MessageId,
-		AgentId:               req.AgentId,
-		ParentAgentId:         parentAgentID,
-		PreviousState:         previousState,
-		QueryConfig:           queryConfig,
-		QueryContext:          req.QueryContext,
-		SessionId:             req.SessionId,
-		ConversationSource:    req.ConversationSource,
-		EnableQueryRefinement: req.EnableQueryRefinement,
-	}
+	resumeReq := buildResumeAgentRequest(req, parentAgentID, previousState, queryConfig)
 
 	ctx.GetLogger().Info("resume_v2: executing agent resume",
 		"agent_name", agentName,
@@ -403,6 +406,27 @@ func runAgentResumeV2(ctx *security.RequestContext, req NBAgentRequest, agent Co
 	// correctly considers sibling state.
 
 	return executeAgent(ctx, agentImpl, resumeReq)
+}
+
+// buildResumeAgentRequest carries the turn's request forward and overrides only
+// what resume changes. Copy-then-override, not an allowlist: the request already
+// arrives fully populated from the normal conversation path, and rebuilding it
+// field by field silently dropped 18 of 35 fields — account context, memory, KB
+// content, skills, images — degrading the resumed answer and evicting the first
+// turn's provider cache, which shares one slot with the shortened prefix.
+//
+// QueryConfig is the durable representation loaded from message_config; ClientTools
+// and Capabilities are the runtime fields the planner and executor read directly.
+// Omitting the runtime fields makes a request-scoped client tool work for the
+// first iteration and disappear after client-tool-result resumes it.
+func buildResumeAgentRequest(req NBAgentRequest, parentAgentID, previousState string, queryConfig toolcore.NBQueryConfig) NBAgentRequest {
+	resumed := req
+	resumed.ParentAgentId = parentAgentID
+	resumed.PreviousState = previousState
+	resumed.QueryConfig = queryConfig
+	resumed.ClientTools = queryConfig.ClientTools
+	resumed.Capabilities = queryConfig.Capabilities
+	return resumed
 }
 
 // bubbleUpIfSiblingsDone is the recursive parent-resume helper.
@@ -426,10 +450,7 @@ func bubbleUpIfSiblingsDone(ctx *security.RequestContext, req NBAgentRequest, ch
 
 	// Top-level agent: no parent to bubble up to. Persist final message + conversation state.
 	if parentAgentID == "" || parentAgentID == uuid.Nil.String() || parentAgentID == childAgent.ID.String() {
-		persistFinalMessage(ctx, req.MessageId, childResp)
-		if err := dao.UpdateConversationStatus(req.ConversationId, ConversationStatusCompleted); err != nil {
-			logger.Warn("resume_v2: failed to mark conversation complete", "error", err)
-		}
+		finalizeCompletedConversation(ctx, req, childResp)
 		return childResp, nil
 	}
 
@@ -459,33 +480,58 @@ func bubbleUpIfSiblingsDone(ctx *security.RequestContext, req NBAgentRequest, ch
 		return childResp, nil
 	}
 
-	// All siblings done. If the completed child's answer IS the final answer
-	// (IsTerminal — e.g. automation_builder returning the built workflow JSON after
-	// "Approve and Build"), finalize from it and do NOT resume the parent. Resuming
-	// would re-run the ancestor planner, which for a nested builder
+	// All siblings done. If the completed child explicitly declares that its
+	// terminal answer is also the parent's final answer (e.g. automation_builder
+	// returning workflow JSON after "Approve and Build"), finalize from it and do
+	// NOT resume the parent. Resuming would re-run the ancestor planner, which for
+	// a nested builder
 	// (k8s_debug → automation → automation_builder) re-delegates a FRESH build,
 	// regenerating the plan and re-prompting for approval in a loop (#31997).
 	//
-	// This mirrors the non-resume executor, which already finalizes on a nested
-	// sub-agent's IsTerminal everywhere — the ReAct loop and parallel exec paths in
-	// executor_planner.go, and waiting-tool resume. The V2 bubble-up
-	// was the one path that forgot the terminal short-circuit; this restores parity.
+	// This mirrors the non-resume agent-tool wrapper, which converts the child's
+	// IsTerminal flag into an explicit parent-terminal flag only for opted-in agents.
 	// Placed AFTER the waitingCount>0 guard above so a still-waiting parallel sibling
 	// is never stranded — we only short-circuit once no sibling needs user input.
+	childMayFinalizeParent := false
 	if childResp.IsTerminal {
+		childAgentName := childAgent.AgentName
+		if childAgentName == "" {
+			childAgentName = childResp.AgentName
+		}
+		if runtimeAgent, found := GetNBAgent(ctx, childAgentName, req.AccountId, AgentStatusEnabled); found {
+			childMayFinalizeParent = ResolveAgentParentTerminal(runtimeAgent, true)
+		}
+	}
+	if childMayFinalizeParent {
 		logger.Info("resume_v2: child returned terminal response; finalizing without ancestor re-run",
 			"child_agent_id", childAgent.ID.String(),
 			"agent_name", childAgent.AgentName,
 			"parent_agent_id", parentAgentID)
-		persistFinalMessage(ctx, req.MessageId, childResp)
-		if err := dao.UpdateConversationStatus(req.ConversationId, ConversationStatusCompleted); err != nil {
-			logger.Warn("resume_v2: failed to mark conversation complete after terminal child", "error", err)
-		}
+		finalizeCompletedConversation(ctx, req, childResp)
 		return childResp, nil
 	}
 
-	// All siblings done. Resume parent.
-	_, parentState := dao.GetConversationAgentParentAgentIdAndPreviousState(parentAgentID)
+	// All siblings done. Resolve the executable parent before reading state.
+	// Dynamic wrappers such as delegate_agent have their own persisted row but
+	// no registered implementation; their state is not the state the ancestor
+	// orchestrator must resume with.
+	originalParentID := parentAgentID
+	parentAgentImpl, executableParent, grandparentID, parentState, walkedLevels, resolveErr := resolveBubbleUpParent(
+		ctx, dao, parentAgentID, req.AccountId, childAgent.ID,
+	)
+	if resolveErr != nil {
+		return childResp, resolveErr
+	}
+	parentAgentID = executableParent.ID.String()
+	parentName := executableParent.AgentName
+	if walkedLevels > 0 {
+		logger.Info("resume_v2: skipping unregistered dynamic parent agent",
+			"original_parent_agent_id", originalParentID,
+			"resolved_parent_agent_id", parentAgentID,
+			"resolved_parent_name", parentName,
+			"walked_levels", walkedLevels)
+	}
+
 	if parentState == "" {
 		// The parent already completed out-of-band and its state was cleared, so
 		// it cannot be re-run — but its final answer is on the agent row. Surface
@@ -506,23 +552,8 @@ func bubbleUpIfSiblingsDone(ctx *security.RequestContext, req NBAgentRequest, ch
 			len(parents) > 0 && parents[0].Response != nil && *parents[0].Response != "" {
 			finalResp.Response = []string{*parents[0].Response}
 		}
-		persistFinalMessage(ctx, req.MessageId, finalResp)
-		_ = dao.UpdateConversationStatus(req.ConversationId, ConversationStatusCompleted)
+		finalizeCompletedConversation(ctx, req, finalResp)
 		return finalResp, nil
-	}
-
-	parentName, nameErr := dao.GetAgentNameFromAgentId(parentAgentID)
-	if nameErr != nil || parentName == "" {
-		return childResp, fmt.Errorf("resume_v2: parent agent name lookup failed: %w", nameErr)
-	}
-	parentAgentImpl, ok := GetNBAgent(ctx, parentName, req.AccountId, AgentStatusEnabled)
-	if !ok {
-		return childResp, fmt.Errorf("resume_v2: parent agent impl not registered: %s", parentName)
-	}
-
-	grandparentID, _ := dao.GetConversationAgentParentAgentIdAndPreviousState(parentAgentID)
-	if grandparentID == "" || grandparentID == uuid.Nil.String() {
-		grandparentID = parentAgentID
 	}
 
 	// For parent resume: the parent's followup message is already COMPLETED
@@ -622,6 +653,126 @@ func bubbleUpIfSiblingsDone(ctx *security.RequestContext, req NBAgentRequest, ch
 		logger.Warn("resume_v2: failed to persist post-parent status", "error", err)
 	}
 	return parentResp, nil
+}
+
+// resolveBubbleUpParent resolves past dynamic wrapper rows, then loads the
+// ancestry and saved state from the executable agent row. Keeping these steps
+// together prevents callers from accidentally pairing an ancestor
+// implementation with a delegate_agent state blob.
+func resolveBubbleUpParent(
+	ctx *security.RequestContext,
+	dao IConversationDao,
+	parentAgentID, accountID string,
+	originID uuid.UUID,
+) (NBAgent, *ConversationAgent, string, string, int, error) {
+	parentUUID, err := uuid.Parse(parentAgentID)
+	if err != nil {
+		return nil, nil, "", "", 0, fmt.Errorf("resume_v2: invalid parent agent id %s: %w", parentAgentID, err)
+	}
+
+	agent, executableParent, walkedLevels, err := resolveRegisteredAncestor(ctx, parentUUID, accountID, originID)
+	if err != nil {
+		return nil, nil, "", "", 0, fmt.Errorf("resume_v2: failed to resolve executable parent agent: %w", err)
+	}
+	if agent == nil || executableParent == nil {
+		return nil, nil, "", "", 0, fmt.Errorf("resume_v2: no registered parent agent found from %s", parentAgentID)
+	}
+
+	grandparentID, state := dao.GetConversationAgentParentAgentIdAndPreviousState(executableParent.ID.String())
+	if grandparentID == "" || grandparentID == uuid.Nil.String() {
+		grandparentID = executableParent.ID.String()
+	}
+	return agent, executableParent, grandparentID, state, walkedLevels, nil
+}
+
+// finalizeCompletedConversation persists the final message + conversation
+// status and fires the answer-confidence grader — the same post-completion
+// hook the normal (non-followup) path runs right after its save-back
+// (conversation.go:1561-1568). resume_v2 bubbles up through executeAgent
+// directly rather than returning through handleConversationRequest's
+// save-back block, so without this call the grader never ran for a turn
+// that needed a followup (any confirm-to-proceed, pick-one, or extra-input
+// exchange) — #37534.
+func finalizeCompletedConversation(ctx *security.RequestContext, req NBAgentRequest, resp NBAgentResponse) {
+	persistFinalMessage(ctx, req.MessageId, resp)
+	if err := GetConversationDao().UpdateConversationStatus(req.ConversationId, ConversationStatusCompleted); err != nil {
+		ctx.GetLogger().Warn("resume_v2: failed to mark conversation complete", "error", err)
+	}
+
+	if resp.AgentName == ToolLlm {
+		return
+	}
+
+	// Free checks before either DB read below. shouldScoreAnswerConfidence
+	// rejects a blank answer anyway, so reaching it costs two round-trips for a
+	// turn that was never gradeable.
+	answer := ""
+	if len(resp.Response) > 0 {
+		answer = strings.TrimSpace(resp.Response[0])
+	}
+	if answer == "" {
+		return
+	}
+
+	// Cheap gate before the GetConversationMessage round-trip below, so a tenant
+	// without the feature pays nothing on every followup resume. This repeats a
+	// check ScoreAnswerConfidenceAsync also makes, which costs one extra indexed
+	// lookup for tenants that DO have it enabled.
+	secCtx := ctx.GetSecurityContext()
+	if secCtx == nil || !AnswerConfidenceEnabledForTenant(ctx, secCtx.GetTenantId()) {
+		return
+	}
+
+	question, err := originalQuestionForScoring(req)
+	if err != nil {
+		// Worth surfacing: a dropped connection or schema mismatch here stops
+		// every resumed turn being graded, and silence would make that look
+		// like the feature simply doing nothing.
+		ctx.GetLogger().Error("resume_v2: unable to recover the original question, skipping confidence scoring",
+			"error", err, "message_id", req.MessageId)
+		return
+	}
+	if question == "" {
+		// Must not fall through with an empty OriginalQuery: on this resume
+		// path req.Query is always the followup answer (e.g. "yes"), never
+		// empty (HandleFollowupAndResumeV2 rejects that at the door), so
+		// shouldScoreAnswerConfidence's OriginalQuery-empty fallback would
+		// grade the followup answer as if it were the question — reintroducing
+		// the bug this function exists to fix (#37535 review).
+		return
+	}
+
+	scoreReq := req
+	scoreReq.OriginalQuery = question
+	ScoreAnswerConfidenceAsync(ctx, scoreReq, answer)
+}
+
+// originalQuestionForScoring resolves the user's verbatim top-level question
+// for answer-confidence classification. On a followup-resume completion,
+// req.Query is the user's answer to the followup (e.g. "yes"), not the
+// question — the generation message row holds the original text, untouched
+// by any followup exchange.
+//
+// An empty string with a nil error means "no usable question" — a missing
+// identifier, or a blank stored message — and the caller skips scoring quietly.
+// A non-nil error means the lookup itself failed and is worth logging. Either
+// way the caller must NOT hand on a "", which shouldScoreAnswerConfidence would
+// silently replace with req.Query, i.e. the followup answer.
+func originalQuestionForScoring(req NBAgentRequest) (string, error) {
+	// Not an error: there is simply nothing to look up, and querying with a
+	// blank uuid would turn a structurally impossible case into log noise.
+	if req.AccountId == "" || req.MessageId == "" || req.ConversationId == "" {
+		return "", nil
+	}
+	msg, err := GetConversationDao().GetConversationMessage(req.MessageId, req.AccountId, req.ConversationId)
+	if err != nil {
+		return "", fmt.Errorf("resume_v2: failed to load generation message %s for confidence scoring: %w", req.MessageId, err)
+	}
+	// Return the trimmed form so the value matches the predicate computed from
+	// it. Both consumers trim anyway (IsInvestigationRequestTask, and
+	// generateAnswerConfidence when it builds the grader prompt), so this
+	// normalizes rather than changes behaviour.
+	return strings.TrimSpace(msg.Message), nil
 }
 
 // persistFinalMessage writes the agent response content + status to the

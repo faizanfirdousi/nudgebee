@@ -8,13 +8,34 @@ import {
   getStartOfMonth,
   getEndOfMonth,
   getYesterday,
-  getLast7Days,
   formatDateTime,
 } from '@lib/datetime';
 import { getBudgetExpectedMonthlyExpense, getExpectedYearlyExpense } from '@lib/budget';
-import { convertNumberToTimestampPromFormat, parseHttpResponseBodyMessage, safeJSONParse } from 'src/utils/common';
+import { parseHttpResponseBodyMessage, safeJSONParse } from 'src/utils/common';
 import getMockData from '@api1/mock';
+import observability from '@api1/observability';
 import { getClusterData } from '@context/DataContext';
+
+// Range step for a PromQL window when the caller has no opinion — the same table
+// the relay-server applies on the agent path, so a chart is as dense on a
+// Prometheus connected without an agent as it is behind one.
+function promqlDefaultStepSeconds(startMs: number, endMs: number) {
+  const seconds = Math.max(1, (endMs - startMs) / 1000);
+  let resolution: number;
+  if (seconds <= 3600) resolution = 250;
+  else if (seconds <= 86400) resolution = Math.ceil(seconds / 60);
+  else if (seconds <= 7 * 86400) resolution = Math.ceil(seconds / 300);
+  else resolution = 3000;
+  return Math.max(1, Math.round(seconds / resolution));
+}
+
+// '1d' | '1w' | '30d' — the bucket sizes getClusterMetrices2 charts by.
+function promStepToSeconds(step: string) {
+  const match = /^(\d+)([smhdw])$/.exec(step);
+  if (!match) return undefined;
+  const unit: Record<string, number> = { s: 1, m: 60, h: 3600, d: 86400, w: 7 * 86400 };
+  return parseInt(match[1], 10) * unit[match[2]];
+}
 
 function parseInsightJsonFields(rows: any[]) {
   if (!rows) return rows;
@@ -309,6 +330,7 @@ query k8s_pods_list($limit:Int, $offset:Int) {
       namespace
       name
       status
+      container_status
       is_active
       node_name
       workload_name
@@ -362,10 +384,13 @@ query ResolveEventRecord($id:String!) {
       id
       subject_name
       starts_at
+      ends_at
+      created_at
       subject_namespace
       cluster
       subject_node
       subject_owner
+      subject_owner_kind
       subject_type
       title
       priority
@@ -388,6 +413,30 @@ query ResolveEventRecord($id:String!) {
       incident_leader_id
       incident_member_count
     }
+  }
+}
+`;
+
+// Lifecycle fields only — for showing another event's state without loading its evidences.
+export const EVENT_UPDATE_STATUS = `
+mutation EventUpdateStatus($event_id: String!, $status: String!, $reason_code: String!, $reason_text: String, $evidence_url: String) {
+  event_update_status(event_id: $event_id, status: $status, reason_code: $reason_code, reason_text: $reason_text, evidence_url: $evidence_url) {
+    success
+    prev_status
+    new_status
+  }
+}
+`;
+export const EVENT_GET_STATUS_CHANGE = `
+mutation EventGetStatusChange($event_ids: [String!]!) {
+  event_get_status_change(event_ids: $event_ids) {
+    event_id
+    changed_by_name
+    status
+    changed_at
+    reason_code
+    reason_text
+    evidence_url
   }
 }
 `;
@@ -435,16 +484,6 @@ query ListK8sWorkloadNames {
 }
 `;
 
-export const K8S_POD_STATUS_TYPE = `
-query ListK8PodStatusType {
-  k8s_pods: k8s_pod_groupings_v2(where:__WHERE__){
-    rows{
-   		status   
-    }
-  }
-}
-`;
-
 export const K8S_WORKLOAD_WORKLOAD_TYPE = `
 query ListK8WorkloadWorkloadType {
   k8s_workloads: k8s_workload_groupings_v2(where:__WHERE__){
@@ -475,6 +514,18 @@ query getPodDetails {
 }
 `;
 
+export const K8S_EVENT_SUBJECT_RESOURCES = `
+query getEventSubjectResources {
+  cloud_resourses: cloud_resource_v2(where: __WHERE__, limit: 5) {
+    rows {
+      id
+      name
+      type
+    }
+  }
+}
+`;
+
 export const K8S_METRICS_GROUPINGS = `
 query MetricsGroupings($limit:Int!, $dateUnit: String!) {
   cloud_resource_metrics_groupings: metric_groupings_v2(where:__WHERE__, column_transformations: [{name: "timestamp", expr: "date_unit", args:[$dateUnit]}], limit: $limit){
@@ -489,28 +540,34 @@ query MetricsGroupings($limit:Int!, $dateUnit: String!) {
 }
 `;
 
+// Each column is a separate metric the backend reads from cloud_resource_metrics
+// (one row per metric per timestamp), so requesting fewer reads proportionally fewer rows.
+const K8S_METRIC_COLUMNS = [
+  'cost',
+  'avg_efficiency',
+  'max_efficiency',
+  'avg_cpu_used',
+  'max_cpu_used',
+  'avg_memory_used',
+  'max_memory_used',
+  'avg_cpu_request',
+  'max_cpu_request',
+  'avg_memory_request',
+  'max_memory_request',
+  'avg_cpu_efficiency',
+  'max_cpu_efficiency',
+  'avg_ram_efficiency',
+  'max_ram_efficiency',
+  'sum_ingress',
+  'sum_egress',
+];
+
 export const K8S_POD_GROUPINGS = `
 query PodGroupings($limit:Int!, $dateUnit: String!) {
   k8s_pod_groupings: k8s_metrics_groupings_v2(where:__WHERE__, limit:$limit, column_transformations: [{name: "timestamp", expr: "date_unit", args:[$dateUnit]}]){
     rows {
       tenant_id
-      cost
-      avg_efficiency
-      max_efficiency
-      avg_cpu_used
-      max_cpu_used
-      avg_memory_used
-      max_memory_used
-      avg_cpu_request
-      max_cpu_request
-      avg_memory_request
-      max_memory_request
-      avg_cpu_efficiency
-      max_cpu_efficiency
-      avg_ram_efficiency
-      max_ram_efficiency
-      sum_ingress
-      sum_egress
+      __METRIC_COLUMNS__
       __ADDITIONAL_COLUMNS__
     }
   }
@@ -667,8 +724,8 @@ query GenerateAIRecommendation($eventId: String!, $accountId: String!, $recommen
 `;
 
 export const AI_REMEDIATION_GENERATE = `
-query AiRemediationGenerate($accountId: String!, $eventId: String, $context: String!, $availableArtifacts: [String!]) {
-  ai_remediation_generate(account_id: $accountId, event_id: $eventId, context: $context, available_artifacts: $availableArtifacts) {
+query AiRemediationGenerate($accountId: String!, $eventId: String, $context: String!, $availableArtifacts: [String!], $alertRule: jsonb) {
+  ai_remediation_generate(account_id: $accountId, event_id: $eventId, context: $context, available_artifacts: $availableArtifacts, alert_rule: $alertRule) {
     data
   }
 }
@@ -683,8 +740,8 @@ query AiRemediationGet($accountId: String!, $eventId: String) {
 `;
 
 export const AI_REMEDIATION_EXECUTE = `
-mutation AiRemediationExecute($accountId: String!, $eventId: String, $command: String!, $configName: String, $slot: String) {
-  ai_remediation_execute(account_id: $accountId, event_id: $eventId, command: $command, config_name: $configName, slot: $slot) {
+mutation AiRemediationExecute($accountId: String!, $eventId: String, $command: String!, $configName: String, $slot: String, $executeCommand: String) {
+  ai_remediation_execute(account_id: $accountId, event_id: $eventId, command: $command, config_name: $configName, slot: $slot, execute_command: $executeCommand) {
     data
   }
 }
@@ -828,6 +885,11 @@ function buildEventFilterParams(query: any) {
   }
   if (query?.incident_leader_id) {
     filterParams['incident_leader_id'] = { _eq: query['incident_leader_id'] };
+  }
+  // Fold incident children out of the list: only leaders and ungrouped events
+  // remain, each group represented by its leader row (#34655).
+  if (query?.hide_incident_children) {
+    filterParams['incident_leader_id'] = { _is_null: true };
   }
   if (Array.isArray(query?.aggregation_key_nin) && query['aggregation_key_nin'].length) {
     filterParams['aggregation_key'] = { ...(filterParams['aggregation_key'] || {}), _not_in: query['aggregation_key_nin'] };
@@ -1125,29 +1187,34 @@ const apiKubernetes = {
       return error;
     }
   },
+  // The Status filter's options: every status the cluster's pods are actually in
+  // right now, taken from the same per-cluster counts the Summary donut renders,
+  // plus the four phases so they stay selectable when no pod is in them.
+  //
+  // Sourced from the counts rather than SELECT DISTINCT over the pods: the
+  // distinct has to look at every pod row the account has ever had (one dev
+  // account holds 333k), while the counts are restricted to live pods and are
+  // already computed for the Summary.
   async listK8sPodStatusType({ accountId }: { accountId?: string }) {
+    const phases = ['Failed', 'Pending', 'Running', 'Succeeded'];
     try {
-      if (accountId === 'demo') {
-        return {
-          data: {
-            k8s_pods: [],
-          },
-        };
+      if (accountId === 'demo' || !accountId) {
+        return { data: { k8s_pods: phases.map((status) => ({ status })) } };
       }
-      const where: any = {};
-      if (accountId) {
-        where['account_id'] = { _eq: accountId };
-      }
-      const query = K8S_POD_STATUS_TYPE.replaceAll('__WHERE__', gqlStringify(where));
-      const response = await queryGraphQL(query, 'ListK8PodStatusType', {});
+      const response = await queryGraphQL(GET_k8_CLUSTER_GROUPINGS, 'get_k8_cluster_groupings', {
+        accountId1: accountId,
+      });
+      const counts = response?.data?.data?.k8s_cluster_groupings?.rows?.[0]?.pod_status_counts;
+      const present = Object.entries(typeof counts === 'string' ? JSON.parse(counts || '{}') : counts || {})
+        .filter(([, count]) => Number(count) > 0)
+        .map(([status]) => status);
       return {
         data: {
-          k8s_pods: response?.data?.data?.k8s_pods?.rows,
+          k8s_pods: Array.from(new Set([...present, ...phases])).map((status) => ({ status })),
         },
       };
-    } catch (error) {
-      console.log('Your Error is', error);
-      return error;
+    } catch {
+      return { data: { k8s_pods: phases.map((status) => ({ status })) } };
     }
   },
   async resolveEventRecord(id: string, accountId?: string) {
@@ -1196,8 +1263,11 @@ const apiKubernetes = {
         id: id,
         aggregation_key: aggregation_key,
         service_key: service_key,
-        sdate_1_days: getYesterday(new Date()),
-        sdate_7_days: getLast7Days(new Date()),
+        // Anchored on the event, not on now: with `endDate` set to the event's
+        // start and these set from today, the range inverted on any event older
+        // than the window and the count silently came back 0.
+        sdate_1_days,
+        sdate_7_days,
         endDate: parsedEndDate,
       });
       const d = response?.data?.data;
@@ -1664,7 +1734,8 @@ const apiKubernetes = {
       score_factors
       score_confidence
       incident_leader_id
-      incident_member_count${issueTypeFields}
+      incident_member_count
+      is_investigated${issueTypeFields}
     }
   }
 }`;
@@ -1695,10 +1766,14 @@ const apiKubernetes = {
        finding_id
        fingerprint
        subject_owner
+       source
        computed_score
        computed_priority
        score_factors
-       score_confidence${issueTypeFields}
+       score_confidence
+       incident_leader_id
+       incident_member_count
+       is_investigated${issueTypeFields}
      }
    }
  }`;
@@ -2273,7 +2348,11 @@ query k8s_event_groupings($limit:Int,$offset:Int){
       where.push({ is_active: { _eq: false } });
     }
     if (query.status) {
-      where.push({ status: { _eq: query.status } });
+      // display_status, not status: `status` is the phase, so filtering for
+      // CrashLoopBackOff never matched (the phase is Running) and filtering for
+      // Failed did not return crashlooping pods either. display_status is what
+      // the Status/State column shows.
+      where.push({ display_status: { _eq: query.status } });
     }
     if (query.podName || query.pod_name || query.name) {
       where.push({ name: { _ilike: '%' + (query.podName || query.pod_name || query.name) + '%' } });
@@ -2309,6 +2388,7 @@ query k8s_event_groupings($limit:Int,$offset:Int){
             namespace
             name
             status
+            container_status
             is_active
             node_name
             workload_name
@@ -2532,14 +2612,36 @@ query k8s_event_groupings($limit:Int,$offset:Int){
       return error;
     }
   },
-  async getK8sPodGroupings(
-    limit = 10,
-    query: any = {},
-    groupBy: string[] = ['tenant_id', 'account_id', 'timestamp'],
-    datasource = 'auto',
-    gpuTrend = false,
-    timeRangeInMinutes = 1
-  ) {
+  /**
+   * Runs PromQL through the account's metrics provider (`metrics_list`) rather than the
+   * relay, so a Prometheus connected without an agent answers too; hands back the relay's
+   * `{key: {series_list_result: [{metric, timestamps, values}]}}` shape the chart code
+   * was written against. `null` when the request itself failed.
+   */
+  async promqlSeriesListByKey(
+    accountId: string,
+    queries: { key: string; query: string }[],
+    startMs: number,
+    endMs: number,
+    stepSeconds?: number
+  ): Promise<Record<string, { series_list_result: any[] }> | null> {
+    const queryMap: Record<string, string> = {};
+    for (const q of queries) queryMap[q.key] = q.query;
+    const response = await observability.metricsQuery({
+      account_id: accountId,
+      queries: queryMap,
+      instant: false,
+      start_time: startMs,
+      end_time: endMs,
+      step_interval: stepSeconds || promqlDefaultStepSeconds(startMs, endMs),
+    });
+    const results = response?.data?.data?.metrics_list?.results;
+    if (!Array.isArray(results)) return null;
+    const byKey: Record<string, { series_list_result: any[] }> = {};
+    for (const r of results) byKey[r.query_key] = { series_list_result: r.payload || [] };
+    return byKey;
+  },
+  async getK8sPodGroupings(limit = 10, query: any = {}, groupBy: string[] = ['tenant_id', 'account_id', 'timestamp'], datasource = 'auto') {
     if (query?.account_id === 'demo' || query?.accountId === 'demo') {
       const podGroupingsDemo: any = await getMockData('k8s-pod-groupings');
       return {
@@ -2613,405 +2715,20 @@ query k8s_event_groupings($limit:Int,$offset:Int){
         },
       };
     }
-    const queries = [];
-    if ((query.containerName || query.container_name) && (query.podName || query.pod_name) && (query.namespaceName || query.namespace_name)) {
-      queries.push(
-        {
-          key: 'cpu_usage',
-          query: `sum(irate(container_cpu_usage_seconds_total{ __CLUSTER__ container = "${query.containerName || query.container_name}", pod = "${
-            query.podName || query.pod_name
-          }", namespace="${query.namespaceName || query.namespace_name}"}[${timeRangeInMinutes}m]))`,
-        },
-        {
-          key: 'memory_usage',
-          query: `sum(container_memory_working_set_bytes{ __CLUSTER__ container = "${query.containerName || query.container_name}", pod = "${
-            query.podName || query.pod_name
-          }", namespace="${query.namespaceName || query.namespace_name}"})`,
-        },
-        {
-          key: 'cpu_request',
-          query: `sum(kube_pod_container_resource_requests{ __CLUSTER__ resource = "cpu", container = "${
-            query.containerName || query.container_name
-          }", pod = "${query.podName || query.pod_name}", namespace="${query.namespaceName || query.namespace_name}"})`,
-        },
-        {
-          key: 'memory_request',
-          query: `sum(kube_pod_container_resource_requests{ __CLUSTER__ resource = "memory", container = "${
-            query.containerName || query.container_name
-          }", pod = "${query.podName || query.pod_name}", namespace="${query.namespaceName || query.namespace_name}"})`,
-        },
-        {
-          key: 'cpu_limit',
-          query: `sum(kube_pod_container_resource_limits{ __CLUSTER__ resource = "cpu", container = "${
-            query.containerName || query.container_name
-          }", pod = "${query.podName || query.pod_name}", namespace="${query.namespaceName || query.namespace_name}"})`,
-        },
-        {
-          key: 'memory_limit',
-          query: `sum(kube_pod_container_resource_limits{ __CLUSTER__ resource = "memory", container = "${
-            query.containerName || query.container_name
-          }", pod = "${query.podName || query.pod_name}", namespace="${query.namespaceName || query.namespace_name}"})`,
-        }
-      );
-      if (gpuTrend) {
-        queries.push(
-          {
-            key: 'gpu_usage',
-            query: `sum(kube_pod_container_resource_requests{ __CLUSTER__ resource="nvidia_com_gpu", container = "${
-              query.containerName || query.container_name
-            }", pod = "${query.podName || query.pod_name}", namespace="${query.namespaceName || query.namespace_name}"})`,
-          },
-          {
-            key: 'gpu_temp',
-            query: `sum(DCGM_FI_DEV_GPU_TEMP{ __CLUSTER__ exported_pod=~"${query.podName ?? query.pod_name}.*"})`,
-          },
-          {
-            key: 'gpu_mem_temp',
-            query: `sum(DCGM_FI_DEV_MEMORY_TEMP{ __CLUSTER__ exported_pod=~"${query.podName ?? query.pod_name}.*"})`,
-          },
-          {
-            key: 'gpu_mem_usage',
-            query: `sum(DCGM_FI_DEV_MEM_COPY_UTIL{ __CLUSTER__ exported_pod=~"${query.podName ?? query.pod_name}.*"})`,
-          }
-        );
-      }
-    } else if ((query.podName || query.pod_name) && (query.namespaceName || query.namespace_name)) {
-      queries.push(
-        {
-          key: 'cpu_usage',
-          query: `sum(irate(container_cpu_usage_seconds_total{ __CLUSTER__ container != "", pod =~ "${query.podName || query.pod_name}", namespace="${
-            query.namespaceName || query.namespace_name
-          }"}[${timeRangeInMinutes}m]))`,
-        },
-        {
-          key: 'memory_usage',
-          query: `sum(container_memory_working_set_bytes{ __CLUSTER__ container != "", pod =~ "${query.podName || query.pod_name}", namespace="${
-            query.namespaceName || query.namespace_name
-          }"})`,
-        },
-        {
-          key: 'cpu_request',
-          query: `sum(kube_pod_container_resource_requests{ __CLUSTER__ resource = "cpu", container != "", pod =~ "${
-            query.podName || query.pod_name
-          }", namespace="${query.namespaceName || query.namespace_name}"})`,
-        },
-        {
-          key: 'memory_request',
-          query: `sum(kube_pod_container_resource_requests{ __CLUSTER__ resource = "memory", container != "", pod =~ "${
-            query.podName || query.pod_name
-          }", namespace="${query.namespaceName || query.namespace_name}"})`,
-        },
-        {
-          key: 'cpu_limit',
-          query: `sum(kube_pod_container_resource_limits{ __CLUSTER__ resource = "cpu", container != "", pod =~ "${
-            query.podName || query.pod_name
-          }", namespace="${query.namespaceName || query.namespace_name}"})`,
-        },
-        {
-          key: 'memory_limit',
-          query: `sum(kube_pod_container_resource_limits{ __CLUSTER__ resource = "memory", container != "", pod =~ "${
-            query.podName || query.pod_name
-          }", namespace="${query.namespaceName || query.namespace_name}"})`,
-        }
-      );
-      if (gpuTrend) {
-        queries.push(
-          {
-            key: 'gpu_usage',
-            query: `sum(kube_pod_container_resource_requests{ __CLUSTER__ resource="nvidia_com_gpu", container != "", pod =~ "${
-              query.podName || query.pod_name
-            }", namespace="${query.namespaceName || query.namespace_name}"})`,
-          },
-          {
-            key: 'gpu_temp',
-            query: `sum(DCGM_FI_DEV_GPU_TEMP{ __CLUSTER__ exported_pod=~"${query.podName ?? query.pod_name}.*"})`,
-          },
-          {
-            key: 'gpu_mem_temp',
-            query: `sum(DCGM_FI_DEV_MEMORY_TEMP{ __CLUSTER__ exported_pod=~"${query.podName ?? query.pod_name}.*"})`,
-          },
-          {
-            key: 'gpu_mem_usage',
-            query: `sum(DCGM_FI_DEV_MEM_COPY_UTIL{ __CLUSTER__ exported_pod=~"${query.podName ?? query.pod_name}.*"})`,
-          }
-        );
-      }
-    } else if (
-      (query.workloadName || query.workload_name) &&
-      (query.namespaceName || query.namespace_name) &&
-      (query.containerName || query.container_name)
-    ) {
-      queries.push(
-        {
-          key: 'cpu_usage',
-          query: `sum(irate(container_cpu_usage_seconds_total{ __CLUSTER__ container = "${query.containerName || query.container_name}", pod =~ "${
-            query.workloadName || query.workload_name
-          }.*", namespace="${query.namespaceName || query.namespace_name}"}[${timeRangeInMinutes}m]))`,
-        },
-        {
-          key: 'memory_usage',
-          query: `sum(container_memory_working_set_bytes{ __CLUSTER__ container = "${query.containerName || query.container_name}", pod =~ "${
-            query.workloadName || query.workload_name
-          }.*", namespace="${query.namespaceName || query.namespace_name}"})`,
-        },
-        {
-          key: 'cpu_request',
-          query: `sum(kube_pod_container_resource_requests{ __CLUSTER__ resource = "cpu", container = "${
-            query.containerName || query.container_name
-          }", pod =~ "${query.workloadName || query.workload_name}.*", namespace="${query.namespaceName || query.namespace_name}"})`,
-        },
-        {
-          key: 'memory_request',
-          query: `sum(kube_pod_container_resource_requests{ __CLUSTER__ resource = "memory",container = "${
-            query.containerName || query.container_name
-          }", pod =~ "${query.workloadName || query.workload_name}.*", namespace="${query.namespaceName || query.namespace_name}"})`,
-        },
-        {
-          key: 'cpu_limit',
-          query: `sum(kube_pod_container_resource_limits{ __CLUSTER__ resource = "cpu", container = "${
-            query.containerName || query.container_name
-          }", pod =~ "${query.workloadName || query.workload_name}.*", namespace="${query.namespaceName || query.namespace_name}"})`,
-        },
-        {
-          key: 'memory_limit',
-          query: `sum(kube_pod_container_resource_limits{ __CLUSTER__ resource = "memory", container = "${
-            query.containerName || query.container_name
-          }", pod =~ "${query.workloadName || query.workload_name}.*", namespace="${query.namespaceName || query.namespace_name}"})`,
-        }
-      );
-    } else if ((query.workloadName || query.workload_name) && (query.namespaceName || query.namespace_name)) {
-      queries.push(
-        {
-          key: 'cpu_usage',
-          query: `sum(irate(container_cpu_usage_seconds_total{ __CLUSTER__ container != "", pod =~ "${
-            query.workloadName || query.workload_name
-          }.*", namespace="${query.namespaceName || query.namespace_name}"}[${timeRangeInMinutes}m]))`,
-        },
-        {
-          key: 'memory_usage',
-          query: `sum(container_memory_working_set_bytes{ __CLUSTER__ container != "", pod =~ "${
-            query.workloadName || query.workload_name
-          }.*", namespace="${query.namespaceName || query.namespace_name}"})`,
-        },
-        {
-          key: 'cpu_request',
-          query: `sum(kube_pod_container_resource_requests{ __CLUSTER__ resource = "cpu", container != "", pod =~ "${
-            query.workloadName || query.workload_name
-          }.*", namespace="${query.namespaceName || query.namespace_name}"})`,
-        },
-        {
-          key: 'memory_request',
-          query: `sum(kube_pod_container_resource_requests{ __CLUSTER__ resource = "memory",container != "", pod =~ "${
-            query.workloadName || query.workload_name
-          }.*", namespace="${query.namespaceName || query.namespace_name}"})`,
-        },
-        {
-          key: 'cpu_limit',
-          query: `sum(kube_pod_container_resource_limits{ __CLUSTER__ resource = "cpu", container != "", pod =~ "${
-            query.workloadName || query.workload_name
-          }.*", namespace="${query.namespaceName || query.namespace_name}"})`,
-        },
-        {
-          key: 'memory_limit',
-          query: `sum(kube_pod_container_resource_limits{ __CLUSTER__ resource = "memory", container != "", pod =~ "${
-            query.workloadName || query.workload_name
-          }.*", namespace="${query.namespaceName || query.namespace_name}"})`,
-        }
-      );
-    } else if (query.namespaceName || query.namespace_name) {
-      queries.push(
-        {
-          key: 'cpu_usage',
-          query: `sum(irate(container_cpu_usage_seconds_total{ __CLUSTER__ container != "", namespace="${
-            query.namespaceName || query.namespace_name
-          }"}[${timeRangeInMinutes}m]))`,
-        },
-        {
-          key: 'memory_usage',
-          query: `sum(container_memory_working_set_bytes{__CLUSTER__ container != "", namespace="${query.namespaceName || query.namespace_name}"})`,
-        },
-        {
-          key: 'cpu_request',
-          query: `sum(kube_pod_container_resource_requests{ __CLUSTER__ resource = "cpu", container != "", namespace="${
-            query.namespaceName || query.namespace_name
-          }"})`,
-        },
-        {
-          key: 'memory_request',
-          query: `sum(kube_pod_container_resource_requests{ __CLUSTER__ resource = "memory",container != "", namespace="${
-            query.namespaceName || query.namespace_name
-          }"})`,
-        },
-        {
-          key: 'cpu_limit',
-          query: `sum(kube_pod_container_resource_limits{ __CLUSTER__ resource = "cpu", container != "", namespace="${
-            query.namespaceName || query.namespace_name
-          }"})`,
-        },
-        {
-          key: 'memory_limit',
-          query: `sum(kube_pod_container_resource_limits{ __CLUSTER__ resource = "memory", container != "", namespace="${
-            query.namespaceName || query.namespace_name
-          }"})`,
-        }
-      );
-    } else if (query.internalIp) {
-      queries.push(
-        {
-          key: 'cpu_usage',
-          query: `sum(irate(node_cpu_seconds_total{ __CLUSTER__ mode != "idle", instance=~"${query.internalIp}.*"}[${timeRangeInMinutes}m])) OR sum(irate(node_resources_cpu_usage_seconds_total{ __CLUSTER__ mode != "idle", instance=~"${query.nodeName}.*"}[${timeRangeInMinutes}m]))`,
-        },
-        {
-          key: 'memory_usage',
-          query: `sum(node_memory_Active_bytes{__CLUSTER__ instance=~"${query.internalIp}.*"}) or sum(node_resources_memory_total_bytes{ __CLUSTER__ instance=~"${query.nodeName}.*"} - node_resources_memory_available_bytes{ __CLUSTER__ instance=~"${query.nodeName}.*"})`,
-        },
-        {
-          key: 'cpu_request',
-          query: `sum(kube_pod_container_resource_requests{ __CLUSTER__ resource = "cpu", node=~"${query.nodeName}.*"})`,
-        },
-        {
-          key: 'memory_request',
-          query: `sum(kube_pod_container_resource_requests{ __CLUSTER__ resource = "memory", node=~"${query.nodeName}.*"})`,
-        },
-        {
-          key: 'cpu_limit',
-          query: `sum(kube_pod_container_resource_limits{ __CLUSTER__ resource = "cpu", node=~"${query.nodeName}.*"})`,
-        },
-        {
-          key: 'memory_limit',
-          query: `sum(kube_pod_container_resource_limits{ __CLUSTER__ resource = "memory", node=~"${query.nodeName}.*"})`,
-        },
-        {
-          key: 'disk_total',
-          query: `sum(node_filesystem_size_bytes{ __CLUSTER__ mountpoint="/", instance=~"${query.internalIp}.*"}) or sum(kubelet_volume_stats_capacity_bytes{ __CLUSTER__ instance=~"${query.nodeName}.*"}) or sum(kubelet_volume_stats_capacity_bytes{ __CLUSTER__ instance=~"${query.nodeIp}.*"})`,
-        },
-        {
-          key: 'disk_used',
-          query: `(sum(node_filesystem_size_bytes{ __CLUSTER__ mountpoint="/", instance=~"${query.internalIp}.*"}) - sum(node_filesystem_free_bytes{ __CLUSTER__ mountpoint="/", instance=~"${query.internalIp}.*"})) or (sum(kubelet_volume_stats_capacity_bytes{ __CLUSTER__ instance=~"${query.nodeName}.*"}) - sum(kubelet_volume_stats_available_bytes{ __CLUSTER__ instance=~"${query.nodeName}.*"})) or (sum(kubelet_volume_stats_capacity_bytes{ __CLUSTER__ instance=~"${query.nodeIp}.*"}) - sum(kubelet_volume_stats_available_bytes{ __CLUSTER__ instance=~"${query.nodeIp}.*"}))`,
-        }
-      );
-      if (gpuTrend) {
-        queries.push(
-          {
-            key: 'gpu_usage',
-            query: `sum(kube_pod_container_resource_requests{ __CLUSTER__ resource="nvidia_com_gpu", container != "",container != "POD", node=~"${query.nodeName}.*"})`,
-          },
-          {
-            key: 'gpu_temp',
-            query: `sum(DCGM_FI_DEV_GPU_TEMP{ __CLUSTER__ instance=~"${query.internalIp}.*"})`,
-          },
-          {
-            key: 'gpu_mem_temp',
-            query: `sum(DCGM_FI_DEV_MEMORY_TEMP{ __CLUSTER__ instance=~"${query.internalIp}.*"})`,
-          },
-          {
-            key: 'gpu_mem_usage',
-            query: `sum(DCGM_FI_DEV_MEM_COPY_UTIL{ __CLUSTER__ instance=~"${query.internalIp}.*"})`,
-          }
-        );
-        if (gpuTrend) {
-          queries.push(
-            {
-              key: 'gpu_usage',
-              query: `sum(kube_pod_container_resource_requests{resource="nvidia_com_gpu", container != "", pod =~ "${
-                query.podName || query.pod_name
-              }", namespace="${query.namespaceName || query.namespace_name}"})`,
-            },
-            {
-              key: 'gpu_temp',
-              query: `sum(DCGM_FI_DEV_GPU_TEMP{exported_pod=~"${query.podName ?? query.pod_name}.*"})`,
-            },
-            {
-              key: 'gpu_mem_temp',
-              query: `sum(DCGM_FI_DEV_MEMORY_TEMP{exported_pod=~"${query.podName ?? query.pod_name}.*"})`,
-            },
-            {
-              key: 'gpu_mem_usage',
-              query: `sum(DCGM_FI_DEV_MEM_COPY_UTIL{exported_pod=~"${query.podName ?? query.pod_name}.*"})`,
-            }
-          );
-        }
-      }
-    }
-
-    const data = {
-      no_sinks: true,
-      body: {
-        account_id: query.accountId || query.account_Id,
-        action_name: 'prometheus_queries_enricher',
-        action_params: {
-          promql_query: '',
-          promql_queries: queries,
-          steps: '',
-          duration: {
-            starts_at: convertNumberToTimestampPromFormat(time1),
-            ends_at: convertNumberToTimestampPromFormat(time2),
-          },
-        },
-        origin: 'Nudgebee UI',
-      },
-    };
-    const response = await this.relayForwardRequest(data);
-
-    let result: any[] = [];
-    const isSuccess = response?.data?.success || false;
-
-    if (isSuccess) {
-      const findings = response?.data?.findings || [];
-      if (findings && findings.length == 1) {
-        const findingEvidence = findings[0]?.evidence || [];
-        if (findingEvidence && findingEvidence.length == 1) {
-          const evidenceData = findingEvidence[0]?.data || '';
-          if (evidenceData) {
-            const evidenceParsed = JSON.parse(evidenceData);
-            if (evidenceParsed && evidenceParsed.length == 1) {
-              const promqlData = evidenceParsed[0]?.data || '';
-              if (promqlData) {
-                const promqlParsed = JSON.parse(promqlData);
-                const metrics = [
-                  'cpu_usage',
-                  'memory_usage',
-                  'cpu_request',
-                  'memory_request',
-                  'cpu_limit',
-                  'memory_limit',
-                  'disk_used',
-                  'disk_total',
-                ];
-                const hasData = metrics.some((metric) => promqlParsed[metric]?.series_list_result?.length > 0);
-
-                if (hasData) {
-                  const firstAvailableMetric = metrics.find((metric) => promqlParsed[metric]?.series_list_result?.length > 0);
-
-                  if (firstAvailableMetric) {
-                    result = promqlParsed[firstAvailableMetric].series_list_result[0].timestamps.map((timestamp: any, index: any) => ({
-                      timestamp: formatDateTime(timestamp),
-                      avg_cpu_used: parseFloat(promqlParsed.cpu_usage?.series_list_result[0]?.values?.[index]),
-                      avg_memory_used: parseFloat(promqlParsed.memory_usage?.series_list_result[0]?.values?.[index]),
-                      avg_cpu_request: parseFloat(promqlParsed.cpu_request?.series_list_result[0]?.values?.[index]),
-                      avg_cpu_limit: parseFloat(promqlParsed.cpu_limit?.series_list_result[0]?.values?.[index]),
-                      avg_memory_request: parseFloat(promqlParsed.memory_request?.series_list_result[0]?.values?.[index]),
-                      avg_memory_limit: parseFloat(promqlParsed.memory_limit?.series_list_result[0]?.values?.[index]),
-                      sum_gpu_used: parseFloat(promqlParsed.gpu_usage?.series_list_result[0]?.values?.[index]),
-                      sum_gpu_temp: parseFloat(promqlParsed.gpu_temp?.series_list_result[0]?.values?.[index]),
-                      sum_gpu_mem_temp: parseFloat(promqlParsed.gpu_temp?.series_list_result[0]?.values?.[index]),
-                      sum_gpu_mem_usage: parseFloat(promqlParsed.gpu_mem_usage?.series_list_result[0]?.values?.[index]),
-                      disk_total: parseFloat(promqlParsed.disk_total?.series_list_result[0]?.values?.[index]),
-                      disk_used: parseFloat(promqlParsed.disk_used?.series_list_result[0]?.values?.[index]),
-                      pod_cost: '',
-                      account_id: query.accountId || query.account_Id,
-                    }));
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
+    // Cost is not a Prometheus metric, and this function never pretended otherwise:
+    // the branch that used to live here built ~30 PromQL queries for CPU, memory,
+    // requests, limits and disk, then set `pod_cost: ''` on every row it produced.
+    // Its only caller is the cost chart in KubernetesTable, which reads `pod_cost`
+    // and `timestamp` — so all those queries fed a flat 0.00 line, and every real
+    // number on that chart comes from the Hasura rows returned above.
+    //
+    // Deleted rather than migrated to utilisation keys: there is no key for cost, and
+    // adding one would not help, because the chart's numbers already come from the
+    // other branch. A range short enough to miss that branch simply has no cost data,
+    // which an empty series says honestly and a row of zeroes does not.
     return {
       data: {
-        k8s_pod_groupings: result,
+        k8s_pod_groupings: [],
       },
     };
   },
@@ -3101,10 +2818,15 @@ query k8s_event_groupings($limit:Int,$offset:Int){
       data.kind = 'pod';
       data.workload_namespace = query.namespaceName || query.namespace_name;
       data.workload_name = query.pod_name || query.podName || query.workload_name;
+      // Forwarded here too, not only on the workload branch below: asking about one
+      // container of one pod otherwise widened to every container in that pod.
+      if (query.containerName || query.container_name) data.container_name = query.containerName || query.container_name;
     } else if ((query.workloadName || query.workload_name) && (query.namespaceName || query.namespace_name)) {
       data.kind = query.workloadType;
       data.workload_namespace = query.namespaceName || query.namespace_name;
       data.workload_name = query.workloadName || query.workload_name;
+      // Scopes usage to one container of the workload's pods when asked.
+      if (query.containerName || query.container_name) data.container_name = query.containerName || query.container_name;
     } else if (query.namespaceName || query.namespace_name) {
       data.kind = 'namespace';
       data.workload_namespace = query.namespaceName || query.namespace_name;
@@ -3135,6 +2857,11 @@ query k8s_event_groupings($limit:Int,$offset:Int){
     const cpuUsageVals = getDataByKey('cpu_usage'); // key from your API
     const cpuRequestVals = getDataByKey('cpu_request'); // key from your API
     const cpuLimitVals = getDataByKey('cpu_limit'); // key from your API
+    // Per-pod companions, present only when they were asked for and the
+    // provider knows them (Prometheus does; the others return nothing).
+    const podCountVals = getDataByKey('pod_count');
+    const cpuMaxPodVals = getDataByKey('cpu_usage_max_pod');
+    const memMaxPodVals = getDataByKey('memory_usage_max_pod');
     const timestamps = metricsResults.find((item: any) => item.payload?.[0]?.timestamps)?.payload[0].timestamps || [];
     const result = timestamps.map((timestamp: number, index: number) => {
       return {
@@ -3145,10 +2872,9 @@ query k8s_event_groupings($limit:Int,$offset:Int){
         avg_memory_used: parseFloat(memUsageVals[index]) || null,
         avg_memory_request: parseFloat(memRequestVals[index]) || null,
         avg_memory_limit: parseFloat(memLimitVals[index]) || null,
-        sum_gpu_used: null,
-        sum_gpu_temp: null,
-        sum_gpu_mem_temp: null,
-        sum_gpu_mem_usage: null,
+        pod_count: parseFloat(podCountVals[index]) || null,
+        max_pod_cpu_used: parseFloat(cpuMaxPodVals[index]) || null,
+        max_pod_memory_used: parseFloat(memMaxPodVals[index]) || null,
         disk_total: null,
         disk_used: null,
         pod_cost: '',
@@ -3195,6 +2921,44 @@ query k8s_event_groupings($limit:Int,$offset:Int){
       return error;
     }
   },
+  // Candidate targets for an event's subject link: the resource the event is
+  // linked to (api-server points a pod event at its OWNING WORKLOAD, see
+  // event/service.go linkK8sCloudResource) and the subject pod itself, which the
+  // event never carries an id for. Fetched in one round trip via _or.
+  async getEventSubjectResources({
+    resourceId,
+    podName,
+    namespace,
+    accountId,
+  }: {
+    resourceId?: string;
+    podName?: string;
+    namespace?: string;
+    accountId?: string;
+  }) {
+    const or: any[] = [];
+    if (resourceId) {
+      or.push({ id: { _eq: resourceId } });
+    }
+    if (podName && accountId) {
+      const podMatch: any = { name: { _eq: podName }, type: { _eq: 'Pod' }, account: { _eq: accountId } };
+      if (namespace) {
+        podMatch.namespace = { _eq: namespace };
+      }
+      or.push(podMatch);
+    }
+    if (or.length === 0) {
+      return [];
+    }
+    try {
+      const formattedQuery = K8S_EVENT_SUBJECT_RESOURCES.replaceAll('__WHERE__', gqlStringify({ _or: or }));
+      const response = await queryGraphQL(formattedQuery, 'getEventSubjectResources', {});
+      return response?.data?.data?.cloud_resourses?.rows || [];
+    } catch (error) {
+      console.error(error);
+      return [];
+    }
+  },
   async getClusterMetrices2({
     accountId,
     metric,
@@ -3221,6 +2985,20 @@ query k8s_event_groupings($limit:Int,$offset:Int){
         data: [],
       };
     }
+    if (!accountId) {
+      return {
+        data: [],
+      };
+    }
+    // The same defaults the PromQL implementation applied: a caller that omits the
+    // range gets the last seven days rather than an empty chart.
+    if (!startDate) {
+      startDate = new Date();
+      startDate.setDate(startDate.getDate() - 7);
+    }
+    if (!endDate) {
+      endDate = new Date();
+    }
 
     let steps = '1d';
     if (dateUnit == 'week') {
@@ -3229,129 +3007,103 @@ query k8s_event_groupings($limit:Int,$offset:Int){
       steps = '30d';
     }
     try {
-      const queries = [];
-      if (metric?.includes('networkReceiveBytes')) {
-        queries.push({
-          key: 'networkReceiveBytes',
-          query: `sum(increase(container_network_receive_bytes_total{__CLUSTER__}[${steps}]))`,
-        });
-      }
-      if (metric?.includes('networkTransferBytes')) {
-        queries.push({
-          key: 'networkTransferBytes',
-          query: `sum(increase(container_network_transmit_bytes_total{__CLUSTER__}[${steps}]))`,
-        });
-      }
-      if (metric?.includes('cpu')) {
-        queries.push({
-          key: 'cpu_usage',
-          query: `sum(irate(node_cpu_seconds_total{ __CLUSTER__ mode!="idle" }[${steps}]))`,
-        });
-        queries.push({
-          key: 'cpu_total',
-          query: `sum(irate(node_cpu_seconds_total{ __CLUSTER__}[${steps}]))`,
-        });
-      }
-      if (metric?.includes('memory')) {
-        queries.push({
-          key: 'memory_usage',
-          query: `sum(node_memory_Active_bytes{__CLUSTER__})`,
-        });
-        queries.push({
-          key: 'memory_total',
-          query: `sum(node_memory_MemTotal_bytes{__CLUSTER__})`,
-        });
-      }
-
-      if (!startDate) {
-        startDate = new Date();
-        startDate.setDate(startDate.getDate() - 7);
-      }
-      if (!endDate) {
-        endDate = new Date();
-      }
-
-      const data = {
-        no_sinks: true,
-        body: {
-          account_id: accountId,
-          action_name: 'prometheus_queries_enricher',
-          action_params: {
-            promql_query: '',
-            promql_queries: queries,
-            step: steps,
-            duration: {
-              starts_at: convertNumberToTimestampPromFormat(startDate.getTime()),
-              ends_at: convertNumberToTimestampPromFormat(endDate.getTime()),
-            },
-          },
-          origin: 'Nudgebee UI',
-        },
+      // One request, by key, naming no provider — api-server resolves the account's
+      // backend and builds the native query.
+      //
+      // `step` sizes the window the network keys count bytes over, which is the
+      // bucket these tiles chart. `step_interval` asks for the point spacing, and is
+      // sent because that is what it means — but measured against the agent-backed
+      // Prometheus path it changes nothing: a 7-day range returns ~1,965 points
+      // whether it is omitted, 1h or 24h. The series therefore arrives at the
+      // provider's own resolution, exactly as it did before this migration, and the
+      // chart buckets it the same way it always has.
+      const keyFor: Record<string, string[]> = {
+        networkReceiveBytes: ['network_receive_bytes_increase'],
+        networkTransferBytes: ['network_transmit_bytes_increase'],
+        cpu: ['cpu_usage_trend', 'cpu_total'],
+        memory: ['mem_usage_trend', 'mem_total'],
       };
-      const response = await this.relayForwardRequest(data);
-      let result: any[] = [];
-      const isSuccess = response?.data?.success || false;
-      if (isSuccess) {
-        const findings = response?.data?.findings || [];
-        if (findings && findings.length == 1) {
-          const findingEvidence = findings[0]?.evidence || [];
-          if (findingEvidence && findingEvidence.length == 1) {
-            const evidenceData = findingEvidence[0]?.data || '';
-            if (evidenceData) {
-              const evidenceParsed = JSON.parse(evidenceData);
-              if (evidenceParsed && evidenceParsed.length == 1) {
-                const promqlData = evidenceParsed[0]?.data || '';
-                if (promqlData) {
-                  const promqlParsed = JSON.parse(promqlData);
-                  const metrics = ['networkReceiveBytes', 'networkTransferBytes', 'cpu_usage', 'cpu_total', 'memory_usage', 'memory_total'];
-                  const hasData = metrics.some((metric) => promqlParsed[metric]?.series_list_result?.length > 0);
-                  if (hasData) {
-                    const firstAvailableMetric = metrics.find((metric) => promqlParsed[metric]?.series_list_result?.length > 0);
+      const wanted = new Set<string>();
+      if (metric?.includes('networkReceiveBytes')) keyFor.networkReceiveBytes.forEach((k) => wanted.add(k));
+      if (metric?.includes('networkTransferBytes')) keyFor.networkTransferBytes.forEach((k) => wanted.add(k));
+      if (metric?.includes('cpu')) keyFor.cpu.forEach((k) => wanted.add(k));
+      if (metric?.includes('memory')) keyFor.memory.forEach((k) => wanted.add(k));
 
-                    if (firstAvailableMetric) {
-                      result = promqlParsed[firstAvailableMetric].series_list_result[0].timestamps.flatMap((timestamp: any, index: any) => {
-                        const response: any = [];
-                        if (metric?.includes('networkTransferBytes')) {
-                          response.push({
-                            timestamp: formatDateTime(timestamp),
-                            metric: 'networkTransferBytes',
-                            avg_value: parseFloat(promqlParsed.networkTransferBytes?.series_list_result[0]?.values?.[index]),
-                            account_id: accountId,
-                          });
-                        }
-                        if (metric?.includes('networkReceiveBytes')) {
-                          response.push({
-                            timestamp: formatDateTime(timestamp),
-                            metric: 'networkReceiveBytes',
-                            avg_value: parseFloat(promqlParsed.networkReceiveBytes?.series_list_result[0]?.values?.[index]),
-                            account_id: accountId,
-                          });
-                        }
-                        if (metric?.includes('cpu')) {
-                          response.push({
-                            timestamp: formatDateTime(timestamp),
-                            avg_cpu_used_node: parseFloat(promqlParsed.cpu_usage?.series_list_result[0]?.values?.[index]),
-                            total_cpu_allocatable: parseFloat(promqlParsed.cpu_total?.series_list_result[0]?.values?.[index]),
-                            account_id: accountId,
-                          });
-                        }
-                        if (metric?.includes('memory')) {
-                          response.push({
-                            timestamp: formatDateTime(timestamp),
-                            avg_memory_used_node: parseFloat(promqlParsed.memory_usage?.series_list_result[0]?.values?.[index]),
-                            total_memory_allocatable: parseFloat(promqlParsed.memory_total?.series_list_result[0]?.values?.[index]),
-                            account_id: accountId,
-                          });
-                        }
-                        return response;
-                      });
-                    }
-                  }
-                }
-              }
-            }
+      const CLUSTER_METRICS_UTILISATION = `
+    query MetricsQueryUtilisation($jsonFilter: jsonb!, $accountId: String!, $startTime: Float!, $endTime: Float!, $step: Int, $stepInterval: Int) {
+      metrics_aggregate_utilisation(request: {account_id: $accountId, request: $jsonFilter, end_time: $endTime, start_time: $startTime, step: $step, step_interval: $stepInterval}) {
+        results
+      }
+    }
+    `;
+
+      const bucketSeconds = promStepToSeconds(steps);
+      const response = await queryGraphQL(CLUSTER_METRICS_UTILISATION, 'MetricsQueryUtilisation', {
+        accountId,
+        startTime: startDate.getTime(),
+        endTime: endDate.getTime(),
+        step: bucketSeconds,
+        stepInterval: bucketSeconds,
+        jsonFilter: { metrics: Array.from(wanted) },
+      });
+
+      const results = response?.data?.data?.metrics_aggregate_utilisation?.results || [];
+      const seriesFor = (key: string) => results.find((r: any) => r.query_key === key)?.payload?.[0];
+      const valuesFor = (key: string) => seriesFor(key)?.values || [];
+
+      let result: any[] = [];
+      const timestamps = Array.from(wanted)
+        .map((k) => seriesFor(k)?.timestamps)
+        .find((t: any) => t?.length);
+
+      if (timestamps) {
+        const rx = valuesFor('network_receive_bytes_increase');
+        const tx = valuesFor('network_transmit_bytes_increase');
+        const cpuUsed = valuesFor('cpu_usage_trend');
+        const cpuTotal = valuesFor('cpu_total');
+        const memUsed = valuesFor('mem_usage_trend');
+        const memTotal = valuesFor('mem_total');
+
+        result = timestamps.flatMap((timestamp: any, index: any) => {
+          // One object per metric FAMILY, never a merged row with null members: the
+          // summary tiles decide what a row is by which keys it carries
+          // (`'avg_cpu_used_node' in item`), so a null-valued key would add phantom
+          // points to a chart the caller never asked for.
+          const response: any = [];
+          if (metric?.includes('networkTransferBytes')) {
+            response.push({
+              timestamp: formatDateTime(timestamp),
+              metric: 'networkTransferBytes',
+              avg_value: parseFloat(tx[index]),
+              account_id: accountId,
+            });
           }
-        }
+          if (metric?.includes('networkReceiveBytes')) {
+            response.push({
+              timestamp: formatDateTime(timestamp),
+              metric: 'networkReceiveBytes',
+              avg_value: parseFloat(rx[index]),
+              account_id: accountId,
+            });
+          }
+          if (metric?.includes('cpu')) {
+            response.push({
+              timestamp: formatDateTime(timestamp),
+              avg_cpu_used_node: parseFloat(cpuUsed[index]),
+              total_cpu_allocatable: parseFloat(cpuTotal[index]),
+              account_id: accountId,
+            });
+          }
+          if (metric?.includes('memory')) {
+            response.push({
+              timestamp: formatDateTime(timestamp),
+              avg_memory_used_node: parseFloat(memUsed[index]),
+              total_memory_allocatable: parseFloat(memTotal[index]),
+              account_id: accountId,
+            });
+          }
+          return response;
+        });
       }
       return {
         data: {
@@ -3440,6 +3192,7 @@ query k8s_event_groupings($limit:Int,$offset:Int){
     isTrend = false,
     limit = 100,
     dateUnit = 'day',
+    columns,
   }: {
     accountId?: string;
     workloadFqdn?: string | string[];
@@ -3453,6 +3206,7 @@ query k8s_event_groupings($limit:Int,$offset:Int){
     isTrend?: boolean;
     limit: number;
     dateUnit: string;
+    columns?: string[];
   }) {
     try {
       if (accountId === 'demo') {
@@ -3537,7 +3291,9 @@ query k8s_event_groupings($limit:Int,$offset:Int){
         where['timestamp'] = { _lte: endDate.toISOString() };
       }
 
+      const metricColumns = Array.isArray(columns) && columns.length ? K8S_METRIC_COLUMNS.filter((c) => columns.includes(c)) : K8S_METRIC_COLUMNS;
       let query = K8S_POD_GROUPINGS.replaceAll('__WHERE__', gqlStringify(where));
+      query = query.replaceAll('__METRIC_COLUMNS__', metricColumns.join(' '));
       query = query.replaceAll('__GROUPBY__', gqlStringify(`{${groupBy.join(',')}}`));
       query = query.replaceAll('__ADDITIONAL_COLUMNS__', `${groupBy.join(' ')}`);
       const response = await queryGraphQL(query, 'PodGroupings', {
@@ -3790,13 +3546,21 @@ query k8s_event_groupings($limit:Int,$offset:Int){
     });
     return response?.data?.data?.generate_ai_recommendation?.data || parseHttpResponseBodyMessage(response?.data);
   },
-  async generateRemediation(accountId: string, eventId: string, context: string, availableArtifacts: string[] = []) {
+  async generateRemediation(
+    accountId: string,
+    eventId: string,
+    context: string,
+    availableArtifacts: string[] = [],
+    // The event's alert rule and which changes the plan may propose to it.
+    alertRule: Record<string, unknown> | null = null
+  ) {
     if (accountId === 'demo') return null;
     const response = await queryGraphQL(AI_REMEDIATION_GENERATE, 'AiRemediationGenerate', {
       accountId,
       eventId,
       context,
       availableArtifacts,
+      alertRule,
     });
     return response?.data?.data?.ai_remediation_generate?.data;
   },
@@ -3808,7 +3572,16 @@ query k8s_event_groupings($limit:Int,$offset:Int){
     });
     return response?.data?.data?.ai_remediation_get?.data;
   },
-  async executeRemediationCommand(accountId: string, command: string, eventId?: string, configName?: string, slot?: string) {
+  async executeRemediationCommand(
+    accountId: string,
+    command: string,
+    eventId?: string,
+    configName?: string,
+    slot?: string,
+    // The action's execute command, sent on a verify run so the server can attach the result to the
+    // attempt it checked rather than filing it as an attempt of its own.
+    executeCommand?: string
+  ) {
     if (accountId === 'demo') return null;
     const response = await queryGraphQL(AI_REMEDIATION_EXECUTE, 'AiRemediationExecute', {
       accountId,
@@ -3816,6 +3589,7 @@ query k8s_event_groupings($limit:Int,$offset:Int){
       command,
       configName: configName || null,
       slot: slot || null,
+      executeCommand: executeCommand || null,
     });
     return response?.data?.data?.ai_remediation_execute?.data;
   },
@@ -4338,6 +4112,25 @@ query k8s_event_groupings($limit:Int,$offset:Int){
       data: response?.data?.data?.relay_forward_request?.data,
       errors: response?.data?.errors,
     };
+  },
+
+  async updateEventStatus(eventId: string, status: string, details: { reasonCode: string; reasonText?: string; evidenceUrl?: string }) {
+    const response = await queryGraphQL(EVENT_UPDATE_STATUS, 'EventUpdateStatus', {
+      event_id: eventId,
+      status,
+      reason_code: details.reasonCode,
+      reason_text: details.reasonText,
+      evidence_url: details.evidenceUrl,
+    });
+    return response?.data?.data?.event_update_status;
+  },
+
+  async getEventStatusChanges(eventIds: string[]) {
+    if (!eventIds.length) return [];
+    const response = await queryGraphQL(EVENT_GET_STATUS_CHANGE, 'EventGetStatusChange', {
+      event_ids: eventIds,
+    });
+    return response?.data?.data?.event_get_status_change || [];
   },
 
   async upsertResourceAttributes(resourceId: string, accountId: string, attributes: { name: string; value: string }[]) {

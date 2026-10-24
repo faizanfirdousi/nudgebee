@@ -7,6 +7,7 @@ import TroubleshootIcon1Comp from '@assets/sidebar-icon/troubleshoot.icon.svg';
 import WhiteOptimizeIconComp from '@assets/header/whiteOptimizeIcon.icon.svg';
 import ProfileOutlineIconComp from '@assets/new/profile-outline-icon.icon.svg';
 import KubernetesClusterIconComp from '@assets/home/new-cluster-icon.icon.svg';
+import VmIconComp from '@assets/sidebar-icon/vm.icon.svg';
 import SummaryIconBlueComp from '@assets/header/SummaryIconBlue.icon.svg';
 import AppsInfraIconBlueComp from '@assets/header/AppsInfraIconBlue.icon.svg';
 import MonitoringIconBlueComp from '@assets/header/MonitoringIconBlue.icon.svg';
@@ -178,10 +179,7 @@ export const troubleshootIconBlack = require('@assets/sidebar-icon/troubleshootB
 export const GroupOfUsersIcon = require('@assets/group-users.svg');
 
 export const CloudAccountIcon = require('@assets/sidebar-icon/cloud-account.svg');
-// Two variants because the two placements sit on opposite backgrounds: the
-// sidebar draws icons white on the brand-navy rail, the tab bar draws them dark
-// on white. SafeIcon renders an <img>, so the colour is baked into the file.
-export const VmIcon = require('@assets/sidebar-icon/vm.svg');
+export const VmIcon = VmIconComp;
 export const VmServerIcon = require('@assets/new/vm-server.svg');
 export const CloudIconBlackOutline = require('@assets/sidebar-icon/cloud-black-outline.svg');
 export const ToolIcon = require('@assets/Tool.svg');
@@ -223,7 +221,6 @@ export const NotificationIcon1 = NotificationIcon1Comp;
  * @OUmanagement
  */
 export const menuShow = require('@assets/ou-management/g_show.svg');
-export const menuDelete = require('@assets/ou-management/g_delete.svg');
 export const menuUser = require('@assets/ou-management/g_user.svg');
 export const menuOU = require('@assets/ou-management/g_OU.svg');
 export const archiveImg = require('@assets/ou-management/archive.svg');
@@ -260,7 +257,6 @@ export const ouNoProjects = require('@assets/ou-management/no-project.svg');
 /***
  * @ProjectManagement
  */
-export const pencilIcon = require('@assets/ou-management/g_pencil.svg');
 export const unLoackIcon = require('@assets/ou-management/unlock-cloud.svg');
 export const cloudBlackIcon = require('@assets/ou-management/cloud_black.svg');
 export const ArrowBarICon = require('@assets/ou-management/arrow_drop_down_black.svg');
@@ -326,8 +322,6 @@ export const calenderDataIcon = require('@assets/calendar_today.svg');
 
 export const mfilterSvg = require('@assets/m_filter.svg');
 export const mshowSvg = require('@assets/m_show.svg');
-export const pencilSvg = require('@assets/m_pencil.svg');
-export const mdeleteSvg = require('@assets/m_delete.svg');
 export const mblockSvg = require('@assets/m_block.svg');
 export const maddUserSvg = require('@assets/m_adduser.svg');
 export const mloginSvg = require('@assets/m_login.svg');
@@ -361,7 +355,6 @@ export const electricBolt = require('@assets/electricbolt-icon.svg');
 export const newAwsLogo = require('@assets/logo/aws_logo.png');
 export const gcloudLogo = require('@assets/logo/gcloud.svg');
 
-export const writeIcon = require('@assets/new/write-icon.svg');
 export const writeIconLight = require('@assets/new/write-icon-light.svg');
 export const ArrowDown = require('@assets/arrow_down.svg');
 
@@ -370,12 +363,7 @@ export const addIconWhite = require('@assets/ou-management/plus-circle-white.svg
 export const fourSquaresIcon = require('@assets/ou-management/four-square-icon.svg');
 export const peopleGroupIcon = require('@assets/ou-management/people-group-icon.svg');
 
-export const deleteIcon = require('@assets/ou-management/delete_icon1.svg');
-
 export const TicketsIcon = require('@assets/sidebar-icon/tickets-icon.svg');
-
-export const NewDelete = require('@assets/new_delete.svg');
-export const NewDeleteLight = require('@assets/new_delete_light.svg');
 
 export const CloudUploadIcon = require('@assets/cloud-upload.svg');
 
@@ -596,7 +584,6 @@ export const ThumbsUpOutlineIcon = require('@assets/thumbs-up-outline.svg');
 export const ThumbsDownOutlineIcon = require('@assets/thumbs-down-outline.svg');
 export const ExpandIcon = require('@assets/expand-icon.svg');
 export const checklistIcon = require('@assets/checklist-icon.svg');
-export const EditNewIcon = require('@assets/new/edit-icon.png');
 export const ManualTriggerIconBlue = require('@assets/new/manual-icon-blue.svg');
 export const AutomateBlue = require('@assets/new/automate-blue.svg');
 export const TimelineIcon = require('@assets/kubernetes/timeline-icon.svg');
@@ -758,6 +745,12 @@ export const TracesBlueIcon = require('@assets/ask-nudgebee/traces-blue-icon.svg
 export const AgentIcon = require('@assets/ask-nudgebee/agent-icon.svg');
 export const ToolsIcon = require('@assets/ask-nudgebee/tools-icon.svg');
 export const LLMFunctionIcon = require('@assets/ask-nudgebee/llm-function-icon.svg');
+// Same glyphs as above, recolored to the design system's brand blue
+// (#3B82F6) — for menus (AI & Tools) where these sit beside other tabs'
+// custom icons that already hardcode that blue, so an unstyled dark/black
+// glyph here would be the odd one out.
+export const AgentIconTabBlue = require('@assets/ask-nudgebee/agent-icon-blue.svg');
+export const ToolsIconTabBlue = require('@assets/ask-nudgebee/tools-icon-blue.svg');
 export const LLMConsumptionIcon = LLMConsumptionIconComp;
 export const FollowUpBlueIcon = require('@assets/ask-nudgebee/followup-blue.svg');
 export const UploadIcon = require('@assets/upload-icon.svg');
@@ -766,6 +759,7 @@ export const PlayCircleIcon = require('@assets/play-circle.svg');
 export const LoggleIcon = require('@assets/loggly.svg');
 export const ObserveIcon = require('@assets/observe-logo.svg');
 export const OpenObserveIcon = require('@assets/openobserve-icon.svg');
+export const CubeAPMIcon = require('@assets/cubeapm-icon.svg');
 export const AzureAppInsightIcon = require('@assets/azure_app_insight.svg');
 export const OpentelemetryIcon = require('@assets/opentelemetry.svg');
 export const ChronosphereIcon = require('@assets/chronosphere-icon.svg');

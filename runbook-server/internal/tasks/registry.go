@@ -138,6 +138,7 @@ func NewInitializedTaskRegistry() *TaskRegistry {
 	tr.RegisterTask(&k8s.PVRightsizeTask{})
 	tr.RegisterTask(&k8s.ContinuousRightsizeTask{})
 	tr.RegisterTask(&k8s.PodDeleteTask{})
+	tr.RegisterTask(&k8s.ProfileTask{})
 	tr.RegisterTask(&k8s.WorkloadRestartTask{})
 	tr.RegisterTask(&k8s.NodeGracefulShutdownTask{})
 
@@ -155,6 +156,7 @@ func NewInitializedTaskRegistry() *TaskRegistry {
 	tr.RegisterTask(&scm.GithubCliTask{})
 	tr.RegisterTask(&scm.GitlabCliTask{})
 	tr.RegisterTask(&events.EventsStoreTask{})
+	tr.RegisterTask(&events.EventsAddEvidenceTask{})
 
 	tr.RegisterTask(&network.DnsTask{})
 	tr.RegisterTask(&network.TcpTask{})

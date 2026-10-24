@@ -40,6 +40,14 @@ type appConfig struct {
 	ServiceEndpoint                string `mapstructure:"service_api_server_url"`
 	ServiceApiServerTimeoutSeconds int    `mapstructure:"service_api_server_timeout_seconds"`
 
+	// ServiceCronEndpoint, when set, replaces ServiceEndpoint for the scheduled
+	// cron triggers only (internal/system/cron_triggers.yaml). It exists for a
+	// split services-server: cron handlers run as goroutines on whichever pod
+	// takes the call, so pointing this at the worker Service moves scheduled
+	// jobs off the API pods while every other call keeps using ServiceEndpoint.
+	// Empty means crons follow ServiceEndpoint, as they always have.
+	ServiceCronEndpoint string `mapstructure:"service_api_server_cron_url"`
+
 	BaseUrl string `mapstructure:"base_url"`
 
 	ApprovalSigningKey string `mapstructure:"approval_signing_key"`
@@ -138,6 +146,10 @@ type appConfig struct {
 
 	NudgebeeNamespace string `mapstructure:"nudgebee_namespace"`
 
+	// TaskAllowedCIDRs is a comma-separated list of private CIDRs that network
+	// tasks may reach despite the SSRF guard (on-prem installs). Empty = none.
+	TaskAllowedCIDRs string `mapstructure:"runbook_server_task_allowed_cidrs"`
+
 	OptimizationEnabled                           bool `mapstructure:"runbook_server_optimization_enabled"`
 	OptimizationRecommendationPollIntervalSeconds int  `mapstructure:"runbook_server_optimization_poll_interval_seconds"`
 	WebhookMaxBodySizeMB                          int  `mapstructure:"webhook_max_body_size_mb"`
@@ -174,6 +186,7 @@ func init() {
 
 	viper.SetDefault("env", "")
 	viper.SetDefault("service_api_server_url", "http://services-server:8000")
+	viper.SetDefault("service_api_server_cron_url", "")
 	viper.SetDefault("service_api_server_timeout_seconds", "10")
 
 	// viper requires default values or bind.. else Unmarshal skips fields with no default values
@@ -267,6 +280,7 @@ func init() {
 	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 
 	viper.SetDefault("nudgebee_namespace", "nudgebee")
+	viper.SetDefault("runbook_server_task_allowed_cidrs", "")
 
 	err := viper.ReadInConfig()
 	if err != nil {

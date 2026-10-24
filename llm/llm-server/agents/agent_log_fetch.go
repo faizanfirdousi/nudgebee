@@ -17,6 +17,7 @@ import (
 	"nudgebee/llm/workspace"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,7 +28,11 @@ const FetchLogsAgentName = "fetch_logs"
 
 // FetchLogsAgent dispatches an NL log question to the configured backend:
 //
-//	loki / signoz / es / elasticsearch  → JSON-where → logs_execute
+//	any services-server-backed provider (loki/es/signoz/…) → canonical
+//	  `{"where": {...}}` → logs_execute_v2 → services-server FetchLogs, which
+//	  resolves canonical→provider labels and builds the native query
+//	  server-side. When that path errors or returns no logs, it falls back to
+//	  kubectl (kubectlFallback).
 //	datadog                             → DD facet syntax → datadog_log_execute
 //	empty / k8s-only                    → kubectlLogQuery → kubectl_execute
 type FetchLogsAgent struct {
@@ -48,11 +53,7 @@ func init() {
 	toolOutput := "JSON envelope: {\"query\": \"<rendered backend query>\", \"logs\": \"<raw lines or preview>\", \"file_ref\": \"<workspace file path or empty>\", \"provider\": \"<loki|es|datadog|kubectl>\", \"bundle_signal\": \"<category-tagged crash-bundle sweep against file_ref, computed server-side when the query wording asked for error content (error/fail/crash/timeout/oom/…); empty when it didn't fire>\", \"fallback_note\": \"<present only when the configured backend's query matched zero rows and the agent retried via kubectl — explains that this answer came from kubectl instead of the configured provider, so a zero-row backend result isn't mistaken for 'no logs exist'; absent otherwise>\"}"
 
 	core.RegisterNBAgentFactoryAsTool(FetchLogsAgentName, func(accountId string) (core.NBAgent, error) {
-		// Always construct v2. It embeds v1 and gates the canonical path on the
-		// LLM_SERVER_LOG_AGENT_V2_ENABLED env var (FetchLogsAgentV2.Execute); when
-		// the gate is off it delegates to the embedded v1 agent, so behaviour is
-		// identical to v1.
-		return newFetchLogsAgentV2(accountId), nil
+		return newFetchLogsAgent(accountId), nil
 	}, toolDescription, toolInput, toolOutput)
 }
 
@@ -78,7 +79,7 @@ func (a *FetchLogsAgent) effectiveProvider(request core.NBAgentRequest) services
 
 func (a *FetchLogsAgent) GetName() string { return FetchLogsAgentName }
 
-func (a *FetchLogsAgent) GetNameAliases() []string { return []string{"Fetch Logs"} }
+func (a *FetchLogsAgent) GetNameAliases() []string { return []string{"Log Query Runner", "Fetch Logs"} }
 
 func (a *FetchLogsAgent) GetDescription() string {
 	return `Translates a natural-language log question into the right backend query and runs it.`
@@ -98,17 +99,8 @@ func (a *FetchLogsAgent) GetPlannerType() core.AgentPlannerType {
 	return core.AgentPlannerTypeCustom
 }
 
-func (a *FetchLogsAgent) Execute(ctx *security.RequestContext, request core.NBAgentRequest) (core.NBAgentResponse, error) {
-	provider := a.effectiveProvider(request)
-
-	switch strings.ToLower(provider.Provider) {
-	case "datadog":
-		return a.generateDatadogLogQueryAndExecute(ctx, request)
-	case "loki", "signoz", "es", "elasticsearch":
-		return a.generateLogQueryAndExecute(ctx, request, provider)
-	default:
-		return a.generateKubeCtlLogQueryAndExecute(ctx, request)
-	}
+func (a *FetchLogsAgent) GetKnowledgeMode() core.AgentKnowledgeMode {
+	return core.AgentKnowledgeAutoChunks
 }
 
 func (a *FetchLogsAgent) generateKubeCtlLogQueryAndExecute(ctx *security.RequestContext, request core.NBAgentRequest) (core.NBAgentResponse, error) {
@@ -129,12 +121,85 @@ func (a *FetchLogsAgent) generateKubeCtlLogQueryAndExecute(ctx *security.Request
 		}
 		return errorResponse(a.GetName(), fmt.Errorf("kubectl fetch failed: %s", reason)), nil
 	}
+	// kubectl silently resolves a workload target to one pod and announces it
+	// in stdout. Keep that control line out of the logs and disclose the
+	// narrowed coverage in the response envelope.
+	logs, podCount, usedPod := stripKubectlPodBanner(logs)
+	if kubectlStdoutFieldIsEmpty(logs) {
+		logs = noMatchingKubectlLogsCaveat(intent.FilterPattern, logs)
+	}
+
 	fileRef, flattened, fileRefs := saveLogsToWorkspace(ctx, a.accountId, request.ConversationId, "kubectl", logs)
 	bundleSignal, err := runAutoDiagnosticBundle(ctx, a.accountId, request, fileRef)
 	if err != nil {
 		return core.NBAgentResponse{}, err
 	}
-	return makeFetchResponse(a.GetName(), cmd, logs, flattened, fileRef, bundleSignal, mergeRefs(toolRefs, fileRefs)), nil
+	resp := makeFetchResponse(a.GetName(), cmd, logs, flattened, fileRef, bundleSignal, mergeRefs(toolRefs, fileRefs))
+	return withKubectlDisclosure(resp, kubectlDisclosureNote(intent, podCount, usedPod)), nil
+}
+
+var kubectlPodBannerRe = regexp.MustCompile(`^Found (\d+) pods, using pod/(\S+)\n?`)
+
+func stripKubectlPodBanner(raw string) (cleaned string, podCount int, usedPod string) {
+	var envelope map[string]json.RawMessage
+	if json.Unmarshal([]byte(raw), &envelope) != nil {
+		return raw, 0, ""
+	}
+	stdoutRaw, ok := envelope["stdout"]
+	if !ok {
+		return raw, 0, ""
+	}
+	var stdout string
+	if json.Unmarshal(stdoutRaw, &stdout) != nil {
+		return raw, 0, ""
+	}
+	loc := kubectlPodBannerRe.FindStringSubmatchIndex(stdout)
+	if loc == nil {
+		return raw, 0, ""
+	}
+	n, err := strconv.Atoi(stdout[loc[2]:loc[3]])
+	if err != nil {
+		return raw, 0, ""
+	}
+	usedPod = stdout[loc[4]:loc[5]]
+	newStdout, err := json.Marshal(stdout[:loc[0]] + stdout[loc[1]:])
+	if err != nil {
+		return raw, 0, ""
+	}
+	envelope["stdout"] = newStdout
+	body, err := json.Marshal(envelope)
+	if err != nil {
+		return raw, 0, ""
+	}
+	return string(body), n, usedPod
+}
+
+func kubectlDisclosureNote(intent kubectlLogQuery, podCount int, usedPod string) string {
+	var parts []string
+	if podCount > 1 {
+		parts = append(parts, fmt.Sprintf("read pod %s only — %d other pod(s) of this workload were not read", usedPod, podCount-1))
+	}
+	if pat := strings.TrimSpace(intent.FilterPattern); pat != "" {
+		parts = append(parts, fmt.Sprintf("filtered to lines matching /%s/ and capped at 200 matching lines", pat))
+	}
+	return strings.Join(parts, "; ")
+}
+
+func withKubectlDisclosure(resp core.NBAgentResponse, note string) core.NBAgentResponse {
+	if note == "" || len(resp.Response) == 0 {
+		return resp
+	}
+	var envelope map[string]any
+	if json.Unmarshal([]byte(resp.Response[0]), &envelope) != nil {
+		return resp
+	}
+	envelope["kubectl_disclosure"] = note
+	body, err := json.Marshal(envelope)
+	if err != nil {
+		return resp
+	}
+	resp.Response[0] = string(body)
+	return resp
 }
 
 // isNotFoundReason excludes forbidden/unauthorized/connection errors, which a
@@ -180,6 +245,49 @@ func extractKubectlStdout(out string) string {
 	return strings.TrimSpace(out)
 }
 
+// kubectlStdoutFieldIsEmpty reports whether a kubectl_execute {"stdout":...}
+// envelope's stdout field is present and blank. Unlike extractKubectlStdout
+// (which falls back to the raw envelope string when Stdout == "", so it is
+// never itself empty), this only cares about the actual field value —
+// EXPERIMENTAL, added alongside the filter_pattern empty-result caveat above.
+func kubectlStdoutFieldIsEmpty(out string) bool {
+	var env map[string]json.RawMessage
+	if json.Unmarshal([]byte(out), &env) != nil {
+		return false
+	}
+	raw, ok := env["stdout"]
+	if !ok {
+		return false
+	}
+	var stdout string
+	if json.Unmarshal(raw, &stdout) != nil {
+		return false
+	}
+	return strings.TrimSpace(stdout) == ""
+}
+
+// filteredEmptyLogsCaveat builds the {"stdout":...} envelope replacing an
+// empty, filtered kubectl result — see the call site in
+// generateKubeCtlLogQueryAndExecute. Built via json.Marshal, not a hand-built
+// `{"stdout":"...%q..."}` literal: pattern can contain characters (quotes,
+// backslashes) that Go's %q verb escapes Go-style rather than JSON-style,
+// producing invalid JSON that every downstream JSON-consuming caller
+// (extractKubectlStdout, kubectlStdoutFieldIsEmpty, makeFetchResponse) would
+// then fail to parse — caught in review before this shipped. fallback is
+// returned unchanged if marshaling somehow fails (never expected for a
+// map[string]string, but this must never itself panic or emit broken JSON).
+func noMatchingKubectlLogsCaveat(pattern, fallback string) string {
+	msg := "[NO MATCHING LINES — kubectl returned zero log lines for this target/time window. This does NOT confirm the workload has no relevant output; verify the target, time window, and (if the pod was picked automatically) which pod was read before concluding there is no issue.]"
+	if pattern = strings.TrimSpace(pattern); pattern != "" {
+		msg = fmt.Sprintf("[FILTERED — zero lines matched the pattern %q. This does NOT mean the container has no relevant output, only that nothing matched this specific filter. Re-fetch without a filter_pattern (or with a broader one) before concluding there is no issue.]", pattern)
+	}
+	payload, err := json.Marshal(map[string]string{"stdout": msg})
+	if err != nil {
+		return fallback
+	}
+	return string(payload)
+}
+
 const discoveryCandidateCap = 5
 
 // parseKubectlDiscoveryCandidates parses `kubectl get <types> -A --no-headers`
@@ -217,36 +325,12 @@ func formatDiscoveryHint(candidates []string) string {
 	)
 }
 
-func (a *FetchLogsAgent) generateLogQueryAndExecute(ctx *security.RequestContext, request core.NBAgentRequest, provider services_server.ObservabilityProvider) (core.NBAgentResponse, error) {
-	fields, indices := fetchLabelsAndIndices(a.accountId, provider)
-	jsonQuery, err := generateLogQuery(ctx, request, provider.Provider, fields, indices, provider.DefaultIndex)
-	if err != nil {
-		return errorResponse(a.GetName(), fmt.Errorf("loki/es query extraction: %w", err)), nil
-	}
-	logs, toolRefs, err := callTool(ctx, a.accountId, request, tools.ToolLogsExecute, jsonQuery)
-	if err != nil {
-		return errorResponse(a.GetName(), fmt.Errorf("logs_execute: %w", err)), nil
-	}
-	if matched, reason := looksLikeFetchError(provider.Provider, logs); matched {
-		return errorResponse(a.GetName(), fmt.Errorf("%s fetch failed: %s", provider.Provider, reason)), nil
-	}
-	if strings.EqualFold(provider.Provider, "loki") {
-		logs = unwrapLokiInnerTimestamps(ctx, logs)
-	}
-	fileRef, flattened, fileRefs := saveLogsToWorkspace(ctx, a.accountId, request.ConversationId, provider.Provider, logs)
-	bundleSignal, err := runAutoDiagnosticBundle(ctx, a.accountId, request, fileRef)
-	if err != nil {
-		return core.NBAgentResponse{}, err
-	}
-	return makeFetchResponse(a.GetName(), jsonQuery, logs, flattened, fileRef, bundleSignal, mergeRefs(toolRefs, fileRefs)), nil
-}
-
 func (a *FetchLogsAgent) generateDatadogLogQueryAndExecute(ctx *security.RequestContext, request core.NBAgentRequest) (core.NBAgentResponse, error) {
 	ddQuery, err := generateDatadogLogQuery(ctx, request)
 	if err != nil {
 		return errorResponse(a.GetName(), fmt.Errorf("datadog query extraction: %w", err)), nil
 	}
-	// logs_execute does not handle Datadog — Datadog has its own executor.
+	// logs_execute_v2 does not handle Datadog — Datadog has its own executor.
 	logs, toolRefs, err := callTool(ctx, a.accountId, request, tools.ToolDatadogLogExecute, ddQuery)
 	if err != nil {
 		return errorResponse(a.GetName(), fmt.Errorf("datadog_log_execute: %w", err)), nil
@@ -269,7 +353,7 @@ func (a *FetchLogsAgent) generateDatadogLogQueryAndExecute(ctx *security.Request
 // LLM call, on the critical path of every fetch. Discovery costs an HTTP
 // round-trip to services-server, which in turn queries the backend's own label
 // API. The previous per-instance sync.Once memo never helped: FetchLogsAgent is
-// reconstructed on every invocation (GetNBAgent → newFetchLogsAgentV2), so two
+// reconstructed on every invocation (GetNBAgent → newFetchLogsAgent), so two
 // fetches in one investigation meant two full discoveries.
 const logLabelsCacheNS = "llm_log_labels"
 
@@ -374,8 +458,8 @@ func fetchLabelsAndIndices(accountId string, provider services_server.Observabil
 // ToolConfig is resolved — without it, kubectl_execute and similar tools fail
 // their ToolConfig.Name precondition.
 // callTool runs an underlying *_execute tool and returns both its data and its
-// UI references. The references must be propagated: tools like logs_execute /
-// loki_execute build the canonical "#monitoring/logs" source link (with the
+// UI references. The references must be propagated: tools like logs_execute_v2
+// build the canonical "#monitoring/logs" source link (with the
 // rendered query pre-filled); dropping them here is why fetch_logs answers
 // historically had no clickable source. saveLogsToWorkspace's file reference is
 // merged on top by the callers.
@@ -539,7 +623,7 @@ func matchFetchErrorSignals(raw string) (bool, string) {
 var relayWrapperRE = regexp.MustCompile(`\bServer returned \d{3}:`)
 
 // mergeRefs combines the underlying tool's UI references (e.g. the
-// "#monitoring/logs" source link from logs_execute) with saveLogsToWorkspace's
+// "#monitoring/logs" source link from logs_execute_v2) with saveLogsToWorkspace's
 // file reference, de-duplicating by URL. The tool's navigation reference is
 // ordered first so it surfaces as the primary source; the workspace file ref
 // follows as a downloadable artifact. Either side may be nil.
@@ -571,6 +655,83 @@ func mergeRefs(toolRefs, fileRefs []toolcore.NBToolResponseReference) []toolcore
 // a preview — inlining the full logs (often 50k-200k tokens) alongside the
 // file_ref duplicated the payload and dominated prompt size.
 const logInlinePreviewBytes = 4096
+
+// logMode is the deterministic intent bucket the Go classifier emits. The
+// logs agent's prompt then has a single authoritative MODE flag instead of
+// asking the LLM to classify routine vs investigation vs enumeration on the
+// fly. The LLM frequently treats a parent's paraphrased "Get logs for X" as
+// routine even when OriginalQuery is "Were there issues" — the classifier in
+// Go fixes this deterministically.
+type logMode int
+
+const (
+	logModeRoutine logMode = iota
+	logModeInvestigation
+	logModeEnumeration
+)
+
+func logModeName(m logMode) string {
+	switch m {
+	case logModeInvestigation:
+		return "INVESTIGATION"
+	case logModeEnumeration:
+		return "ENUMERATION"
+	default:
+		return "ROUTINE"
+	}
+}
+
+// Classifier patterns. Investigation has two tiers so precedence against
+// enumeration can differ by strength of signal:
+//
+//   - Enumeration:        "show / list / summarise / enumerate" verb
+//     co-occurring with an error/symptom noun within
+//     ~30 chars, plus "what kinds of errors" and
+//     "distinct errors" idioms. The noun list includes
+//     symptom words (failing/broken/crash*), not just
+//     "error"-family nouns, so "list the pods that are
+//     failing" matches here rather than falling through
+//     to the weak investigation tier below.
+//   - strongInvestigationRE: causal verbs/phrases (why / root cause /
+//     diagnose / troubleshoot / debug / investigate,
+//     plus inflections; "what caused/happened/went
+//     wrong/broke", "were there"). These checked BEFORE
+//     enumeration — a query naming both a causal ask and
+//     a listing verb ("show me the errors and explain why
+//     it broke") is an investigation that happens to
+//     mention "show", not an enumeration.
+//   - weakSymptomRE:        bare "broken" / "failing" / "crash*" with no
+//     causal verb and no enumeration match — checked
+//     AFTER enumeration, so a plain listing request
+//     ("list failing pods") isn't misrouted into the
+//     heavier investigation workflow just because it
+//     names a symptom instead of the word "error".
+var (
+	strongInvestigationRE = regexp.MustCompile(`(?i)\bwhy\b|\broot\s+cause\b|\bdiagnos\w*\b|\btroubleshoot\w*\b|\bdebug\w*\b|\binvestigat\w*\b|\bwhat\s+(caused|happened|went\s+wrong|broke|broken)\b|\bwere\s+there\b`)
+	enumerationVerbsRE    = regexp.MustCompile(`(?i)\b(show|list|summari[sz]e|categori[sz]e|enumerate)\b.{0,30}\b(errors?|fail\w*|exceptions?|issues?|broken|crash\w*)\b|what\s+(kinds?\s+of\s+)?errors|\bdistinct\s+errors?\b`)
+	weakSymptomRE         = regexp.MustCompile(`(?i)\bbroken\b|\bfail\w*\b|\bcrash\w*\b`)
+)
+
+// classifyLogMode buckets the user's intent. The verbatim user question
+// (OriginalQuery) wins over per-step paraphrases from a parent planner —
+// "Get logs for X" emitted by a parent does not erase the user's "why is X
+// broken" intent. When OriginalQuery is empty we fall back to Query.
+func classifyLogMode(query, originalQuery string) logMode {
+	q := strings.TrimSpace(originalQuery)
+	if q == "" {
+		q = strings.TrimSpace(query)
+	}
+	if strongInvestigationRE.MatchString(q) {
+		return logModeInvestigation
+	}
+	if enumerationVerbsRE.MatchString(q) {
+		return logModeEnumeration
+	}
+	if weakSymptomRE.MatchString(q) {
+		return logModeInvestigation
+	}
+	return logModeRoutine
+}
 
 // autoBundleQueryRE keeps the routine-mode fallback: fire the bundle even
 // on a "get logs" request when the wording explicitly names error content
@@ -666,7 +827,8 @@ func runAutoDiagnosticBundle(ctx *security.RequestContext, accountId string, req
 	return resp.Data, nil
 }
 
-// makeFetchResponse returns {query, logs, file_ref, provider, complete, bundle_signal} so the
+// makeFetchResponse returns {query, logs, file_ref, provider, logs_complete,
+// logs_format, logs_format_hint, bundle_signal} so the
 // parent's scratchpad shows which query produced the data, where the raw
 // logs were saved, and — when the query wording indicates an error-content
 // investigation and the bundle flag is on — a pre-computed category-level
@@ -676,7 +838,7 @@ func runAutoDiagnosticBundle(ctx *security.RequestContext, accountId string, req
 // runAutoDiagnosticBundle for the gating logic.
 func makeFetchResponse(agentName, query, logs, flattened, fileRef, bundleSignal string, refs []toolcore.NBToolResponseReference) core.NBAgentResponse {
 	// Preview the SAME representation that was written to file_ref, not the raw
-	// backend payload. saveLogsToWorkspace writes flattenLogsToJSONL(logs) —
+	// backend payload. saveLogsToWorkspace writes flattenLogsToTabSeparated(logs) —
 	// "<timestamp>\t<message>" per line — while this used to inline the raw
 	// Loki/ES envelope. Showing one format and handing over a file in another
 	// makes it impossible to write a working grep from the preview alone, so the
@@ -693,6 +855,7 @@ func makeFetchResponse(agentName, query, logs, flattened, fileRef, bundleSignal 
 		previewSource = logs
 	}
 	inlineLogs := previewSource
+	format := logsLayout(logs, previewSource)
 	logsComplete := true
 	if fileRef != "" && len(previewSource) > logInlinePreviewBytes {
 		logsComplete = false
@@ -717,6 +880,11 @@ func makeFetchResponse(agentName, query, logs, flattened, fileRef, bundleSignal 
 		"file_ref":      fileRef,
 		"provider":      providerFromLogs(logs),
 		"bundle_signal": bundleSignal,
+		// The saved artifact is deliberately not always a JSON document. Expose
+		// the already-known layout so consumers do not waste turns trying
+		// json.load(file_ref), inspecting its head, then rewriting the parser.
+		"logs_format":      format,
+		"logs_format_hint": logsFormatHint(format),
 		// logs_complete=true means every matching line is already inline and
 		// file_ref holds nothing extra — shelling out to read it is pure cost.
 		// Signalled explicitly because the previous "absence of a truncation
@@ -771,14 +939,17 @@ func saveLogsToWorkspace(ctx *security.RequestContext, accountId, conversationId
 	if label == "" {
 		label = "kubectl"
 	}
-	body := flattenLogsToJSONL(logs)
+	body := flattenLogsToTabSeparated(logs)
 	filename := fmt.Sprintf("logs_%s_%d.txt", label, time.Now().UnixNano())
 	wm := workspace.NewWorkspaceManager()
-	if err := wm.SaveFile(ctx, accountId, conversationId, filename, body); err != nil {
-		ctx.GetLogger().Warn("fetch_logs: failed to save logs to workspace", "error", err, "file", filename)
+	saveStart := time.Now()
+	err := wm.SaveFile(ctx, accountId, conversationId, filename, body)
+	saveDuration := time.Since(saveStart)
+	if err != nil {
+		ctx.GetLogger().Warn("fetch_logs: failed to save logs to workspace", "error", err, "file", filename, "duration", saveDuration.String())
 		return "", body, nil
 	}
-	ctx.GetLogger().Info("fetch_logs: logs saved", "file", filename, "bytes", len(body), "raw_bytes", len(logs), "format", logsLayout(logs, body))
+	ctx.GetLogger().Info("fetch_logs: logs saved", "file", filename, "bytes", len(body), "raw_bytes", len(logs), "format", logsLayout(logs, body), "duration", saveDuration.String())
 	return filename, body, []toolcore.NBToolResponseReference{
 		{
 			Text:        filename,
@@ -789,7 +960,7 @@ func saveLogsToWorkspace(ctx *security.RequestContext, accountId, conversationId
 	}
 }
 
-// flattenLogsToJSONL converts a Loki/Signoz/ES JSON envelope to one entry per
+// flattenLogsToTabSeparated converts a Loki/Signoz/ES JSON envelope to one entry per
 // line. Each output line is `<outer_timestamp>\t<message>` where <message> is
 // the application's emitted line (often itself JSON of the form
 // `{"timestamp":"...","level":"ERROR",...}`). grep then matches per-entry
@@ -799,7 +970,7 @@ func saveLogsToWorkspace(ctx *security.RequestContext, accountId, conversationId
 //   - it doesn't parse as the expected envelope (kubectl text, "No logs
 //     found" placeholder, Datadog alternate shapes)
 //   - the envelope has zero entries
-func flattenLogsToJSONL(raw string) string {
+func flattenLogsToTabSeparated(raw string) string {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return raw
@@ -830,10 +1001,8 @@ func flattenLogsToJSONL(raw string) string {
 	for _, e := range doc.Logs {
 		ts := strings.TrimSpace(e.Timestamp)
 		msg := strings.TrimSpace(e.Message)
-		if ts != "" {
-			b.WriteString(ts)
-			b.WriteByte('\t')
-		}
+		b.WriteString(ts)
+		b.WriteByte('\t')
 		b.WriteString(msg)
 		b.WriteByte('\n')
 	}
@@ -847,7 +1016,14 @@ func logsLayout(raw, body string) string {
 	if raw == body {
 		return "passthrough"
 	}
-	return "jsonl"
+	return "timestamp_tab_message"
+}
+
+func logsFormatHint(format string) string {
+	if format == "timestamp_tab_message" {
+		return "One record per line: <timestamp><TAB><message>. Parse line-by-line and split once on TAB; never JSON-decode the whole file. JSON-decode only the message field when it begins with an object or array."
+	}
+	return "The file is the same line-oriented passthrough representation shown in the logs preview. Filter it directly with grep/awk; only apply structured parsing when the preview demonstrates that format."
 }
 
 func errorResponse(agentName string, err error) core.NBAgentResponse {
@@ -1018,7 +1194,7 @@ func buildLogIntentMessages(systemPrompt string, request core.NBAgentRequest) []
 	// TestBuildLogIntentMessages_SystemPromptIsStable is preserved — only
 	// per-call inputs (Query/OriginalQuery/ConversationContext) must stay out
 	// of the system message.
-	if ap := strings.TrimSpace(request.AccountPrompt); ap != "" {
+	if ap := strings.TrimSpace(core.CombinedAccountPrompt(request)); ap != "" {
 		ap = core.TruncateHead(ap, customAgentAccountPromptCap())
 		systemPrompt += "\n\n**Account preferences (operator-curated for THIS deployment):**\n" +
 			"The notes below may state this backend's real log field names, id formats, and query conventions. " +
@@ -1064,18 +1240,25 @@ Return ONLY a JSON object with the following fields:
 - container: Specific container name if mentioned (string)
 - tail: Number of lines to retrieve (int). Use 100 for routine "show me logs". Use 10000 for INVESTIGATION queries ("were there issues", "what is causing X", "why is Y broken") so rare errors in long streams aren't missed when combined with filter_pattern.
 - is_previous: true if requesting previously crashed logs (bool)
-- filter_pattern: Regex pattern for grep if looking for errors/warnings (string). REQUIRED for investigation queries — set to "` + kubectlErrorRegex + `" or similar so the wide tail is narrowed server-side to relevant lines only. Must be a plain POSIX extended regex (grep -E syntax): no Perl-only syntax like inline flags ("(?i)", "(?:...)"). The search is already case-insensitive (grep -i is always applied), so never add a case-insensitivity flag yourself.
+- filter_pattern: Regex pattern for grep, ONLY when the question already names a specific symptom to search for (a known error string, "OOMKilled", a request id, a status code). Leave it empty for a first read of an already-identified resource — especially one with no restarts or warning events at the Kubernetes level — because a component that is failing quietly typically logs the actual cause at INFO or without any error-shaped word at all, and a keyword filter can only surface what you already expect. An empty filter_pattern with a large tail/since window is the correct, safe default for "what is causing this" style questions; do not default to "` + kubectlErrorRegex + `" just because the question sounds investigative. When you do set one, it must be a plain POSIX extended regex (grep -E syntax): no Perl-only syntax like inline flags ("(?i)", "(?:...)"). The search is already case-insensitive (grep -i is always applied), so never add a case-insensitivity flag yourself.
+- time_range: Relative lookback such as "30m", "6h", "24h", or "7d". Set it for an explicit past window.
+- start_time: RFC3339 timestamp when the user gives an absolute start instant; prefer it over time_range.
 
 CRITICAL — Read the ORIGINAL USER QUESTION (when provided) to determine intent, not just the per-step query.
 A parent planner may paraphrase an investigative question into a routine-looking sub-step (e.g. user asks
 "Was the X pod affected by today's incident?" but planner forwards "get logs for pod X"). The per-step query alone is
 ambiguous; the original question carries the true intent. If the original question is investigative
 (contains phrasings like "were there issues", "what is causing", "why is X broken/failing", "did Y happen",
-"was there an outage", "what went wrong", "diagnose", "troubleshoot", "root cause"), you MUST set
-filter_pattern and tail=10000 even if the per-step query reads as routine.
+"was there an outage", "what went wrong", "diagnose", "troubleshoot", "root cause"), set tail=10000 even if the
+per-step query reads as routine — but only set filter_pattern too if that original question, or evidence already
+gathered, names a specific symptom to filter for. Investigative intent widens the window; it does not by itself
+justify narrowing what's visible inside that window.
 
-Defaults: tail=100 for routine queries, tail=10000 for investigation queries. When filter_pattern is set,
-tail SHOULD be 10000 so the grep has a meaningful window to scan.
+If the question names an explicit window, set time_range or start_time. Otherwise use time_range="24h" for
+investigations and leave both fields empty for routine requests.
+
+Defaults: tail=100 for routine queries, tail=10000 for investigation queries. filter_pattern stays empty unless
+a specific symptom is already known — when it is set, tail SHOULD be 10000 so the grep has a meaningful window to scan.
 `
 	messages := buildLogIntentMessages(systemPrompt, request)
 
@@ -1111,134 +1294,6 @@ tail SHOULD be 10000 so the grep has a meaningful window to scan.
 		}
 	}
 	return intent, nil
-}
-
-// defaultProviderLogFields is the field list advertised to the query-generator
-// LLM when the backend's label discovery (QueryLabels) fails or returns empty.
-// The where-clause keys are passed to the backend verbatim (no canonical
-// mapping), so the fallback must use each backend's REAL field names: Signoz
-// stores logs under OTel attribute names — the generic `_body`/`namespace`/
-// `pod` set matches no Signoz attribute and every query silently returns zero
-// rows.
-//
-// Signoz is special-cased because it has ONE fixed schema (OTel), so a
-// universally-correct fallback exists. Do NOT add hardcoded fallbacks for
-// schema-less backends like Elasticsearch: their field names depend entirely
-// on the customer's log shipper (filebeat `message`/`kubernetes.*`, OTel
-// `body`/`k8s.*`, custom pipelines), and any guessed list silently returns
-// zero rows for the setups it doesn't match — the exact failure mode this
-// function exists to fix. Those backends must rely on label/index discovery
-// and the account GlobalContext (propagated by buildLogIntentMessages).
-func defaultProviderLogFields(provider string) []string {
-	if strings.EqualFold(provider, "signoz") {
-		return []string{"body", "service.name", "k8s.cluster.name", "k8s.namespace.name", "k8s.pod.name", "trace_id"}
-	}
-	return []string{"_body", "namespace", "pod"}
-}
-
-// generateLogQuery returns the JSON-where envelope logs_execute consumes.
-// defaultIndex is the backend's account-default index (from get_default_provider);
-// empty for backends with no index concept (e.g. Loki).
-func generateLogQuery(ctx *security.RequestContext, request core.NBAgentRequest, provider string, fields []string, indices map[string]string, defaultIndex string) (string, error) {
-	supportedOperators := []string{"_eq", "_neq", "_gt", "_gte", "_lt", "_lte", "_in", "_nin", "_like", "_ilike", "_nlike", "_is_null", "_or", "_and"}
-
-	fieldsProvided := len(fields) > 0
-	if !fieldsProvided {
-		fields = defaultProviderLogFields(provider)
-	}
-
-	var b strings.Builder
-	b.WriteString("**GOAL:** Only Generate Query, Cannot Execute Query.\n")
-	b.WriteString("You are an expert in generating JSON queries from natural language.\n")
-	b.WriteString("Your goal is to create a valid JSON query based on the user's question.\n")
-	b.WriteString("Follow this JSON schema:\n")
-	b.WriteString(`{"where": {"<field>": {"<operator>": "<value>"}}, "_or": [ ... ], "_and": [ ... ]}, "limit": <number>, "time_range": "<string>", "start_time": "<string>", "index": "<string>", "direction": "<forward|backward> (Loki only)"}` + "\n")
-	b.WriteString("The `where` clause is for filtering. For `_and` or `_or` operators, the value is an array of filter objects.\n")
-	b.WriteString("The `index` field is optional. Use it to target a specific Elasticsearch index or pattern when the user's query implies a particular log source.\n")
-	b.WriteString("Do not use anything other than the provided fields and operators.\n")
-	b.WriteString("Prefer ilike operator for regex matches.\n")
-	b.WriteString("Prefer ilike operator for text matches over eq operator.\n")
-	b.WriteString("AVAILABLE FIELDS AND OPERATORS for query building\n")
-	fmt.Fprintf(&b, "  - **Fields**: %s\n", strings.Join(fields, ", "))
-	fmt.Fprintf(&b, "  - **Operators**: %s\n", strings.Join(supportedOperators, ", "))
-
-	if len(indices) > 0 {
-		keys := make([]string, 0, len(indices))
-		for k := range indices {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		indexList := make([]string, 0, len(indices))
-		for _, name := range keys {
-			indexList = append(indexList, fmt.Sprintf("%s (%s)", name, indices[name]))
-		}
-		b.WriteString("AVAILABLE ELASTICSEARCH INDICES:\n")
-		fmt.Fprintf(&b, "  %s\n", strings.Join(indexList, ", "))
-		if defaultIndex != "" {
-			fmt.Fprintf(&b, "  Account default index (used when `index` is omitted): %s\n", defaultIndex)
-		}
-		b.WriteString("Pick the most relevant index based on the user's question. If unsure or the request is general, omit the index field to use the account default.\n")
-	} else if defaultIndex != "" {
-		fmt.Fprintf(&b, "Account default log index (used when `index` is omitted): %s. Omit the `index` field unless the user's question implies a different source.\n", defaultIndex)
-	}
-
-	b.WriteString("\n**Constraints:**\n")
-	if fieldsProvided {
-		// Loki labels (`app`, `namespace`, ...) lose to the model's stronger
-		// OTel/Datadog prior (`service_name`) without an explicit prohibition.
-		b.WriteString("- MUST use ONLY the labels/fields listed in the Fields section above. Do not invent labels.\n")
-		b.WriteString("- NEVER emit labels that are not in the Fields list. Do not fall back to generic OTel/Datadog conventions (e.g. `service_name`, `service.name`, `kubernetes.*`) unless they are explicitly present in the Fields list. If the equivalent appears in the Fields list under a different name (e.g. `app`, `namespace`, `pod`), use that name verbatim.\n")
-		b.WriteString("- When the user's natural-language question uses generic words like 'service X', 'pod X', or 'app X', map them to the matching label from the Fields list. The choice of label name is dictated by the Fields list, not by the user's wording.\n")
-	}
-	b.WriteString("- Do not answer questions without generating a query.\n")
-	b.WriteString("- Ensure the generated JSON is a valid query.\n")
-	b.WriteString("- Return only the JSON query object enclosed in triple backticks.\n")
-
-	if strings.EqualFold(provider, "loki") {
-		b.WriteString("\n**Loki direction (Loki backend only):**\n")
-		b.WriteString("- Default: omit `direction` (Loki defaults to backward — newest first). This is correct for both routine fetches AND the FIRST pass of an investigation, because:\n")
-		b.WriteString("  - For routine queries (\"show me recent errors\", \"tail logs\"), newest-first is what the user expects.\n")
-		b.WriteString("  - For investigations (\"why did X fail\", \"diagnose\", \"root cause\"), errors are typically scattered across history; newest-first guarantees the most recent error window is in the response, which is usually what the user is asking about. The orchestrator may then issue a SECOND, narrower forward fetch around the first error timestamp to pull antecedent context (config reload, deploy, secret rotation) — but that is a follow-up call, not the default.\n")
-		b.WriteString("- Use `\"direction\": \"forward\"` ONLY for that targeted second-pass: a narrow `start_time`/`end_time` window (e.g. 5-15 min) immediately preceding a known error timestamp. Forward + a wide window is almost always wrong because `limit` will truncate before reaching the error window.\n")
-	}
-
-	b.WriteString("\n**Strategy is the caller's responsibility, not yours:**\n")
-	b.WriteString("Translate the natural-language question into a query that reflects exactly what was asked. ")
-	b.WriteString("Do NOT add an error-pattern body filter (e.g. `{\"_body\": {\"_ilike\": \"%error%\"}}`) unless the question explicitly asks for errors/warnings/failures. ")
-	b.WriteString("If the caller asks for \"all logs\" or \"recent logs\" with no error keyword, emit a query with NO body filter — even if the broader context looks investigative. ")
-	b.WriteString("The orchestrator above you decides whether to filter for errors or pull a broad chronological window; your job is to honour that decision faithfully.\n")
-
-	b.WriteString("\n**Always emit `time_range` and `limit` (mandatory):**\n")
-	b.WriteString("- A query without `time_range` falls back to a narrow 1h window centred on `now`. For pods that emit historical/burst data at startup (cron schedulers, replay-style fixtures, jobs that backfill), a 1h window misses errors that happened earlier in the pod's lifetime.\n")
-	b.WriteString("- If the caller's question explicitly mentions a window (\"last 30m\", \"last 6h\", \"between 10:00 and 11:00\"), honour it verbatim.\n")
-	b.WriteString("- Otherwise, choose `time_range` and `limit` from the caller's intent:\n")
-	b.WriteString("    * **Investigation intent** (\"why is X broken\", \"diagnose\", \"what caused\", \"were there issues\", \"what went wrong\", \"root cause\", \"troubleshoot\", \"failing\", \"crash\"): emit `\"time_range\": \"24h\"`, `\"limit\": 5000`. Errors can be hours old; a narrow window will miss them.\n")
-	b.WriteString("    * **Routine intent** (\"show me logs\", \"recent logs\", \"tail\", \"any errors right now\"): emit `\"time_range\": \"1h\"`, `\"limit\": 1000`. Routine viewing favours a recent slice but still needs enough volume to surface scattered errors.\n")
-	b.WriteString("- Read the caller's ORIGINAL user question (when provided) to classify intent — a parent planner often paraphrases an investigative question into a routine-looking sub-step (\"Get recent logs for X\"). The original question carries the true intent.\n")
-	b.WriteString("- These are defaults, not caps. If the caller specifies `last 7d` or `limit 10000`, use those.\n")
-
-	b.WriteString("\n**Examples:**\n")
-	examples := providerSpecificQueryExamples(provider)
-	if len(examples) == 0 {
-		examples = defaultQueryExamples()
-	}
-	for i, ex := range examples {
-		fmt.Fprintf(&b, "Example %d:\n  Question: %s\n  Answer: %s\n", i+1, ex.Question, ex.Answer)
-		if ex.Explanation != "" {
-			fmt.Fprintf(&b, "  Explanation: %s\n", ex.Explanation)
-		}
-	}
-
-	messages := buildLogIntentMessages(b.String(), request)
-
-	res, err := core.GenerateAndTrackLLMContent(ctx, request.UserId, request.AccountId, request.ConversationId, request.MessageId, request.AgentId, false, messages, true)
-	if err != nil {
-		return "", err
-	}
-	if len(res.Choices) == 0 {
-		return "", fmt.Errorf("empty LLM response")
-	}
-	return strings.TrimSpace(res.Choices[0].Content), nil
 }
 
 // generateDatadogLogQuery returns a Datadog facet-syntax query (e.g. "service:my-api status:error").
@@ -1300,6 +1355,8 @@ type kubectlLogQuery struct {
 	Tail          int    `json:"tail"`
 	IsPrevious    bool   `json:"is_previous"`
 	FilterPattern string `json:"filter_pattern"`
+	TimeRange     string `json:"time_range"`
+	StartTime     string `json:"start_time"`
 }
 
 // podHashSuffix conservatively matches Deployment-managed pod names of the
@@ -1345,6 +1402,15 @@ func buildKubectlLogCommand(intent kubectlLogQuery) string {
 		tail = 100
 	}
 	args = append(args, fmt.Sprintf("--tail=%d", tail))
+	if st := strings.TrimSpace(intent.StartTime); st != "" {
+		if _, err := time.Parse(time.RFC3339, st); err == nil {
+			args = append(args, fmt.Sprintf("--since-time=%s", st))
+		}
+	} else if tr := strings.TrimSpace(intent.TimeRange); tr != "" {
+		if d, ok := parseRelativeWindow(tr); ok {
+			args = append(args, fmt.Sprintf("--since=%s", d))
+		}
+	}
 
 	cmd := strings.Join(args, " ")
 	if pat := strings.TrimSpace(intent.FilterPattern); pat != "" {
@@ -1355,52 +1421,6 @@ func buildKubectlLogCommand(intent kubectlLogQuery) string {
 
 func escapeShellSingleQuoted(s string) string {
 	return strings.ReplaceAll(s, "'", `'\''`)
-}
-
-// defaultQueryExamples is the fallback example set for unrecognised providers.
-func defaultQueryExamples() []core.NBAgentPromptExample {
-	return []core.NBAgentPromptExample{
-		{
-			Question:    "show me recent 504 failures for services abc?",
-			Answer:      `{"where":{"http.status_code": {"_eq": 504}, "service_name": {"_eq": "abc"}}}`,
-			Explanation: "Available Labels - http.status_code, service_name",
-		},
-		{
-			Question:    "How many apis are taking more than 10seconds for service abc?",
-			Answer:      `{"where": {"duration_ns": {"_gt": 10000000000}, "service_name": {"_eq": "abc"}}}`,
-			Explanation: "Available Labels - duration_ns, service_name",
-		},
-		{
-			Question:    "Get Recent Api Failures on services-server?",
-			Answer:      `{"where": {"service_name": {"_eq": "services-server"}, "http.status_code": {"_gte": 500}}}`,
-			Explanation: "Available Labels - service_name, http.status_code",
-		},
-		{
-			Question:    "Show me traces from the last 2 hours for ml-k8s-server",
-			Answer:      `{"where": {"service_name": {"_eq": "ml-k8s-server"}}, "time_range": "2h"}`,
-			Explanation: "Available Labels - service_name, time_range",
-		},
-		{
-			Question:    "get traces of llm server",
-			Answer:      `{"where": {"service_name": {"_eq": "llm-server"}}}`,
-			Explanation: "Available Labels - service_name",
-		},
-		{
-			Question:    "get traces of llm server after 2025-01-01",
-			Answer:      `{"where": {"service_name": {"_eq": "llm-server"}}, "start_time": "2025-01-01T00:00:00Z"}`,
-			Explanation: "Available Labels - service_name, start_time",
-		},
-		{
-			Question:    "get 10 error logs of services-server",
-			Answer:      `{"where": {"service_name": {"_eq": "services-server"}, "body": {"_ilike": "%error%"}}, "limit":10}`,
-			Explanation: "Available Labels - service_name, body",
-		},
-		{
-			Question:    "Get me recent logs of app metrics-server in kube-system namespace",
-			Answer:      `{"where": {"service_name": {"_eq": "metrics-server"}}, "limit":10}`,
-			Explanation: "Available Labels - service_name",
-		},
-	}
 }
 
 // providerSpecificQueryExamples returns few-shot examples tuned to each

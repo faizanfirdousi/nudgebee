@@ -48,7 +48,7 @@ function UserModal({ open, handleClose, handleSnackBarData, mode, userData = nul
   const router = useRouter();
   const currentFragment = useMemo(() => {
     const hash = router.asPath.split('#')[1];
-    return hash || 'users';
+    return hash || 'access-users';
   }, [router.asPath]);
 
   const [validationError, setValidationError] = useState({});
@@ -410,6 +410,11 @@ function UserModal({ open, handleClose, handleSnackBarData, mode, userData = nul
       open={open}
       handleClose={() => (loading ? undefined : handleModalClose())}
       title={isAddMode ? 'Add User' : 'Edit User'}
+      subtitle={
+        isAddMode
+          ? 'Work is more fun with friends! Invite people by email and pick the role and groups they start with.'
+          : 'Keep your teammate set up right — update their details, role, groups and integration profiles.'
+      }
       width='sm'
       loader={loading}
       sx={{ '& .MuiDialog-paper': { maxWidth: ds.space.mul(0, 280), maxHeight: '90vh' } }}

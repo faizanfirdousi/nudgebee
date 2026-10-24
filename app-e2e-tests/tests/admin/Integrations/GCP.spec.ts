@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { navigateToCloudTab, saveAndHandleAlreadyExists } from "./util";
+import { navigateToCloudTab, saveAndHandleAlreadyExists, getGcpServiceAccountKey } from "./util";
 
 const requiredEnv = [
   "GCP_DISPLAY_NAME",
@@ -10,7 +10,7 @@ const requiredEnv = [
 ];
 const missingEnv = requiredEnv.filter((key) => !process.env[key]);
 
-test("Add GCP Account Integration", async ({ page }) => {
+test("Add GCP Account Integration", { tag: ["@dev", "@test", "@oss", "@regression", "@functional", "@crud", "@quarantine"] }, async ({ page }) => {
   test.skip(
     missingEnv.length > 0,
     `Missing required env vars: ${missingEnv.join(", ")} — add them to the E2E_TEST_ENV secret`,
@@ -21,7 +21,7 @@ test("Add GCP Account Integration", async ({ page }) => {
   await locators.addGcpAccountBtn.click();
 
   await locators.gcpDisplayNameInput.fill(process.env.GCP_DISPLAY_NAME!);
-  await locators.gcpServiceAccountKeyInput.fill(process.env.GCP_SERVICE_ACCOUNT_KEY!);
+  await locators.gcpServiceAccountKeyInput.fill(getGcpServiceAccountKey());
   await locators.gcpCheckPermissionsBtn.click();
   await locators.gcpNextBtn.click();
   await locators.gcpDiscoverProjectsBtn.click();

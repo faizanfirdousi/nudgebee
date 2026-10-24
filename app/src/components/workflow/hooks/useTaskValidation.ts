@@ -1,6 +1,7 @@
 import { useMemo } from 'react';
 import { isCronExpressionValid, validateCron } from 'src/utils/cron';
 import { validateDateTemplate } from 'src/utils/templateValidation';
+import { isTemplateString, isValidUrl, isUrlFieldName } from 'src/utils/url';
 import { SUBTASK_BLOCKED_TYPES } from '../constants/subtaskConstants';
 
 // Validate a container node's nested sub-task list ({id, type, params} entries)
@@ -242,6 +243,34 @@ export const validateTaskData = (actionType: string, data: any, validationRules:
           }
           break;
 
+        // Schema type "any" is how the backend spells "a JSON document, or a
+        // template that resolves to one". Every `any` field on an *input*
+        // schema wants JSON when handed a string — data.filter's `list`
+        // (filter_task.go json.Unmarshal into []any), core.foreach's `items`
+        // (foreach_task.go GetLoopConfig, same), and llm.a2a's `params`
+        // (JSON-RPC params). The `any` fields that legitimately hold a bare
+        // string — dns `answer`, http `body`, run_script `data` — are all on
+        // output schemas, which this validator never sees.
+        //
+        // JsonEditor stores the raw string whenever JSON.parse failed, so a
+        // non-template string arriving here is malformed JSON the user has no
+        // other way to see: without this case the mistake travels to the task
+        // executor and comes back as a Go parser error after Run (#34764).
+        case 'any':
+          if (typeof value === 'string' && !/\{\{|\{%/.test(value)) {
+            try {
+              JSON.parse(value);
+            } catch (parseError: any) {
+              errors[fieldName] = `${fieldName
+                .replace(/_/g, ' ')
+                .replace(/([A-Z])/g, ' $1')
+                .toLowerCase()
+                .trim()} must be valid JSON — ${parseError?.message || 'could not be parsed'}`;
+              isValid = false;
+            }
+          }
+          break;
+
         case 'string':
           if (typeof value !== 'string') {
             errors[fieldName] = `${fieldName
@@ -299,10 +328,8 @@ export const validateTaskData = (actionType: string, data: any, validationRules:
     }
 
     // URL validation
-    if ((fieldName.toLowerCase().includes('url') || fieldName.toLowerCase().includes('endpoint')) && typeof value === 'string' && value.trim()) {
-      try {
-        new URL(value);
-      } catch {
+    if (isUrlFieldName(fieldName) && typeof value === 'string' && value.trim()) {
+      if (!isTemplateString(value) && !isValidUrl(value)) {
         errors[fieldName] = `${fieldName
           .replace(/_/g, ' ')
           .replace(/([A-Z])/g, ' $1')
@@ -331,6 +358,23 @@ export const validateTaskData = (actionType: string, data: any, validationRules:
       if (res.warnings.length > 0) {
         warnings[fieldName] = [warnings[fieldName], ...res.warnings].filter(Boolean).join(' ');
       }
+    }
+  }
+
+  // Paired resize fields (change_by + change_to): exclusive, but one of them is
+  // mandatory — a JSON-schema `required` flag can't express "exactly one of", so
+  // tasks like k8s.pv_rightsize declared neither and the node validated as OK
+  // with no resize value at all, failing only at execution ("either 'change_by'
+  // or 'change_to' must be provided"). Gate mirrors the sidebar's synthetic
+  // "Resize" dropdown: suppressed when the task exposes its own `scaling_mode`
+  // selector (k8s.horizontal_rightsize), which drives visibility itself.
+  const hasChangeGroup = !!inputSchema.change_by && !!inputSchema.change_to && !inputSchema.scaling_mode;
+  if (hasChangeGroup) {
+    const isBlank = (v: any) => v === undefined || v === null || (typeof v === 'string' && v.trim() === '');
+    if (isBlank(data?.change_by) && isBlank(data?.change_to)) {
+      errors.change_by = 'Resize value is required';
+      errors.change_to = 'Resize value is required';
+      isValid = false;
     }
   }
 

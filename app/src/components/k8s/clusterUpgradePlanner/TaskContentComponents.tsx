@@ -1,5 +1,6 @@
-import React, { useEffect, useState } from 'react';
-import { Box, Typography, Alert } from '@mui/material';
+import React, { useEffect, useMemo, useState } from 'react';
+import { Box, Typography } from '@mui/material';
+import { Banner } from '@ui/Banner';
 import { Skeleton } from '@ui/Skeleton';
 import { Chip as DsChip, type ChipTone } from '@ui/Chip';
 import Pdb from '@components/k8s/cluster-upgrade/cards/Pdb';
@@ -10,7 +11,7 @@ import apiKubernetes1 from '@api1/kubernetes1';
 import CustomTable2 from '@shared/tables/CustomTable2';
 import { Label } from '@ui/Label';
 import { Button as DsButton } from '@ui/Button';
-import WidgetCard from '@ui/WidgetCard';
+import { Card } from '@ui/Card';
 import { Stat } from '@ui/Stat';
 import { hasWriteAccess } from '@lib/auth';
 import { convertToLocalTime } from '@lib/datetime';
@@ -36,7 +37,7 @@ const healthLabelToTone: Record<string, ChipTone> = {
 };
 const toHealthTone = (label: string): ChipTone => healthLabelToTone[label] || 'neutral';
 
-const statCardSx = { flex: 1, minWidth: 0, mt: 0, padding: 'var(--ds-space-3) var(--ds-space-4)' };
+const statCardSx = { flex: 1, minWidth: 0 };
 const statRowSx = {
   display: 'grid',
   gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
@@ -48,9 +49,14 @@ export const PdbContent: React.FC<{ accountId?: string; onInsightsChange?: (insi
   const [pdbComponent, setPdbComponent] = useState<React.ReactNode>(null);
 
   useEffect(() => {
+    let cancelled = false;
+
     const initializePdb = async () => {
       const pdb = new Pdb();
       await pdb.canRenderContent(accountId);
+      if (cancelled) {
+        return;
+      }
       const contentComponents = pdb.getContentComponents();
       const insights = pdb.getHighLightsData();
 
@@ -66,6 +72,10 @@ export const PdbContent: React.FC<{ accountId?: string; onInsightsChange?: (insi
     if (accountId) {
       initializePdb();
     }
+
+    return () => {
+      cancelled = true;
+    };
   }, [accountId, onInsightsChange]);
 
   return <>{pdbComponent}</>;
@@ -98,20 +108,32 @@ export const HelmContent: React.FC<{ accountId?: string; onInsightsChange?: (ins
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    let cancelled = false;
+
     if (accountId) {
       apiKubernetes1
         .getClusterHealth(accountId, 'helm_compatibility')
         .then((response: any) => {
+          if (cancelled) {
+            return;
+          }
           if (response?.res?.helm_compatibility) {
             setData(response.res.helm_compatibility);
           }
           setLoading(false);
         })
         .catch(() => {
+          if (cancelled) {
+            return;
+          }
           setError('Failed to fetch Helm compatibility data');
           setLoading(false);
         });
     }
+
+    return () => {
+      cancelled = true;
+    };
   }, [accountId]);
 
   useEffect(() => {
@@ -154,7 +176,7 @@ export const HelmContent: React.FC<{ accountId?: string; onInsightsChange?: (ins
   if (error) {
     return (
       <Box sx={{ p: ds.space[4] }}>
-        <Alert severity='error'>{error}</Alert>
+        <Banner tone='critical' message={error} />
       </Box>
     );
   }
@@ -191,7 +213,7 @@ export const HelmContent: React.FC<{ accountId?: string; onInsightsChange?: (ins
     {
       text: release.chart_version,
       component: (
-        <Typography sx={{ fontSize: 'var(--ds-text-small)', color: 'var(--ds-gray-600)', fontFamily: 'monospace' }}>
+        <Typography sx={{ fontSize: 'var(--ds-text-small)', color: 'var(--ds-gray-600)', fontFamily: ds.font.mono }}>
           {release.chart_version}
         </Typography>
       ),
@@ -199,7 +221,7 @@ export const HelmContent: React.FC<{ accountId?: string; onInsightsChange?: (ins
     {
       text: release.kube_version || '-',
       component: (
-        <Typography sx={{ fontSize: 'var(--ds-text-caption)', color: 'var(--ds-gray-600)', fontFamily: 'monospace' }}>
+        <Typography sx={{ fontSize: 'var(--ds-text-caption)', color: 'var(--ds-gray-600)', fontFamily: ds.font.mono }}>
           {release.kube_version || '-'}
         </Typography>
       ),
@@ -246,9 +268,14 @@ export const AddOnContent: React.FC<{ accountId?: string; onInsightsChange?: (in
   const [addOnComponent, setAddOnComponent] = useState<React.ReactNode>(null);
 
   useEffect(() => {
+    let cancelled = false;
+
     const initializeAddOn = async () => {
       const addOn = new EksAddOn();
       await addOn.canRenderContent(accountId);
+      if (cancelled) {
+        return;
+      }
       const contentComponents = addOn.getContentComponents();
       const insights = addOn.getHighLightsData();
 
@@ -264,6 +291,10 @@ export const AddOnContent: React.FC<{ accountId?: string; onInsightsChange?: (in
     if (accountId) {
       initializeAddOn();
     }
+
+    return () => {
+      cancelled = true;
+    };
   }, [accountId, onInsightsChange]);
 
   return <>{addOnComponent}</>;
@@ -273,9 +304,14 @@ export const KubeProxyContent: React.FC<{ accountId?: string; onInsightsChange?:
   const [kubeProxyComponent, setKubeProxyComponent] = useState<React.ReactNode>(null);
 
   useEffect(() => {
+    let cancelled = false;
+
     const initializeKubeProxy = async () => {
       const kubeProxy = new KubeVersion();
       await kubeProxy.canRenderContent(accountId);
+      if (cancelled) {
+        return;
+      }
       const contentComponents = kubeProxy.getContentComponents();
       const insights = kubeProxy.getHighLightsData();
 
@@ -291,6 +327,10 @@ export const KubeProxyContent: React.FC<{ accountId?: string; onInsightsChange?:
     if (accountId) {
       initializeKubeProxy();
     }
+
+    return () => {
+      cancelled = true;
+    };
   }, [accountId, onInsightsChange]);
 
   return <>{kubeProxyComponent}</>;
@@ -304,9 +344,14 @@ export const DeprecatedApisContent: React.FC<{ accountId?: string; targetVersion
   const [deprecatedApisComponent, setDeprecatedApisComponent] = useState<React.ReactNode>(null);
 
   useEffect(() => {
+    let cancelled = false;
+
     const initializeDeprecatedApis = async () => {
       const deprecatedApis = new DeprecatedApis({ disabledInfographic: true });
       await deprecatedApis.canRenderContent(accountId, targetVersion);
+      if (cancelled) {
+        return;
+      }
       const contentComponents = deprecatedApis.getContentComponents();
       const insights = deprecatedApis.getHighLightsData();
 
@@ -322,6 +367,10 @@ export const DeprecatedApisContent: React.FC<{ accountId?: string; targetVersion
     if (accountId) {
       initializeDeprecatedApis();
     }
+
+    return () => {
+      cancelled = true;
+    };
   }, [accountId, targetVersion, onInsightsChange]);
 
   return <>{deprecatedApisComponent}</>;
@@ -334,27 +383,105 @@ interface Workload {
   available: number;
 }
 
+const getWorkloadStatus = (available: number, replicas: number) => {
+  if (available === replicas && replicas > 0) {
+    return 'healthy';
+  }
+  if (available === 0) {
+    return 'failed';
+  }
+  if (available < replicas) {
+    return 'degraded';
+  }
+  return 'unknown';
+};
+
+const WORKLOAD_TABLE_HEADERS = [
+  { name: 'Workload Name', width: '30%' },
+  { name: 'Namespace', width: '25%' },
+  { name: 'Status', width: '15%' },
+  { name: 'Replicas', width: '30%' },
+];
+
 export const ClusterHealthWorkloadsContent: React.FC<{ accountId?: string }> = ({ accountId }) => {
   const [workloads, setWorkloads] = useState<Workload[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    let cancelled = false;
+
     if (accountId) {
       apiKubernetes1
         .getClusterHealth(accountId, 'workloads')
         .then((response: any) => {
+          if (cancelled) {
+            return;
+          }
           if (response?.res?.workloads) {
             setWorkloads(response.res.workloads);
           }
           setLoading(false);
         })
         .catch(() => {
+          if (cancelled) {
+            return;
+          }
           setError('Failed to fetch workloads health data');
           setLoading(false);
         });
     }
+
+    return () => {
+      cancelled = true;
+    };
   }, [accountId]);
+
+  const tableData = useMemo(
+    () =>
+      workloads.map((workload) => {
+        const status = getWorkloadStatus(workload.available, workload.replicas);
+
+        return [
+          {
+            text: workload.name,
+            component: (
+              <Typography sx={{ fontSize: 'var(--ds-text-body)', fontWeight: 'var(--ds-font-weight-medium)', color: 'var(--ds-gray-700)' }}>
+                {workload.name}
+              </Typography>
+            ),
+          },
+          {
+            text: workload.namespace,
+            component: <Typography sx={{ fontSize: 'var(--ds-text-small)', color: 'var(--ds-gray-600)' }}>{workload.namespace}</Typography>,
+          },
+          {
+            text: status,
+            component: <Label text={status} />,
+          },
+          {
+            text: `${workload.available}/${workload.replicas}`,
+            component: (
+              <Typography sx={{ fontSize: 'var(--ds-text-small)', color: 'var(--ds-gray-600)', fontFamily: ds.font.mono }}>
+                {workload.available}/{workload.replicas}
+              </Typography>
+            ),
+          },
+        ];
+      }),
+    [workloads]
+  );
+
+  // Count by status
+  const statusCounts = useMemo(
+    () =>
+      workloads.reduce((acc, workload) => {
+        const status = getWorkloadStatus(workload.available, workload.replicas);
+        acc[status] = (acc[status] || 0) + 1;
+        return acc;
+      }, {} as Record<string, number>),
+    [workloads]
+  );
 
   if (loading) {
     return (
@@ -368,68 +495,10 @@ export const ClusterHealthWorkloadsContent: React.FC<{ accountId?: string }> = (
   if (error) {
     return (
       <Box sx={{ p: ds.space[4] }}>
-        <Alert severity='error'>{error}</Alert>
+        <Banner tone='critical' message={error} />
       </Box>
     );
   }
-
-  const getWorkloadStatus = (available: number, replicas: number) => {
-    if (available === replicas && replicas > 0) {
-      return 'healthy';
-    }
-    if (available === 0) {
-      return 'failed';
-    }
-    if (available < replicas) {
-      return 'degraded';
-    }
-    return 'unknown';
-  };
-
-  const tableHeaders = [
-    { name: 'Workload Name', width: '30%' },
-    { name: 'Namespace', width: '25%' },
-    { name: 'Status', width: '15%' },
-    { name: 'Replicas', width: '30%' },
-  ];
-
-  const tableData = workloads.map((workload) => {
-    const status = getWorkloadStatus(workload.available, workload.replicas);
-
-    return [
-      {
-        text: workload.name,
-        component: (
-          <Typography sx={{ fontSize: 'var(--ds-text-body)', fontWeight: 'var(--ds-font-weight-medium)', color: 'var(--ds-gray-700)' }}>
-            {workload.name}
-          </Typography>
-        ),
-      },
-      {
-        text: workload.namespace,
-        component: <Typography sx={{ fontSize: 'var(--ds-text-small)', color: 'var(--ds-gray-600)' }}>{workload.namespace}</Typography>,
-      },
-      {
-        text: status,
-        component: <Label text={status} />,
-      },
-      {
-        text: `${workload.available}/${workload.replicas}`,
-        component: (
-          <Typography sx={{ fontSize: 'var(--ds-text-small)', color: 'var(--ds-gray-600)', fontFamily: 'monospace' }}>
-            {workload.available}/{workload.replicas}
-          </Typography>
-        ),
-      },
-    ];
-  });
-
-  // Count by status
-  const statusCounts = workloads.reduce((acc, workload) => {
-    const status = getWorkloadStatus(workload.available, workload.replicas);
-    acc[status] = (acc[status] || 0) + 1;
-    return acc;
-  }, {} as Record<string, number>);
 
   return (
     <Box>
@@ -449,7 +518,7 @@ export const ClusterHealthWorkloadsContent: React.FC<{ accountId?: string }> = (
           No workloads found in the cluster.
         </Typography>
       ) : (
-        <CustomTable2 tableData={tableData as any} headers={tableHeaders as any} loading={loading} rowsPerPage={10} />
+        <CustomTable2 tableData={tableData as any} headers={WORKLOAD_TABLE_HEADERS as any} loading={loading} rowsPerPage={10} />
       )}
     </Box>
   );
@@ -468,14 +537,30 @@ export const ClusterHealthServicesContent: React.FC<{ accountId?: string }> = ({
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    let cancelled = false;
+
     if (accountId) {
-      apiKubernetes1.getClusterHealth(accountId, 'services').then((response: any) => {
-        if (response?.res?.services) {
-          setServices(response.res.services);
-        }
-        setLoading(false);
-      });
+      apiKubernetes1
+        .getClusterHealth(accountId, 'services')
+        .then((response: any) => {
+          if (cancelled) {
+            return;
+          }
+          if (response?.res?.services) {
+            setServices(response.res.services);
+          }
+          setLoading(false);
+        })
+        // This component has no error state, unlike its ClusterHealth* siblings; leaving
+        // `loading` set keeps the skeleton up as before rather than flashing an empty table.
+        .catch((error) => {
+          console.error('Failed to fetch cluster health services:', error);
+        });
     }
+
+    return () => {
+      cancelled = true;
+    };
   }, [accountId]);
 
   if (loading) {
@@ -590,27 +675,99 @@ interface Node {
   };
 }
 
+const getNodeHealthStatus = (conditions: NodeCondition[] | undefined) => {
+  const hasIssues = !!conditions?.some(
+    (c) => (c.type === 'MemoryPressure' || c.type === 'DiskPressure' || c.type === 'PIDPressure') && c.status === 'True'
+  );
+  return hasIssues ? 'Issues' : 'Healthy';
+};
+
+const NODE_TABLE_HEADERS = [
+  { name: 'Node Name', width: '25%' },
+  { name: 'Version', width: '15%' },
+  { name: 'Status', width: '10%' },
+  { name: 'Conditions', width: '50%' },
+];
+
 export const ClusterHealthNodesContent: React.FC<{ accountId?: string }> = ({ accountId }) => {
   const [nodes, setNodes] = useState<Node[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    let cancelled = false;
+
     if (accountId) {
       apiKubernetes1
         .getClusterHealth(accountId, 'nodes')
         .then((response: any) => {
+          if (cancelled) {
+            return;
+          }
           if (response?.res?.nodes) {
             setNodes(response.res.nodes);
           }
           setLoading(false);
         })
         .catch(() => {
+          if (cancelled) {
+            return;
+          }
           setError('Failed to fetch nodes health data');
           setLoading(false);
         });
     }
+
+    return () => {
+      cancelled = true;
+    };
   }, [accountId]);
+
+  const tableData = useMemo(
+    () =>
+      nodes.map((node) => {
+        const healthStatus = getNodeHealthStatus(node.conditions);
+        const conditionsText = node.conditions?.map((c) => `${c.type}: ${c.status}`).join(', ') ?? '';
+
+        return [
+          {
+            text: node.name,
+            component: (
+              <Typography sx={{ fontSize: 'var(--ds-text-body)', fontWeight: 'var(--ds-font-weight-medium)', color: 'var(--ds-gray-700)' }}>
+                {node.name}
+              </Typography>
+            ),
+            drilldownQuery: node.nodeGroup ? { nodeName: node.name, nodeGroup: node.nodeGroup } : undefined,
+          },
+          {
+            text: node.version,
+            component: (
+              <Typography sx={{ fontSize: 'var(--ds-text-small)', color: 'var(--ds-gray-600)', fontFamily: ds.font.mono }}>{node.version}</Typography>
+            ),
+          },
+          {
+            text: healthStatus,
+            component: <Label text={healthStatus} />,
+          },
+          {
+            text: conditionsText,
+            component: <Typography sx={{ fontSize: 'var(--ds-text-caption)', color: 'var(--ds-gray-600)' }}>{conditionsText}</Typography>,
+          },
+        ];
+      }),
+    [nodes]
+  );
+
+  // Count healthy vs unhealthy nodes
+  const healthyCounts = useMemo(
+    () =>
+      nodes.reduce((acc, node) => {
+        const status = getNodeHealthStatus(node.conditions);
+        acc[status] = (acc[status] || 0) + 1;
+        return acc;
+      }, {} as Record<string, number>),
+    [nodes]
+  );
 
   if (loading) {
     return (
@@ -624,65 +781,10 @@ export const ClusterHealthNodesContent: React.FC<{ accountId?: string }> = ({ ac
   if (error) {
     return (
       <Box sx={{ p: ds.space[4] }}>
-        <Alert severity='error'>{error}</Alert>
+        <Banner tone='critical' message={error} />
       </Box>
     );
   }
-
-  const getNodeHealthStatus = (conditions: NodeCondition[]) => {
-    const hasIssues = conditions.some(
-      (c) => (c.type === 'MemoryPressure' || c.type === 'DiskPressure' || c.type === 'PIDPressure') && c.status === 'True'
-    );
-    return hasIssues ? 'Issues' : 'Healthy';
-  };
-
-  const tableHeaders = [
-    { name: 'Node Name', width: '25%' },
-    { name: 'Version', width: '15%' },
-    { name: 'Status', width: '10%' },
-    { name: 'Conditions', width: '50%' },
-  ];
-
-  const tableData = nodes.map((node) => {
-    const healthStatus = getNodeHealthStatus(node.conditions);
-
-    return [
-      {
-        text: node.name,
-        component: (
-          <Typography sx={{ fontSize: 'var(--ds-text-body)', fontWeight: 'var(--ds-font-weight-medium)', color: 'var(--ds-gray-700)' }}>
-            {node.name}
-          </Typography>
-        ),
-        drilldownQuery: node.nodeGroup ? { nodeName: node.name, nodeGroup: node.nodeGroup } : undefined,
-      },
-      {
-        text: node.version,
-        component: (
-          <Typography sx={{ fontSize: 'var(--ds-text-small)', color: 'var(--ds-gray-600)', fontFamily: 'monospace' }}>{node.version}</Typography>
-        ),
-      },
-      {
-        text: healthStatus,
-        component: <Label text={healthStatus} />,
-      },
-      {
-        text: node.conditions.map((c) => `${c.type}: ${c.status}`).join(', '),
-        component: (
-          <Typography sx={{ fontSize: 'var(--ds-text-caption)', color: 'var(--ds-gray-600)' }}>
-            {node.conditions.map((c) => `${c.type}: ${c.status}`).join(', ')}
-          </Typography>
-        ),
-      },
-    ];
-  });
-
-  // Count healthy vs unhealthy nodes
-  const healthyCounts = nodes.reduce((acc, node) => {
-    const status = getNodeHealthStatus(node.conditions);
-    acc[status] = (acc[status] || 0) + 1;
-    return acc;
-  }, {} as Record<string, number>);
 
   return (
     <Box>
@@ -702,7 +804,7 @@ export const ClusterHealthNodesContent: React.FC<{ accountId?: string }> = ({ ac
           No nodes found in the cluster.
         </Typography>
       ) : (
-        <CustomTable2 tableData={tableData as any} headers={tableHeaders as any} loading={loading} />
+        <CustomTable2 tableData={tableData as any} headers={NODE_TABLE_HEADERS as any} loading={loading} />
       )}
     </Box>
   );
@@ -744,20 +846,32 @@ export const ClusterHealthLoadBalancerContent: React.FC<{ accountId?: string }> 
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    let cancelled = false;
+
     if (accountId) {
       apiKubernetes1
         .getClusterHealth(accountId, 'load_balancer')
         .then((response: any) => {
+          if (cancelled) {
+            return;
+          }
           if (response?.res?.load_balancers) {
             setLoadBalancers(response.res.load_balancers);
           }
           setLoading(false);
         })
         .catch(() => {
+          if (cancelled) {
+            return;
+          }
           setError('Failed to fetch load balancer health data');
           setLoading(false);
         });
     }
+
+    return () => {
+      cancelled = true;
+    };
   }, [accountId]);
 
   if (loading) {
@@ -772,7 +886,7 @@ export const ClusterHealthLoadBalancerContent: React.FC<{ accountId?: string }> 
   if (error) {
     return (
       <Box sx={{ p: ds.space[4] }}>
-        <Alert severity='error'>{error}</Alert>
+        <Banner tone='critical' message={error} />
       </Box>
     );
   }
@@ -826,7 +940,7 @@ export const ClusterHealthLoadBalancerContent: React.FC<{ accountId?: string }> 
       {
         text: `${health_counts.InService}/${lb.instances?.total_instances ?? 0}`,
         component: (
-          <Typography sx={{ fontSize: 'var(--ds-text-small)', color: 'var(--ds-gray-600)', fontFamily: 'monospace' }}>
+          <Typography sx={{ fontSize: 'var(--ds-text-small)', color: 'var(--ds-gray-600)', fontFamily: ds.font.mono }}>
             {health_counts.InService}/{lb.instances?.total_instances ?? 0}
           </Typography>
         ),
@@ -874,7 +988,7 @@ export const ClusterHealthLoadBalancerContent: React.FC<{ accountId?: string }> 
           <Typography
             sx={{
               fontSize: 'var(--ds-text-small)',
-              fontFamily: 'monospace',
+              fontFamily: ds.font.mono,
               color: 'var(--ds-gray-700)',
               fontWeight: 'var(--ds-font-weight-medium)',
             }}
@@ -937,7 +1051,7 @@ export const ClusterHealthLoadBalancerContent: React.FC<{ accountId?: string }> 
           </Typography>
           <Typography
             variant='body2'
-            sx={{ fontFamily: 'monospace', fontSize: 'var(--ds-text-caption)', color: 'var(--ds-gray-700)', wordBreak: 'break-all' }}
+            sx={{ fontFamily: ds.font.mono, fontSize: 'var(--ds-text-caption)', color: 'var(--ds-gray-700)', wordBreak: 'break-all' }}
           >
             {loadBalancer.hostname}
           </Typography>
@@ -1035,20 +1149,32 @@ export const ClusterHealthNodeGroupsContent: React.FC<{ accountId?: string }> = 
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    let cancelled = false;
+
     if (accountId) {
       apiKubernetes1
         .getClusterHealth(accountId, 'node_groups')
         .then((response: any) => {
+          if (cancelled) {
+            return;
+          }
           if (response?.res?.node_groups) {
             setNodeGroups(response.res.node_groups);
           }
           setLoading(false);
         })
         .catch(() => {
+          if (cancelled) {
+            return;
+          }
           setError('Failed to fetch node groups health data');
           setLoading(false);
         });
     }
+
+    return () => {
+      cancelled = true;
+    };
   }, [accountId]);
 
   if (loading) {
@@ -1063,7 +1189,7 @@ export const ClusterHealthNodeGroupsContent: React.FC<{ accountId?: string }> = 
   if (error) {
     return (
       <Box sx={{ p: ds.space[4] }}>
-        <Alert severity='error'>{error}</Alert>
+        <Banner tone='critical' message={error} />
       </Box>
     );
   }
@@ -1129,7 +1255,7 @@ export const ClusterHealthNodeGroupsContent: React.FC<{ accountId?: string }> = 
       {
         text: node.kubelet_version,
         component: (
-          <Typography sx={{ fontSize: 'var(--ds-text-caption)', color: 'var(--ds-gray-600)', fontFamily: 'monospace' }}>
+          <Typography sx={{ fontSize: 'var(--ds-text-caption)', color: 'var(--ds-gray-600)', fontFamily: ds.font.mono }}>
             {node.kubelet_version}
           </Typography>
         ),
@@ -1186,7 +1312,7 @@ export const ClusterHealthNodeGroupsContent: React.FC<{ accountId?: string }> = 
       {
         text: `${ng.min_size}/${ng.desired_size}/${ng.max_size}`,
         component: (
-          <Typography sx={{ fontSize: 'var(--ds-text-small)', color: 'var(--ds-gray-600)', fontFamily: 'monospace' }}>
+          <Typography sx={{ fontSize: 'var(--ds-text-small)', color: 'var(--ds-gray-600)', fontFamily: ds.font.mono }}>
             {ng.min_size}/{ng.desired_size}/{ng.max_size}
           </Typography>
         ),
@@ -1194,7 +1320,7 @@ export const ClusterHealthNodeGroupsContent: React.FC<{ accountId?: string }> = 
       {
         text: ng.kubernetes_version,
         component: (
-          <Typography sx={{ fontSize: 'var(--ds-text-caption)', color: 'var(--ds-gray-600)', fontFamily: 'monospace' }}>
+          <Typography sx={{ fontSize: 'var(--ds-text-caption)', color: 'var(--ds-gray-600)', fontFamily: ds.font.mono }}>
             {ng.kubernetes_version}
           </Typography>
         ),
@@ -1202,7 +1328,7 @@ export const ClusterHealthNodeGroupsContent: React.FC<{ accountId?: string }> = 
       {
         text: `${readyNodes}/${totalNodes}`,
         component: (
-          <Typography sx={{ fontSize: 'var(--ds-text-small)', color: 'var(--ds-gray-600)', fontFamily: 'monospace' }}>
+          <Typography sx={{ fontSize: 'var(--ds-text-small)', color: 'var(--ds-gray-600)', fontFamily: ds.font.mono }}>
             {readyNodes}/{totalNodes}
           </Typography>
         ),
@@ -1269,20 +1395,32 @@ export const ClusterHealthPvContent: React.FC<{ accountId?: string }> = ({ accou
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    let cancelled = false;
+
     if (accountId) {
       apiKubernetes1
         .getClusterHealth(accountId, 'persistentvolumes')
         .then((response: any) => {
+          if (cancelled) {
+            return;
+          }
           if (response?.res?.persistentVolumes) {
             setPersistentVolumes(response.res.persistentVolumes);
           }
           setLoading(false);
         })
         .catch(() => {
+          if (cancelled) {
+            return;
+          }
           setError('Failed to fetch persistent volumes health data');
           setLoading(false);
         });
     }
+
+    return () => {
+      cancelled = true;
+    };
   }, [accountId]);
 
   if (loading) {
@@ -1297,7 +1435,7 @@ export const ClusterHealthPvContent: React.FC<{ accountId?: string }> = ({ accou
   if (error) {
     return (
       <Box sx={{ p: ds.space[4] }}>
-        <Alert severity='error'>{error}</Alert>
+        <Banner tone='critical' message={error} />
       </Box>
     );
   }
@@ -1506,33 +1644,33 @@ export const PreFlightCheckContent: React.FC<PreFlightCheckContentProps> = ({ ac
         </Box>
 
         <Box sx={statRowSx}>
-          <WidgetCard sx={statCardSx}>
+          <Card size='sm' sx={statCardSx}>
             <Stat size='md' label='Nodes' value={nodesCount} sub={healthySub(`${metrics.healthyNodes}/${metrics.totalNodes} healthy`)} />
-          </WidgetCard>
-          <WidgetCard sx={statCardSx}>
+          </Card>
+          <Card size='sm' sx={statCardSx}>
             <Stat
               size='md'
               label='Workloads'
               value={workloadsCount}
               sub={healthySub(`${metrics.healthyWorkloads}/${metrics.totalWorkloads} healthy`)}
             />
-          </WidgetCard>
-          <WidgetCard sx={statCardSx}>
+          </Card>
+          <Card size='sm' sx={statCardSx}>
             <Stat size='md' label='Services' value={servicesCount} />
-          </WidgetCard>
-          <WidgetCard sx={statCardSx}>
+          </Card>
+          <Card size='sm' sx={statCardSx}>
             <Stat
               size='md'
               label='Persistent Volumes'
               value={persistentVolumesCount}
               sub={healthySub(`${metrics.boundPVs}/${metrics.totalPVs} bound`)}
             />
-          </WidgetCard>
+          </Card>
         </Box>
 
-        <Alert severity='success' sx={{ mb: ds.space[4] }}>
-          Pre-flight check snapshot captured successfully
-        </Alert>
+        <Box sx={{ mb: ds.space[4] }}>
+          <Banner tone='success' message='Pre-flight check snapshot captured successfully' />
+        </Box>
 
         {checkData.created_at && (
           <Box sx={{ mt: ds.space[4] }}>
@@ -1558,9 +1696,9 @@ export const PreFlightCheckContent: React.FC<PreFlightCheckContentProps> = ({ ac
       </Box>
 
       {error && (
-        <Alert severity='error' sx={{ mb: ds.space[4] }}>
-          {error}
-        </Alert>
+        <Box sx={{ mb: ds.space[4] }}>
+          <Banner tone='critical' message={error} />
+        </Box>
       )}
 
       {loading && (
@@ -1858,18 +1996,18 @@ export const PostFlightCheckContent: React.FC<PostFlightCheckProps> = ({ account
             </Typography>
 
             <Box sx={statRowSx}>
-              <WidgetCard sx={statCardSx}>
+              <Card size='sm' sx={statCardSx}>
                 <Stat size='md' label='Nodes' value={pre.nodes_count} />
-              </WidgetCard>
-              <WidgetCard sx={statCardSx}>
+              </Card>
+              <Card size='sm' sx={statCardSx}>
                 <Stat size='md' label='Workloads' value={pre.workloads_count} />
-              </WidgetCard>
-              <WidgetCard sx={statCardSx}>
+              </Card>
+              <Card size='sm' sx={statCardSx}>
                 <Stat size='md' label='Services' value={pre.services_count} />
-              </WidgetCard>
-              <WidgetCard sx={statCardSx}>
+              </Card>
+              <Card size='sm' sx={statCardSx}>
                 <Stat size='md' label='Persistent Volumes' value={pre.persistent_volumes_count} />
-              </WidgetCard>
+              </Card>
             </Box>
           </Box>
         )}
@@ -1892,38 +2030,38 @@ export const PostFlightCheckContent: React.FC<PostFlightCheckProps> = ({ account
             </DsChip>
           </Box>
 
-          <Alert severity='success' sx={{ mb: ds.space[4] }}>
-            Post-flight check snapshot captured successfully
-          </Alert>
+          <Box sx={{ mb: ds.space[4] }}>
+            <Banner tone='success' message='Post-flight check snapshot captured successfully' />
+          </Box>
 
           <Box sx={statRowSx}>
-            <WidgetCard sx={statCardSx}>
+            <Card size='sm' sx={statCardSx}>
               <Stat
                 size='md'
                 label='Nodes'
                 value={recommendation.nodes?.length || 0}
                 sub={healthySub(`${metrics.healthyNodes}/${metrics.totalNodes} healthy`)}
               />
-            </WidgetCard>
-            <WidgetCard sx={statCardSx}>
+            </Card>
+            <Card size='sm' sx={statCardSx}>
               <Stat
                 size='md'
                 label='Workloads'
                 value={recommendation.workloads?.length || 0}
                 sub={healthySub(`${metrics.healthyWorkloads}/${metrics.totalWorkloads} healthy`)}
               />
-            </WidgetCard>
-            <WidgetCard sx={statCardSx}>
+            </Card>
+            <Card size='sm' sx={statCardSx}>
               <Stat size='md' label='Services' value={recommendation.services?.length || 0} />
-            </WidgetCard>
-            <WidgetCard sx={statCardSx}>
+            </Card>
+            <Card size='sm' sx={statCardSx}>
               <Stat
                 size='md'
                 label='Persistent Volumes'
                 value={recommendation.persistentVolumes?.length || 0}
                 sub={healthySub(`${metrics.boundPVs}/${metrics.totalPVs} bound`)}
               />
-            </WidgetCard>
+            </Card>
           </Box>
           {check.created_at && (
             <Typography
@@ -1956,9 +2094,9 @@ export const PostFlightCheckContent: React.FC<PostFlightCheckProps> = ({ account
       </Box>
 
       {error && (
-        <Alert severity='error' sx={{ mb: ds.space[4] }}>
-          {error}
-        </Alert>
+        <Box sx={{ mb: ds.space[4] }}>
+          <Banner tone='critical' message={error} />
+        </Box>
       )}
 
       {loading && (

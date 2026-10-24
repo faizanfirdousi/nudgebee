@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { Box, Stack, Typography, Grid, Divider } from '@mui/material';
+import { Box, Stack, Typography, Grid } from '@mui/material';
+import { Divider } from '@ui/Divider';
 import DSModal from '@ui/Modal';
 import ClusterNode from './common/ClusterNode';
 import { formatNumber } from '@lib/formatter';
@@ -132,7 +133,7 @@ export const PotentialSavings = ({ clusterSummary = {} }) => {
           Savings{''}
         </Typography>
         <Currency
-          sx={{ color: 'var(--ds-brand-600)', fontSize: '36px', fontWeight: 600 }}
+          sx={{ color: 'var(--ds-brand-600)', fontSize: '36px', fontWeight: 'var(--ds-font-weight-semibold)' }}
           value={clusterSummary?.yearly_recommendation_saving}
           suffix='/yr'
         />
@@ -148,10 +149,10 @@ PotentialSavings.propTypes = {
 const ClusterBlock = ({ cluster = {} }) => {
   return (
     <Box>
-      <Typography color='var(--ds-gray-500)' fontSize={'var(--ds-text-small)'} fontWeight={400} mb={'var(--ds-space-0)'}>
+      <Typography color='var(--ds-gray-500)' fontSize={'var(--ds-text-small)'} fontWeight={'var(--ds-font-weight-regular)'} mb={'var(--ds-space-0)'}>
         {cluster.lable}
       </Typography>
-      <Typography color='var(--ds-gray-700)' fontSize={'24px'} lineHeight={'36px'} fontWeight={600}>
+      <Typography color='var(--ds-gray-700)' fontSize={'24px'} lineHeight={'36px'} fontWeight={'var(--ds-font-weight-semibold)'}>
         {formatNumber(cluster.count)}
       </Typography>
     </Box>
@@ -195,14 +196,28 @@ const ClusterSummary = ({ clusterSummary = {}, accountId }) => {
       return;
     }
 
+    let cancelled = false;
+
     const fetchSLOData = async () => {
       try {
         const last24Hours = getLast24Hrs(new Date()).toISOString();
 
-        // Fetch all configured SLOs in the account (overall total)
-        const configResponse = await apiKubernetes1.listSLOConfigs({
-          cloud_account_id: accountId,
-        });
+        // Fetch all configured SLOs in the account (overall total) alongside the
+        // last-24h observations — neither read depends on the other.
+        const [configResponse, observationResponse] = await Promise.all([
+          apiKubernetes1.listSLOConfigs({
+            cloud_account_id: accountId,
+          }),
+          apiKubernetes1.getSLOObservation({
+            accountId,
+            timestamp: last24Hours,
+          }),
+        ]);
+
+        if (cancelled) {
+          return;
+        }
+
         const configuredSLOs = configResponse?.data?.data?.slo_config || [];
         const configuredWorkloads = new Set();
         configuredSLOs.forEach((config) => {
@@ -212,11 +227,6 @@ const ClusterSummary = ({ clusterSummary = {}, accountId }) => {
         const totalConfiguredCount = configuredWorkloads.size;
         setTotalSlo(totalConfiguredCount);
 
-        // Fetch SLO observations for last 24 hours to get firing status
-        const observationResponse = await apiKubernetes1.getSLOObservation({
-          accountId,
-          timestamp: last24Hours,
-        });
         const sloResponseData = observationResponse?.data?.data?.slo_report_observation_v2?.rows || [];
 
         if (sloResponseData.length > 0) {
@@ -246,6 +256,10 @@ const ClusterSummary = ({ clusterSummary = {}, accountId }) => {
     };
 
     fetchSLOData();
+
+    return () => {
+      cancelled = true;
+    };
   }, [accountId]);
 
   return (
@@ -277,7 +291,7 @@ const ClusterSummary = ({ clusterSummary = {}, accountId }) => {
               size='md'
               onClick={() => router.push(`/kubernetes/details/${accountId}?accountId=${accountId}#kubernetes/nodes`)}
             />
-            <Divider orientation='vertical' flexItem />
+            <Divider orientation='vertical' sx={{ mx: 0 }} />
             <ClusterNode
               largeVariant
               node={{
@@ -293,7 +307,7 @@ const ClusterSummary = ({ clusterSummary = {}, accountId }) => {
             <></>
           </Box>
         </Box>
-        <Divider sx={{ backgroundColor: 'var(--ds-gray-200)', mt: 'var(--ds-space-1)' }} />
+        <Divider sx={{ mt: 'var(--ds-space-1)', mb: 0 }} />
         <Box
           sx={{
             borderRadius: 'var(--ds-radius-sm)',
@@ -319,7 +333,7 @@ const ClusterSummary = ({ clusterSummary = {}, accountId }) => {
               size='md'
               onClick={() => router.push(`/kubernetes/details/${accountId}?accountId=${accountId}#kubernetes/applications`)}
             />
-            <Divider orientation='vertical' flexItem />
+            <Divider orientation='vertical' sx={{ mx: 0 }} />
             <Box display={'grid'} gridTemplateColumns={'1fr 1fr'} width={'100%'} gap={'calc(var(--ds-space-0) * 10)'} rowGap={'var(--ds-space-0)'}>
               {kindArray && kindArray.length > 0 ? (
                 kindArray.map((kind) => (
@@ -370,7 +384,7 @@ const ClusterSummary = ({ clusterSummary = {}, accountId }) => {
             </Box>
           </Box>
         </Box>
-        <Divider sx={{ backgroundColor: 'var(--ds-gray-200)', mt: 'var(--ds-space-1)' }} />
+        <Divider sx={{ mt: 'var(--ds-space-1)', mb: 0 }} />
 
         <Box
           sx={{
@@ -397,7 +411,7 @@ const ClusterSummary = ({ clusterSummary = {}, accountId }) => {
               size='md'
               onClick={() => router.push(`/kubernetes/details/${accountId}?accountId=${accountId}#kubernetes/pods`)}
             />
-            <Divider orientation='vertical' flexItem />
+            <Divider orientation='vertical' sx={{ mx: 0 }} />
             <Box
               display={'grid'}
               gridTemplateColumns={'1fr 1fr'}
@@ -468,7 +482,7 @@ const ClusterSummary = ({ clusterSummary = {}, accountId }) => {
             </Box>
           </Box>
         </Box>
-        <Divider sx={{ backgroundColor: 'var(--ds-gray-100)', mt: 'var(--ds-space-1)' }} />
+        <Divider sx={{ mt: 'var(--ds-space-1)', mb: 0 }} />
 
         <Box
           sx={{

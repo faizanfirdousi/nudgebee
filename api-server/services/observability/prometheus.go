@@ -320,7 +320,49 @@ func decodeInnerData(result []map[string]any) ([]string, map[string]any, error) 
 	return strs, raw, nil
 }
 
+// labelValuesOutput wraps decoded label values for the metrics_list_label_values
+// response. Attributes is deliberately empty: it used to carry the whole decoded
+// provider reply, which made the response O(N^2) because every one of the N items
+// embedded a copy of the full N-value payload (a 2362-value 'pod' lookup marshalled
+// to 193MiB instead of 144KiB, OOM-killing both the API and llm-server pods).
+// No caller reads it, and every other provider already returns an empty map.
+func labelValuesOutput(values []string) []OutputMetricsLabelValues {
+	output := make([]OutputMetricsLabelValues, len(values))
+	for i, v := range values {
+		output[i] = OutputMetricsLabelValues{Value: v, Attributes: map[string]any{}}
+	}
+	return output
+}
+
+// requestedMetricName reads the optional metric the caller wants label values
+// scoped to. Both the query builder and the agent tools already send it; it was
+// previously dropped, so every lookup ran cluster-wide.
+func requestedMetricName(req FetchMetricsLabelValueRequest) string {
+	m, _ := req.Request["metric_name"].(string)
+	return strings.TrimSpace(m)
+}
+
 func (s *PrometheusMetricSource) FetchMetricLabelValues(ctx *security.RequestContext, req FetchMetricsLabelValueRequest) ([]OutputMetricsLabelValues, error) {
+	// Scope the lookup to the requested metric when there is one. The
+	// prometheus_labels action takes only a label name, so it returns the
+	// label's values across the whole cluster; the proxy path accepts a
+	// match[] selector, the same mechanism FetchMetricList already uses.
+	if metric := requestedMetricName(req); metric != "" {
+		match := metricNameSelector(metric)
+		path := fmt.Sprintf("prometheus-v2/api/v1/label/%s/values?match[]=%s",
+			url.PathEscape(req.Label), url.QueryEscape(match))
+
+		resp, err := relayProxyRequest(ctx, req.AccountId, nil, path)
+		if err != nil {
+			return nil, err
+		}
+		values, err := stringListFromProxyData(resp)
+		if err != nil {
+			return nil, err
+		}
+		return labelValuesOutput(values), nil
+	}
+
 	resp, err := relayRequest(ctx, req.AccountId, "prometheus_labels", map[string]any{"label_name": req.Label})
 	if err != nil {
 		return nil, err
@@ -331,16 +373,47 @@ func (s *PrometheusMetricSource) FetchMetricLabelValues(ctx *security.RequestCon
 		return nil, err
 	}
 
-	values, raw, err := decodeInnerData(result)
+	values, _, err := decodeInnerData(result)
 	if err != nil {
 		return nil, err
 	}
 
-	output := make([]OutputMetricsLabelValues, len(values))
-	for i, v := range values {
-		output[i] = OutputMetricsLabelValues{Value: v, Attributes: raw}
+	return labelValuesOutput(values), nil
+}
+
+// metricNameSelector builds the match[] selector that scopes a label lookup to
+// one metric. %q quotes and escapes on its own — escaping the metric first as
+// well would double-escape an embedded quote.
+func metricNameSelector(metric string) string {
+	return fmt.Sprintf("{__name__=%q}", metric)
+}
+
+// stringListFromProxyData pulls the string array out of a Prometheus proxy
+// reply ({"status":"success","data":[...]}). An error envelope arrives with
+// HTTP 200 on some engines, so the status is inspected rather than trusted --
+// the same reason PrometheusSaasMetricSource checks it.
+func stringListFromProxyData(resp map[string]any) ([]string, error) {
+	if status, _ := resp["status"].(string); status == "error" {
+		if msg, _ := resp["error"].(string); msg != "" {
+			return nil, fmt.Errorf("prometheus error: %s", msg)
+		}
+		return nil, fmt.Errorf("prometheus returned an error envelope")
 	}
-	return output, nil
+	data, ok := resp["data"]
+	if !ok {
+		return nil, fmt.Errorf("missing data field in response")
+	}
+	list, ok := data.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("data field is not a list")
+	}
+	out := make([]string, 0, len(list))
+	for _, v := range list {
+		if str, ok := v.(string); ok {
+			out = append(out, str)
+		}
+	}
+	return out, nil
 }
 
 func (s *PrometheusMetricSource) FetchMetricList(ctx *security.RequestContext, req FetchMetricsListRequest) ([]OutputMetrics, error) {
@@ -420,19 +493,46 @@ func toInt64Slice(arr []any) []int64 {
 	return res
 }
 
-func toFloat64Slice(arr []any) []float64 {
+// toFloat64Slice converts a provider's raw sample array, emitting exactly one
+// entry per input entry so Values stays index-aligned with Timestamps. Anything it
+// cannot read — a string that is not a number, an unexpected type — becomes NaN
+// (which marshals as null) and is counted in the returned total. Skipping those
+// silently, as this used to, shortened Values and shifted the entire series
+// against its own timestamps.
+//
+// "NaN", "+Inf" and "-Inf" parse successfully and are NOT counted here: they are
+// values the provider genuinely reported, and Result.MarshalJSON reports them
+// under their own names.
+func toFloat64Slice(arr []any) ([]float64, int) {
 	res := make([]float64, 0, len(arr))
+	unreadable := 0
 	for _, v := range arr {
 		switch vv := v.(type) {
 		case string:
-			if f, err := strconv.ParseFloat(vv, 64); err == nil {
-				res = append(res, f)
+			f, err := strconv.ParseFloat(vv, 64)
+			if err != nil {
+				res = append(res, math.NaN())
+				unreadable++
+				continue
 			}
+			res = append(res, f)
 		case float64:
 			res = append(res, vv)
+		default:
+			res = append(res, math.NaN())
+			unreadable++
 		}
 	}
-	return res
+	return res, unreadable
+}
+
+// unreadableSamples seeds Result.NonFinite for a series the parser could not fully
+// read. Nil when everything parsed, so the field stays absent on healthy series.
+func unreadableSamples(n int) map[string]int {
+	if n == 0 {
+		return nil
+	}
+	return map[string]int{nonFiniteUnparseable: n}
 }
 
 func (s *PrometheusMetricSource) FetchMetricsQuery(
@@ -444,26 +544,47 @@ func (s *PrometheusMetricSource) FetchMetricsQuery(
 		instant = v
 	}
 
+	// One key whose text will not parse must not cost the others their answer. The
+	// build failure is recorded against that key and the rest of the batch goes on --
+	// the same shape the per-key providers use, and what the relay response loop below
+	// already does for a key the backend rejects.
 	filteredQueries := make(map[string]string, len(req.Queries))
+	buildFailures := make([]QueryResult, 0)
 	for k, v := range req.Queries {
 		injected, err := injectPromQLMatchers(v, nil, req.Labels)
 		if err != nil {
-			return OutputMetricQuery{}, err
+			ctx.GetLogger().Warn("FetchMetricsQuery: query build failed", "key", k, "error", err)
+			msg := err.Error()
+			buildFailures = append(buildFailures, QueryResult{QueryKey: k, Error: &msg})
+			continue
 		}
 		filteredQueries[k] = injected
 	}
+	// Nothing left to ask for. Returning here is not just saving a call: the fetch below
+	// reports a transport failure by returning an error and an EMPTY result, which would
+	// throw away the per-key reasons collected above and leave every key silent -- the
+	// exact failure this build loop exists to prevent.
+	if len(filteredQueries) == 0 {
+		return OutputMetricQuery{Results: buildFailures}, nil
+	}
 
-	externalAppMap, err := relay.ExecutePrometheus(
+	// The step travels with the request so a panel can size the answer to what
+	// it can draw; zero keeps the agent's default, as before.
+	externalAppMap, err := relay.ExecutePrometheusWithStep(
 		req.AccountId,
 		time.Unix(req.StartTime/1000, 0).UTC(),
 		time.Unix(req.EndTime/1000, 0).UTC(),
 		filteredQueries,
 		instant,
+		req.StepInterval,
 	)
 	if err != nil {
 		return OutputMetricQuery{}, err
 	}
-	output := OutputMetricQuery{Results: make([]QueryResult, 0, len(externalAppMap))}
+	output := OutputMetricQuery{Results: make([]QueryResult, 0, len(externalAppMap)+len(buildFailures))}
+	// Keys whose text would not parse are reported alongside the ones that ran, so the
+	// caller sees every key it asked for rather than a short list it has to diff.
+	output.Results = append(output.Results, buildFailures...)
 	for queryKey, query := range externalAppMap {
 		switch q := query.(type) {
 		case map[string]any: // Range / instant / error — relay wraps every result as {result_type, *_result}
@@ -487,10 +608,12 @@ func (s *PrometheusMetricSource) FetchMetricsQuery(
 				results := make([]Result, 0, len(seriesListResult))
 				for _, seriesAny := range seriesListResult {
 					seriesMap := seriesAny.(map[string]any)
+					values, unreadable := toFloat64Slice(seriesMap["values"].([]any))
 					results = append(results, Result{
 						Metric:     toStringMap(seriesMap["metric"].(map[string]any)),
 						Timestamps: toInt64Slice(seriesMap["timestamps"].([]any)),
-						Values:     toFloat64Slice(seriesMap["values"].([]any)),
+						Values:     values,
+						NonFinite:  unreadableSamples(unreadable),
 					})
 				}
 				output.Results = append(output.Results, QueryResult{
@@ -550,10 +673,11 @@ func parseInstantVectorEntries(entries []any) []Result {
 				ts = []int64{int64(t)}
 			}
 			if s, ok := v["value"].(string); ok {
+				// NaN/±Inf parse fine here and are filtered by
+				// dropNonFiniteSamples in FetchMetricsQuery, which drops the
+				// sample instead of the 0 this used to coerce NaN to — a false
+				// zero is indistinguishable from a real one on a chart.
 				if f, err := strconv.ParseFloat(s, 64); err == nil {
-					if math.IsNaN(f) {
-						f = 0
-					}
 					vals = []float64{f}
 				}
 			}
@@ -564,9 +688,6 @@ func parseInstantVectorEntries(entries []any) []Result {
 				}
 				if s, ok := v[1].(string); ok {
 					if f, err := strconv.ParseFloat(s, 64); err == nil {
-						if math.IsNaN(f) {
-							f = 0
-						}
 						vals = []float64{f}
 					}
 				}

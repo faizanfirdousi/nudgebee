@@ -8,6 +8,7 @@ import (
 
 	"nudgebee/services/internal/database"
 	"nudgebee/services/internal/database/models"
+	"nudgebee/services/internal/database/pgbatch"
 	"nudgebee/services/vulnmatcher"
 
 	"github.com/jmoiron/sqlx"
@@ -17,20 +18,6 @@ import (
 const (
 	recommendationCategory = "Security"
 	recommendationRuleName = "vm_package_vulnerability"
-
-	// findingRowColumns is the column count in the recommendation upsert
-	// below; findingBatchSize keeps each NamedExec's bind-parameter count
-	// (rows*columns) under Postgres's 65535 limit. A single real host's
-	// finding set can run into the thousands, so this isn't just a
-	// defensive margin — a busy host hits the unbatched limit outright.
-	findingRowColumns = 16
-	findingBatchSize  = 65535 / findingRowColumns
-
-	// packageRowColumns/packageBatchSize apply the same bind-parameter cap
-	// to the vm_package upsert — a host's installed package count can run
-	// into the thousands too.
-	packageRowColumns = 15
-	packageBatchSize  = 65535 / packageRowColumns
 )
 
 // packageRow is vm_package's insert shape as a struct rather than
@@ -108,10 +95,10 @@ func upsertPackages(tenantID, cloudAccountID, cloudResourceID, osFamily, osVersi
 			return nil, fmt.Errorf("vmpackage: archive stale packages: %w", err)
 		}
 
-		for start := 0; start < len(rows); start += packageBatchSize {
-			end := min(start+packageBatchSize, len(rows))
-			if _, err := tx.NamedExec(
-				`INSERT INTO vm_package
+		// A host's installed package count runs into the thousands, so the
+		// upsert is batched under Postgres's bind-parameter limit.
+		if err := pgbatch.NamedExec(tx,
+			`INSERT INTO vm_package
 				   (tenant_id, cloud_account_id, cloud_resource_id, os_family, os_version, pkg_type, name, version,
 				    arch, epoch, source_name, source_version, is_active, last_seen_at, updated_at)
 				 VALUES
@@ -121,10 +108,9 @@ func upsertPackages(tenantID, cloudAccountID, cloudResourceID, osFamily, osVersi
 				 DO UPDATE SET is_active = true, last_seen_at = EXCLUDED.last_seen_at, updated_at = EXCLUDED.updated_at,
 				               os_family = EXCLUDED.os_family, os_version = EXCLUDED.os_version,
 				               source_version = EXCLUDED.source_version`,
-				rows[start:end],
-			); err != nil {
-				return nil, fmt.Errorf("vmpackage: upsert packages: %w", wrapPQError(err))
-			}
+			rows,
+		); err != nil {
+			return nil, fmt.Errorf("vmpackage: upsert packages: %w", wrapPQError(err))
 		}
 		return nil, nil
 	})
@@ -143,14 +129,31 @@ func persistFindings(tenantID, cloudAccountID, cloudResourceID string, findings 
 		return fmt.Errorf("vmpackage: db: %w", err)
 	}
 
-	rows, vulnRows, vulnKeys := buildFindingRows(tenantID, cloudAccountID, cloudResourceID, findings, pkgsByKey, time.Now())
+	// One timestamp for both the archive UPDATE and the upsert, so the retired
+	// and refreshed rows carry the same updated_at within the transaction.
+	now := time.Now()
+	rows, vulnRows, vulnKeys := buildFindingRows(tenantID, cloudAccountID, cloudResourceID, findings, pkgsByKey, now)
+
+	// Retire only the findings that vanished from this scan, keyed on the scan's
+	// keep-set rather than every row for this VM. A finding that is still present
+	// must keep whatever status its user gave it, and the upsert's CASE guard
+	// below can only preserve that if the archive has not already overwritten it.
+	// Closed rows are left as a terminal record.
+	keepObjectIDs := make([]string, 0, len(rows))
+	for i := range rows {
+		if rows[i].AccountObjectId != nil {
+			keepObjectIDs = append(keepObjectIDs, *rows[i].AccountObjectId)
+		}
+	}
 
 	_, err = dbms.DoInTransaction(func(tx *sqlx.Tx) (any, error) {
 		if _, err := tx.Exec(
 			`UPDATE recommendation SET status = 'Archive', updated_at = $1
 			 WHERE tenant_id = $2 AND cloud_account_id = $3 AND category = $4 AND rule_name = $5
-			   AND resource_id = $6 AND status != 'Archive'`,
-			time.Now(), tenantID, cloudAccountID, recommendationCategory, recommendationRuleName, cloudResourceID,
+			   AND resource_id = $6 AND status NOT IN ('Archive', 'Closed')
+			   AND NOT (account_object_id = ANY($7))`,
+			now, tenantID, cloudAccountID, recommendationCategory, recommendationRuleName, cloudResourceID,
+			pq.Array(keepObjectIDs),
 		); err != nil {
 			return nil, fmt.Errorf("vmpackage: archive existing findings: %w", err)
 		}
@@ -165,10 +168,10 @@ func persistFindings(tenantID, cloudAccountID, cloudResourceID string, findings 
 			}
 		}
 
-		for start := 0; start < len(rows); start += findingBatchSize {
-			end := min(start+findingBatchSize, len(rows))
-			if _, err := tx.NamedExec(
-				`INSERT INTO recommendation
+		// A busy host's finding set runs into the thousands, so the upsert is
+		// batched under Postgres's bind-parameter limit.
+		if err := pgbatch.NamedExec(tx,
+			`INSERT INTO recommendation
 				   (status, tenant_id, cloud_account_id, recommendation, severity, category, rule_name,
 				    estimated_savings, recommendation_action, resource_id, account_object_id, updated_at,
 				    finops_score, finops_band, finops_score_breakdown, vulnerability_id)
@@ -178,15 +181,15 @@ func persistFindings(tenantID, cloudAccountID, cloudResourceID string, findings 
 				    :finops_score, :finops_band, :finops_score_breakdown, :vulnerability_id)
 				 ON CONFLICT (rule_name, cloud_account_id, resource_id, category, account_object_id)
 				 DO UPDATE SET recommendation = EXCLUDED.recommendation,
-				               status = EXCLUDED.status,
+				               status = CASE WHEN recommendation.status NOT IN ('Open', 'Archive')
+				                             THEN recommendation.status ELSE EXCLUDED.status END,
 				               updated_at = EXCLUDED.updated_at,
 				               severity = EXCLUDED.severity,
 				               recommendation_action = EXCLUDED.recommendation_action,
 				               vulnerability_id = EXCLUDED.vulnerability_id`,
-				rows[start:end],
-			); err != nil {
-				return nil, fmt.Errorf("vmpackage: upsert findings: %w", wrapPQError(err))
-			}
+			rows,
+		); err != nil {
+			return nil, fmt.Errorf("vmpackage: upsert findings: %w", wrapPQError(err))
 		}
 		return nil, nil
 	})
@@ -307,7 +310,7 @@ func buildVulnerabilityRow(pkg Package, f vulnmatcher.Finding) models.Vulnerabil
 		PackageType:  nonEmptyPtr(pkg.Type),
 		FixedVersion: nonEmptyPtr(f.FixedVersion),
 		Severity:     &severity,
-		CVSSScore:    &f.CVSSv3Score,
+		CVSSScore:    f.CVSSv3Score,
 		CVSSVector:   nonEmptyPtr(f.CVSSv3Vector),
 		Description:  nonEmptyPtr(f.Description),
 		DataSource:   nonEmptyPtr(f.DataSource),

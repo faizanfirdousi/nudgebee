@@ -4,6 +4,11 @@ import cache from '@lib/cache';
 import observability from '@api1/observability';
 import { safeJSONParse, EXCLUDED_TRIAGE_AGGREGATION_KEYS } from 'src/utils/common';
 
+// Event rule names are read for pickers and re-read often; five minutes keeps a
+// newly created or renamed rule from being invisible for long without making the
+// picker re-query on every render.
+const EVENT_RULE_NAMES_TTL_SEC = 5 * 60;
+
 export const GET_EVENT_RULES = `
 query GetEventRules($limit: Int, $offset: Int) {
   event_rules_v2(where: __WHERE__, order_by: [{column: "updated_at", order: desc}], limit: $limit, offset: $offset) {
@@ -87,6 +92,98 @@ mutation DisableAlertManagerRule {
 }
 `;
 
+export const GET_EVENT_RULE_CAPABILITIES = `
+query GetEventRuleCapabilities {
+  capabilities: eventrules_get_capabilities(request: __REQUEST__)
+}
+`;
+
+export const UPDATE_EVENT_RULE_MUTE = `
+mutation UpdateEventRuleMute {
+  mute: eventrules_update_mute(request: __REQUEST__)
+}
+`;
+
+export const GET_EVENT_ALERT_CONTROLS = `
+query GetEventAlertControls {
+  controls: eventrules_get_event_alert_controls(request: __REQUEST__)
+}
+`;
+
+export const UPDATE_EVENT_MUTE = `
+mutation UpdateEventMute {
+  controls: eventrules_update_event_mute(request: __REQUEST__)
+}
+`;
+
+export const APPLY_RULE_CHANGE = `
+mutation ApplyRuleChange {
+  result: eventrules_apply_rule_change(request: __REQUEST__)
+}
+`;
+
+export interface EventRuleCapability {
+  available: boolean;
+  reason?: string;
+  warning?: string;
+}
+
+export interface EventRuleCapabilities {
+  rule_id: string;
+  alert: string;
+  source: string;
+  target: string;
+  enabled?: boolean;
+  muted: boolean;
+  // Workloads muted on their own from the investigation screen.
+  muted_workloads?: number;
+  operations: {
+    edit_definition: EventRuleCapability;
+    update_threshold: EventRuleCapability;
+    update_duration: EventRuleCapability;
+    disable_at_source: EventRuleCapability;
+    mute: EventRuleCapability;
+    pr: EventRuleCapability;
+  };
+}
+
+export type EventMuteScopeName = 'workload' | 'rule';
+
+export interface EventMuteScope {
+  scope: EventMuteScopeName;
+  namespace?: string;
+  owner?: string;
+  matched_7d: number;
+  workloads_7d: number;
+  muted: boolean;
+  expires_at?: string | null;
+}
+
+export interface EventSuppression {
+  rule_id: string;
+  name: string;
+  is_mute: boolean;
+  mute_scope?: EventMuteScopeName;
+  expires_at?: string | null;
+}
+
+// What the investigation screen can do about an event's alert.
+export interface EventAlertControls {
+  event_id: string;
+  alert: string;
+  source: string;
+  rule: EventRuleCapabilities | null;
+  rule_location?: { namespace: string; name: string; managed_by?: string };
+  // The rule's expression and `for` when they can be changed from here.
+  rule_definition?: { expr: string; duration: string; expr_normalized: string };
+  scopes: EventMuteScope[];
+  suppressions: EventSuppression[];
+}
+
+// The first GraphQL error message, so a rejected rule change shows the server's reason.
+export const firstGraphQLError = (res: any): string | undefined =>
+  res?.data?.errors?.[0]?.message || res?.data?.data?.errors?.[0]?.message || res?.response?.data?.errors?.[0]?.message;
+
 export const LIST_ACC = `
 query ListAcc($limit: Int, $offset: Int) {
   accounts_list(where: __WHERE__, order_by: [{column: "created_at", order: desc}] limit: $limit, offset: $offset) {
@@ -156,6 +253,7 @@ query AccountAgentHealth {
       last_connected_at
       k8s_version
       version
+      status
     }
   }
 }
@@ -270,18 +368,6 @@ mutation AzureEventGridOnboard($object: AzureEventGridOnboardInput!) {
     url
     external_id
     webhook_url
-  }
-}
-`;
-
-export const GCP_PUBSUB_ONBOARD = `
-mutation GcpPubSubOnboard($object: GcpPubSubOnboardInput!) {
-  gcp_get_onboard_pubsub_url(object: $object) {
-    deployment_manager_url
-    external_id
-    pubsub_project_id
-    subscription_name
-    template_yaml_url
   }
 }
 `;
@@ -556,9 +642,17 @@ const apiKubernetes1 = {
         const transformedData = {
           event_rules: response?.data?.data?.event_rules_v2?.rows || [],
         };
-        cache.set(`${query.accountId}.listAllEventRuleNames`, {
-          data: transformedData,
-        });
+        // cache.set defaults ttlSec to 0, which cache.ts turns into a ONE YEAR
+        // expiry, and nothing invalidates this key when a rule is created,
+        // renamed or deleted — so the picker kept serving the rule names it
+        // first saw. Five minutes matches the other event-rule reads here.
+        cache.set(
+          `${query.accountId}.listAllEventRuleNames`,
+          {
+            data: transformedData,
+          },
+          EVENT_RULE_NAMES_TTL_SEC
+        );
         return {
           data: transformedData,
         };
@@ -615,6 +709,71 @@ const apiKubernetes1 = {
       return error;
     }
   },
+  // Which rule changes Nudgebee can really make, keyed by rule id. An empty map
+  // (request failed) hides every write control rather than offering fake ones.
+  async getEventRuleCapabilities(ruleIds: string[]): Promise<Record<string, EventRuleCapabilities>> {
+    if (!ruleIds.length) {
+      return {};
+    }
+    try {
+      const response = await queryGraphQL(
+        GET_EVENT_RULE_CAPABILITIES.replace('__REQUEST__', gqlStringify({ rule_ids: ruleIds })),
+        'GetEventRuleCapabilities',
+        {}
+      );
+      const list: EventRuleCapabilities[] = response?.data?.data?.capabilities?.capabilities || [];
+      return Object.fromEntries(list.map((c) => [c.rule_id, c]));
+    } catch (error) {
+      console.warn('failed to fetch alert rule capabilities', error);
+      return {};
+    }
+  },
+  async updateEventRuleMute(data: { rule_id: string; account_id: string; muted: boolean }) {
+    try {
+      const response = await queryGraphQL(UPDATE_EVENT_RULE_MUTE.replace('__REQUEST__', gqlStringify(data)), 'UpdateEventRuleMute', {});
+      return {
+        data: response?.data,
+      };
+    } catch (error) {
+      return error;
+    }
+  },
+  async getEventAlertControls(data: { event_id: string; account_id: string }): Promise<EventAlertControls | null> {
+    try {
+      const response = await queryGraphQL(GET_EVENT_ALERT_CONTROLS.replace('__REQUEST__', gqlStringify(data)), 'GetEventAlertControls', {});
+      return response?.data?.data?.controls || null;
+    } catch (error) {
+      console.warn('failed to fetch event alert controls', error);
+      return null;
+    }
+  },
+  async updateEventMute(data: { event_id: string; account_id: string; scope: EventMuteScopeName; duration_hours: number; muted: boolean }) {
+    try {
+      const response = await queryGraphQL(UPDATE_EVENT_MUTE.replace('__REQUEST__', gqlStringify(data)), 'UpdateEventMute', {});
+      return {
+        data: response?.data,
+      };
+    } catch (error) {
+      return error;
+    }
+  },
+  async applyRuleChange(data: {
+    rule_id: string;
+    account_id: string;
+    expr?: string;
+    duration?: string;
+    expected_expr: string;
+    expected_duration?: string;
+  }) {
+    try {
+      const response = await queryGraphQL(APPLY_RULE_CHANGE.replace('__REQUEST__', gqlStringify(data)), 'ApplyRuleChange', {});
+      return {
+        data: response?.data,
+      };
+    } catch (error) {
+      return error;
+    }
+  },
   async disableAlertManager(data: any) {
     try {
       const response = await queryGraphQL(DISABLE_ALERT_MANAGER.replace('__REQUEST__', gqlStringify(data)), 'DisableAlertManagerRule', {});
@@ -654,9 +813,15 @@ const apiKubernetes1 = {
       return error;
     }
   },
-  async listK8sAccAgentHealth(cloudAccountId?: string | string[]) {
+  /**
+   * `agentType` filters the agent rows: 'k8s' for cluster agents, 'proxy' for the
+   * foragers behind a self-hosted VM account. Pass null to take whatever agent an
+   * account has — a caller holding a mixed set of account ids can't name one type,
+   * and each account only ever carries agents of its own kind anyway.
+   */
+  async listK8sAccAgentHealth(cloudAccountId?: string | string[], agentType: string | null = 'k8s') {
     try {
-      const where: Record<string, unknown> = { type: { _eq: 'k8s' } };
+      const where: Record<string, unknown> = agentType ? { type: { _eq: agentType } } : {};
       if (Array.isArray(cloudAccountId) && cloudAccountId.length > 0) {
         where.cloud_account_id = { _in: cloudAccountId };
       } else if (cloudAccountId) {
@@ -715,18 +880,6 @@ const apiKubernetes1 = {
       return response;
     } catch (error) {
       console.error('failed to get azure arm template url-', error);
-      return error;
-    }
-  },
-  async getGcpDeploymentManagerURL(accountId: string) {
-    try {
-      if (accountId === 'demo') return null;
-      const response = await queryGraphQL(GCP_PUBSUB_ONBOARD, 'GcpPubSubOnboard', {
-        object: { account_id: accountId },
-      });
-      return response;
-    } catch (error) {
-      console.error('failed to get gcp deployment manager url-', error);
       return error;
     }
   },
@@ -995,6 +1148,12 @@ const apiKubernetes1 = {
     }
     if (data?.status) {
       query['status'] = { _eq: data['status'] };
+    }
+    if (data?.start_date || data?.end_date) {
+      const and: any[] = query['_and'] || [];
+      if (data?.start_date) and.push({ starts_at: { _gte: data['start_date'] } });
+      if (data?.end_date) and.push({ starts_at: { _lte: data['end_date'] } });
+      query['_and'] = and;
     }
 
     const response = await queryGraphQL(
@@ -1717,9 +1876,11 @@ const apiKubernetes1 = {
         seed { node_id name namespace type }
         impacted { name node_type namespace environment hops_away relationship alerting active_alerts { event_id title priority source starts_at } }
         depends_on { name node_type namespace hops_away relationship }
+        infrastructure_impacted { name node_type namespace hops_away relationship alerting active_alerts { event_id title priority source starts_at } }
         correlated_count
         dependent_count
         production_dependents
+        infrastructure_count
         coverage_confidence
         truncated
         assembly {
@@ -1813,6 +1974,9 @@ const apiKubernetes1 = {
     if (data?.nodeTypes?.length > 0) {
       request['node_types'] = data.nodeTypes;
     }
+    if (data?.specificTypes?.length > 0) {
+      request['specific_types'] = data.specificTypes;
+    }
     if (data?.attributes) {
       request['attributes'] = data?.attributes;
     }
@@ -1828,7 +1992,7 @@ const apiKubernetes1 = {
       throw err;
     }
   },
-  knowledgeGraphFilterOptions: async function (data?: { accountIds?: string[]; nodeTypes?: string[] }) {
+  knowledgeGraphFilterOptions: async function (data?: { accountIds?: string[]; nodeTypes?: string[]; specificTypes?: string[] }) {
     const KNOWLEDGE_GRAPH_FILTER_OPTIONS = `
     query KgFilterOptions {
       kg_get_filter_options(request: __WHERE__) {
@@ -1854,9 +2018,10 @@ const apiKubernetes1 = {
       }
     }
     `;
-    const request: { account_ids?: string[]; node_types?: string[] } = {};
+    const request: { account_ids?: string[]; node_types?: string[]; specific_types?: string[] } = {};
     if (data?.accountIds?.length) request.account_ids = data.accountIds;
     if (data?.nodeTypes?.length) request.node_types = data.nodeTypes;
+    if (data?.specificTypes?.length) request.specific_types = data.specificTypes;
     try {
       return await queryGraphQL(KNOWLEDGE_GRAPH_FILTER_OPTIONS.replace('__WHERE__', gqlStringify(request)), 'KgFilterOptions', {});
     } catch (err) {
@@ -1961,18 +2126,15 @@ const apiKubernetes1 = {
   // the numbers reconcile against each other and against the Events list below.
   //
   // Two counting units are deliberately mixed and must not be confused:
-  //   - EVENTS (raw count(*))          — "events ingested", the correlation splits
-  //   - ISSUES (distinct fingerprints) — everything the user acts on
-  // Blocks that count issues carry the distinct-over-fingerprint transformation.
-  briefingAggregates: async function (data: {
-    startDate: string;
-    endDate: string;
-    bandStartDate: string;
-    stuckBeforeDate: string;
-    stuckAfterDate: string;
-    accountId?: string[] | string;
-  }) {
-    const DISTINCT_ISSUES = '[{name: "event_count", expr: "distinct", args: ["fingerprint"]}]';
+  //   - EVENTS (raw count(*))                 — "events ingested", the correlation splits
+  //   - ISSUES (distinct account+fingerprint) — everything the user acts on
+  // Blocks that count issues carry the distinct transformation. The key is
+  // (account_id, fingerprint), not fingerprint alone: the same fingerprint can
+  // land under two accounts (e.g. one cluster onboarded twice), and each copy is
+  // separately triaged/ticketed — so it is two issues, and this matches the
+  // Events tab's "Unique" view row-for-row.
+  briefingAggregates: async function (data: { startDate: string; endDate: string; bandStartDate: string; accountId?: string[] | string }) {
+    const DISTINCT_ISSUES = '[{name: "event_count", expr: "distinct", args: ["account_id", "fingerprint"]}]';
     const BRIEFING_AGGREGATES = `
     query NubiBriefingAggregates {
       window_totals: event_groupings_v2(where: __WHERE__) {
@@ -1998,6 +2160,11 @@ const apiKubernetes1 = {
         }
       }
 
+      # P0-only on purpose. The briefing reads exactly one number off this block
+      # (the P0 trailing count); grouping the whole 30-day band by rank made the
+      # engine sort every issue in the band to disk to produce four rows we throw
+      # away, and it was the slowest query in the briefing by an order of
+      # magnitude. Keeping group_by means the shape still matches by_rank.
       by_rank_30d: event_groupings_v2(
         where: __WHERE_BAND__, group_by: ["computed_priority"], column_transformations: ${DISTINCT_ISSUES}, columns: ["computed_priority", "event_count"]
       ) {
@@ -2033,15 +2200,6 @@ const apiKubernetes1 = {
           event_count
         }
       }
-
-      stuck_firing: event_groupings_v2(
-        where: __WHERE_STUCK__, group_by: ["created_at"], column_transformations: [{name: "created_at", expr: "date_unit", args: ["day"]}], columns: ["created_at", "event_count"]
-      ) {
-        rows {
-          created_at
-          event_count
-        }
-      }
     }
     `;
 
@@ -2058,28 +2216,178 @@ const apiKubernetes1 = {
     // derived from the window itself would compare a number to itself. That is
     // why by_rank_30d doesn't reuse __WHERE__.
     const bandRange = [{ created_at: { _gte: data.bandStartDate } }, { created_at: { _lte: data.endDate } }];
-    // "Stuck firing" is a standing integrity check, not a window metric: alerts
-    // still FIRING long after they arrived. Bounded below so the scan can't walk
-    // the whole table on a large tenant.
-    const stuckRange = [{ created_at: { _gte: data.stuckAfterDate } }, { created_at: { _lte: data.stuckBeforeDate } }];
 
     const base: any = { ...accountFilter, ...excludeKeys };
     const request = { _and: windowRange, ...base };
-    const requestBand = { _and: bandRange, ...base };
+    const requestBand = { _and: bandRange, computed_priority: { _eq: 'P0' }, ...base };
     const requestFiring = { _and: windowRange, status: { _eq: 'FIRING' }, ...base };
-    const requestStuck = { _and: stuckRange, status: { _eq: 'FIRING' }, ...base };
 
     try {
       return await queryGraphQL(
         BRIEFING_AGGREGATES.replaceAll('__WHERE__', gqlStringify(request))
           .replaceAll('__WHERE_BAND__', gqlStringify(requestBand))
-          .replace('__WHERE_FIRING__', gqlStringify(requestFiring))
-          .replace('__WHERE_STUCK__', gqlStringify(requestStuck)),
+          .replace('__WHERE_FIRING__', gqlStringify(requestFiring)),
         'NubiBriefingAggregates',
         {}
       );
     } catch (err) {
       console.error('Error in briefingAggregates:', err);
+      throw err;
+    }
+  },
+  // Aggregates for the Troubleshoot > Analytics tab.
+  //
+  // The briefing above the tab answers "what did Nubi do to this window" — a
+  // snapshot. This answers "are we improving" and "what keeps coming back",
+  // which need a previous window to compare against and per-chain recurrence.
+  //
+  // Every count is DISTINCT (account_id, fingerprint), not raw rows: the issue
+  // unit is one fingerprint in one account (one alert firing 1,797 times is one
+  // issue, not 1,797; the same fingerprint under two accounts is two issues).
+  // This keeps the tab agreeing with the briefing directly above and with the
+  // Events tab's "Unique" view. `chains` below stays fingerprint-only on purpose
+  // — see its comment.
+  analyticsAggregates: async function (data: {
+    startDate: string;
+    endDate: string;
+    prevStartDate: string;
+    prevEndDate: string;
+    accountId?: string[] | string;
+  }) {
+    const DISTINCT_ISSUES = '[{name: "event_count", expr: "distinct", args: ["account_id", "fingerprint"]}]';
+    // date_unit -> date_trunc(day, created_at) in the query engine
+    // (query/sql.go generateColumnExpression).
+    const DAILY =
+      '[{name: "created_at", expr: "date_unit", args: ["day"]}, {name: "event_count", expr: "distinct", args: ["account_id", "fingerprint"]}]';
+
+    // window_issues is the whole-window distinct count and is NOT the sum of
+    // daily_volume: a fingerprint that fires on Monday and again on Thursday is
+    // one issue but lands in two day buckets, so summing the buckets over-counts.
+    //
+    // chains groups by fingerprint ONLY — never by computed_priority or
+    // subject_name. Both vary within a single chain (triage rescores over time; a
+    // chain spans every pod that hit the same problem), so grouping by them
+    // splits one issue into several rows that are visibly the same issue with
+    // different labels. Priority comes from latest_computed_priority (the most
+    // recent verdict) and the workload count from count_subject_name.
+    //
+    // chains is capped: it feeds the "what keeps coming back" list, which only
+    // ever shows the worst offenders, and an uncapped per-fingerprint scan on a
+    // large tenant is a very different query. The cap is deliberately larger
+    // than the list so the client can filter to recurring-only and still fill it.
+    const ANALYTICS_AGGREGATES = `
+    query TroubleshootAnalyticsAggregates {
+      window_issues: event_groupings_v2(
+        where: __WHERE__, group_by: [], column_transformations: ${DISTINCT_ISSUES}, columns: ["event_count", "count_analysed_issues", "minutes_to_first_analysis"]
+      ) {
+        rows {
+          event_count
+          count_analysed_issues
+          minutes_to_first_analysis
+        }
+      }
+
+      eligible_issues: event_groupings_v2(
+        where: __WHERE_ELIGIBLE__, group_by: [], column_transformations: ${DISTINCT_ISSUES}, columns: ["event_count", "count_analysed_issues"]
+      ) {
+        rows {
+          event_count
+          count_analysed_issues
+        }
+      }
+
+      prev_issues: event_groupings_v2(
+        where: __WHERE_PREV__, group_by: [], column_transformations: ${DISTINCT_ISSUES}, columns: ["event_count"]
+      ) {
+        rows {
+          event_count
+        }
+      }
+
+      by_rank: event_groupings_v2(
+        where: __WHERE__, group_by: ["computed_priority"], column_transformations: ${DISTINCT_ISSUES}, columns: ["computed_priority", "event_count"]
+      ) {
+        rows {
+          computed_priority
+          event_count
+        }
+      }
+
+      prev_by_rank: event_groupings_v2(
+        where: __WHERE_PREV__, group_by: ["computed_priority"], column_transformations: ${DISTINCT_ISSUES}, columns: ["computed_priority", "event_count"]
+      ) {
+        rows {
+          computed_priority
+          event_count
+        }
+      }
+
+      daily_volume: event_groupings_v2(
+        where: __WHERE__, group_by: ["created_at"], column_transformations: ${DAILY}, columns: ["created_at", "event_count"]
+      ) {
+        rows {
+          created_at
+          event_count
+        }
+      }
+
+      chains: event_groupings_v2(
+        where: __WHERE__,
+        group_by: ["fingerprint", "aggregation_key"],
+        columns: ["fingerprint", "aggregation_key", "latest_computed_priority", "count_subject_name", "distinct_subject_name", "fingerprint_event_count", "fingerprint_first_seen_at", "event_count"],
+        order_by: [{column: "fingerprint_event_count", order: desc}],
+        limit: 200
+      ) {
+        rows {
+          fingerprint
+          aggregation_key
+          latest_computed_priority
+          count_subject_name
+          distinct_subject_name
+          fingerprint_event_count
+          fingerprint_first_seen_at
+          event_count
+        }
+      }
+    }
+    `;
+
+    // Same display filter the briefing and the Events list apply, so the tab's
+    // totals reconcile with the briefing rendered directly above it.
+    const excludeKeys = { aggregation_key: { _not_in: EXCLUDED_TRIAGE_AGGREGATION_KEYS } };
+    const accountIds = Array.isArray(data.accountId) ? data.accountId.filter(Boolean) : data.accountId ? [data.accountId] : [];
+    const accountFilter = accountIds.length > 0 ? { account_id: { _in: accountIds } } : {};
+    const base: any = { ...accountFilter, ...excludeKeys };
+
+    const request = { _and: [{ created_at: { _gte: data.startDate } }, { created_at: { _lte: data.endDate } }], ...base };
+    // The comparison window is the same length immediately before this one, so
+    // "up 12%" means up against a like-for-like period rather than an arbitrary
+    // fixed lookback.
+    const requestPrev = { _and: [{ created_at: { _gte: data.prevStartDate } }, { created_at: { _lt: data.prevEndDate } }], ...base };
+
+    // Mirrors the auto-analysis gate in api-server's ProcessEvent: non-duplicate,
+    // source priority HIGH/CRITICAL, minus the two aggregation keys it skips
+    // outright. Coverage over ALL problems answers a question nobody asked — we
+    // never attempt most of them — so the tile divides by what we actually try
+    // to explain. If the gate changes, this filter has to change with it; that
+    // coupling is the cost of reporting a number the gate defines.
+    const requestEligible = {
+      ...request,
+      priority: { _in: ['HIGH', 'CRITICAL'] },
+      nb_status: { _neq: 'DUPLICATE' },
+      aggregation_key: { _not_in: [...EXCLUDED_TRIAGE_AGGREGATION_KEYS, 'HighErrorCriticalLogs', 'Anomaly'] },
+    };
+
+    try {
+      return await queryGraphQL(
+        ANALYTICS_AGGREGATES.replaceAll('__WHERE__', gqlStringify(request))
+          .replaceAll('__WHERE_PREV__', gqlStringify(requestPrev))
+          .replaceAll('__WHERE_ELIGIBLE__', gqlStringify(requestEligible)),
+        'TroubleshootAnalyticsAggregates',
+        {}
+      );
+    } catch (err) {
+      console.error('Error in analyticsAggregates:', err);
       throw err;
     }
   },

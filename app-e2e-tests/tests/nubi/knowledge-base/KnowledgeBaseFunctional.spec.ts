@@ -9,31 +9,37 @@ const KB_NAME = "auto_kb_e2e_test";
 test.describe("Knowledge Base", () => {
   test.describe.configure({ mode: "serial" });
 
-  test("Clicking Knowledge Base tab API validation", async ({ page }) => {
+  test("Clicking Knowledge Base tab API validation", { tag: ["@dev", "@test", "@smoke", "@functional"] }, async ({ page }) => {
     const loginPage = new LoginPage(page);
     const nubi = new NubiLocators(page);
     const kb = new KnowledgeBaseLocators(page);
 
     await loginPage.doFullLogin();
     await nubi.openPanel();
-    await kb.openBCortex();
 
+    // The whole navigation is inside the watcher, not just the sub-tab click:
+    // b-Cortex's Knowledge group opens on Knowledge Base already
+    // (BCortexModal's DEFAULT_TAB_STATE), so clicking that sub-tab on its own
+    // re-selects what is selected and issues nothing. Naming the operation is
+    // also what makes this an assertion — "any GraphQL POST" was satisfied by
+    // whatever background poll happened to land in the window.
     await waitForGraphQLAndValidate(
       page,
       async () => {
+        await kb.openBCortex();
         await kb.knowledgeBaseTab.first().click();
-        await page.waitForLoadState("networkidle");
+        await kb.knowledgeBaseLanded();
       },
       {
         testName: "Clicking Knowledge Base tab API validation",
-        operationNames: [],
-        timeoutMs: 20000,
+        operationNames: ["ListKnowledgeBases"],
+        timeoutMs: 45000,
       }
     );
   });
 
 
-  test("Add Knowledge Base button is visible", async ({ page }) => {
+  test("Add Knowledge Base button is visible", { tag: ["@dev", "@test", "@sanity", "@functional"] }, async ({ page }) => {
     const loginPage = new LoginPage(page);
     const nubi = new NubiLocators(page);
     const kb = new KnowledgeBaseLocators(page);
@@ -46,7 +52,7 @@ test.describe("Knowledge Base", () => {
     console.log("Add Knowledge Base button is visible");
   });
 
-  test("Create Knowledge Base and shows success snackbar", async ({ page }) => {
+  test("Create Knowledge Base and shows success snackbar", { tag: ["@dev", "@test", "@regression", "@functional", "@crud"] }, async ({ page }) => {
     const loginPage = new LoginPage(page);
     const nubi = new NubiLocators(page);
     const kb = new KnowledgeBaseLocators(page);
@@ -55,10 +61,9 @@ test.describe("Knowledge Base", () => {
     await nubi.openPanel();
     await kb.navigateToKnowledgeBase(nubi);
     await kb.navigateToUserTab();
-    const existingCard = kb.getKBCardByName(KB_NAME);
-    if (await existingCard.isVisible().catch(() => false)) {
-      await kb.deleteKBByName(KB_NAME);
-    }
+    // An aborted run can leave more than one KB under this fixed name, and the
+    // create below fails on a duplicate.
+    await kb.removeAllKBsNamed(KB_NAME);
 
     await kb.openCreateModal();
     await kb.fillForm(
@@ -82,7 +87,7 @@ test.describe("Knowledge Base", () => {
   });
 
 
-  test("Hovering info button on KB form shows tooltip", async ({ page }) => {
+  test("Hovering info button on KB form shows tooltip", { tag: ["@dev", "@test", "@sanity", "@functional"] }, async ({ page }) => {
     const loginPage = new LoginPage(page);
     const nubi = new NubiLocators(page);
     const kb = new KnowledgeBaseLocators(page);
@@ -100,7 +105,7 @@ test.describe("Knowledge Base", () => {
   });
 
 
-  test("Creating KB with invalid name shows validation error snackbar", async ({ page }) => {
+  test("Creating KB with invalid name shows validation error snackbar", { tag: ["@dev", "@test", "@regression", "@negative", "@validation"] }, async ({ page }) => {
     const loginPage = new LoginPage(page);
     const nubi = new NubiLocators(page);
     const kb = new KnowledgeBaseLocators(page);
@@ -122,24 +127,29 @@ test.describe("Knowledge Base", () => {
   });
 
 
-  test("User tab shows created KB card after ListKnowledgeBases query", async ({ page }) => {
+  test("User tab shows created KB card after ListKnowledgeBases query", { tag: ["@dev", "@test", "@regression", "@functional"] }, async ({ page }) => {
     const loginPage = new LoginPage(page);
     const nubi = new NubiLocators(page);
     const kb = new KnowledgeBaseLocators(page);
 
     await loginPage.doFullLogin();
     await nubi.openPanel();
-    await kb.openBCortex();
+
+    // Same reason as the API-validation case above: b-Cortex's Knowledge group
+    // opens on Knowledge Base already, so the query fires on that selection and
+    // clicking the sub-tab afterwards issues nothing. networkidle never arrives
+    // either — the Nubi surface behind the modal keeps polling.
     await waitForGraphQLAndValidate(
       page,
       async () => {
+        await kb.openBCortex();
         await kb.knowledgeBaseTab.first().click();
-        await page.waitForLoadState("networkidle");
+        await kb.knowledgeBaseLanded();
       },
       {
         testName: "User tab shows created KB card after ListKnowledgeBases query",
         operationNames: ["ListKnowledgeBases"],
-        timeoutMs: 20000,
+        timeoutMs: 45000,
       }
     );
 
@@ -148,7 +158,7 @@ test.describe("Knowledge Base", () => {
     console.log("User tab shows created KB after ListKnowledgeBases");
   });
 
-  test("Editing KB-> UpdateKnowledgeBase and shows success snackbar", async ({ page }) => {
+  test("Editing KB-> UpdateKnowledgeBase and shows success snackbar", { tag: ["@dev", "@test", "@regression", "@functional", "@crud"] }, async ({ page }) => {
     const loginPage = new LoginPage(page);
     const nubi = new NubiLocators(page);
     const kb = new KnowledgeBaseLocators(page);
@@ -178,7 +188,7 @@ test.describe("Knowledge Base", () => {
   });
 
 
-  test("Three-dot menu Load History option opens history panel", async ({ page }) => {
+  test("Three-dot menu Load History option opens history panel", { tag: ["@dev", "@test", "@sanity", "@functional"] }, async ({ page }) => {
     const loginPage = new LoginPage(page);
     const nubi = new NubiLocators(page);
     const kb = new KnowledgeBaseLocators(page);
@@ -200,7 +210,7 @@ test.describe("Knowledge Base", () => {
     console.log("Three-dot menu Load History option opens history panel");
   });
 
-  test("Deleting KB -> shows success snackbar", async ({ page }) => {
+  test("Deleting KB -> shows success snackbar", { tag: ["@dev", "@test", "@regression", "@functional", "@crud"] }, async ({ page }) => {
     const loginPage = new LoginPage(page);
     const nubi = new NubiLocators(page);
     const kb = new KnowledgeBaseLocators(page);

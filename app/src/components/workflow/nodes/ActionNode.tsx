@@ -2,7 +2,6 @@ import { Handle, Position, useReactFlow, useStore } from 'reactflow';
 import PlayArrowIcon from '@mui/icons-material/PlayArrow';
 import PauseCircleOutlineIcon from '@mui/icons-material/PauseCircleOutline';
 import PlayCircleOutlineIcon from '@mui/icons-material/PlayCircleOutline';
-import EditOutlinedIcon from '@mui/icons-material/EditOutlined';
 import ContentCopyOutlinedIcon from '@mui/icons-material/ContentCopyOutlined';
 import CheckIcon from '@mui/icons-material/Check';
 import CloseIcon from '@mui/icons-material/Close';
@@ -44,6 +43,7 @@ import {
   SkipForwardIcon,
   timerSVG,
   McpIcon,
+  EditIcon,
 } from '@assets';
 import BaseNode from './BaseNode';
 import HalfEdgeAddButton from '@components/workflow/components/HalfEdgeAddButton';
@@ -450,7 +450,7 @@ const ActionNode = ({ id, data, isConnectable, selected, onTestTask, accountId, 
             height: '28px',
             borderRadius: 'var(--ds-radius-xl)',
             width: '28px',
-            backgroundColor: 'white',
+            backgroundColor: 'var(--ds-background-100)',
             padding: 'var(--ds-space-1)',
             color: data.serverError || data.taskConfig?.valid === false ? 'var(--ds-red-600)' : 'var(--ds-green-500)',
           }}
@@ -496,7 +496,7 @@ const ActionNode = ({ id, data, isConnectable, selected, onTestTask, accountId, 
             padding: 'var(--ds-space-1) var(--ds-space-2)',
             borderRadius: 999,
             background: 'var(--ds-red-600)',
-            color: 'white',
+            color: 'var(--ds-background-100)',
             fontSize: 10,
             fontWeight: 'var(--ds-font-weight-semibold)',
             letterSpacing: 0.3,
@@ -522,7 +522,7 @@ const ActionNode = ({ id, data, isConnectable, selected, onTestTask, accountId, 
             padding: 'var(--ds-space-1) var(--ds-space-2)',
             borderRadius: 'var(--ds-radius-pill)',
             background: 'var(--ds-gray-600)',
-            color: 'white',
+            color: 'var(--ds-background-100)',
             fontSize: 10,
             fontWeight: 'var(--ds-font-weight-semibold)',
             letterSpacing: 0.3,
@@ -530,14 +530,14 @@ const ActionNode = ({ id, data, isConnectable, selected, onTestTask, accountId, 
             boxShadow: '0 1px 2px rgba(0,0,0,0.15)',
           }}
         >
-          <PauseCircleOutlineIcon sx={{ fontSize: 'var(--ds-text-small)', color: 'white' }} />
+          <PauseCircleOutlineIcon sx={{ fontSize: 'var(--ds-text-small)', color: 'var(--ds-background-100)' }} />
           Disabled
         </div>
       )}
       <BaseNode
         selected={selected}
         border={getBorder()}
-        background={data.isDeleted || isDisabled ? 'var(--ds-background-200)' : 'white'}
+        background={data.isDeleted || isDisabled ? 'var(--ds-background-200)' : 'var(--ds-background-100)'}
         nodeStyle={getNodeStyle()}
         onDelete={handleDeleteClick}
         content={{
@@ -767,7 +767,7 @@ const ActionNode = ({ id, data, isConnectable, selected, onTestTask, accountId, 
                 },
                 {
                   label: 'Rename',
-                  icon: <EditOutlinedIcon sx={{ fontSize: 'var(--ds-text-title)', color: 'var(--ds-gray-600)' }} />,
+                  icon: <SafeIcon src={EditIcon} alt='' width={16} height={16} />,
                   onClick: handleEditId,
                 },
                 {

@@ -7,15 +7,15 @@ import SafeIcon from '@shared/icons/SafeIcon';
 import Text from '@shared/format/Text';
 import ConversationCollapsableCard from '@components/llm/common/ConversationCollapsableCardV2';
 import KubernetesLLMRequestResponse from './KubernetesLLMRequestResponseV2';
-import { AskNudgebeeErrorIcon, AskNudgebeeInProgressIcon, AskNudgebeeSkipIcon, AskNudgebeeSuccessIcon, AskNudgebeeWaitingIcon } from '@assets';
+import { AskNudgebeeErrorIcon, AskNudgebeeInProgressIcon, AskNudgebeeSkipIcon, AskNudgebeeSuccessIcon, RunningIcon } from '@assets';
 import capitalize from 'lodash/capitalize';
+import { unwrapTypedValueString } from '@utils/common';
 import { ds } from '@utils/colors';
 import { Button } from '@ui/Button';
 import ReferencesPopover from './common/ReferencesModal';
 import ResponseMetaRail from './common/ResponseMetaRail';
 import FileDownloadIcon from '@mui/icons-material/FileDownload';
 import ExpandMoreRoundedIcon from '@mui/icons-material/ExpandMoreRounded';
-import ChevronRightRoundedIcon from '@mui/icons-material/ChevronRightRounded';
 import { useTenantBranding, getNubiIconUrl } from '@hooks/useTenantBranding';
 import { Modal } from '@ui/Modal';
 
@@ -26,11 +26,14 @@ const getStatusIcon = (status) => {
   if (s === 'fail' || s === 'error' || s === 'failed') {
     return { icon: AskNudgebeeErrorIcon, label: 'Error' };
   }
+  if (s === 'completed_with_errors') {
+    return { icon: AskNudgebeeSuccessIcon, label: 'Completed with errors' };
+  }
   if (s === 'skipped') {
     return { icon: AskNudgebeeSkipIcon, label: 'Skipped' };
   }
   if (s === 'waiting') {
-    return { icon: AskNudgebeeWaitingIcon, label: 'Waiting' };
+    return { icon: RunningIcon, label: 'Waiting' };
   }
   if (s === 'in_progress') {
     return { icon: AskNudgebeeInProgressIcon, label: 'In-Progress' };
@@ -73,7 +76,7 @@ const getCardTitle = (data, { indented = false } = {}) => {
       }
       answerSuffix = ' → ' + answer;
     }
-    response = 'Followup Question: ' + data.text + answerSuffix;
+    response = 'Followup Question: ' + unwrapTypedValueString(data.text) + answerSuffix;
   } else if (isInProgress) {
     response = data.query || '';
   } else {
@@ -84,7 +87,16 @@ const getCardTitle = (data, { indented = false } = {}) => {
     if (typeof response === 'string' && response.trim().startsWith('{')) {
       const parsed = JSON.parse(response);
       if (parsed && typeof parsed === 'object' && parsed.command) {
-        response = parsed.command;
+        // `command` is normally the bare title string. A malformed tool payload can
+        // wrap every arg in a `{type, value}` envelope — take the inner value, and
+        // never assign a non-string: it renders as a React child and throws #31,
+        // taking the whole page down via AppErrorBoundary.
+        const command = parsed.command;
+        if (typeof command === 'string') {
+          response = command;
+        } else if (command && typeof command === 'object' && command.type === 'string' && typeof command.value === 'string') {
+          response = command.value;
+        }
       }
     }
   } catch {
@@ -115,6 +127,7 @@ const MessageItem = ({
   showFullText,
   onShowFullText,
   isLoadingInvestigation,
+  isResponseInProgress,
   siblingTasks,
   // Context Props
   accountId,
@@ -146,7 +159,6 @@ const MessageItem = ({
   // (which doesn't pass it) rendered flat, unchanged.
   indentDepth = 0,
   hideTimeline = false,
-  stepCount,
   collapsed,
 }) => {
   const [referencesAnchorEl, setReferencesAnchorEl] = React.useState(null);
@@ -172,17 +184,25 @@ const MessageItem = ({
   // backend ships it as a raw JSON string so the frontend dispatches on
   // whichever top-level keys it understands. See llm-server
   // docs/llm-egress-filter.md §7b for the egressfilter event shape.
-  const egressfilterEvents = React.useMemo(() => {
+  const parsedMetadata = React.useMemo(() => {
     if (!message.metadata) {
-      return [];
+      return null;
     }
     try {
-      const parsed = typeof message.metadata === 'string' ? JSON.parse(message.metadata) : message.metadata;
-      return Array.isArray(parsed?.egressfilter) ? parsed.egressfilter : [];
+      return typeof message.metadata === 'string' ? JSON.parse(message.metadata) : message.metadata;
     } catch {
-      return [];
+      return null;
     }
   }, [message.metadata]);
+
+  const egressfilterEvents = React.useMemo(() => (Array.isArray(parsedMetadata?.egressfilter) ? parsedMetadata.egressfilter : []), [parsedMetadata]);
+
+  // `metadata.confidence` — the agent's self-assessment of how well the answer
+  // is backed by the evidence it gathered. Written only for investigation turns
+  // whose answer carried a parseable <confidence> block (llm-server
+  // agents/core/answer_confidence.go); absent everywhere else, which renders no
+  // chip rather than a synthesized score.
+  const confidence = parsedMetadata?.confidence ?? null;
 
   const getUniqueReferencesCount = (references) => {
     if (!references || references.length === 0) {
@@ -220,8 +240,11 @@ const MessageItem = ({
     headerActionsNode = (
       <ResponseMetaRail
         createdAt={message.created_at}
-        // answer-completion time, not row last-modified (background jobs bump updated_at); falls back for old msgs
+        // responded_at isn't selected today, so this resolves to updated_at —
+        // the safe branch, since followup_wait_seconds is guaranteed to sit
+        // inside that span (an open followup's wait wouldn't fit responded_at).
         updatedAt={message.responded_at || message.updated_at}
+        followupWaitSeconds={message.followup_wait_seconds}
         taskCount={responseMeta.taskCount}
         contextCount={responseMeta.contextCount}
         memoryCount={responseMeta.memoryCount}
@@ -236,6 +259,7 @@ const MessageItem = ({
         onTokenUsageHover={responseMeta.onTokenUsageHover}
         isFetchingTokenData={responseMeta.isFetchingTokenData}
         egressfilterEvents={egressfilterEvents}
+        confidence={confidence}
       />
     );
   } else if (isTask && !['followup-question', 'acknowledgment', 'planner'].includes(messageType) && onOpenToolDetails) {
@@ -253,6 +277,21 @@ const MessageItem = ({
           Details
         </Button>
       </Box>
+    );
+  }
+
+  let expanderNode = null;
+  if (collapsed !== undefined) {
+    expanderNode = (
+      <ExpandMoreRoundedIcon
+        sx={{
+          fontSize: 18,
+          color: 'var(--ds-gray-500)',
+          flexShrink: 0,
+          transition: 'transform 0.2s ease',
+          transform: `rotate(${collapsed ? 0 : 180}deg)`,
+        }}
+      />
     );
   }
 
@@ -378,10 +417,10 @@ const MessageItem = ({
                   }
                   placement='top'
                 >
-                  <Box sx={{ width: '100%', ...(stepCount ? { display: 'flex', alignItems: 'baseline', gap: ds.space[1], flexWrap: 'wrap' } : {}) }}>
+                  <Box sx={{ width: '100%' }}>
                     <Box
                       sx={{
-                        width: stepCount ? 'auto' : '100%',
+                        width: '100%',
                         minWidth: 0,
                         // Clip the question to ~6 lines worth of height when collapsed.
                         // max-height (rather than -webkit-line-clamp) is used because the
@@ -414,7 +453,7 @@ const MessageItem = ({
                           fontWeight: isResponse ? '500' : '400',
                           fontSize: isQuestion ? 'var(--ds-text-body)' : isResponse ? 'var(--ds-text-title)' : 'var(--ds-text-small)',
                           color: 'var(--ds-gray-700)',
-                          fontFamily: isQuestion ? "'Poppins', sans-serif" : 'Roboto',
+                          fontFamily: isQuestion ? ds.font.display : 'Roboto',
                           wordBreak: 'break-all',
                           lineHeight: isQuestion ? 1.5 : undefined,
                         }}
@@ -425,29 +464,6 @@ const MessageItem = ({
                         showAutoEllipsis={!isQuestion}
                       />
                     </Box>
-                    {stepCount ? (
-                      <Box
-                        component='span'
-                        sx={{
-                          display: 'inline-flex',
-                          alignItems: 'center',
-                          gap: ds.space[0],
-                          fontSize: 'var(--ds-text-caption)',
-                          color: 'var(--ds-gray-500)',
-                          fontFamily: ds.font.sans,
-                          whiteSpace: 'nowrap',
-                          flexShrink: 0,
-                        }}
-                      >
-                        · {stepCount} {stepCount === 1 ? 'step' : 'steps'}
-                        {collapsed !== undefined &&
-                          (collapsed ? (
-                            <ChevronRightRoundedIcon sx={{ fontSize: 16, color: 'var(--ds-gray-500)' }} />
-                          ) : (
-                            <ExpandMoreRoundedIcon sx={{ fontSize: 16, color: 'var(--ds-gray-500)' }} />
-                          ))}
-                      </Box>
-                    ) : null}
                   </Box>
                 </Tooltip>
                 {isQuestion && Array.isArray(message.attachments) && message.attachments.length > 0 && (
@@ -502,9 +518,7 @@ const MessageItem = ({
                     })}
                   </Box>
                 )}
-                {/* Container-header rows (stepCount set) stay minimal — icon + name + "· N steps" only,
-                    like the acknowledgment row — so the status/sources sub-line is suppressed for them. */}
-                {!['question', 'response', 'followup-question', 'acknowledgment'].includes(messageType) && !stepCount && (
+                {!['question', 'response', 'followup-question', 'acknowledgment'].includes(messageType) && (
                   <Box sx={{ display: 'flex', alignItems: 'center', gap: ds.space[1], flexWrap: 'wrap' }}>
                     <Tooltip title={statusIcon.label} placement='top'>
                       <Box component='span' sx={{ display: 'inline-flex', lineHeight: 0 }}>
@@ -519,6 +533,8 @@ const MessageItem = ({
                           ? message?.response_summary
                           : message?.response?.text === 'error: unable to fetch data'
                           ? 'Unable to fetch data'
+                          : message.response_status === 'completed_with_errors'
+                          ? statusIcon.label
                           : capitalize(message.response_status)
                       }
                       sx={{ fontSize: 'var(--ds-text-caption)', color: 'var(--ds-gray-500)', fontFamily: ds.font.sans, flex: 1, minWidth: 0 }}
@@ -588,6 +604,7 @@ const MessageItem = ({
                   toolCall={message}
                   messages={siblingTasks || []}
                   isLoadingInvestigation={isLoadingInvestigation}
+                  isResponseInProgress={isResponseInProgress}
                   generateQuestionText={generateQuestionText}
                   accountId={accountId}
                   handleShare={handleShare}
@@ -612,6 +629,7 @@ const MessageItem = ({
             conversationCreatedAt={message?.created_at}
             conversationUpdatedAt={message?.updated_at}
             headerActions={headerActionsNode}
+            expander={expanderNode}
           />
         </Box>
       </Box>
@@ -671,6 +689,7 @@ MessageItem.propTypes = {
   showFullText: PropTypes.bool,
   onShowFullText: PropTypes.func,
   isLoadingInvestigation: PropTypes.bool,
+  isResponseInProgress: PropTypes.bool,
   siblingTasks: PropTypes.array,
   accountId: PropTypes.string,
   generateQuestionText: PropTypes.string,
@@ -690,7 +709,6 @@ MessageItem.propTypes = {
   groupIndex: PropTypes.number,
   indentDepth: PropTypes.number,
   hideTimeline: PropTypes.bool,
-  stepCount: PropTypes.number,
   collapsed: PropTypes.bool,
   responseMeta: PropTypes.shape({
     taskCount: PropTypes.number,

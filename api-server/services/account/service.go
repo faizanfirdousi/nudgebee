@@ -2,6 +2,7 @@ package account
 
 import (
 	"bytes"
+	"cmp"
 	ctx "context"
 	"crypto/sha256"
 	"database/sql"
@@ -19,6 +20,7 @@ import (
 	"nudgebee/services/internal/database"
 	"nudgebee/services/internal/database/models"
 	"nudgebee/services/license"
+	"nudgebee/services/llm"
 	"nudgebee/services/security"
 	tenantpkg "nudgebee/services/tenant"
 	"slices"
@@ -55,6 +57,12 @@ const (
 const (
 	// azureCostManagementWarningMsg is the message shown when Azure credentials lack Cost Management API access
 	azureCostManagementWarningMsg = "Azure account created successfully, but the credentials do not have permission to access the Azure Cost Management API. Please grant the 'Cost Management Reader' role or equivalent to enable cost tracking. You can update the permissions in the Azure Portal and the system will automatically detect the change on the next sync."
+
+	// awsNoCurWarningMsg is the message shown when an AWS account is created
+	// without a usable Cost & Usage Report. Onboarding no longer blocks on this
+	// (the account works for everything except cost), so this is the only place
+	// the user is told cost data will be missing.
+	awsNoCurWarningMsg = "AWS account created successfully, but no usable Cost & Usage Report was found, so spend, rightsizing and cost recommendations will stay empty. Create a CUR in the AWS billing console with TimeUnit=DAILY and Format=text/csv (the newer Data Exports / CUR 2.0 format is not supported), then attach it via Edit Billing Config on the account. The system also picks it up automatically on the next daily sync."
 
 	// azureBulkOnboardConcurrency caps how many subscriptions AzureBulkOnboard
 	// creates at once, and so how much of the connection pool (20 per pod) one
@@ -308,35 +316,257 @@ type tableDetails struct {
 	name              string
 	accountColumnName string
 	whereSubclause    string
+	// optional marks a table that no migration creates: it exists only on
+	// databases older than the migration history, so it is skipped when absent.
+	optional bool
+}
+
+// accountColumn is the column the table is deleted on when it has no
+// whereSubclause.
+func (t tableDetails) accountColumn(defaultAccountIdColumn string) string {
+	if t.accountColumnName != "" {
+		return t.accountColumnName
+	}
+	if defaultAccountIdColumn != "" {
+		return defaultAccountIdColumn
+	}
+	return "cloud_account_id"
+}
+
+// deleteGroup is a run of tables whose account column defaults to
+// defaultAccountIdColumn.
+type deleteGroup struct {
+	defaultAccountIdColumn string
+	tables                 []tableDetails
+}
+
+// accountDataDeletePlan is every per-account table DeleteAccount clears, in the
+// order it clears them. A table has to be cleared before any table it holds a
+// RESTRICT / NO ACTION foreign key to, and every such referencing table has to
+// be listed, or the delete fails on a foreign-key error.
+// TestAccountDeletePlanCoversForeignKeys_DB checks both against the migrated
+// schema, so a migration that adds an account-scoped table fails CI until the
+// table is listed here.
+var accountDataDeletePlan = []deleteGroup{
+	// projects tables
+	{defaultAccountIdColumn: "cloud_account_id", tables: []tableDetails{{name: "project_accounts", accountColumnName: "account_id"}}},
+	// metrices & spends; the second spends pass is a one off for a data population issue
+	{defaultAccountIdColumn: "cloud_account_id", tables: []tableDetails{
+		{name: "spends", accountColumnName: "cloud_account"},
+		{name: "cloud_resource_metrics"},
+		{name: "cloud_resource_metrics", whereSubclause: "cloud_resource_id in (select id from cloud_resourses where account = $1)"},
+		{name: "spends", whereSubclause: "cloud_resource_id in (select id from cloud_resourses WHERE account = $1)"},
+	}},
+	// recommendations
+	{defaultAccountIdColumn: "cloud_account_id", tables: []tableDetails{{name: "recommendation_resolution", whereSubclause: "recommendation_id in (select id from recommendation where cloud_account_id = $1)"}, {name: "recommendation"}}},
+	// dw tables
+	{defaultAccountIdColumn: "cloud_account_id", tables: []tableDetails{{name: "dw_pipe_usage"}, {name: "dw_pipe"}, {name: "dw_queries", accountColumnName: "account_id"}, {name: "dw_query_profile_data"}, {name: "dw_tables"}}},
+	// agent related tables
+	{defaultAccountIdColumn: "cloud_account_id", tables: []tableDetails{{name: "agent_task"}, {name: "agent_playbook"}, {name: "agent"}}},
+	// auto_pilot
+	{defaultAccountIdColumn: "account_id", tables: []tableDetails{
+		{name: "auto_pilot_task", whereSubclause: "account_id = $1 OR auto_pilot_id in (select id from auto_pilot WHERE account_id = $1)"},
+		{name: "runbook_task_output"},
+		{name: "auto_pilot_reviewee"}, {name: "auto_pilot_reviewers"}, {name: "auto_pilot_approvals"}, {name: "auto_pilot_approval_policy"}, {name: "auto_playbook_task"}, {name: "auto_playbook_executions"}, {name: "auto_optimize_resource_map"}, {name: "auto_pilot"}, {name: "auto_playbook"},
+	}},
+	// notifications; repointNotificationRuleMirrors has already moved the mirror
+	// off this account for rules that cover others, so notification_rules loses
+	// only the rules scoped to this account alone
+	{defaultAccountIdColumn: "account_id", tables: []tableDetails{
+		{name: "notification_channel_account_mappings", accountColumnName: "account_id"},
+		{name: "notification_rules"},
+		{name: "notification_rule_accounts"},
+	}},
+	// tickets
+	{defaultAccountIdColumn: "account_id", tables: []tableDetails{{name: "tickets"}}},
+	// event related tables; they go before the resource tables because
+	// events.cloud_resource_id references cloud_resourses on older databases, and
+	// event_bulk_operations before events because deleting an event cascades to
+	// the event_classification rows a bulk operation references
+	{defaultAccountIdColumn: "cloud_account_id", tables: []tableDetails{
+		{name: "event_bulk_operations", accountColumnName: "account_id"},
+		{name: "event_resolution", whereSubclause: "event_id in (select id from events where cloud_account_id = $1)"},
+		{name: "event_duplicates"}, {name: "event_rules", accountColumnName: "account_id"}, {name: "event_log_analysis"}, {name: "events"},
+		{name: "event_incoming_webhooks", accountColumnName: "account_id"},
+	}},
+	// user_history and cloud resource attributes
+	{defaultAccountIdColumn: "account_id", tables: []tableDetails{
+		{name: "user_history"},
+		{name: "cloud_resource_attributes", whereSubclause: "resource_id in (select id from cloud_resourses WHERE account = $1)"},
+	}},
+	// resources tables
+	{defaultAccountIdColumn: "cloud_account_id", tables: []tableDetails{
+		{name: "application_group_mapping", accountColumnName: "account_id"}, {name: "application_profile"}, {name: "k8s_namespaces"}, {name: "k8s_pods"}, {name: "k8s_workloads"}, {name: "k8s_nodes"},
+		{name: "cloud_resource_relationships", whereSubclause: "source_id in (select id from cloud_resourses where account = $1) OR destination_id in (select id from cloud_resourses where account = $1)", optional: true},
+		{name: "cloud_resourses", accountColumnName: "account"},
+	}},
+	// insight tables
+	{defaultAccountIdColumn: "account_id", tables: []tableDetails{{name: "insight"}}},
+	// llm related tables
+	{defaultAccountIdColumn: "account_id", tables: []tableDetails{{name: "llm_retrieval_trace", accountColumnName: "cloud_account_id"}, {name: "llm_rags"}, {name: "llm_conversation_history"}, {name: "llm_conversation_saved", whereSubclause: "conversation_id in (select id from llm_conversations where account_id = $1)"}, {name: "llm_functions"}, {name: "llm_tools_installation"}, {name: "llm_agents_installation"}, {name: "llm_conversation_feedback", accountColumnName: "cloud_account_id"}, {name: "llm_conversation_tool_calls"}, {name: "llm_conversation_agent"}, {name: "llm_conversation_messages"}, {name: "llm_conversation_attachments"}, {name: "llm_conversation_references"}, {name: "llm_conversations"}}},
+	// anomaly/slo related tables
+	{defaultAccountIdColumn: "cloud_account_id", tables: []tableDetails{{name: "anomaly_config"}, {name: "anomaly", accountColumnName: "account_id"}, {name: "slo_report"}, {name: "slo_config"}}},
+	// knowledge graph; edges carry no foreign key to nodes, and a cross-account
+	// edge belongs to the other account, so edges that point at this account's
+	// nodes go too
+	{defaultAccountIdColumn: "cloud_account_id", tables: []tableDetails{
+		{name: "knowledge_graph_edge"},
+		{name: "knowledge_graph_edge", whereSubclause: "source_node_id in (select id from knowledge_graph_node where cloud_account_id = $1)"},
+		{name: "knowledge_graph_edge", whereSubclause: "destination_node_id in (select id from knowledge_graph_node where cloud_account_id = $1)"},
+		{name: "knowledge_graph_node"},
+		{name: "knowledge_graph_metadata"},
+	}},
+	// discovery snapshots, workload criticality (keyed by resource ids that
+	// rediscovery issues afresh), predictions, delivered notifications and
+	// threshold suggestions
+	{defaultAccountIdColumn: "cloud_account_id", tables: []tableDetails{
+		{name: "active_resources"},
+		{name: "workload_criticality"},
+		{name: "discovery_batch_progress"},
+		{name: "ml_inference", accountColumnName: "account_id"},
+		{name: "sent_notifications", accountColumnName: "account_id"},
+		{name: "event_threshold_suggestions"},
+	}},
+	// integration related tables
+	{defaultAccountIdColumn: "cloud_account_id", tables: []tableDetails{{name: "integrations_cloud_accounts"}}},
+	// additional tables
+	{defaultAccountIdColumn: "cloud_account_id", tables: []tableDetails{{name: "cloud_account_score"}, {name: "billing_usage_cost", accountColumnName: "account_id"}, {name: "cloud_api_permission_errors"}, {name: "feature_flag", accountColumnName: "account_id"}, {name: "upgrade_plan_steps", accountColumnName: "account_id"}, {name: "upgrade_plan_audit", accountColumnName: "account_id"}}},
+}
+
+// accountRoleGrants matches built-in role grants scoped to the account or to one
+// of its namespaces, whose entity_id is "<accountId>:<namespace>".
+var accountRoleGrants = "(entity_type = '" + security.RBAC_ENTITY_TYPE_ACCOUNT + "' AND entity_id = $1) OR " +
+	"(entity_type = '" + security.RBAC_ENTITY_TYPE_K8S_NAMESPACE + "' AND split_part(entity_id, ':', 1) = $1)"
+
+// accountRowDeletePlan runs after accountDataDeletePlan when the account itself
+// is removed rather than only cleaned.
+var accountRowDeletePlan = []deleteGroup{
+	// role grants and per-account settings
+	{defaultAccountIdColumn: "account_id", tables: []tableDetails{
+		{name: "user_roles", whereSubclause: accountRoleGrants},
+		{name: "group_roles", whereSubclause: accountRoleGrants},
+		{name: "custom_role_assignments", whereSubclause: "entity_type = '" + security.RBAC_ENTITY_TYPE_ACCOUNT + "' AND entity_id = $1"},
+		{name: "llm_budget_config", whereSubclause: "entity_type = 'account' AND entity_id = $1"},
+		{name: "configs"},
+		{name: "llm_prompt_configuration"},
+		{name: "event_triage_rule_overrides"},
+		{name: "event_triage_rules"},
+	}},
+	{defaultAccountIdColumn: "account_id", tables: []tableDetails{
+		{name: "workflow_templates"},
+		{name: "llm_kb_agent_mappings"},
+		{name: "llm_global_contexts"},
+	}},
+	{defaultAccountIdColumn: "cloud_account_id", tables: []tableDetails{
+		{name: "cloud_account_attrs"},
+		{name: "cloud_accounts", accountColumnName: "id"},
+	}},
+}
+
+// eeAccountRowTables are cleared with the account row but exist only in EE
+// schema, so OSS never names them; EE code adds them via RegisterEEAccountRowTable.
+var eeAccountRowTables []tableDetails
+
+// RegisterEEAccountRowTable adds an EE-only table that removing an account clears.
+func RegisterEEAccountRowTable(name, accountColumnName string) {
+	eeAccountRowTables = append(eeAccountRowTables, tableDetails{name: name, accountColumnName: accountColumnName})
+}
+
+type accountDeleteBlocker struct {
+	table             string
+	accountColumnName string
+	label             string
+}
+
+// accountDeleteBlockers are account-owned rows whose owning service tears down
+// state outside Postgres when it deletes them: Temporal schedules and running
+// executions for an automation (runbook-server), the Qdrant collection for a
+// knowledge base (llm-server). Deleting the rows here would orphan that state
+// with nothing left that names it, so an account is not removed while any exist.
+var accountDeleteBlockers = []accountDeleteBlocker{
+	{table: "workflows", accountColumnName: "account_id", label: "automations"},
+	{table: "llm_knowledgebases", accountColumnName: "account_id", label: "knowledge bases"},
+}
+
+// CheckAccountDeletable returns an error naming what has to be deleted first
+// while the account still owns rows in accountDeleteBlockers.
+func CheckAccountDeletable(accountId string) error {
+	databaseManager, err := database.GetDatabaseManager(database.Metastore)
+	if err != nil {
+		return err
+	}
+	var remaining []string
+	for _, blocker := range accountDeleteBlockers {
+		var count int
+		err = databaseManager.Db.Get(&count, fmt.Sprintf("SELECT count(*) FROM %s WHERE %s = $1", blocker.table, blocker.accountColumnName), accountId)
+		if err != nil {
+			return err
+		}
+		if count > 0 {
+			remaining = append(remaining, fmt.Sprintf("%s (%d)", blocker.label, count))
+		}
+	}
+	if len(remaining) > 0 {
+		return fmt.Errorf("account %s still has %s; delete them first", accountId, strings.Join(remaining, " and "))
+	}
+	return nil
 }
 
 func deleteTables(context *security.RequestContext, tx *sql.Tx, tables []tableDetails, accountId string, defaultAccountIdColumn string) error {
-	if defaultAccountIdColumn == "" {
-		defaultAccountIdColumn = "cloud_account_id"
-	}
-
-	var err error
 	for _, table := range tables {
-		context.GetLogger().Info("Deleting table", "table", table.name, "account_id", accountId)
-		if table.accountColumnName == "" {
-			table.accountColumnName = defaultAccountIdColumn
+		if table.optional {
+			var exists bool
+			if err := tx.QueryRow("SELECT to_regclass($1) IS NOT NULL", table.name).Scan(&exists); err != nil {
+				return rollbackTableDelete(context, tx, table.name, err)
+			}
+			if !exists {
+				continue
+			}
 		}
+
+		context.GetLogger().Info("Deleting table", "table", table.name, "account_id", accountId)
+		var err error
 		if table.whereSubclause != "" {
 			_, err = tx.Exec(fmt.Sprintf("DELETE FROM %s WHERE %s", table.name, table.whereSubclause), accountId)
 		} else {
-			_, err = tx.Exec(fmt.Sprintf("DELETE FROM %s WHERE %s = $1", table.name, table.accountColumnName), accountId)
+			_, err = tx.Exec(fmt.Sprintf("DELETE FROM %s WHERE %s = $1", table.name, table.accountColumn(defaultAccountIdColumn)), accountId)
 		}
-
 		if err != nil {
-			context.GetLogger().Error("Error deleting", "table", table.name, "error", err)
-			err1 := tx.Rollback()
-			if err1 != nil {
-				context.GetLogger().Error("Error rolling back transaction", "error", err1)
-			}
-			return err
+			return rollbackTableDelete(context, tx, table.name, err)
 		}
 	}
 	return nil
+}
+
+// repointNotificationRuleMirrors moves notification_rules.account_id, the
+// first-account mirror older clients read, off accountId for every rule that
+// covers another account too. The mirror of a rule scoped to accounts must
+// never be NULL: older code reads NULL as every account.
+func repointNotificationRuleMirrors(context *security.RequestContext, tx *sql.Tx, accountId string) error {
+	_, err := tx.Exec(`
+		UPDATE notification_rules r
+		SET account_id = other.account_id, cluster = other.account_name
+		FROM (
+			SELECT DISTINCT ON (nra.rule_id) nra.rule_id, nra.account_id, ca.account_name
+			FROM notification_rule_accounts nra
+			JOIN cloud_accounts ca ON ca.id = nra.account_id
+			WHERE nra.account_id <> $1
+			  AND nra.rule_id IN (SELECT id FROM notification_rules WHERE account_id = $1)
+			ORDER BY nra.rule_id, nra.account_id
+		) other
+		WHERE r.id = other.rule_id`, accountId)
+	if err != nil {
+		return rollbackTableDelete(context, tx, "notification_rules", err)
+	}
+	return nil
+}
+
+func rollbackTableDelete(context *security.RequestContext, tx *sql.Tx, table string, err error) error {
+	context.GetLogger().Error("Error deleting", "table", table, "error", err)
+	if err1 := tx.Rollback(); err1 != nil {
+		context.GetLogger().Error("Error rolling back transaction", "error", err1)
+	}
+	return err
 }
 
 func DeleteAccount(context *security.RequestContext, query AccountDeleteRequest) (AccountDeleteResponse, error) {
@@ -345,9 +575,13 @@ func DeleteAccount(context *security.RequestContext, query AccountDeleteRequest)
 		return AccountDeleteResponse{}, err
 	}
 
-	createdBy := context.GetSecurityContext().GetUserId()
-	tenant := context.GetSecurityContext().GetTenantId()
-	if createdBy == "" && tenant == "" && !context.GetSecurityContext().IsSuperAdmin() {
+	// Only a super admin, or an admin of the caller's own tenant, may delete an
+	// account. The roles come from the calling service (the app gateway, or an
+	// in-cluster caller holding the action token), so this backs up that token
+	// rather than replacing it.
+	sc := context.GetSecurityContext()
+	tenant := sc.GetTenantId()
+	if !sc.HasTenantAccess(security.SecurityAccessTypeDelete) || (tenant == "" && !sc.IsSuperAdmin()) {
 		return AccountDeleteResponse{}, fmt.Errorf("Unauthorized")
 	}
 
@@ -359,11 +593,13 @@ func DeleteAccount(context *security.RequestContext, query AccountDeleteRequest)
 
 	context.GetLogger().Info("deleting account", "account_id", query.Id)
 
+	// A super admin deletes across tenants: tenant_delete runs as one, whatever
+	// tenant its own session carries. Everyone else only inside their tenant.
 	var accountDetailRow *sqlx.Row
-	if tenant != "" {
-		accountDetailRow = databaseManager.Db.QueryRowx("SELECT * FROM cloud_accounts WHERE id = $1 AND tenant = $2", query.Id, tenant)
-	} else {
+	if sc.IsSuperAdmin() {
 		accountDetailRow = databaseManager.Db.QueryRowx("SELECT * FROM cloud_accounts WHERE id = $1", query.Id)
+	} else {
+		accountDetailRow = databaseManager.Db.QueryRowx("SELECT * FROM cloud_accounts WHERE id = $1 AND tenant = $2", query.Id, tenant)
 	}
 
 	if accountDetailRow.Err() != nil {
@@ -377,183 +613,31 @@ func DeleteAccount(context *security.RequestContext, query AccountDeleteRequest)
 	}
 
 	removeAccount := !query.OnlyClean
+	if removeAccount {
+		if err := CheckAccountDeletable(query.Id); err != nil {
+			return AccountDeleteResponse{}, err
+		}
+	}
 
 	// remove all in single transaction
 	tx, err := databaseManager.Db.Begin()
 	if err != nil {
 		return AccountDeleteResponse{}, err
 	}
-	// projects tables
-	projectTables := []tableDetails{{name: "project_accounts", accountColumnName: "account_id"}}
-	err = deleteTables(context, tx, projectTables, query.Id, "cloud_account_id")
-	if err != nil {
+	if err := repointNotificationRuleMirrors(context, tx, query.Id); err != nil {
 		return AccountDeleteResponse{}, err
 	}
-
-	// metrices & spends
-	metricsSpendsTables := []tableDetails{{name: "spends", accountColumnName: "cloud_account"}, {name: "cloud_resource_metrics", whereSubclause: "cloud_resource_id in (select id from cloud_resourses where account = $1)"}}
-	err = deleteTables(context, tx, metricsSpendsTables, query.Id, "cloud_account_id")
-	if err != nil {
-		return AccountDeleteResponse{}, err
-	}
-	// one off scenario necaise pf data population issue
-	_, err = tx.Exec("DELETE FROM spends WHERE cloud_resource_id in (select id from cloud_resourses WHERE account = $1)", query.Id)
-	if err != nil {
-		context.GetLogger().Error("Error deleting spends > resources", "error", err)
-		err = tx.Rollback()
-		if err != nil {
-			context.GetLogger().Error("Error rolling back transaction", "error", err)
-		}
-		return AccountDeleteResponse{}, err
-	}
-
-	// recommendations
-	recommendationsTables := []tableDetails{{name: "recommendation_resolution", whereSubclause: "recommendation_id in (select id from recommendation where cloud_account_id = $1)"}, {name: "recommendation"}}
-	err = deleteTables(context, tx, recommendationsTables, query.Id, "cloud_account_id")
-	if err != nil {
-		return AccountDeleteResponse{}, err
-	}
-
-	// dw tables
-	dwTables := []tableDetails{{name: "dw_pipe_usage"}, {name: "dw_pipe"}, {name: "dw_queries", accountColumnName: "account_id"}, {name: "dw_query_profile_data"}, {name: "dw_tables"}}
-	err = deleteTables(context, tx, dwTables, query.Id, "cloud_account_id")
-	if err != nil {
-		return AccountDeleteResponse{}, err
-	}
-
-	// agent related tables
-	agentTables := []tableDetails{{name: "agent_task"}, {name: "agent_playbook"}, {name: "agent"}}
-	err = deleteTables(context, tx, agentTables, query.Id, "cloud_account_id")
-	if err != nil {
-		return AccountDeleteResponse{}, err
-	}
-
-	// auto_pilot
-	// auto_pilot_task with join to auto_pilot by auto_pilot_id and id and filter by account id
-	context.GetLogger().Info("Deleting auto_pilot_task ", "account_id", query.Id)
-	_, err = tx.Exec("DELETE FROM auto_pilot_task WHERE auto_pilot_id in (select id from auto_pilot WHERE account_id = $1)", query.Id)
-	if err != nil {
-		context.GetLogger().Error("Error deleting auto_pilot_task", "error", err)
-		err = tx.Rollback()
-		if err != nil {
-			context.GetLogger().Error("Error rolling back transaction", "error", err)
-		}
-		return AccountDeleteResponse{}, err
-	}
-
-	autopilotTables := []tableDetails{{name: "auto_pilot_reviewee"}, {name: "auto_pilot_reviewers"}, {name: "auto_pilot_approvals"}, {name: "auto_pilot_approval_policy"}, {name: "auto_playbook_task"}, {name: "auto_playbook_executions"}, {name: "auto_optimize_resource_map"}, {name: "auto_pilot"}, {name: "auto_playbook"}, {name: "runbook_task_output"}}
-	err = deleteTables(context, tx, autopilotTables, query.Id, "account_id")
-	if err != nil {
-		return AccountDeleteResponse{}, err
-	}
-
-	// notifications
-	notificationTables := []tableDetails{{name: "notification_channel_account_mappings", accountColumnName: "account_id"}, {name: "notification_rules"}}
-	err = deleteTables(context, tx, notificationTables, query.Id, "account_id")
-	if err != nil {
-		return AccountDeleteResponse{}, err
-	}
-
-	//	tickets
-	ticketTables := []tableDetails{{name: "tickets"}}
-	err = deleteTables(context, tx, ticketTables, query.Id, "account_id")
-	if err != nil {
-		return AccountDeleteResponse{}, err
-	}
-
-	// user_history
-	context.GetLogger().Info("Deleting user_history ", "account_id", query.Id)
-	_, err = tx.Exec("DELETE FROM user_history WHERE account_id = $1", query.Id)
-	if err != nil {
-		context.GetLogger().Error("Error deleting user_history", "error", err)
-		err = tx.Rollback()
-		if err != nil {
-			context.GetLogger().Error("Error rolling back transaction", "error", err)
-		}
-		return AccountDeleteResponse{}, err
-	}
-
-	context.GetLogger().Info("Deleting cloud resources attributes ", "account_id", query.Id)
-	_, err = tx.Exec("DELETE FROM cloud_resource_attributes WHERE resource_id in (select id from cloud_resourses WHERE account = $1)", query.Id)
-	if err != nil {
-		context.GetLogger().Error("Error deleting cloud_resource_attributes", "error", err)
-		err = tx.Rollback()
-		if err != nil {
-			context.GetLogger().Error("Error rolling back transaction", "error", err)
-		}
-		return AccountDeleteResponse{}, err
-	}
-	// resources tables
-	resourcesTables := []tableDetails{{name: "application_group_mapping", accountColumnName: "account_id"}, {name: "application_profile"}, {name: "k8s_namespaces"}, {name: "k8s_pods"}, {name: "k8s_workloads"}, {name: "k8s_nodes"}, {name: "cloud_resourses", accountColumnName: "account"}}
-	err = deleteTables(context, tx, resourcesTables, query.Id, "cloud_account_id")
-	if err != nil {
-		return AccountDeleteResponse{}, err
-	}
-
-	// insight tables
-	insightTables := []tableDetails{{name: "insight"}}
-	err = deleteTables(context, tx, insightTables, query.Id, "account_id")
-	if err != nil {
-		return AccountDeleteResponse{}, err
-	}
-
-	// llm related tables
-	llmTables := []tableDetails{{name: "llm_rag_audit", accountColumnName: "cloud_account_id"}, {name: "llm_rags"}, {name: "llm_conversation_history"}, {name: "llm_conversation_saved", whereSubclause: "conversation_id in (select id from llm_conversations where account_id = $1)"}, {name: "llm_functions"}, {name: "llm_tools_installation"}, {name: "llm_agents_installation"}, {name: "llm_conversation_feedback", accountColumnName: "cloud_account_id"}, {name: "llm_conversation_tool_calls"}, {name: "llm_conversation_agent"}, {name: "llm_conversation_messages"}, {name: "llm_conversations"}}
-	err = deleteTables(context, tx, llmTables, query.Id, "account_id")
-	if err != nil {
-		return AccountDeleteResponse{}, err
-	}
-
-	// anomaly/slo related tables
-	anomalySloTables := []tableDetails{{name: "anomaly_config"}, {name: "anomaly", accountColumnName: "account_id"}, {name: "slo_report"}, {name: "slo_config"}}
-	err = deleteTables(context, tx, anomalySloTables, query.Id, "cloud_account_id")
-	if err != nil {
-		return AccountDeleteResponse{}, err
-	}
-
-	// event related tables
-	eventTables := []tableDetails{{name: "event_resolution", whereSubclause: "event_id in (select id from events where cloud_account_id = $1)"}, {name: "event_duplicates"}, {name: "event_rules", accountColumnName: "account_id"}, {name: "event_log_analysis"}, {name: "events"}}
-	err = deleteTables(context, tx, eventTables, query.Id, "cloud_account_id")
-	if err != nil {
-		return AccountDeleteResponse{}, err
-	}
-
-	// integration related tables
-	integrationTables := []tableDetails{{name: "integrations_cloud_accounts"}}
-	err = deleteTables(context, tx, integrationTables, query.Id, "cloud_account_id")
-	if err != nil {
-		return AccountDeleteResponse{}, err
-	}
-
-	// additional tables
-	additionalAccountTables := []tableDetails{{name: "cloud_account_score"}, {name: "billing_usage_cost", accountColumnName: "account_id"}, {name: "cloud_api_permission_errors"}, {name: "feature_flag", accountColumnName: "account_id"}, {name: "upgrade_plan_steps", accountColumnName: "account_id"}, {name: "upgrade_plan_audit", accountColumnName: "account_id"}}
-	err = deleteTables(context, tx, additionalAccountTables, query.Id, "cloud_account_id")
-	if err != nil {
-		return AccountDeleteResponse{}, err
-	}
-
+	plan := accountDataDeletePlan
 	if removeAccount {
-		// account attrs
-		context.GetLogger().Info("Deleting Account Attrs", "account_id", query.Id)
-		_, err = tx.Exec("DELETE FROM cloud_account_attrs WHERE cloud_account_id = $1", query.Id)
-		if err != nil {
-			context.GetLogger().Error("Error deleting cloud_account_attrs", "error", err)
-			err = tx.Rollback()
-			if err != nil {
-				context.GetLogger().Error("Error rolling back transaction", "error", err)
-			}
-			return AccountDeleteResponse{}, err
+		plan = slices.Clone(plan)
+		if len(eeAccountRowTables) > 0 {
+			plan = append(plan, deleteGroup{defaultAccountIdColumn: "account_id", tables: eeAccountRowTables})
 		}
-
-		// accounts
-		context.GetLogger().Info("Deleting Account ", "account_id", query.Id)
-		_, err = tx.Exec("DELETE FROM cloud_accounts WHERE id = $1", query.Id)
+		plan = append(plan, accountRowDeletePlan...)
+	}
+	for _, group := range plan {
+		err = deleteTables(context, tx, group.tables, query.Id, group.defaultAccountIdColumn)
 		if err != nil {
-			context.GetLogger().Error("Error deleting cloud_accounts", "error", err)
-			err1 := tx.Rollback()
-			if err1 != nil {
-				context.GetLogger().Error("Error rolling back transaction", "error", err1)
-			}
 			return AccountDeleteResponse{}, err
 		}
 	}
@@ -683,6 +767,16 @@ func CreateAccount(context *security.RequestContext, query AccountCreateRequest)
 	// This ensures consistent matching against database enum values
 	if strings.EqualFold(query.CloudProvider, "aws") {
 		query.CloudProvider = "AWS"
+
+		// Fold the optional region allowlist into the data blob the collector
+		// reads, and pin the SDK bootstrap region to it. Validated here rather
+		// than downstream: a malformed region yields an empty crawl that looks
+		// healthy, so the person who typed it must see the error.
+		data, region, regionErr := applyAWSRegions(query.Data, query.Regions, query.Region)
+		if regionErr != nil {
+			return AccountCreateResponse{}, regionErr
+		}
+		query.Data, query.Region = data, region
 	} else if strings.EqualFold(query.CloudProvider, "azure") {
 		query.CloudProvider = "Azure"
 	} else if strings.EqualFold(query.CloudProvider, "gcp") {
@@ -746,6 +840,7 @@ func CreateAccount(context *security.RequestContext, query AccountCreateRequest)
 
 	k8sAccessSecret := ""
 	azureCostManagementWarning := "" // Track Azure Cost Management permission issue
+	awsNoCurWarning := ""            // Track AWS account onboarded without a Cost & Usage Report
 
 	if strings.EqualFold(query.CloudProvider, "k8s") || strings.EqualFold(query.AccountType, "kubernetes") {
 		k8sAccessKey := common.GenerateUUID()
@@ -793,8 +888,11 @@ func CreateAccount(context *security.RequestContext, query AccountCreateRequest)
 			}
 
 			// Re-run validation server-side at create time (STS + CUR + S3
-			// probe). This blocks onboarding when no usable Cost & Usage
-			// Report is discoverable — see plan "Block onboarding (hard error)".
+			// probe). Only the STS/auth step blocks onboarding: the validator
+			// leaves Success=true when just the cost steps fail, so an account
+			// with no usable Cost & Usage Report is created without cost data
+			// rather than refused. The user is warned below and can attach a
+			// CUR later via Edit Billing Config.
 			validationResult := validateAWSCredentialsInternal(context.GetContext(), AwsValidateInternalRequest{
 				AssumeRole:   query.AssumeRole,
 				ExternalID:   query.ExternalId,
@@ -835,6 +933,15 @@ func CreateAccount(context *security.RequestContext, query AccountCreateRequest)
 						query.Data["cur_source"] = "manual_role"
 					}
 				}
+			} else {
+				// No usable CUR. The account is still created — cost is
+				// optional — but spend, rightsizing and cost recommendations
+				// stay empty until one is attached, so say so explicitly
+				// rather than letting the user discover it as silence.
+				awsNoCurWarning = awsNoCurWarningMsg
+				context.GetLogger().Warn("aws: account will be created without cost & usage report",
+					"account_number", validationResult.AccountNumber,
+					"missing_permissions", validationResult.MissingPermissions)
 			}
 		case "Azure":
 			// AccountNumber = Tenant (Directory) ID
@@ -1027,6 +1134,9 @@ func CreateAccount(context *security.RequestContext, query AccountCreateRequest)
 	// Remove agent-only fields that are not cloud_accounts columns
 	delete(accountFields, "agent_access_key")
 	delete(accountFields, "agent_access_secret")
+	// regions is request-only: it was folded into the data blob above, and
+	// cloud_accounts has no such column.
+	delete(accountFields, "regions")
 
 	newAccountId, err := insertRowFromMap(dbms, "cloud_accounts", accountFields)
 	if err != nil {
@@ -1068,6 +1178,10 @@ func CreateAccount(context *security.RequestContext, query AccountCreateRequest)
 		}
 	}
 
+	if err := llm.AttachTenantDefaultLLMProvider(context.GetContext(), dbms, query.Tenant, newAccountId); err != nil {
+		context.GetLogger().Error("account: created, but failed to attach the default LLM provider", "error", err, "account", newAccountId)
+	}
+
 	// invalidate tenant cache
 	err = security.InvalidateCacheForTenant(context.GetSecurityContext().GetTenantId())
 	if err != nil {
@@ -1078,10 +1192,23 @@ func CreateAccount(context *security.RequestContext, query AccountCreateRequest)
 	if query.CloudProvider == "AWS" || query.CloudProvider == "Azure" || query.CloudProvider == "GCP" || query.CloudProvider == "CloudFoundry" {
 		go func() {
 			context.GetLogger().Info("account: triggering intial load for account", "account", newAccountId)
+			// Backfill: this is the account's first sync, so the current month on
+			// its own is whatever fraction of it has elapsed. An account connected
+			// on the 20th would otherwise show 20 days of spend and no history at
+			// all — no month-on-month comparison, an empty trend chart, and no
+			// baseline for spend-anomaly detection to work from. The organisation
+			// auto-registration path already asks for this; account creation from
+			// the UI never did.
+			// UTC, not local: billing periods are UTC, so a server west of it would
+			// ask for the previous month during the first hours of a new UTC month.
+			// That month is also what the backfill skips as already-processed, so a
+			// local-time answer would skip the wrong one.
+			now := time.Now().UTC()
 			_, err := cloud.StoreUsageReport(context, cloud.StoreUsageRequest{
 				AccountId: newAccountId,
-				Month:     time.Now().Month(),
-				Year:      time.Now().Year(),
+				Month:     now.Month(),
+				Year:      now.Year(),
+				Backfill:  true,
 			})
 			if err != nil {
 				context.GetLogger().Error("failed to hit store_usage", "error", err)
@@ -1123,7 +1250,7 @@ func CreateAccount(context *security.RequestContext, query AccountCreateRequest)
 		Id:           newAccountId,
 		AccessKey:    query.AgentAccessKey,
 		AccessSecret: k8sAccessSecret,
-		Warning:      azureCostManagementWarning,
+		Warning:      cmp.Or(azureCostManagementWarning, awsNoCurWarning),
 	}, nil
 }
 
@@ -1692,80 +1819,6 @@ func AwsEventBridgeOnboardUrl(context *security.RequestContext, req AwsEventBrid
 	}, nil
 }
 
-func GcpPubSubOnboardUrl(context *security.RequestContext, req GcpPubSubOnboardRequest) (GcpPubSubOnboardResponse, error) {
-	err := common.ValidateStruct(req)
-	if err != nil {
-		return GcpPubSubOnboardResponse{}, err
-	}
-
-	tenantId := context.GetSecurityContext().GetTenantId()
-
-	manager, err := database.GetDatabaseManager(database.Metastore)
-	if err != nil {
-		return GcpPubSubOnboardResponse{}, fmt.Errorf("account: failed to get database manager: %w", err)
-	}
-
-	var account struct {
-		ExternalId    string `db:"external_id"`
-		AccountNumber string `db:"account_number"` // GCP Project ID
-	}
-	err = manager.Db.Get(&account,
-		`SELECT external_id, account_number FROM cloud_accounts
-		WHERE id = $1 AND tenant = $2 AND lower(cloud_provider) = 'gcp' AND status = 'active'
-		LIMIT 1`,
-		req.AccountId, tenantId,
-	)
-	if err != nil {
-		return GcpPubSubOnboardResponse{}, fmt.Errorf("account: gcp account not found: %w", err)
-	}
-
-	if account.ExternalId == "" {
-		return GcpPubSubOnboardResponse{}, fmt.Errorf("account: gcp account has no external_id")
-	}
-
-	templateYamlURL := config.Config.GcpPubSubTemplateURL
-	nudgebeePubSubProjectId := config.Config.GcpProjectID
-	if nudgebeePubSubProjectId == "" {
-		nudgebeePubSubProjectId = account.AccountNumber // fallback to GCP project ID from account if not set in config
-	}
-	nudgebeeSubscriptionName := config.Config.CloudCollectorGcpPubSubSubscriptionID
-
-	if templateYamlURL == "" {
-		return GcpPubSubOnboardResponse{}, fmt.Errorf("account: gcp_pubsub_template_url config is not set")
-	}
-	if nudgebeePubSubProjectId == "" {
-		return GcpPubSubOnboardResponse{}, fmt.Errorf("account: cloud_collector_gcp_pubsub_project_id config is not set")
-	}
-	if nudgebeeSubscriptionName == "" {
-		return GcpPubSubOnboardResponse{}, fmt.Errorf("account: cloud_collector_gcp_pubsub_subscription_id config is not set")
-	}
-
-	// Build GCP Deployment Manager URL
-	// Format: https://console.cloud.google.com/dm/deployments/new?template=<encoded-template-url>&project=<project-id>
-	// Note: GCP Console supports pre-filling project but not template parameters via URL
-	// User must manually paste the external_id token after clicking the link
-	deployURL := fmt.Sprintf(
-		"https://console.cloud.google.com/dm/deployments/new?template=%s&project=%s",
-		url.QueryEscape(templateYamlURL),
-		url.QueryEscape(account.AccountNumber),
-	)
-
-	context.GetLogger().Info("account: generated GCP Pub/Sub Deployment Manager URL",
-		slog.String("account_id", req.AccountId),
-		slog.String("external_id", account.ExternalId),
-		slog.String("project_id", account.AccountNumber),
-		slog.String("pubsub_project_id", nudgebeePubSubProjectId),
-	)
-
-	return GcpPubSubOnboardResponse{
-		DeploymentManagerUrl: deployURL,
-		ExternalId:           account.ExternalId,
-		PubSubProjectId:      nudgebeePubSubProjectId,
-		SubscriptionName:     nudgebeeSubscriptionName,
-		TemplateYamlUrl:      templateYamlURL,
-	}, nil
-}
-
 func SetupGCPMonitoringWebhook(ctx *security.RequestContext, req GcpMonitoringWebhookSetupRequest) (GcpMonitoringWebhookSetupResponse, error) {
 	if !ctx.GetSecurityContext().HasAccountAccess(req.AccountId, security.SecurityAccessTypeUpdate) {
 		return GcpMonitoringWebhookSetupResponse{}, common.ErrorUnauthorized("unauthorized")
@@ -1893,43 +1946,6 @@ func CheckGCPMonitoringPermission(ctx *security.RequestContext, req GcpCheckMoni
 		HasPermission: apiResponse.Data.HasPermission,
 		ErrorDetail:   apiResponse.Data.ErrorDetail,
 	}, nil
-}
-
-func GCPOnBoardUrl(context *security.RequestContext, query AccountCreateRequest) (GCPOnBoardResponse, error) {
-	err := common.ValidateStruct(query)
-	if err != nil {
-		return GCPOnBoardResponse{}, err
-	}
-
-	if query.CloudProvider == "GCP" {
-		createdBy := context.GetSecurityContext().GetUserId()
-		tenant := context.GetSecurityContext().GetTenantId()
-		randomId := common.GenerateUUID()
-		projectName := fmt.Sprintf("nudgebee-project-%s", randomId)
-		bucketName := fmt.Sprintf("nudgebee-gcp-cur-%s", randomId)
-
-		// Construct a GCP deployment manager template URL or marketplace onboarding link
-		baseURL := "https://console.cloud.google.com/dm/deploy/new"
-		params := url.Values{}
-		params.Set("project", projectName)
-		// for now harcoded
-		params.Set("templateUrl", "https://storage.googleapis.com/nudgebee-templates/nudgebee-gcp-cloud-formation.json")
-		params.Set("param_NudgebeeID", tenant)
-		params.Set("param_NudgebeeDomain", config.Config.NUDGEBEE_URL)
-		params.Set("param_NudgebeeIamRole", config.Config.NUDGEBEE_INSTANCE_ROLE)
-		params.Set("param_BucketName", bucketName)
-		params.Set("param_NudgebeeUserId", createdBy)
-		params.Set("param_NudgebeeAccountName", query.AccountName)
-
-		encodedUrl := fmt.Sprintf("%s?%s", baseURL, params.Encode())
-
-		return GCPOnBoardResponse{
-			Url:        encodedUrl,
-			BucketName: bucketName,
-		}, nil
-	}
-
-	return GCPOnBoardResponse{}, fmt.Errorf("account: only for GCP")
 }
 
 func GetResource(ctx *security.RequestContext, id string) (models.Resource, error) {
@@ -2180,6 +2196,44 @@ func ValidateCloudCredentials(context *security.RequestContext, query ValidateCl
 
 	switch provider {
 	case "AWS":
+		// AccountID resolves the credentials of an already-onboarded account
+		// server-side, for callers (Edit Billing Config) that only have a CUR
+		// report name and no raw secret. Mirrors the GCP branch below, but AWS
+		// has two credential shapes: assume_role is stored in plaintext, while
+		// access_secret is encrypted at rest.
+		if query.AccountID != "" {
+			if !context.GetSecurityContext().HasAccountAccess(query.AccountID, security.SecurityAccessTypeRead) {
+				return ValidateCloudCredentialsResponse{}, common.ErrorUnauthorized("unauthorized")
+			}
+			acct, err := GetAccount(context, query.AccountID)
+			if err != nil {
+				return ValidateCloudCredentialsResponse{}, fmt.Errorf("failed to load account %s: %w", query.AccountID, err)
+			}
+			switch {
+			case acct.AssumeRole != nil && strings.TrimSpace(*acct.AssumeRole) != "":
+				query.AssumeRole = *acct.AssumeRole
+				if acct.ExternalId != nil {
+					query.ExternalID = *acct.ExternalId
+				}
+			case acct.AccessKey != nil && strings.TrimSpace(*acct.AccessKey) != "" && acct.AccessSecret != nil && *acct.AccessSecret != "":
+				decrypted, derr := common.Decrypt(*acct.AccessSecret)
+				if derr != nil {
+					return ValidateCloudCredentialsResponse{}, fmt.Errorf("failed to decrypt credentials for account %s: %w", query.AccountID, derr)
+				}
+				query.AccessKey = *acct.AccessKey
+				query.AccessSecret = decrypted
+			default:
+				return ValidateCloudCredentialsResponse{
+					Success:      false,
+					Provider:     provider,
+					ErrorMessage: "no stored credentials found for this account",
+				}, nil
+			}
+			if query.Region == "" && acct.Region != nil {
+				query.Region = *acct.Region
+			}
+		}
+
 		hasRole := strings.TrimSpace(query.AssumeRole) != ""
 		hasKeys := strings.TrimSpace(query.AccessKey) != "" && strings.TrimSpace(query.AccessSecret) != ""
 		if !hasRole && !hasKeys {
@@ -2198,11 +2252,13 @@ func ValidateCloudCredentials(context *security.RequestContext, query ValidateCl
 		}
 
 		result := validateAWSCredentialsInternal(context.GetContext(), AwsValidateInternalRequest{
-			AssumeRole:   query.AssumeRole,
-			ExternalID:   query.ExternalID,
-			AccessKey:    query.AccessKey,
-			AccessSecret: query.AccessSecret,
-			Region:       query.Region,
+			AssumeRole:    query.AssumeRole,
+			ExternalID:    query.ExternalID,
+			AccessKey:     query.AccessKey,
+			AccessSecret:  query.AccessSecret,
+			Region:        query.Region,
+			CurReportName: query.CurReportName,
+			CurS3Bucket:   query.CurS3Bucket,
 		})
 
 		if !result.Success {
@@ -2558,6 +2614,12 @@ func UpsertAccountAttrs(context *security.RequestContext, request AccountAttrUps
 		return AccountAttrUpsertResponse{}, fmt.Errorf("unauthorized: missing tenant")
 	}
 
+	for _, attr := range request.Objects {
+		if err := validateKnowledgePolicyAttribute(context.GetSecurityContext(), attr); err != nil {
+			return AccountAttrUpsertResponse{}, err
+		}
+	}
+
 	dbms, err := database.GetDatabaseManager(database.Metastore)
 	if err != nil {
 		return AccountAttrUpsertResponse{}, fmt.Errorf("failed to get database: %w", err)
@@ -2640,8 +2702,8 @@ func UpdateAccountByAction(context *security.RequestContext, request AccountUpda
 		return AccountUpdateResponse{}, common.ErrorUnauthorized("Not Allowed")
 	}
 
-	if request.Status == "" && request.AccountName == "" && request.AccountEnv == "" && len(request.Data) == 0 {
-		return AccountUpdateResponse{}, fmt.Errorf("at least one of status, account_name, account_env, or data must be provided")
+	if request.Status == "" && request.AccountName == "" && request.AccountEnv == "" && len(request.Data) == 0 && request.Regions == nil {
+		return AccountUpdateResponse{}, fmt.Errorf("at least one of status, account_name, account_env, data, or regions must be provided")
 	}
 
 	dbms, err := database.GetDatabaseManager(database.Metastore)
@@ -2671,13 +2733,48 @@ func UpdateAccountByAction(context *security.RequestContext, request AccountUpda
 		args = append(args, request.AccountEnv)
 		argIdx++
 	}
-	if len(request.Data) > 0 {
-		dataJSON, jsonErr := json.Marshal(request.Data)
+	// data and regions both write the data column, so they resolve to a single
+	// assignment — emitting one SET clause each makes Postgres reject the whole
+	// statement with "multiple assignments to same column".
+	dataToWrite := request.Data
+	regionToWrite := ""
+	// Whether to emit the clause at all, tracked separately from the map being
+	// non-empty: clearing the last key leaves an empty map that must still be
+	// written, or the deletion is silently dropped.
+	writeData := len(request.Data) > 0
+	if request.Regions != nil {
+		// Merge rather than replace: the data blob also carries the CUR billing
+		// config, and writing a regions-only object here would wipe it.
+		merged, region, regionErr := mergeAccountRegions(dbms, request.Id, tenantId, *request.Regions, request.Data)
+		if regionErr != nil {
+			return AccountUpdateResponse{}, regionErr
+		}
+		dataToWrite = merged
+		regionToWrite = region
+		writeData = true
+	} else if writeData {
+		// A data write replaces the whole column, so an unrelated edit — the CUR
+		// billing config, say — would drop the region allowlist and silently
+		// return the account to region auto-discovery, breaking collection for a
+		// region-scoped role. Carry the stored allowlist across such a write.
+		carried, carryErr := carryForwardRegions(dbms, request.Id, tenantId, request.Data)
+		if carryErr != nil {
+			return AccountUpdateResponse{}, carryErr
+		}
+		dataToWrite = carried
+	}
+	if writeData {
+		dataJSON, jsonErr := json.Marshal(dataToWrite)
 		if jsonErr != nil {
 			return AccountUpdateResponse{}, fmt.Errorf("failed to marshal data: %w", jsonErr)
 		}
 		setClauses = append(setClauses, fmt.Sprintf("data = $%d", argIdx))
 		args = append(args, string(dataJSON))
+		argIdx++
+	}
+	if regionToWrite != "" {
+		setClauses = append(setClauses, fmt.Sprintf("region = $%d", argIdx))
+		args = append(args, regionToWrite)
 		argIdx++
 	}
 

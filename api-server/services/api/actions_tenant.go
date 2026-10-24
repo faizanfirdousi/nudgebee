@@ -5,6 +5,7 @@ import (
 	"nudgebee/services/account"
 	"nudgebee/services/audit"
 	"nudgebee/services/common"
+	"nudgebee/services/observability"
 	"nudgebee/services/tenant"
 	"strings"
 	"time"
@@ -403,6 +404,19 @@ func handleTenantAction(actionPayload *ActionRequest, c *gin.Context, tracer *tr
 		}
 
 		c.JSON(200, resp)
+		// Drop the cached tenant-level log/trace label mappings so an edit applies on the
+		// next query rather than after the 10 min TTL. Scoped to the attributes that
+		// feed those caches — this handler writes many unrelated tenant attrs.
+		// Tenant id comes from the security context, not AttributeObject.TenantId: the UI
+		// omits that field and UpsertTenantAttributes overwrites it with this same value.
+		for _, attr := range request.Object {
+			switch attr.Name {
+			case "log_labels":
+				observability.InvalidateLogLabelsCacheForTenant(ctx.GetSecurityContext().GetTenantId())
+			case "trace_labels":
+				observability.InvalidateTraceLabelsCacheForTenant(ctx.GetSecurityContext().GetTenantId())
+			}
+		}
 		return
 	case "delete_feature":
 		var request tenant.DeleteFeatureRequest
@@ -769,6 +783,7 @@ func handleTenantAction(actionPayload *ActionRequest, c *gin.Context, tracer *tr
 			c.JSON(400, common.ErrorActionBadRequest(err.Error()))
 			return
 		}
+		notifyRulesCacheInvalidate(ctx.GetSecurityContext().GetTenantId())
 		c.JSON(200, resp)
 		return
 	case "notification_channel_mapping_create":
@@ -1178,6 +1193,16 @@ func handleTenantAction(actionPayload *ActionRequest, c *gin.Context, tracer *tr
 		if err != nil {
 			c.JSON(400, common.ErrorActionBadRequest("Failed to fetch accounts for tenant: "+err.Error()))
 			return
+		}
+
+		// Refuse before deleting anything: an account that still owns automations
+		// or knowledge bases would otherwise stop the loop below after the
+		// accounts ahead of it were already gone.
+		for _, accountId := range accountIds {
+			if err := account.CheckAccountDeletable(accountId); err != nil {
+				c.JSON(400, common.ErrorActionBadRequest(err.Error()))
+				return
+			}
 		}
 
 		var deletedAccountIds []string

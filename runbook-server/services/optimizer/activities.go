@@ -99,8 +99,10 @@ func (a *Activities) ExecuteTaskActivity(ctx context.Context, taskID string) err
 		return err
 	}
 
-	if task.Status == string(model.AutopilotTaskStatusSkipped) {
-		slog.Info("Task already skipped, skipping execution", "task_id", taskID)
+	if task.Status == string(model.AutopilotTaskStatusSkipped) ||
+		task.Status == string(model.AutopilotTaskStatusComplete) ||
+		task.Status == string(model.AutopilotTaskStatusFailed) {
+		slog.Info("Task already processed, skipping execution", "task_id", taskID, "status", task.Status)
 		return nil
 	}
 
@@ -191,6 +193,12 @@ func (a *Activities) ExecuteTaskActivity(ctx context.Context, taskID string) err
 				task.Attributes.PRAction = prAction
 			}
 
+			// Why the apply reached that outcome, which pr_action alone does not say
+			// (see AutoOptimizeTaskAttributes.PRDecision).
+			if prDecision, ok := outMap["pr_decision"].(string); ok && prDecision != "" {
+				task.Attributes.PRDecision = prDecision
+			}
+
 			// Store ticket URL in task attributes
 			if ticketURL, ok := outMap["ticket_url"].(string); ok && ticketURL != "" {
 				task.Attributes.TicketLink = &ticketURL
@@ -219,12 +227,10 @@ func (a *Activities) ExecuteTaskActivity(ctx context.Context, taskID string) err
 		if markErr := a.Dao.MarkAutoOptimizeTaskTerminal(ctx, task.ID, task.Status, reason); markErr != nil {
 			slog.Error("Failed to record terminal task status after save error", "task_id", taskID, "error", markErr)
 		}
-		if taskErr == nil {
-			return err
-		}
+		return err
 	}
 
-	return taskErr
+	return nil
 }
 
 // closesRecommendation reports whether the task's outcome resolves its

@@ -11,7 +11,7 @@ import { LogDate } from '@components/k8s/common/LogDate';
 import observability from '@api1/observability';
 import { parseHttpResponseBodyMessage } from 'src/utils/common';
 import { toast as snackbar } from '@ui/Toast';
-import WidgetCard from '@ui/WidgetCard';
+import { Card } from '@ui/Card';
 import SafeIcon from '@shared/icons/SafeIcon';
 import Loader from '@shared/Loader';
 import { getNubiIconUrl, useTenantBranding } from '@hooks/useTenantBranding';
@@ -161,6 +161,12 @@ const KubernetesPlusMinusLogsGradual: React.FC<KubernetesPlusMinusLogsGradualPro
   useEffect(() => {
     if (!query?.data?.timestamp) return;
 
+    // `loadInitialLogs` is async, so a teardown during the fetch runs the cleanup
+    // while scrollTimer is still undefined. The flag is what stops the continuation
+    // from scheduling a timer (and setting state) after the effect is gone.
+    let active = true;
+    let scrollTimer: ReturnType<typeof setTimeout> | undefined;
+
     const loadInitialLogs = async () => {
       // Reset state when query changes
       setLogs([]);
@@ -177,6 +183,7 @@ const KubernetesPlusMinusLogsGradual: React.FC<KubernetesPlusMinusLogsGradualPro
       setEndTime(newEndTime);
 
       const fetchedLogs = await fetchLogs(newStartTime, newEndTime);
+      if (!active) return;
 
       // Ensure the original log entry is included
 
@@ -196,12 +203,17 @@ const KubernetesPlusMinusLogsGradual: React.FC<KubernetesPlusMinusLogsGradualPro
       setInitialLoading(false);
 
       // Scroll to event marker after initial load
-      setTimeout(() => {
+      scrollTimer = setTimeout(() => {
         eventMarkerRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
       }, 100);
     };
 
     loadInitialLogs();
+
+    return () => {
+      active = false;
+      if (scrollTimer) clearTimeout(scrollTimer);
+    };
   }, [query?.data?.timestamp, query?.data?.message, query?.sample, query?.logQuery]);
 
   // Safety check for query data - after all hooks
@@ -313,7 +325,7 @@ const KubernetesPlusMinusLogsGradual: React.FC<KubernetesPlusMinusLogsGradualPro
   }
 
   return (
-    <WidgetCard sx={{ p: 0, overflow: 'hidden' }}>
+    <Card sx={{ mt: 'var(--ds-space-5)', p: 0, overflow: 'hidden' }}>
       <Box sx={{ width: '100%', position: 'relative' }}>
         {/* Header with controls */}
         <Box
@@ -464,7 +476,7 @@ const KubernetesPlusMinusLogsGradual: React.FC<KubernetesPlusMinusLogsGradualPro
                           lineHeight: '1.6',
                           overflowWrap: 'anywhere',
                           wordBreak: 'break-all',
-                          fontFamily: 'monospace',
+                          fontFamily: ds.font.mono,
                         }}
                       />
                     </Box>
@@ -521,7 +533,7 @@ const KubernetesPlusMinusLogsGradual: React.FC<KubernetesPlusMinusLogsGradualPro
           </Box>
         )}
       </Box>
-    </WidgetCard>
+    </Card>
   );
 };
 

@@ -1,20 +1,25 @@
-import { Box, Typography, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, CircularProgress } from '@mui/material';
-import { useState, useEffect } from 'react';
+import { Box, Typography, CircularProgress } from '@mui/material';
+import { useMemo } from 'react';
 import { ds } from 'src/utils/colors';
 import { formatMemory } from '@lib/formatter';
 import ArrowForwardIcon from '@mui/icons-material/ArrowForward';
 import DragHandleIcon from '@mui/icons-material/DragHandle';
 import Chart from '@ui/Chart';
 import { Card } from '@ui/Card';
-import k8sApi from '@api1/kubernetes';
 import { SavingsFooter } from './evidencePrimitives';
 import { safeParseJSON } from '@components/optimise-new/utils';
 import MetricQueryInfo, { K8S_METRIC_QUERY_LABELS } from '@shared/MetricQueryInfo';
+import CustomTable from '@shared/tables/CustomTable';
+import { perPodCaption } from './perPodTrend';
+import { buildTrendSeries } from './trendSeries';
+import type { RightSizingTrend } from '@hooks/useRightSizingTrend';
 
 interface RightSizingEvidenceProps {
   recommendation: any;
   estimatedSavings?: number;
   fullRecommendation?: any;
+  /** The usage trend, fetched once by the drawer and shared with the Details tab. */
+  trend: RightSizingTrend;
 }
 
 // Extract notifications from either format:
@@ -111,92 +116,30 @@ const ValueArrow = ({
   );
 };
 
-const RightSizingEvidence = ({ recommendation, estimatedSavings, fullRecommendation }: RightSizingEvidenceProps) => {
-  const rec = safeParseJSON(recommendation);
-  const containers = extractContainerData(rec);
+const PerPodCaption = ({ text }: { text: string }) => (
+  <Typography sx={{ fontSize: ds.text.caption, color: ds.gray[500], mb: ds.space[2] }}>{text}</Typography>
+);
 
-  // Fetch CPU/Memory trend data
-  const [trendData, setTrendData] = useState<any[]>([]);
-  const [trendLoading, setTrendLoading] = useState(false);
-  // Executed metric queries that produced the trend (only the prometheus datasource returns them).
-  const [cpuQueries, setCpuQueries] = useState<Record<string, string>>({});
-  const [memoryQueries, setMemoryQueries] = useState<Record<string, string>>({});
+const RightSizingEvidence = ({ recommendation, estimatedSavings, fullRecommendation, trend }: RightSizingEvidenceProps) => {
+  const rec = useMemo(() => safeParseJSON(recommendation), [recommendation]);
+  const containers = useMemo(() => extractContainerData(rec), [rec]);
 
-  useEffect(() => {
-    if (!fullRecommendation) return;
-    const accountId = fullRecommendation.account_id;
-    const meta = fullRecommendation.cloud_resourse?.meta || {};
-    const resourceType = fullRecommendation.cloud_resourse?.type || fullRecommendation.resource_type || '';
-    const namespaceName = fullRecommendation.resource_k8s_namespace || meta?.config?.namespace || meta?.namespace || meta?.namespaceName || '';
-    const isPod = resourceType === 'Pod';
-    const workloadName = isPod
-      ? meta?.controller || meta?.config?.controller || fullRecommendation.resource_name
-      : fullRecommendation.cloud_resourse?.name || fullRecommendation.resource_name;
-    const workloadType = isPod ? meta?.controllerKind || meta?.config?.controllerKind || 'Deployment' : resourceType || 'Deployment';
-    // For Pod-level: only pass podName if different from workloadName (matches existing page behavior)
-    const podName = isPod ? fullRecommendation.cloud_resourse?.name || fullRecommendation.resource_name : undefined;
-    const effectivePodName = podName && podName !== workloadName ? podName : undefined;
+  // The drawer owns the fetch (useRightSizingTrend); this tab draws it in full.
+  const { perPod, loading: trendLoading, hasData: hasTrendData, cpuQueries, memoryQueries } = trend;
+  const perPodCaptionText = perPodCaption(perPod);
 
-    if (!accountId || !namespaceName || !workloadName) return;
-
-    setTrendLoading(true);
-    setCpuQueries({});
-    setMemoryQueries({});
-    const startDate = new Date();
-    startDate.setDate(startDate.getDate() - 7);
-
-    // Match the existing KubernetesUtilization page: use 'prometheus' datasource with explicit metrics list
-    const query: any = {
-      accountId,
-      namespaceName,
-      workloadName,
-      workloadType: workloadType?.toLowerCase(),
-      startDate,
-      endDate: new Date(),
-      metrics: ['cpu_usage', 'memory_usage', 'cpu_limit', 'cpu_request', 'memory_limit', 'memory_request'],
-    };
-    if (effectivePodName) query.podName = effectivePodName;
-
-    const groupBy = ['tenant_id', 'account_id', 'timestamp'];
-    if (namespaceName) groupBy.push('namespace_name');
-    if (workloadName) groupBy.push('workload_name');
-    if (effectivePodName) groupBy.push('pod_name');
-
-    // Split the executed queries (keyed by metric, e.g. cpu_usage / memory_limit) into CPU and memory groups.
-    const applyQueries = (res: any) => {
-      const promQueries: Record<string, string> = res?.data?.promQueries || {};
-      const cpuQ: Record<string, string> = {};
-      const memQ: Record<string, string> = {};
-      Object.entries(promQueries).forEach(([key, q]) => {
-        if (key.startsWith('cpu_')) {
-          cpuQ[key] = q;
-        } else if (key.startsWith('memory_')) {
-          memQ[key] = q;
-        }
-      });
-      setCpuQueries(cpuQ);
-      setMemoryQueries(memQ);
-    };
-
-    k8sApi
-      .getK8sPodGroupings2(500, query, groupBy, 'prometheus')
-      .then((res: any) => {
-        const rows = res?.data?.k8s_pod_groupings || [];
-        if (rows.length > 0) {
-          setTrendData(rows);
-          applyQueries(res);
-          return;
-        }
-        // Fallback: try 'nb' (RPC) datasource for historical data
-        return k8sApi.getK8sPodGroupings2(500, query, groupBy, 'nb').then((res2: any) => {
-          setTrendData(res2?.data?.k8s_pod_groupings || []);
-        });
-      })
-      .catch((err: any) => {
-        console.error('[RightSizingEvidence] Failed to fetch pod trend data:', err);
-      })
-      .finally(() => setTrendLoading(false));
-  }, [fullRecommendation]);
+  // The recommended values from the recommendation JSONB draw the flat
+  // recommendation line, and the same builder feeds the compact Details chart,
+  // so both tabs plot identical numbers.
+  const firstContainer = containers[0];
+  const series = useMemo(
+    () => buildTrendSeries(perPod, firstContainer?.cpu?.recommended?.request, firstContainer?.memory?.recommended?.request),
+    [perPod, firstContainer]
+  );
+  const { labels: trendLabels, cpu, memory } = series;
+  const { usage: cpuUsage, request: cpuRequest, limit: cpuLimit, hasLimit: hasCpuLimit, busiest: cpuBusiest, recommended: cpuReccLine } = cpu;
+  const { usage: memUsage, request: memRequest, limit: memLimit, hasLimit: hasMemLimit, busiest: memBusiest, recommended: memReccLine } = memory;
+  const basis = perPod.source ? 'per pod' : 'all replicas';
 
   if (containers.length === 0) {
     return (
@@ -206,27 +149,6 @@ const RightSizingEvidence = ({ recommendation, estimatedSavings, fullRecommendat
       </Box>
     );
   }
-
-  // Prepare trend chart data — match existing KubernetesRecommendationCharts format
-  // Shows: Usage, Request, Limit, Recommendation as separate lines
-  const hasTrendData = trendData.length > 0;
-  const trendLabels = trendData.map((r: any) => {
-    const d = new Date(r.timestamp);
-    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-  });
-  const cpuUsage = trendData.map((r: any) => r.avg_cpu_used);
-  const cpuRequest = trendData.map((r: any) => r.avg_cpu_request);
-  const cpuLimit = trendData.map((r: any) => r.avg_cpu_limit);
-  const memUsage = trendData.map((r: any) => (r.avg_memory_used != null ? r.avg_memory_used / (1024 * 1024) : null));
-  const memRequest = trendData.map((r: any) => (r.avg_memory_request != null ? r.avg_memory_request / (1024 * 1024) : null));
-  const memLimit = trendData.map((r: any) => (r.avg_memory_limit != null ? r.avg_memory_limit / (1024 * 1024) : null));
-
-  // Get recommended values from recommendation JSONB to draw horizontal recommendation line
-  const firstContainer = containers[0];
-  const cpuReccValue = firstContainer?.cpu?.recommended?.request;
-  const memReccValue = firstContainer?.memory?.recommended?.request;
-  const cpuReccLine = cpuReccValue != null ? trendData.map(() => cpuReccValue) : null;
-  const memReccLine = memReccValue != null ? trendData.map(() => Number(formatMemory(memReccValue, 'bytes', 'mb', false))) : null;
 
   return (
     <Box sx={{ p: ds.space.mul(0, 7) }}>
@@ -259,27 +181,36 @@ const RightSizingEvidence = ({ recommendation, estimatedSavings, fullRecommendat
             size='sm'
             header={
               <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: ds.space[2] }}>
-                <span>CPU (cores) — 7 day trend</span>
+                <span>CPU (cores) {basis} — 7 day trend</span>
                 <MetricQueryInfo queries={cpuQueries} labelMap={K8S_METRIC_QUERY_LABELS} />
               </Box>
             }
             sx={{ mb: ds.space[3] }}
             data-testid='cpu-trend-card'
           >
+            {perPodCaptionText && <PerPodCaption text={perPodCaptionText} />}
             <Chart.Line
-              data={[cpuUsage, ...(cpuReccLine ? [cpuReccLine] : []), cpuRequest, ...(cpuLimit.some((v: any) => v != null) ? [cpuLimit] : [])]}
+              data={[
+                cpuUsage,
+                ...(cpuBusiest ? [cpuBusiest] : []),
+                ...(cpuReccLine ? [cpuReccLine] : []),
+                cpuRequest,
+                ...(hasCpuLimit ? [cpuLimit] : []),
+              ]}
               labels={trendLabels}
               colors={[
                 ds.blue[500],
+                ...(cpuBusiest ? [ds.blue[200]] : []),
                 ...(cpuReccLine ? [ds.green[600]] : []),
                 ds.gray[400],
-                ...(cpuLimit.some((v: any) => v != null) ? [ds.red[500]] : []),
+                ...(hasCpuLimit ? [ds.red[500]] : []),
               ]}
               chartLabel={[
                 'Usage',
+                ...(cpuBusiest ? ['Busiest pod'] : []),
                 ...(cpuReccLine ? ['Recommendation'] : []),
                 'Requested',
-                ...(cpuLimit.some((v: any) => v != null) ? ['Limit'] : []),
+                ...(hasCpuLimit ? ['Limit'] : []),
               ]}
               minHeight={180}
               dynamicHeight={false}
@@ -291,27 +222,36 @@ const RightSizingEvidence = ({ recommendation, estimatedSavings, fullRecommendat
             size='sm'
             header={
               <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: ds.space[2] }}>
-                <span>Memory (MB) — 7 day trend</span>
+                <span>Memory (MB) {basis} — 7 day trend</span>
                 <MetricQueryInfo queries={memoryQueries} labelMap={K8S_METRIC_QUERY_LABELS} />
               </Box>
             }
             sx={{ mb: ds.space[3] }}
             data-testid='memory-trend-card'
           >
+            {perPodCaptionText && <PerPodCaption text={perPodCaptionText} />}
             <Chart.Line
-              data={[memUsage, ...(memReccLine ? [memReccLine] : []), memRequest, ...(memLimit.some((v: any) => v != null) ? [memLimit] : [])]}
+              data={[
+                memUsage,
+                ...(memBusiest ? [memBusiest] : []),
+                ...(memReccLine ? [memReccLine] : []),
+                memRequest,
+                ...(hasMemLimit ? [memLimit] : []),
+              ]}
               labels={trendLabels}
               colors={[
                 ds.purple[500],
+                ...(memBusiest ? [ds.purple[200]] : []),
                 ...(memReccLine ? [ds.green[600]] : []),
                 ds.gray[400],
-                ...(memLimit.some((v: any) => v != null) ? [ds.red[500]] : []),
+                ...(hasMemLimit ? [ds.red[500]] : []),
               ]}
               chartLabel={[
                 'Usage',
+                ...(memBusiest ? ['Busiest pod'] : []),
                 ...(memReccLine ? ['Recommendation'] : []),
                 'Requested',
-                ...(memLimit.some((v: any) => v != null) ? ['Limit'] : []),
+                ...(hasMemLimit ? ['Limit'] : []),
               ]}
               minHeight={180}
               dynamicHeight={false}
@@ -323,55 +263,35 @@ const RightSizingEvidence = ({ recommendation, estimatedSavings, fullRecommendat
       {/* Limits table */}
       {containers.some(({ cpu, memory }) => cpu?.allocated?.limit || memory?.allocated?.limit) && (
         <Card variant='outlined' elevation='flat' size='sm' header='Limits' sx={{ mb: ds.space[3] }} data-testid='limits-card'>
-          <TableContainer
-            sx={{
-              '& .MuiTableCell-root': { py: ds.space[2], fontSize: ds.text.small, borderColor: ds.gray[100] },
-              '& .MuiTableCell-root:first-of-type': { pl: 0 },
-              '& .MuiTableCell-root:last-of-type': { pr: 0 },
-              '& .MuiTableCell-root:not(:first-of-type):not(:last-of-type)': { px: ds.space.mul(0, 5) },
-            }}
-          >
-            <Table size='small'>
-              <TableHead>
-                <TableRow sx={{ backgroundColor: ds.blue[100] }}>
-                  <TableCell sx={{ fontWeight: ds.weight.semibold, color: ds.gray[700], fontSize: 'var(--ds-text-caption) !important' }}>
-                    Container
-                  </TableCell>
-                  <TableCell sx={{ fontWeight: ds.weight.semibold, color: ds.gray[700], fontSize: 'var(--ds-text-caption) !important' }}>
-                    CPU Limit (Core)
-                  </TableCell>
-                  <TableCell sx={{ fontWeight: ds.weight.semibold, color: ds.gray[700], fontSize: 'var(--ds-text-caption) !important' }}>
-                    Memory Limit (MB)
-                  </TableCell>
-                </TableRow>
-              </TableHead>
-              <TableBody>
-                {containers.map(({ containerName, cpu, memory }) => (
-                  <TableRow key={containerName} sx={{ '&:last-child td': { borderBottom: 'none' } }}>
-                    <TableCell>
-                      <Typography sx={{ fontSize: ds.text.small, color: ds.gray[700], fontWeight: ds.weight.medium, fontStyle: 'italic' }}>
-                        {containerName}
-                      </Typography>
-                    </TableCell>
-                    <TableCell>
-                      {cpu?.allocated?.limit != null || cpu?.recommended?.limit != null ? (
-                        <ValueArrow current={cpu?.allocated?.limit} recommended={cpu?.recommended?.limit} unit='cores' />
-                      ) : (
-                        <Typography sx={{ fontSize: ds.text.small, color: ds.gray[500] }}>—</Typography>
-                      )}
-                    </TableCell>
-                    <TableCell>
-                      {memory?.allocated?.limit != null || memory?.recommended?.limit != null ? (
-                        <ValueArrow current={memory?.allocated?.limit} recommended={memory?.recommended?.limit} unit='MB' isMem />
-                      ) : (
-                        <Typography sx={{ fontSize: ds.text.small, color: ds.gray[500] }}>—</Typography>
-                      )}
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </TableContainer>
+          <CustomTable
+            headers={['Container', 'CPU Limit (Core)', 'Memory Limit (MB)']}
+            tableData={containers.map(({ containerName, cpu, memory }) => [
+              {
+                component: (
+                  <Typography sx={{ fontSize: ds.text.small, color: ds.gray[700], fontWeight: ds.weight.medium, fontStyle: 'italic' }}>
+                    {containerName}
+                  </Typography>
+                ),
+                data: containerName,
+              },
+              {
+                component:
+                  cpu?.allocated?.limit != null || cpu?.recommended?.limit != null ? (
+                    <ValueArrow current={cpu?.allocated?.limit} recommended={cpu?.recommended?.limit} unit='cores' />
+                  ) : (
+                    <Typography sx={{ fontSize: ds.text.small, color: ds.gray[500] }}>—</Typography>
+                  ),
+              },
+              {
+                component:
+                  memory?.allocated?.limit != null || memory?.recommended?.limit != null ? (
+                    <ValueArrow current={memory?.allocated?.limit} recommended={memory?.recommended?.limit} unit='MB' isMem />
+                  ) : (
+                    <Typography sx={{ fontSize: ds.text.small, color: ds.gray[500] }}>—</Typography>
+                  ),
+              },
+            ])}
+          />
         </Card>
       )}
 
@@ -463,7 +383,7 @@ const RightSizingEvidence = ({ recommendation, estimatedSavings, fullRecommendat
 const PercentileItem = ({ label, value }: { label: string; value: string }) => (
   <Box sx={{ display: 'flex', justifyContent: 'space-between', py: ds.space[1] }}>
     <Typography sx={{ fontSize: ds.text.caption, color: ds.gray[500] }}>{label}</Typography>
-    <Typography sx={{ fontSize: ds.text.caption, color: ds.gray[700], fontWeight: ds.weight.medium, fontFamily: 'monospace' }}>{value}</Typography>
+    <Typography sx={{ fontSize: ds.text.caption, color: ds.gray[700], fontWeight: ds.weight.medium, fontFamily: ds.font.mono }}>{value}</Typography>
   </Box>
 );
 
@@ -499,7 +419,7 @@ const UtilizationBar = ({
     <Box>
       <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: ds.space[1] }}>
         <Typography sx={{ fontSize: ds.text.caption, fontWeight: ds.weight.semibold, color: ds.gray[700] }}>{label} Usage (P99)</Typography>
-        <Typography sx={{ fontSize: ds.text.caption, color: ds.gray[500], fontFamily: 'monospace' }}>
+        <Typography sx={{ fontSize: ds.text.caption, color: ds.gray[500], fontFamily: ds.font.mono }}>
           {fmt(usage)} / {fmt(allocated)} {unit} ({pct.toFixed(0)}%)
         </Typography>
       </Box>

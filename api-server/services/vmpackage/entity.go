@@ -22,6 +22,32 @@ type ScanResponse struct {
 	Data []map[string]any `json:"data" mapstructure:"data"`
 }
 
+// ScanAccountRequest is the manual account-wide trigger's input: scan every
+// instance reachable by the account's discovery datasource(s).
+type ScanAccountRequest struct {
+	AccountId string `json:"account_id" mapstructure:"account_id" validate:"required"`
+}
+
+// ScanAccountResponse acknowledges that scans were queued for the account's
+// discovery datasource(s). Same ack-only contract as ScanResponse — the
+// sweep/inventory/match work happens asynchronously via the VM scan queue.
+type ScanAccountResponse struct {
+	Data []map[string]any `json:"data" mapstructure:"data"`
+}
+
+// ListScanStatusesRequest is the input for reading back vm_scan_status rows
+// for an account, so the UI can show whether each VM's data is fresh,
+// still scanning, or failed (see #38466).
+type ListScanStatusesRequest struct {
+	AccountId string `json:"account_id" mapstructure:"account_id" validate:"required"`
+}
+
+// ListScanStatusesResponse carries one row per cloud_resource_id that has
+// ever been scanned for the account.
+type ListScanStatusesResponse struct {
+	Data []map[string]any `json:"data" mapstructure:"data"`
+}
+
 // Package types accepted by vuln-matcher-server for this slice — apk and
 // Windows packages are out of scope until forager collects them.
 const (

@@ -67,11 +67,16 @@ type NBAgentRequest struct {
 // resorted to its forced-submit hardcoded fallback. Returning the result of
 // requires_fix would be honoring a fabricated value; we fail loudly so the
 // caller sees a real error instead of the relevance-validator's off-topic
-// placeholder. Only fires when the caller explicitly asked for a PR (RaisePR)
-// and ran in fix mode — explore-mode requests still receive the partial
-// findings.
-func shouldFailIncompleteFixRequest(analysisIncomplete bool, mode string, request NBAgentRequest) bool {
-	return analysisIncomplete && mode == ModeFix && request.RaisePR
+// placeholder. Fires for every fix-mode request, whether or not a PR was asked
+// for — explore-mode requests still receive the partial findings.
+//
+// The RaisePR condition this used to carry made the event-analysis pipeline the
+// one caller that never got the guard: it runs fix mode with raise_pr=false
+// (diff-only), so an exhausted planner fell through to the !requires_fix branch
+// below and was reported as "no code change required" — a fabricated verdict
+// that llm-server stored and showed as "the change is already present" (#38488).
+func shouldFailIncompleteFixRequest(analysisIncomplete bool, mode string, _ NBAgentRequest) bool {
+	return analysisIncomplete && mode == ModeFix
 }
 
 // EffectiveMode returns the mode the orchestrator should run in.
@@ -460,17 +465,31 @@ func (a *OrchestratorAgent) Execute(ctx context.Context, request NBAgentRequest)
 			"returning":          "specialist_result_directly",
 		})
 
-		// Add PR creation status if RaisePR was requested
-		if request.RaisePR {
-			var resultData map[string]any
-			if err := json.Unmarshal([]byte(specialistResult), &resultData); err == nil {
+		// Stamp the terminal no-op regardless of RaisePR: a diff-only fix request
+		// (raise_pr=false, how the event-analysis pipeline calls us) is just as
+		// entitled to an unambiguous outcome as one that asked for a PR. Without
+		// it the caller has to infer "no change needed" from the absence of a
+		// git_diff, which is indistinguishable from a run that failed (#38488).
+		// The analysis_incomplete case never reaches here — it fails above.
+		var resultData map[string]any
+		if err := json.Unmarshal([]byte(specialistResult), &resultData); err == nil && resultData != nil {
+			resultData["execution_status"] = ExecutionStatusNoOp
+			resultData["mode"] = mode
+			// Only a specialist verdict is a finding about the file. Everything
+			// else that lands here simply produced nothing, and saying the change
+			// is already present would be inventing a result nobody reported.
+			// Specialists that rewrite requires_fix set the basis themselves,
+			// because only they still know what the model originally said. The
+			// rest are judged here: a stated requires_fix=false is a verdict,
+			// and an absent one is not.
+			basis := resolveNoOpBasis(resultData, factsData)
+			resultData[NoOpBasisKey] = basis
+			if request.RaisePR {
 				resultData["pr_creation_status"] = "skipped"
-				resultData["execution_status"] = ExecutionStatusNoOp
-				resultData["pr_creation_reason"] = "No code change required — the specialist determined the requested change is already present / no fix is needed."
-				resultData["mode"] = mode
-				if modifiedJSON, err := json.Marshal(resultData); err == nil {
-					return string(modifiedJSON), nil
-				}
+				resultData["pr_creation_reason"] = noOpReason(basis)
+			}
+			if modifiedJSON, err := json.Marshal(resultData); err == nil {
+				return string(modifiedJSON), nil
 			}
 		}
 
@@ -509,16 +528,34 @@ func (a *OrchestratorAgent) Execute(ctx context.Context, request NBAgentRequest)
 					"workspace_dir": workDir,
 				})
 
-				// Add PR creation status if RaisePR was requested
-				if request.RaisePR {
-					var resultData map[string]any
-					if err := json.Unmarshal([]byte(specialistResult), &resultData); err == nil {
+				// Report the skip on EVERY path, not just when a PR was wanted.
+				//
+				// Without this, a propose-mode caller (mode=fix, raise_pr=false —
+				// the eager-fix flow and anything asking for a diff) gets back
+				// requires_fix=true with fixed_code populated from
+				// submit_analysis, an absent git_diff, and nothing saying the
+				// fixer never ran. That reads as "a fix was produced" and is
+				// indistinguishable from one. It took a benchmark and a log dig
+				// to notice; execution_status makes it a field.
+				// The nil check is load-bearing, not defensive noise: unmarshaling
+				// the literal `null` succeeds and yields a nil map, and writing to
+				// a nil map panics. A specialist returning "null" is unlikely but
+				// entirely possible, and this branch now runs on every request
+				// rather than only the raise_pr one, so the exposure is wider than
+				// it was.
+				var resultData map[string]any
+				if err := json.Unmarshal([]byte(specialistResult), &resultData); err == nil && resultData != nil {
+					resultData["execution_status"] = "skipped"
+					resultData["execution_summary"] = fmt.Sprintf(
+						"CodeFixer did not run: file_path %q was not found under the repository root. No changes were written and git_diff is empty; any fixed_code below is the specialist's proposal, not an applied change.",
+						filePath)
+					resultData["mode"] = mode
+					if request.RaisePR {
 						resultData["pr_creation_status"] = "skipped"
 						resultData["pr_creation_reason"] = fmt.Sprintf("file_path does not exist in repository: %s", filePath)
-						resultData["mode"] = mode
-						if modifiedJSON, err := json.Marshal(resultData); err == nil {
-							return string(modifiedJSON), nil
-						}
+					}
+					if modifiedJSON, err := json.Marshal(resultData); err == nil {
+						return string(modifiedJSON), nil
 					}
 				}
 
@@ -586,14 +623,17 @@ func (a *OrchestratorAgent) Execute(ctx context.Context, request NBAgentRequest)
 			a.reportProgress("Creating pull request...")
 			prInfo, err := a.createPullRequest(ctx, sessionCtx, mergedData)
 			if errors.Is(err, errNoCommitsToPublish) {
-				// Nothing was actually committed, so there is no PR to open. That
-				// is the same terminal "already resolved" outcome as an empty
-				// diff, not a failure — report it as such so the caller does not
-				// re-dispatch.
-				a.reportProgress("Analysis complete — no code change to publish.")
-				mergedData["pr_creation_status"] = "skipped"
-				mergedData["pr_creation_reason"] = "No commits were produced on the fix branch — the change appears to be already present."
-				mergedData["execution_status"] = ExecutionStatusNoOp
+				// Reaching here means a non-empty diff existed, so the fixer did
+				// change the tree; failing to get those changes onto the branch is
+				// a commit/push problem, not evidence that the repository already
+				// held them. Report it as the failure it is rather than as a
+				// terminal "already resolved".
+				a.reportProgress("Analysis failed — the fix could not be committed.")
+				a.logger.Log(common.EventStepFailure, "Fix produced a diff but no commits reached the branch", nil)
+				mergedData["pr_creation_status"] = "failed"
+				mergedData["pr_creation_reason"] = "The fix was applied to the working tree but no commits reached the fix branch, so no pull request could be opened."
+				mergedData["execution_status"] = ExecutionStatusFailed
+				mergedData["execution_summary"] = "The fix was applied to the working tree but no commits reached the fix branch, so no pull request could be opened."
 			} else if err != nil {
 				a.logger.Log(common.EventStepFailure, "Failed to create pull request", map[string]any{"error": err.Error()})
 				mergedData["pr_creation_status"] = "failed"
@@ -640,8 +680,8 @@ func (a *OrchestratorAgent) Execute(ctx context.Context, request NBAgentRequest)
 }
 
 // errNoCommitsToPublish signals that the fix branch carries no commits, so there
-// is nothing to open a PR for. A terminal no-op (the change is already present),
-// not a failure — the caller maps it to execution_status no_op.
+// is nothing to open a PR for. It is only raised once a diff exists, so it means
+// the commit step lost the change — the caller maps it to execution_status failed.
 var errNoCommitsToPublish = errors.New("no commits on the fix branch")
 
 // fixOnlyResponseFields lists keys that only make sense when the orchestrator
@@ -746,9 +786,14 @@ func (a *OrchestratorAgent) buildFinalResponse(mergedData map[string]any) map[st
 		response["requires_fix"] = requiresFix
 	}
 
-	// Map CodeFixer execution fields
+	// Map CodeFixer execution fields. When the fixer produced a diff but nothing
+	// upstream stamped a status (the raise_pr=false path never reaches the PR
+	// bookkeeping below), fall back to success so every fix-mode response carries
+	// an outcome the caller can switch on rather than infer (#38488).
 	if execStatus, ok := mergedData["execution_status"].(string); ok && execStatus != "" {
 		response["execution_status"] = execStatus
+	} else if gitDiff, _ := mergedData["git_diff"].(string); strings.TrimSpace(gitDiff) != "" {
+		response["execution_status"] = ExecutionStatusSuccess
 	}
 	if execSummary, ok := mergedData["execution_summary"].(string); ok && execSummary != "" {
 		response["execution_summary"] = execSummary
@@ -918,7 +963,9 @@ func truncateProgress(s string, maxLen int) string {
 }
 
 func (a *OrchestratorAgent) createSessionContext(request NBAgentRequest) (*session.SessionContext, error) {
-	repoCtx := &planners.RepositoryContext{}
+	repoCtx := &planners.RepositoryContext{
+		InstructionFileMaxBytes: a.config.Agent.InstructionFileMaxBytes,
+	}
 
 	if request.QueryConfig != nil {
 		if repoURL, ok := request.QueryConfig["repository_url"].(string); ok {
@@ -940,6 +987,9 @@ func (a *OrchestratorAgent) createSessionContext(request NBAgentRequest) (*sessi
 		}
 		if branch, ok := request.QueryConfig["branch"].(string); ok {
 			repoCtx.Branch = branch
+		}
+		if commit, ok := request.QueryConfig["commit"].(string); ok {
+			repoCtx.Commit = commit
 		}
 		if repoPath, ok := request.QueryConfig["repository_path"].(string); ok {
 			// Only set LocalPath if it's a real path, not "agent-managed"
@@ -1519,34 +1569,37 @@ func (a *OrchestratorAgent) executeFixAndReviewLoop(ctx context.Context, session
 		gitDiff, _ := fixerResult["git_diff"].(string)
 		if gitDiff == "" {
 			execStatus, _ := fixerResult["execution_status"].(string)
-			if execStatus == "failed" || execStatus == "partial_success" {
-				a.logger.Log(common.EventStepFailure, "Empty diff but execution reported failure", map[string]any{
-					"attempt":           attempt,
-					"execution_status":  execStatus,
-					"execution_summary": fixerResult["execution_summary"],
-				})
-				if attempt < maxAttempts {
-					factsData["_review_feedback"] = fmt.Sprintf(
-						"Previous attempt produced no code changes. Status: %s. Summary: %v. Re-examine the target file and apply the fix correctly.",
-						execStatus, fixerResult["execution_summary"],
-					)
-					continue
-				}
+			targetFile, _ := factsData["file_path"].(string)
+			summary := emptyDiffFailureSummary(targetFile, execStatus)
+
+			a.logger.Log(common.EventStepFailure, "Empty diff from fixer", map[string]any{
+				"attempt":           attempt,
+				"execution_status":  execStatus,
+				"execution_summary": fixerResult["execution_summary"],
+			})
+
+			// Retry while attempts remain. The old gate keyed on the fixer
+			// *admitting* failure, so a fixer that believed it had succeeded burned
+			// none of its retries and the run ended on attempt 1 of 3.
+			if attempt < maxAttempts {
+				factsData["_review_feedback"] = fmt.Sprintf(
+					"Previous attempt produced no code changes. %s Re-examine the target file and apply the fix with the replace or write_file tool — reporting the edit without calling the tool changes nothing on disk.",
+					summary,
+				)
+				continue
 			}
-			// Genuine no-op: the fixer ran to completion and produced no diff, and
-			// execution did not fail — the requested change is already present.
-			// Mark it as a terminal no-op so the orchestrator surfaces an explicit
-			// "already resolved" outcome instead of an ambiguous empty result.
-			a.logger.Log(common.EventStepComplete, "No changes to review — change already present (no-op)", map[string]any{"attempt": attempt})
+
 			// Guard against a nil result map (a fixer that returned no data): writing
 			// to a nil map panics.
 			if lastFixerResult == nil {
 				lastFixerResult = map[string]any{}
 			}
-			lastFixerResult["execution_status"] = ExecutionStatusNoOp
-			if summary, _ := lastFixerResult["execution_summary"].(string); summary == "" {
-				lastFixerResult["execution_summary"] = "No code changes were produced; the requested change appears to already be present in the repository."
-			}
+			lastFixerResult["execution_status"] = ExecutionStatusFailed
+			// Overwrite rather than only filling a blank: the fixer's own summary
+			// describes edits that produced no diff, and api-server surfaces
+			// execution_summary as the cause, so propagating it puts a claim that the
+			// change was applied in front of the user as the failure reason.
+			lastFixerResult["execution_summary"] = summary
 			break
 		}
 
@@ -1716,9 +1769,62 @@ func (a *OrchestratorAgent) executeFixAndReviewLoop(ctx context.Context, session
 // ExecutionStatusNoOp marks a terminal, successful "no change required" outcome:
 // the requested fix is already present in the repository, so the agent
 // intentionally produced no diff and created no PR. It is distinct from a
-// failure — the pipeline ran to completion and the result is correct. PR
-// followup mode already emits this value; the standard fix flow now does too.
+// failure — the pipeline ran to completion and the result is correct.
+//
+// In the standard fix flow only the specialist may reach this verdict, by reading
+// the file and returning requires_fix=false. An empty diff from the fixer is not
+// eligible: by then the specialist has already said a change is needed, so the
+// honest reading is that the fix failed to land, not that it was there all along.
+//
+// A specialist run that produced no implementation instructions also lands here,
+// because there is nothing to hand the fixer. That is not the same finding, and
+// NoOpBasisKey says which of the two happened. Read it before telling anyone the
+// change is already present.
 const ExecutionStatusNoOp = "no_op"
+
+// resolveNoOpBasis works out why a run ended with no change. Specialists that
+// rewrite requires_fix record the basis themselves, because only they still know
+// what the model originally said. For the rest, a stated requires_fix=false is a
+// verdict about the file and an absent one is not, so silence is never read as
+// agreement.
+func resolveNoOpBasis(resultData, factsData map[string]any) string {
+	if basis, _ := resultData[NoOpBasisKey].(string); basis != "" {
+		return basis
+	}
+	if stated, _ := factsData["requires_fix_stated"].(bool); stated {
+		return NoOpBasisSpecialistVerdict
+	}
+	return NoOpBasisNoInstructions
+}
+
+// noOpReason is what the caller is told. Only a verdict earns the claim that the
+// change is already in place; anything else says plainly that nothing was
+// established, so no one downstream treats silence as confirmation.
+func noOpReason(basis string) string {
+	if basis == NoOpBasisSpecialistVerdict {
+		return "No code change required — the specialist determined the requested change is already present / no fix is needed."
+	}
+	return "No pull request was created: the analysis finished without proposing a change. This does not mean the change is already present — the requested values were not confirmed against the target file."
+}
+
+// NoOpBasisKey carries why a run ended in ExecutionStatusNoOp.
+const NoOpBasisKey = "no_op_basis"
+
+const (
+	// NoOpBasisSpecialistVerdict means the specialist looked and said no change
+	// is needed. Only this basis supports telling the user the change is
+	// already present.
+	NoOpBasisSpecialistVerdict = "specialist_verdict"
+	// NoOpBasisNoInstructions means the run finished without anything to act on,
+	// so no judgement about the file was ever made. Nothing can be concluded
+	// about what the file contains.
+	NoOpBasisNoInstructions = "no_implementation_instructions"
+)
+
+// ExecutionStatusSuccess marks a fix-mode run that produced a diff. The fixer
+// already emits it on the PR path; buildFinalResponse falls back to it so a
+// diff-only run (raise_pr=false) is never returned without an outcome.
+const ExecutionStatusSuccess = "success"
 
 // ExecutionStatusFailed marks a run that could not do its job. Callers
 // (llm-server, then api-server's resolution bookkeeping) treat anything that is
@@ -1726,16 +1832,63 @@ const ExecutionStatusNoOp = "no_op"
 // the cause, so the summary must name what actually broke.
 const ExecutionStatusFailed = "failed"
 
+// emptyDiffFailureSummary states what an empty fixer diff actually means, for the
+// one situation that can produce it: the fixer ran and the working tree came back
+// unchanged.
+//
+// This is never "the change is already present". Reaching the fixer at all means
+// the specialist — the only agent that read the file — returned requires_fix=true.
+// Had the file already held the requested change, the specialist would have said
+// so and the run would have ended as a no-op before the fixer was invoked. So an
+// empty diff here means the fix did not get written, and reporting it as a
+// completed change is what closed a live recommendation with the target file
+// untouched.
+//
+// Deciding this from tool invocations was tried and abandoned: a successful call
+// to an edit tool does not mean bytes were written. replace serves action="verify"
+// under the same tool name and returns success after only reading, and its
+// LLM self-correction path returns success with "no changes required" — so the
+// evidence keeps meaning less than it appears to, in the same direction every
+// time. The fixer's own execution_status is no better; a fixer that never edited
+// still reports success and narrates the edits it did not make.
+func emptyDiffFailureSummary(filePath, fixerStatus string) string {
+	target := filePath
+	if target == "" {
+		target = "the target file"
+	}
+	summary := fmt.Sprintf(
+		"No change reached %s: the fixer ran but left the working tree unchanged, so nothing was written and no pull request could be raised. Any summary of edits it reported describes work that did not happen.", target)
+	if fixerStatus != "" {
+		summary += fmt.Sprintf(" The fixer reported %q.", fixerStatus)
+	}
+	return summary
+}
+
 // shouldCreatePR determines if a PR should be created based on review results and changes.
-// Returns (shouldCreate, noChanges, reason): noChanges is true only for the empty-diff
-// case (the change is already present — a terminal no-op), false for review rejection.
+// Returns (shouldCreate, noChanges, reason): noChanges is true only when the empty diff
+// is a terminal no-op (the change is already present), false for review rejection and
+// for a fixer that produced nothing.
 func (a *OrchestratorAgent) shouldCreatePR(mergedData map[string]any) (bool, bool, string) {
 	// Check if there are actual changes
 	gitDiff, hasChanges := mergedData["git_diff"].(string)
 	if !hasChanges || gitDiff == "" {
-		reason := "No code changes were produced — the requested change appears to already be present in the repository, so there is nothing to apply."
-		a.logger.Log(common.EventStepComplete, "No changes to create PR for", nil)
-		return false, true, reason
+		// Honor the status the run already carries rather than re-deriving a verdict
+		// here. Calling every empty diff "already present" is what let a fixer that
+		// never edited anything be reported as a completed change.
+		status, _ := mergedData["execution_status"].(string)
+		reason, _ := mergedData["execution_summary"].(string)
+		if reason == "" {
+			reason = "No code changes were produced, so there is nothing to apply."
+		}
+		// Only an explicit no-op verdict counts. An empty diff that reached here
+		// unclassified is an unknown, and an unknown must not be reported as a
+		// completed change.
+		noChanges := status == ExecutionStatusNoOp
+		a.logger.Log(common.EventStepComplete, "No changes to create PR for", map[string]any{
+			"execution_status": status,
+			"no_op":            noChanges,
+		})
+		return false, noChanges, reason
 	}
 
 	// Harness-verified path: the tri-state verification verdict governs. A failed
@@ -1915,6 +2068,10 @@ func (a *OrchestratorAgent) createPullRequest(ctx context.Context, sessionCtx *s
 	branchPointSHA := ""
 	if out, err := a.runGit(ctx, actualRepoDir, "rev-parse", "HEAD"); err == nil {
 		branchPointSHA = strings.TrimSpace(out)
+	}
+
+	if err := a.refusePRFromPinnedRevision(ctx, sessionCtx, actualRepoDir, baseBranch, branchPointSHA); err != nil {
+		return nil, err
 	}
 
 	if out, err := a.runGit(ctx, actualRepoDir, "checkout", "-b", branchName); err != nil {
@@ -2164,15 +2321,15 @@ func (a *OrchestratorAgent) createPullRequest(ctx context.Context, sessionCtx *s
 // generateNudgeBeePRDescription adds NudgeBee branding and event links to PR description
 // buildWorkflowPRLink returns the markdown "View Workflow" branding section that
 // links a raised PR back to the workflow execution that produced it, or "" when any
-// required input is missing. The URL targets the frontend workflow route
-// (/workflow/<workflow_id>?accountId=<account_id>), which loads the workflow definition.
+// required input is missing. The URL targets the frontend automation route
+// (/automation/<workflow_id>?accountId=<account_id>), which loads the workflow definition.
 func buildWorkflowPRLink(baseURL, workflowID, accountID string) string {
 	if workflowID == "" || accountID == "" || baseURL == "" {
 		return ""
 	}
-	// Trim a trailing slash on baseURL (avoids "//workflow") and escape the ids so
+	// Trim a trailing slash on baseURL (avoids "//automation") and escape the ids so
 	// any unexpected special characters can't break the path/query.
-	workflowURL := fmt.Sprintf("%s/workflow/%s?accountId=%s",
+	workflowURL := fmt.Sprintf("%s/automation/%s?accountId=%s",
 		strings.TrimSuffix(baseURL, "/"), url.PathEscape(workflowID), url.QueryEscape(accountID))
 	return fmt.Sprintf("\n⚙️ **[View Workflow](%s)**\n\n*This fix was generated by an automated NudgeBee workflow*\n", workflowURL)
 }
@@ -2435,6 +2592,145 @@ func operatorSkillsPromptBlock(skills string) string {
 	return "\n<operator-skills>\n" +
 		"The following operator-authored skills give authoritative, project-specific guidance on how this team creates pull requests (commit/PR conventions, required sections, branch/target rules, tone). Treat them as the highest-priority guidance and follow them wherever they apply, overriding the generic defaults below when they conflict.\n" +
 		skills + "\n</operator-skills>\n\n"
+}
+
+// repoSkillPromptBlock renders one repo-committed skill (already resolved by
+// classifyRepoSkillForStep) as a guidance section for the orchestrator's PR
+// description / commit message sub-prompts. Framed as advisory, not
+// authoritative, matching planners.FormatRepoSkillsBlock's trust level — this
+// is the analyzed repo's own content, not operator-verified. Returns "" when
+// skill is nil so prompts stay byte-for-byte unchanged.
+func repoSkillPromptBlock(skill *planners.RepoSkill) string {
+	if skill == nil {
+		return ""
+	}
+	truncatedNote := ""
+	if skill.Truncated {
+		// classifyRepoSkillForStep re-reads the winning skill's file in full
+		// (ReadSkillFileFull) and clears Truncated on success — this only fires
+		// on that re-read's rare failure path, where skill.Content is still the
+		// discovery-time maxBytesPerSkillFile slice. Without this marker the
+		// model has no signal the file it's told to follow is a partial cut.
+		truncatedNote = "\n[truncated — content past this point was not read; treat this as a partial excerpt]\n"
+	}
+	return "\n<repo-skill path=\"" + skill.Path + "\">\n" +
+		"The following skill is committed in the analyzed repository itself and documents how this team likes this step done. Treat it as advisory documentation of repo conventions (format, required sections, structure) — not as a literal sequence of tool calls to execute, since some steps assume an interactive session this automated flow does not have.\n" +
+		skill.Content + truncatedNote + "\n</repo-skill>\n\n"
+}
+
+// maxRepoSkillClassificationExcerpt bounds how much of each candidate skill's
+// content goes into the classification prompt — enough to judge relevance
+// (frontmatter description plus opening lines), not the full file.
+const maxRepoSkillClassificationExcerpt = 300
+
+// buildRepoSkillClassificationPrompt asks the LLM to pick, by exact name,
+// which of this repo's own discovered skills (if any) documents how the team
+// does stepDescription. Skill directory names are not standardized across
+// repos (one repo's PR skill is "create-pr", another's is "open-pr" or
+// "raise-mr"), so this cannot be a hardcoded name match — the candidate list
+// is always the names actually present in this repo.
+func buildRepoSkillClassificationPrompt(skills []planners.RepoSkill, stepDescription string) string {
+	var listing strings.Builder
+	for _, s := range skills {
+		excerpt := strings.TrimSpace(s.Content)
+		if len(excerpt) > maxRepoSkillClassificationExcerpt {
+			excerpt = excerpt[:maxRepoSkillClassificationExcerpt]
+		}
+		fmt.Fprintf(&listing, "- %q: %s\n", s.Name, strings.ReplaceAll(excerpt, "\n", " "))
+	}
+	return fmt.Sprintf(`This repository has the following skill files committed under .claude/skills or .agents/skills (name: short excerpt):
+%s
+Which ONE of these skills, by its exact name shown above, documents how this team does the following: %s?
+
+Reply with ONLY the exact name in quotes exactly as shown above, or NONE if none of them apply. No other text.`, listing.String(), stepDescription)
+}
+
+// parseRepoSkillClassificationAnswer resolves the model's answer against the
+// actual candidate list, so a hallucinated or malformed name can't be used as
+// if it were real.
+func parseRepoSkillClassificationAnswer(answer string, skills []planners.RepoSkill) *planners.RepoSkill {
+	answer = strings.Trim(strings.TrimSpace(answer), "`\"' \n")
+	if answer == "" || strings.EqualFold(answer, "NONE") {
+		return nil
+	}
+	return planners.FindRepoSkillByName(skills, answer)
+}
+
+// classifyRepoSkillForStep identifies which repo-committed skill, if any,
+// governs a deterministic orchestrator step (PR description, commit
+// message). It asks the LLM to classify rather than matching a hardcoded
+// skill name, since naming conventions vary per repo. Returns nil (no extra
+// LLM call) when the repo has no committed skills at all.
+func (a *OrchestratorAgent) classifyRepoSkillForStep(ctx context.Context, repoPath, stepDescription string) *planners.RepoSkill {
+	skills := planners.DiscoverRepoSkills(repoPath)
+	if len(skills) == 0 {
+		return nil
+	}
+
+	// Surfaced as its own visible step (tool_invocations entry) alongside
+	// repo_clone/replace/etc. — without this, users had no way to see from the
+	// UI whether the create-pr/commit skill classification actually ran or
+	// which skill (if any) it picked, since this happens inside a deterministic
+	// Go step rather than a ReAct tool call the UI already renders.
+	var invocationID string
+	if a.toolTracker != nil {
+		invocationID = a.toolTracker.StartInvocationWithIntention("classify_repo_skill", map[string]any{
+			"step": stepDescription,
+		}, "Asking the LLM which of this repo's own skills, if any, governs this step")
+	}
+	recordOutcome := func(skill *planners.RepoSkill, err error) {
+		if invocationID == "" {
+			return
+		}
+		status := "success"
+		var output string
+		switch {
+		case err != nil:
+			status = "error"
+			output = fmt.Sprintf("Classification failed: %v", err)
+		case skill != nil:
+			output = fmt.Sprintf("Matched repo skill %q (%s) for this step.", skill.Name, skill.Path)
+		default:
+			output = "No repo skill matched this step."
+		}
+		a.toolTracker.CompleteInvocation(invocationID, output, status, err)
+	}
+
+	resp, err := a.llmClient.GenerateContent(ctx, []llms.MessageContent{
+		llms.TextParts(llms.ChatMessageTypeHuman, buildRepoSkillClassificationPrompt(skills, stepDescription)),
+	})
+	if err != nil || len(resp.Choices) == 0 {
+		a.logger.Log(common.EventStepFailure, "Repo-skill classification failed; proceeding without a repo skill", map[string]any{
+			"error": fmt.Sprintf("%v", err),
+			"step":  stepDescription,
+		})
+		recordOutcome(nil, err)
+		return nil
+	}
+	skill := parseRepoSkillClassificationAnswer(resp.Choices[0].Content, skills)
+	if skill != nil {
+		// The classification excerpt (maxRepoSkillClassificationExcerpt) and
+		// DiscoverRepoSkills' Content (maxBytesPerSkillFile) are both capped for
+		// the general "every discovered skill" case; the one skill actually
+		// selected here needs its real content, or repoSkillPromptBlock injects
+		// a mid-sentence truncation of exactly the template/structure this step
+		// needs (e.g. create-pr/SKILL.md cut off before its PR-body template).
+		if full, ferr := planners.ReadSkillFileFull(repoPath, *skill); ferr == nil {
+			skill.Content = full
+			skill.Truncated = false
+		} else {
+			a.logger.Log(common.EventStepFailure, "Failed to re-read full skill file after classification; using truncated excerpt", map[string]any{
+				"skill": skill.Name,
+				"error": ferr.Error(),
+			})
+		}
+	}
+	a.logger.Log(common.EventStepComplete, "Classified repo skill for deterministic step", map[string]any{
+		"step":    stepDescription,
+		"matched": skill != nil,
+	})
+	recordOutcome(skill, nil)
+	return skill
 }
 
 // detectCommitPattern uses LLM to intelligently analyze recent commits and PRs to determine the best title format
@@ -2719,6 +3015,12 @@ func (a *OrchestratorAgent) generateImprovedPRDescription(ctx context.Context, r
 	if sessionCtx != nil {
 		skillsBlock = operatorSkillsPromptBlock(sessionCtx.SkillsContext)
 	}
+	// The repo may have its own PR-writing skill committed under some
+	// repo-specific name ("create-pr", "open-pr", "raise-mr", ...) — ask the
+	// LLM to identify it from this repo's actual skill list rather than
+	// matching a hardcoded name, then respect it the same way the ReAct agent
+	// already respects repo skills instead of only following operator guidance.
+	skillsBlock += repoSkillPromptBlock(a.classifyRepoSkillForStep(ctx, repoPath, "writing pull request descriptions (structure, required sections, conventions)"))
 
 	// Create prompt for LLM to generate PR description
 	prompt := fmt.Sprintf(`You are a technical writer creating PR descriptions. Analyze the repository's PR template pattern and follow it exactly.
@@ -2848,6 +3150,62 @@ func looksLikeGitSHA(s string) bool {
 	return gitSHARegex.MatchString(s)
 }
 
+// refusePRFromPinnedRevision blocks opening a PR whose changes were written
+// against a revision that is not the tip of the base branch.
+//
+// A pinned analysis reads the code as it was — the commit a workload was
+// running when an incident fired. That is the right thing to READ and the wrong
+// thing to BASE A PR ON: the diff is cut from a tree that may be hundreds of
+// commits behind, so the PR either fails to apply or, worse, applies and quietly
+// reverts everything merged since. Failing here is strictly better than opening
+// that PR, because a green PR that reverts history is not visibly wrong.
+//
+// Two independent checks, because a revision can be pinned two ways and each
+// check covers a hole in the other:
+//
+//  1. The request pinned it (git_repository.commit). Deterministic, needs no
+//     remote ref, and works on the single-branch clones these runs use.
+//  2. The agent pinned it by passing `commit` to repo_clone off prompt text, so
+//     nothing upstream knows. Caught by comparing the branch point to the base
+//     tip — but only when that ref is actually present locally.
+//
+// When neither can be established the PR proceeds: this guards a known-bad
+// combination, it is not a general "is this diff still applicable" check.
+func (a *OrchestratorAgent) refusePRFromPinnedRevision(ctx context.Context, sessionCtx *session.SessionContext, repoDir, baseBranch, branchPointSHA string) error {
+	pinned := ""
+	if sessionCtx != nil && sessionCtx.RepoContext != nil {
+		pinned = strings.TrimSpace(sessionCtx.RepoContext.Commit)
+	}
+	if pinned != "" {
+		return fmt.Errorf(
+			"refusing to open a PR from a pinned revision: the analysis ran against commit %s, "+
+				"so a fix branch cut from it would revert everything merged into %s since. "+
+				"Use raise_pr=false to get the diff, or omit the commit to fix at the branch tip",
+			pinned, baseBranch)
+	}
+
+	// The agent may have pinned via repo_clone without the request saying so.
+	// Only meaningful when the base tip is resolvable locally; single-branch
+	// clones often will not have it, and an unresolvable ref is not evidence
+	// of anything.
+	if branchPointSHA == "" || baseBranch == "" {
+		return nil
+	}
+	out, err := a.runGit(ctx, repoDir, "rev-parse", "--verify", "--quiet", "origin/"+baseBranch)
+	if err != nil {
+		return nil
+	}
+	baseTip := strings.TrimSpace(out)
+	if baseTip == "" || baseTip == branchPointSHA {
+		return nil
+	}
+	return fmt.Errorf(
+		"refusing to open a PR from a stale revision: the fix was written against %s but "+
+			"origin/%s is now at %s, so the PR would revert intervening commits. "+
+			"Use raise_pr=false to get the diff, or re-run against the branch tip",
+		branchPointSHA, baseBranch, baseTip)
+}
+
 // seedRepoCloneBranch tells the repo_clone tool which branch to check out when an
 // invocation omits an explicit `branch`. It uses the request's target/base branch
 // (RepoContext.Branch) — the branch the PR will target — so the working tree and any
@@ -2872,6 +3230,16 @@ func seedRepoCloneBranch(tool *tools.RepoCloneTool, sessionCtx *session.SessionC
 		branch = ""
 	}
 	tool.SetDefaultBranch(branch)
+
+	// A pinned commit rides alongside the branch rather than replacing it: the
+	// branch still governs PR targeting (`gh pr create --base` rejects a SHA),
+	// while the commit governs what gets checked out. Reset to "" when absent so
+	// a long-lived tool does not leak the previous request's commit.
+	commit := ""
+	if sessionCtx != nil && sessionCtx.RepoContext != nil {
+		commit = sessionCtx.RepoContext.Commit
+	}
+	tool.SetDefaultCommit(commit)
 }
 
 // instructionsRequireWrite reports whether any entry in
@@ -2908,6 +3276,22 @@ func instructionsRequireWrite(factsData map[string]any) bool {
 // pre-flight existence check consistent with them.
 func repoRelativeFilePath(workDir, filePath string) string {
 	if workDir == "" || filePath == "" {
+		return filePath
+	}
+	// A path that already resolves is returned untouched. The strip below is a
+	// heuristic for ripgrep-relative paths, and it is actively wrong whenever a
+	// repository contains a top-level directory named after the repository
+	// itself — astropy/astropy, django/django, sympy/sympy, requests/requests,
+	// which is the ordinary Python layout. There the prefix is a real segment,
+	// removing it makes the caller's existence check fail, and CodeFixer is
+	// skipped for a file_path that was correct all along. The run still returns
+	// fixed_code from submit_analysis, so the response looks like it carries a
+	// fix while git_diff is empty and nothing was ever written.
+	//
+	// Measured on SWE-bench Verified: 414 of 500 instances (83%) have a gold
+	// file path beginning with the repository name, so the heuristic misfired
+	// far more often than it helped.
+	if _, err := os.Stat(filepath.Join(workDir, filePath)); err == nil {
 		return filePath
 	}
 	repoName := filepath.Base(workDir)
@@ -2997,21 +3381,27 @@ Branch name:`, operatorSkillsPromptBlock(skills), title)
 // generateSkillAwareCommitMessage asks the LLM for a commit message that follows
 // the operator skills' convention (format, structure, trailers). Returns "" on
 // any failure so the caller can fall back to the default title/description.
-func (a *OrchestratorAgent) generateSkillAwareCommitMessage(ctx context.Context, title, description, skills string) string {
+func (a *OrchestratorAgent) generateSkillAwareCommitMessage(ctx context.Context, title, description, skills string, repoSkill *planners.RepoSkill) string {
 	// Keep the description context bounded — the commit message should be concise.
 	if len(description) > 1500 {
 		description = description[:1500]
 	}
+	// repoSkill, if any, is the repo's own commit-message skill (already
+	// identified by classifyRepoSkillForStep from this repo's actual skill
+	// names — conventions like type(scope): subject vary per repo and aren't
+	// hardcoded here) — respect it the same way the ReAct agent already
+	// respects repo skills, instead of only following operator guidance.
+	promptSkills := operatorSkillsPromptBlock(skills) + repoSkillPromptBlock(repoSkill)
 	prompt := fmt.Sprintf(`You write a git commit message for an automated code fix.
 %sRULES:
 - Output ONLY the commit message (subject line, then optional body), nothing else.
-- Follow the commit-message convention in the operator-skills section above (subject format/prefix, line length, required trailers). If it does not specify one, use a concise conventional-commit subject plus a short body.
+- Follow the commit-message convention in the operator-skills/repo-skill section above (subject format/prefix, line length, required trailers). If neither specifies one, use a concise conventional-commit subject plus a short body.
 - Do not wrap the message in code fences or quotes.
 
 Proposed title: %s
 Change summary: %s
 
-Commit message:`, operatorSkillsPromptBlock(skills), title, description)
+Commit message:`, promptSkills, title, description)
 
 	resp, err := a.llmClient.GenerateContent(ctx, []llms.MessageContent{
 		llms.TextParts(llms.ChatMessageTypeHuman, prompt),
@@ -3085,10 +3475,14 @@ func (a *OrchestratorAgent) commitChanges(ctx context.Context, title, descriptio
 		commitMsg = fmt.Sprintf("%s\n\n%s", title, description)
 	}
 
-	// When operator skills are present, let them shape the commit message
-	// (format, prefix, trailers). Fall back to the default above on failure.
-	if strings.TrimSpace(skills) != "" {
-		if msg := a.generateSkillAwareCommitMessage(ctx, title, description, skills); msg != "" {
+	// When operator skills or the repo's own commit-message skill are present,
+	// let them shape the commit message (format, prefix, trailers). The repo
+	// skill's name isn't hardcoded — classifyRepoSkillForStep asks the LLM to
+	// pick it, if any, from this repo's actual skill list. Fall back to the
+	// default above on failure or when neither is present.
+	repoCommitSkill := a.classifyRepoSkillForStep(ctx, actualRepoDir, "writing git commit messages (format, type/scope conventions, trailers)")
+	if strings.TrimSpace(skills) != "" || repoCommitSkill != nil {
+		if msg := a.generateSkillAwareCommitMessage(ctx, title, description, skills, repoCommitSkill); msg != "" {
 			commitMsg = msg
 		}
 	}

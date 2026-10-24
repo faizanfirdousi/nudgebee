@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-FROM golang:1.26.5-alpine AS builder
+FROM golang:1.26.6-alpine AS builder
 
 WORKDIR /app
 
@@ -57,6 +57,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # Final stage
 FROM alpine:3.22
 
+
 WORKDIR /app
 
 # Install runtime dependencies
@@ -67,10 +68,8 @@ WORKDIR /app
 # cache key so BuildKit re-runs the apk install and pulls current Alpine security
 # patches instead of a stale cached layer. Committed (not a build-arg) so each
 # refresh is a reviewable, revertable diff; bump when the Trivy scan flags a stale
-# package (e.g. c-ares CVE-2026-33630); currently W31 pulls bind 9.20.26-r0,
-# clearing 14 HIGH — 7 CVEs (CVE-2026-11331/-11605/-11622/-11721/-12617/-13204/
-# -13321) counted against both bind-libs and bind-tools.
-ARG OS_PKG_EPOCH=2026-W31
+# package (e.g. c-ares CVE-2026-33630); currently W36 pulls patched packages (libcrypto3 3.5.8-r0).
+ARG OS_PKG_EPOCH=2026-W36
 RUN echo "os-pkg-epoch: ${OS_PKG_EPOCH}" \
     && apk upgrade --no-cache \
     && apk add --no-cache \
@@ -126,7 +125,21 @@ RUN ARCH=$(uname -m) && \
 # /usr/bin/python3 and the service-account auth crypto path works with the bundle
 # removed.
 ENV CLOUDSDK_PYTHON=/usr/bin/python3
-ENV PATH=/home/appuser/.local/bin:/home/appuser/bin:/app/google-cloud-sdk/bin:$PATH
+# Keep writable HOME directories out of PATH. Workspace commands may persist
+# files under HOME, but must not be able to shadow image-owned tools or relay
+# shims such as kubectl, ssh, git, and gh.
+ENV PATH=/app/google-cloud-sdk/bin:$PATH
+# Keep dependency/build caches in explicit, workspace-owned locations so the
+# runtime can share them across worktrees and remove them safely when idle.
+ENV GOCACHE=/tmp/code-analysis/shared-cache/go-build \
+    GOMODCACHE=/tmp/code-analysis/shared-cache/go-mod \
+    GOLANGCI_LINT_CACHE=/tmp/code-analysis/shared-cache/go-lint \
+    PIP_CACHE_DIR=/tmp/code-analysis/shared-cache/python/pip \
+    PYTHONPYCACHEPREFIX=/tmp/code-analysis/shared-cache/python/pycache \
+    npm_config_cache=/tmp/code-analysis/shared-cache/node/npm \
+    PNPM_HOME=/tmp/code-analysis/shared-cache/node/pnpm \
+    MAVEN_OPTS=-Dmaven.repo.local=/tmp/code-analysis/shared-cache/maven \
+    GRADLE_USER_HOME=/tmp/code-analysis/shared-cache/gradle
 
 # Install Azure CLI in a venv to isolate its dependencies (e.g. urllib3 2.x)
 # from system Python packages used by apk-installed aws-cli
@@ -225,19 +238,27 @@ COPY --from=builder /app/code-analysis-agent .
 COPY --from=builder /app/shim /usr/local/bin/shim
 RUN chown appuser:appuser ./code-analysis-agent /usr/local/bin/shim
 
-# Create symlinks for shims
-RUN ln -s /usr/local/bin/shim /usr/local/bin/kubectl && \
-    ln -s /usr/local/bin/shim /usr/local/bin/helm && \
-    ln -s /usr/local/bin/shim /usr/local/bin/psql && \
-    ln -s /usr/local/bin/shim /usr/local/bin/mysql && \
-    ln -s /usr/local/bin/shim /usr/local/bin/redis-cli && \
-    ln -s /usr/local/bin/shim /usr/local/bin/argocd && \
-    ln -s /usr/local/bin/shim /usr/local/bin/clickhouse-client && \
-    ln -s /usr/local/bin/shim /usr/local/bin/rabbitmqadmin && \
-    ln -s /usr/local/bin/shim /usr/local/bin/rabbitmq-api && \
-    ln -s /usr/local/bin/shim /usr/local/bin/sqlcmd && \
-    ln -s /usr/local/bin/shim /usr/local/bin/sqlplus && \
-    ln -s /usr/local/bin/shim /usr/local/bin/ssh
+# Create symlinks for commands executed through an authenticated server-side
+# boundary. Long-lived cloud credentials never enter the shared workspace
+# process; a provider may still return a deliberately requested short-lived
+# access token as command output.
+RUN ln -sf /usr/local/bin/shim /usr/local/bin/kubectl && \
+    ln -sf /usr/local/bin/shim /usr/local/bin/aws && \
+    ln -sf /usr/local/bin/shim /usr/local/bin/gcloud && \
+    ln -sf /usr/local/bin/shim /usr/local/bin/gsutil && \
+    ln -sf /usr/local/bin/shim /usr/local/bin/bq && \
+    ln -sf /usr/local/bin/shim /usr/local/bin/az && \
+    ln -sf /usr/local/bin/shim /usr/local/bin/helm && \
+    ln -sf /usr/local/bin/shim /usr/local/bin/psql && \
+    ln -sf /usr/local/bin/shim /usr/local/bin/mysql && \
+    ln -sf /usr/local/bin/shim /usr/local/bin/redis-cli && \
+    ln -sf /usr/local/bin/shim /usr/local/bin/argocd && \
+    ln -sf /usr/local/bin/shim /usr/local/bin/clickhouse-client && \
+    ln -sf /usr/local/bin/shim /usr/local/bin/rabbitmqadmin && \
+    ln -sf /usr/local/bin/shim /usr/local/bin/rabbitmq-api && \
+    ln -sf /usr/local/bin/shim /usr/local/bin/sqlcmd && \
+    ln -sf /usr/local/bin/shim /usr/local/bin/sqlplus && \
+    ln -sf /usr/local/bin/shim /usr/local/bin/ssh
 
 # Switch to non-root user
 USER appuser

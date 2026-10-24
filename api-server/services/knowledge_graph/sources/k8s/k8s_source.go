@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"nudgebee/services/account"
 	"nudgebee/services/knowledge_graph/core"
 	"nudgebee/services/knowledge_graph/sources"
 	"nudgebee/services/security"
@@ -27,6 +28,10 @@ type K8sSource struct {
 	config  K8sSourceConfig
 	logger  *slog.Logger
 	enabled bool
+
+	// agentConnected is the relay-availability probe — an instance field rather
+	// than a package var so parallel tests can stub it without racing.
+	agentConnected func(accountID string) bool
 }
 
 // K8sSourceConfig holds configuration for K8s source
@@ -85,26 +90,18 @@ func NewK8sSource(config K8sSourceConfig, logger *slog.Logger) (*K8sSource, erro
 	// TenantID and CloudAccountID are optional at creation time
 	// They will be provided in the SourceBuildRequest when BuildGraph is called
 
-	// Set default workload kinds if not specified
+	// Query for the kinds that declare themselves part of the inventory (see
+	// kinds.go); a caller may narrow it.
 	if len(config.WorkloadKinds) == 0 {
-		config.WorkloadKinds = []string{
-			"Deployment",
-			"StatefulSet",
-			"DaemonSet",
-			"ReplicaSet",
-			"Pod",
-			"Service",
-			"Job",
-			"CronJob",
-			"Ingress",
-		}
+		config.WorkloadKinds = defaultWorkloadKinds()
 	}
 
 	return &K8sSource{
-		BaseSource: sources.NewBaseSource("k8s"),
-		config:     config,
-		logger:     logger,
-		enabled:    true,
+		BaseSource:     sources.NewBaseSource("k8s"),
+		config:         config,
+		logger:         logger,
+		enabled:        true,
+		agentConnected: account.IsK8sAgentConnected,
 	}, nil
 }
 
@@ -140,9 +137,6 @@ func (s *K8sSource) GenerateUniqueKey(node *core.DbNode) string {
 	name, _ := core.GetNodePropertyString(node, "name")
 	keyComponents.Name = name
 
-	// Extract cluster name from properties (still needed for certain node types)
-	cluster, _ := core.GetNodePropertyString(node, "cluster")
-
 	// Always use CloudAccountID (UUID) for unique key consistency
 	// This ensures keys remain stable even if account names change
 	if node.CloudAccountID != "" {
@@ -164,31 +158,14 @@ func (s *K8sSource) GenerateUniqueKey(node *core.DbNode) string {
 		keyComponents.Hierarchy = namespace
 	}
 
-	// Handle special cases for cluster-scoped resources
-	switch node.NodeType {
-	case core.NodeTypeCluster:
-		// Cluster has no hierarchy
+	// Resources that belong to the cluster rather than to a namespace say so in
+	// their own file (see kinds.go): they have no namespace in their key, and
+	// some take their name from what they describe.
+	if rule, ok := clusterScopedKeyRules[node.NodeType]; ok {
 		keyComponents.Hierarchy = ""
-		// Cluster name is the resource name
-		if keyComponents.Name == "" {
-			keyComponents.Name = cluster
+		if keyComponents.Name == "" && rule.NameFallback != nil {
+			keyComponents.Name = rule.NameFallback(node)
 		}
-
-	case core.NodeTypeNamespace:
-		// Namespace itself has no parent namespace
-		keyComponents.Hierarchy = ""
-		// Namespace name is the resource name
-		if keyComponents.Name == "" {
-			keyComponents.Name = namespace
-		}
-
-	case core.NodeTypeNode:
-		// K8s worker node is cluster-scoped, not namespaced
-		keyComponents.Hierarchy = ""
-
-	case core.NodeTypePV:
-		// PersistentVolume is cluster-scoped, not namespaced
-		keyComponents.Hierarchy = ""
 	}
 
 	// Validate and build
@@ -198,6 +175,27 @@ func (s *K8sSource) GenerateUniqueKey(node *core.DbNode) string {
 	}
 
 	return keyComponents.Build()
+}
+
+// relayFetchesAvailable reports whether this build should make relay round-trips
+// for the account, logging the one line that replaces ~20 ERROR/WARN lines when it
+// says no. Fails open on an undetermined answer (see account.IsK8sAgentConnected)
+// — same rationale as the Karpenter gate in karpenter.go.
+func (s *K8sSource) relayFetchesAvailable(req *core.SourceBuildRequest) bool {
+	if req.CloudAccountID == "" {
+		return false
+	}
+	probe := s.agentConnected // nil when built as a bare struct literal
+	if probe == nil {
+		probe = account.IsK8sAgentConnected
+	}
+	if probe(req.CloudAccountID) {
+		return true
+	}
+	s.logger.Info("skipping relay-backed K8s fetches: no connected agent",
+		"tenant_id", req.TenantID,
+		"cloud_account_id", req.CloudAccountID)
+	return false
 }
 
 // BuildGraph builds a knowledge graph from Kubernetes resources
@@ -234,14 +232,24 @@ func (s *K8sSource) BuildGraph(reqCtx *security.RequestContext, req *core.Source
 
 	s.logger.Info("fetched K8s nodes", "count", len(k8sNodes))
 
-	// Fetch K8s services from relay server
-	k8sServices, err := s.fetchK8sServicesFromRelay(ctx, req)
-	if err != nil {
-		s.logger.Warn("failed to fetch K8s services from relay, continuing without them", "error", err)
-		k8sServices = []K8sServiceFromRelay{}
-	}
+	// Everything below that reads from the relay needs a connected in-cluster
+	// agent; without one each round-trip fails with "agent not connected". Only
+	// the relay-derived slices are skipped — workloads and K8s nodes come from
+	// Postgres and are still emitted, so the subgraph is persisted as before and
+	// markInactiveNodes has no new reason to tombstone it.
+	relayAvailable := s.relayFetchesAvailable(req)
 
-	s.logger.Info("fetched K8s services from relay", "count", len(k8sServices))
+	// Fetch K8s services from relay server
+	k8sServices := []K8sServiceFromRelay{}
+	if relayAvailable {
+		k8sServices, err = s.fetchK8sServicesFromRelay(ctx, req)
+		if err != nil {
+			s.logger.Warn("failed to fetch K8s services from relay, continuing without them", "error", err)
+			k8sServices = []K8sServiceFromRelay{}
+		}
+
+		s.logger.Info("fetched K8s services from relay", "count", len(k8sServices))
+	}
 
 	// Convert K8s nodes to graph nodes and edges first
 	k8sNodeGraphNodes, k8sNodeEdges := s.convertK8sNodesToGraph(k8sNodes, req)
@@ -269,22 +277,28 @@ func (s *K8sSource) BuildGraph(reqCtx *security.RequestContext, req *core.Source
 	edges = append(edges, serviceEdges...)
 
 	// Fetch K8s PVCs from relay server
-	k8sPVCs, err := s.fetchK8sPVCsFromRelay(ctx, req)
-	if err != nil {
-		s.logger.Warn("failed to fetch K8s PVCs from relay, continuing without them", "error", err)
-		k8sPVCs = []K8sPVCFromRelay{}
-	}
+	k8sPVCs := []K8sPVCFromRelay{}
+	if relayAvailable {
+		k8sPVCs, err = s.fetchK8sPVCsFromRelay(ctx, req)
+		if err != nil {
+			s.logger.Warn("failed to fetch K8s PVCs from relay, continuing without them", "error", err)
+			k8sPVCs = []K8sPVCFromRelay{}
+		}
 
-	s.logger.Info("fetched K8s PVCs from relay", "count", len(k8sPVCs))
+		s.logger.Info("fetched K8s PVCs from relay", "count", len(k8sPVCs))
+	}
 
 	// Fetch K8s PVs from relay server
-	k8sPVs, err := s.fetchK8sPVsFromRelay(ctx, req)
-	if err != nil {
-		s.logger.Warn("failed to fetch K8s PVs from relay, continuing without them", "error", err)
-		k8sPVs = []K8sPVFromRelay{}
-	}
+	k8sPVs := []K8sPVFromRelay{}
+	if relayAvailable {
+		k8sPVs, err = s.fetchK8sPVsFromRelay(ctx, req)
+		if err != nil {
+			s.logger.Warn("failed to fetch K8s PVs from relay, continuing without them", "error", err)
+			k8sPVs = []K8sPVFromRelay{}
+		}
 
-	s.logger.Info("fetched K8s PVs from relay", "count", len(k8sPVs))
+		s.logger.Info("fetched K8s PVs from relay", "count", len(k8sPVs))
+	}
 
 	// Convert PVs to nodes and edges first (needed for PVC -> PV relationships)
 	pvNodes, pvEdges, _, _ := s.convertK8sPVsToGraph(k8sPVs, workloads, k8sClusterMap, k8sNAmespaceMap, req)
@@ -304,12 +318,15 @@ func (s *K8sSource) BuildGraph(reqCtx *security.RequestContext, req *core.Source
 	// annotation (eks.amazonaws.com/role-arn) that ties a workload to an IAM
 	// role; the cross-account ASSUMES edge is emitted by the phase-3 rules
 	// engine via default_relationships.json.
-	k8sServiceAccounts, err := s.fetchK8sServiceAccountsFromRelay(ctx, req)
-	if err != nil {
-		s.logger.Warn("failed to fetch K8s ServiceAccounts from relay, continuing without them", "error", err)
-		k8sServiceAccounts = []K8sServiceAccountFromRelay{}
+	k8sServiceAccounts := []K8sServiceAccountFromRelay{}
+	if relayAvailable {
+		k8sServiceAccounts, err = s.fetchK8sServiceAccountsFromRelay(ctx, req)
+		if err != nil {
+			s.logger.Warn("failed to fetch K8s ServiceAccounts from relay, continuing without them", "error", err)
+			k8sServiceAccounts = []K8sServiceAccountFromRelay{}
+		}
+		s.logger.Info("fetched K8s ServiceAccounts from relay", "count", len(k8sServiceAccounts))
 	}
-	s.logger.Info("fetched K8s ServiceAccounts from relay", "count", len(k8sServiceAccounts))
 
 	saNodes, saEdges, saByKey := s.convertK8sServiceAccountsToGraph(k8sServiceAccounts, workloads, k8sClusterMap, k8sNAmespaceMap, req)
 	nodes = append(nodes, saNodes...)
@@ -327,19 +344,25 @@ func (s *K8sSource) BuildGraph(reqCtx *security.RequestContext, req *core.Source
 	// metadata. Helm release state (`helm.sh/release.v1` type) is dropped
 	// at fetch time to avoid drowning the graph in 500+ noise nodes per
 	// cluster.
-	k8sConfigMaps, err := s.fetchK8sConfigMapsFromRelay(ctx, req)
-	if err != nil {
-		s.logger.Warn("failed to fetch K8s ConfigMaps from relay, continuing without them", "error", err)
-		k8sConfigMaps = []K8sConfigMapFromRelay{}
+	k8sConfigMaps := []K8sConfigMapFromRelay{}
+	if relayAvailable {
+		k8sConfigMaps, err = s.fetchK8sConfigMapsFromRelay(ctx, req)
+		if err != nil {
+			s.logger.Warn("failed to fetch K8s ConfigMaps from relay, continuing without them", "error", err)
+			k8sConfigMaps = []K8sConfigMapFromRelay{}
+		}
 	}
 	cmNodes, cmEdges, configMapByKey := s.convertK8sConfigMapsToGraph(k8sConfigMaps, workloads, k8sClusterMap, k8sNAmespaceMap, req)
 	nodes = append(nodes, cmNodes...)
 	edges = append(edges, cmEdges...)
 
-	k8sSecrets, err := s.fetchK8sSecretsFromRelay(ctx, req)
-	if err != nil {
-		s.logger.Warn("failed to fetch K8s Secrets from relay, continuing without them", "error", err)
-		k8sSecrets = []K8sSecretFromRelay{}
+	k8sSecrets := []K8sSecretFromRelay{}
+	if relayAvailable {
+		k8sSecrets, err = s.fetchK8sSecretsFromRelay(ctx, req)
+		if err != nil {
+			s.logger.Warn("failed to fetch K8s Secrets from relay, continuing without them", "error", err)
+			k8sSecrets = []K8sSecretFromRelay{}
+		}
 	}
 	secNodes, secEdges, secretByKey := s.convertK8sSecretsToGraph(k8sSecrets, workloads, k8sClusterMap, k8sNAmespaceMap, req)
 	nodes = append(nodes, secNodes...)
@@ -349,7 +372,10 @@ func (s *K8sSource) BuildGraph(reqCtx *security.RequestContext, req *core.Source
 	// (the existing meta column strips them for everything except PVCs).
 	// One round-trip per workload kind against the relay rebuilds the
 	// ConfigMap / Secret reference map.
-	workloadSpecRefs := s.fetchWorkloadConfigSecretRefs(ctx, req)
+	workloadSpecRefs := map[string]workloadSpecRefs{}
+	if relayAvailable {
+		workloadSpecRefs = s.fetchWorkloadConfigSecretRefs(ctx, req)
+	}
 	workloadCMSecEdges := s.createWorkloadConfigSecretEdges(workloads, workloadNodesMap, configMapByKey, secretByKey, workloadSpecRefs, req)
 	edges = append(edges, workloadCMSecEdges...)
 	s.logger.Info("emitted ConfigMap/Secret nodes + Workload edges",
@@ -372,7 +398,7 @@ func (s *K8sSource) BuildGraph(reqCtx *security.RequestContext, req *core.Source
 	// the cluster a question the backend has already answered.
 	karpenterNodePools := []K8sCRDFromRelay{}
 	karpenterNodeClaims := []K8sCRDFromRelay{}
-	if s.clusterHasKarpenter(req) {
+	if relayAvailable && s.clusterHasKarpenter(req) {
 		nodePools, err := s.fetchKarpenterNodePoolsFromRelay(ctx, req)
 		if err != nil {
 			s.logger.Warn("failed to fetch Karpenter NodePools from relay, continuing without them", "error", err)
@@ -388,42 +414,9 @@ func (s *K8sSource) BuildGraph(reqCtx *security.RequestContext, req *core.Source
 	}
 
 	// Resolve the cluster name from any K8s workload we already loaded —
-	// Karpenter CRDs live in the same K8s account so they share the
-	// cluster identity. Empty when no workloads (smoke-test path) — in
-	// that case we still emit the nodes but they won't link to the
-	// ManagedCluster via the phase-3 rule.
-	karpenterClusterName := ""
-	for _, w := range workloads {
-		if w.ClusterName != "" {
-			karpenterClusterName = w.ClusterName
-			break
-		}
-	}
-	// Fallback to K8s Nodes when no workloads carry the cluster name —
-	// can happen for a freshly-provisioned cluster or one whose workloads
-	// haven't been ingested yet. K8s Nodes are fetched from k8s_nodes and
-	// carry the same cluster_name. Without this, Karpenter CRDs wouldn't
-	// link back to their cluster on a cold-start build.
-	if karpenterClusterName == "" {
-		for _, n := range k8sNodes {
-			if n.ClusterName != "" {
-				karpenterClusterName = n.ClusterName
-				break
-			}
-		}
-	}
-
-	// Build a name-keyed lookup over the K8s Node graph nodes we already
-	// emitted. Used by the NodeClaim → RUNS_ON → Node intra-source edge.
-	// We reuse k8sNodeGraphNodes (the original list) rather than the
-	// mutated k8sNodeMap because convertWorkloadsToGraph may have removed
-	// entries when reconciling cluster identities.
-	k8sNodesByName := make(map[string]*core.DbNode, len(k8sNodeGraphNodes))
-	for _, n := range k8sNodeGraphNodes {
-		if name, ok := core.GetNodePropertyString(n, "name"); ok {
-			k8sNodesByName[name] = n
-		}
-	}
+	// Karpenter needs the cluster its CRDs belong to and a name-keyed view of
+	// the nodes it manages; karpenter.go works both out (see karpenterContext).
+	karpenterClusterName, k8sNodesByName := karpenterContext(workloads, k8sNodes, k8sNodeGraphNodes)
 
 	npNodes, npEdges, npByName := s.convertKarpenterNodePoolsToGraph(karpenterNodePools, karpenterClusterName, k8sClusterMap, req)
 	ncNodes, ncEdges := s.convertKarpenterNodeClaimsToGraph(karpenterNodeClaims, npByName, k8sNodesByName, karpenterClusterName, req)
@@ -441,7 +434,7 @@ func (s *K8sSource) BuildGraph(reqCtx *security.RequestContext, req *core.Source
 
 	// Find ingress controller nodes and resolve backend services
 	ingressControllers := s.findIngressControllerNodes(workloadNodesMap, serviceNodes)
-	if len(ingressControllers) > 0 {
+	if relayAvailable && len(ingressControllers) > 0 {
 		s.logger.Info("Found ingress controller nodes", "count", len(ingressControllers))
 		ingressBackendNodes, ingressBackendEdges := s.resolveIngressBackendServices(ctx, reqCtx, ingressControllers, serviceNodes, req)
 		nodes = append(nodes, ingressBackendNodes...)
@@ -463,15 +456,7 @@ func (s *K8sSource) BuildGraph(reqCtx *security.RequestContext, req *core.Source
 	// edges from the image refs already carried on those nodes. Deduped per build so
 	// a shared image is one node ("which workloads run image X"). Runs last, over the
 	// accumulated nodes (before the image nodes themselves are appended).
-	imageUsers := make([]*core.DbNode, 0)
-	for _, n := range nodes {
-		if _, ok := n.Properties["container_images"]; ok {
-			imageUsers = append(imageUsers, n)
-		} else if _, ok := n.Properties["primary_image"]; ok {
-			imageUsers = append(imageUsers, n)
-		}
-	}
-	imageNodes, imageEdges := s.createContainerImageNodesAndEdges(imageUsers, req)
+	imageNodes, imageEdges := s.createContainerImageNodesAndEdges(imageUsers(nodes), req)
 	nodes = append(nodes, imageNodes...)
 	edges = append(edges, imageEdges...)
 	s.logger.Info("emitted ContainerImage nodes + Workload→Image edges",

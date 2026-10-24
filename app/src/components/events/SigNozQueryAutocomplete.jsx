@@ -10,10 +10,15 @@ import {
   Chip,
   InputAdornment,
   IconButton,
-  Tooltip,
   Popover,
   CircularProgress,
+  // The chip-overflow tooltip below stays on MUI: its content is styled for a dark
+  // surface and holds interactive delete buttons, neither of which ds/Tooltip's
+  // light surface or link-only 'interactive' variant can express.
+  // ds-imports-allow: dark, interactive chip-overflow tooltip (see comment above)
+  Tooltip as MuiTooltip,
 } from '@mui/material';
+import Tooltip from '@ui/Tooltip';
 import {
   Label as LabelIcon,
   FilterList as FilterIcon,
@@ -569,7 +574,7 @@ const SigNozQueryAutocomplete = ({ accountId, onQueryChange, queryItems }) => {
           InputProps={{
             startAdornment: <InputAdornment position='start'>{getStepIcon()}</InputAdornment>,
             sx: {
-              fontFamily: 'monospace',
+              fontFamily: ds.font.mono,
               fontSize: ds.text.bodyLg,
             },
           }}
@@ -588,7 +593,7 @@ const SigNozQueryAutocomplete = ({ accountId, onQueryChange, queryItems }) => {
           }}
         />
 
-        <Tooltip title='How to use'>
+        <Tooltip title='How to use' placement='bottom'>
           <IconButton
             onClick={handleInfoClick}
             sx={{
@@ -652,7 +657,7 @@ const SigNozQueryAutocomplete = ({ accountId, onQueryChange, queryItems }) => {
                     primary={suggestion.value}
                     secondary={suggestion.description}
                     primaryTypographyProps={{
-                      fontFamily: 'monospace',
+                      fontFamily: ds.font.mono,
                       fontSize: ds.text.bodyLg,
                       fontWeight: 'medium',
                     }}
@@ -679,13 +684,13 @@ const SigNozQueryAutocomplete = ({ accountId, onQueryChange, queryItems }) => {
                 deleteIcon={<CloseIcon />}
                 color='primary'
                 sx={{
-                  fontFamily: 'monospace',
+                  fontFamily: ds.font.mono,
                   '& .MuiChip-label': { fontSize: ds.text.small },
                 }}
               />
             ))}
             {chips.length > 2 && (
-              <Tooltip
+              <MuiTooltip
                 title={
                   <Box
                     sx={{
@@ -725,7 +730,7 @@ const SigNozQueryAutocomplete = ({ accountId, onQueryChange, queryItems }) => {
                         <Typography
                           variant='caption'
                           sx={{
-                            fontFamily: 'monospace',
+                            fontFamily: ds.font.mono,
                             fontSize: ds.text.small,
                             flex: 1,
                             wordBreak: 'break-word',
@@ -793,7 +798,7 @@ const SigNozQueryAutocomplete = ({ accountId, onQueryChange, queryItems }) => {
                   color='secondary'
                   variant='outlined'
                   sx={{
-                    fontFamily: 'monospace',
+                    fontFamily: ds.font.mono,
                     cursor: 'help',
                     '& .MuiChip-label': {
                       fontSize: ds.text.small,
@@ -801,7 +806,7 @@ const SigNozQueryAutocomplete = ({ accountId, onQueryChange, queryItems }) => {
                     },
                   }}
                 />
-              </Tooltip>
+              </MuiTooltip>
             )}
           </Box>
         </Box>

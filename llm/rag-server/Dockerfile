@@ -21,19 +21,26 @@ WORKDIR /app
 
 COPY uv.lock pyproject.toml ./
 
-# Install dependencies using uv (with poetry.lock compatibility).
+# Install dependencies from uv.lock into the conda env via `uv sync`.
 # Cache mounts persist /root/.cache/{uv,pip} across builds via
 # BuildKit; the previous explicit `rm -rf` of those dirs is removed
 # because the cache mount itself keeps them out of the image layer.
+# UV_PROJECT_ENVIRONMENT points uv at the existing conda env instead of
+# creating its own .venv; --frozen trusts the committed uv.lock as-is
+# (no re-resolve); --no-install-project skips building/installing the
+# local rag-server package itself, matching the deps-only install this
+# replaced. --inexact keeps uv from removing the base image's preinstalled
+# conda/ML packages that aren't tracked in uv.lock.
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=cache,target=/root/.cache/pip \
     set -e; \
     (conda run -n myenv pip uninstall -y importlib-metadata || true); \
+    export UV_PROJECT_ENVIRONMENT=/opt/conda/envs/myenv; \
     success=0; \
     arch=$(uname -m); \
     for i in 1 2 3; do \
         echo "Attempt $i [arch=$arch]: Installing dependencies..."; \
-        if conda run -n myenv uv pip install --system --requirements uv.lock; then \
+        if conda run -n myenv uv sync --frozen --inexact --no-install-project; then \
             success=1; break; \
         else \
             echo "Attempt $i [arch=$arch] failed, retrying in $((i*5)) seconds..."; \
@@ -42,7 +49,6 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     done; \
     [ "$success" -eq 1 ] || exit 1; \
     conda clean --yes --all
-
 
 # `production` image used for runtime
 FROM uv-base AS production

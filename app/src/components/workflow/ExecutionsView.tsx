@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/router';
-import { Alert, Box, Typography } from '@mui/material';
+import { Box, Typography } from '@mui/material';
 import { Select } from '@ui/Select';
+import { Banner } from '@ui/Banner';
 import { Button } from '@ui/Button';
 import {
   ContentCopy,
@@ -69,6 +70,7 @@ import ExecutionStatusBar, { type PendingApproval } from './components/Execution
 import { findExecutionTaskForNode, getSwitchAncestorChain, getSwitchChildNodeIds } from './utils/templateUtils';
 import { getDuration, getStatusColor, getStatusTone, isExecutionCompleted } from './utils/executionStatus';
 import { getLlmSessionId, buildAskNudgebeeHref } from './utils/llmChat';
+import { resolveApprovalOptions } from './utils/approvalOptions';
 import { useTenantBranding } from '@hooks/useTenantBranding';
 
 // Function to get appropriate icon based on task type (matches ActionNode.tsx exactly)
@@ -238,10 +240,20 @@ const ExecutionsView: React.FC<ExecutionsViewProps> = ({
   const [cancelLoading, setCancelLoading] = useState(false);
   const [approvalLoading, setApprovalLoading] = useState<string | null>(null);
   const pendingSelectionRef = useRef<string | null>(null);
+  // Set when the user applies a status/version filter, which deselects everything.
+  // Without it the auto-select effect below re-picks executions[0] on the very next
+  // list refresh (status refetch, or the 4s poll) and the deselection never sticks.
+  const skipAutoSelectRef = useRef(false);
   const [highlightedExecutionId, setHighlightedExecutionId] = useState<string | null>(null);
   const [inlineOutputViewMode, setInlineOutputViewMode] = useState<'json' | 'formatted'>('formatted');
   const [inlineInputViewMode, setInlineInputViewMode] = useState<'json' | 'formatted'>('formatted');
-  const [executionData, setExecutionData] = useState<any>(null);
+  const [loadedExecutionData, setLoadedExecutionData] = useState<any>(null);
+  // Same guard as `effectiveTasks`, one level up: the detail payload is only ever
+  // read when it belongs to the execution currently selected. Switching executions
+  // leaves the previous payload in state until the new fetch lands, and every
+  // consumer below (canvas, version strip, provenance banners, inputs/outputs,
+  // error panels) would otherwise render the previous run's data in the meantime.
+  const executionData = loadedExecutionData?.id === selectedExecution?.id ? loadedExecutionData : null;
   const [logsExpanded, setLogsExpanded] = useState(false);
   const reactFlowInstanceRef = useRef<ReactFlowInstance | null>(null);
   const canvasContainerRef = useRef<HTMLDivElement | null>(null);
@@ -364,6 +376,7 @@ const ExecutionsView: React.FC<ExecutionsViewProps> = ({
       if (pendingSelectionRef.current) {
         const targetExecution = executions.find((exec) => exec.id === pendingSelectionRef.current);
         if (targetExecution) {
+          skipAutoSelectRef.current = false;
           setSelectedExecution(targetExecution);
           setHighlightedExecutionId(targetExecution.id);
           setSelectedTask(null);
@@ -380,6 +393,7 @@ const ExecutionsView: React.FC<ExecutionsViewProps> = ({
       if (deepLinkExecutionId) {
         const target = executions.find((exec) => exec.id === deepLinkExecutionId);
         if (target) {
+          skipAutoSelectRef.current = false;
           setDeepLinkExecutionId(null);
           setSelectedExecution(target);
           setHighlightedExecutionId(target.id);
@@ -387,6 +401,9 @@ const ExecutionsView: React.FC<ExecutionsViewProps> = ({
           return;
         }
       }
+
+      // A filter was just applied: stay deselected until the user picks a row.
+      if (skipAutoSelectRef.current) return;
 
       // Default: select first if none selected or current not in list
       if (!selectedExecution || !executions.find((exec) => exec.id === selectedExecution.id)) {
@@ -397,6 +414,7 @@ const ExecutionsView: React.FC<ExecutionsViewProps> = ({
       setSelectedExecution(null);
       setSelectedTask(null);
       setExecutionTasks([]);
+      setLoadedExecutionData(null);
       setLoadedExecutionId(null);
       pendingSelectionRef.current = null;
     }
@@ -445,14 +463,31 @@ const ExecutionsView: React.FC<ExecutionsViewProps> = ({
 
   // Poll execution tasks when the selected execution is running
   const taskPollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Execution we were polling as a live run — tells "this run just finished" apart from
+  // "the user selected a run that was already finished".
+  const wasLivePollingRef = useRef<string | null>(null);
   useEffect(() => {
     if (taskPollingRef.current) {
       clearInterval(taskPollingRef.current);
       taskPollingRef.current = null;
     }
 
-    if (!selectedExecution || !workflowId || !accountId) return;
-    if (isExecutionCompleted(selectedExecution.status)) return;
+    if (!selectedExecution || !workflowId || !accountId) {
+      // Deselecting drops the live run: keeping its id would fire a redundant fetch if the
+      // user re-selects it after it finished.
+      wasLivePollingRef.current = null;
+      return;
+    }
+    if (isExecutionCompleted(selectedExecution.status)) {
+      // Polling stops here, so a run that just went terminal (e.g. cancelled) would keep
+      // its pre-cancel tasks — including an approval still badged SCHEDULED (#36358).
+      if (wasLivePollingRef.current === selectedExecution.id) {
+        fetchExecutionTasks(selectedExecution.id, true);
+      }
+      wasLivePollingRef.current = null;
+      return;
+    }
+    wasLivePollingRef.current = selectedExecution.id;
 
     taskPollingRef.current = setInterval(() => {
       fetchExecutionTasks(selectedExecution.id, true);
@@ -484,7 +519,7 @@ const ExecutionsView: React.FC<ExecutionsViewProps> = ({
 
       const execution = response.data?.workflow_get_execution;
       const tasks = execution?.tasks || [];
-      setExecutionData(execution);
+      setLoadedExecutionData(execution);
       setExecutionTasks(tasks);
       setLoadedExecutionId(executionId);
 
@@ -500,6 +535,29 @@ const ExecutionsView: React.FC<ExecutionsViewProps> = ({
       if (!isPolling && isMountedRef.current) setTasksLoading(false);
     }
   };
+
+  // Applying a filter invalidates whatever run is on screen: the selected execution
+  // may not even be in the filtered list, and its loaded definition/tasks would keep
+  // rendering on the canvas under a version label that no longer matches. Drop all of
+  // it and stay deselected until the user picks a row.
+  const clearExecutionSelection = useCallback(() => {
+    setSelectedExecution(null);
+    // Set directly rather than waiting on the syncing effect, so an in-flight
+    // fetchExecutionTasks response is dropped by its stale-response guard.
+    selectedExecutionIdRef.current = null;
+    setSelectedTask(null);
+    setExecutionTasks([]);
+    setLoadedExecutionData(null);
+    setLoadedExecutionId(null);
+    setTasksLoading(false);
+    setHighlightedExecutionId(null);
+    pendingSelectionRef.current = null;
+    // A pinned deep-link is prepended to the list regardless of the status filter,
+    // and its id would be re-selected by the deep-link branch on the next refresh.
+    setPinnedExecution(null);
+    setDeepLinkExecutionId(null);
+    skipAutoSelectRef.current = true;
+  }, []);
 
   const copyToClipboard = (text: string, label: string) => {
     navigator.clipboard.writeText(text).then(() => {
@@ -536,6 +594,7 @@ const ExecutionsView: React.FC<ExecutionsViewProps> = ({
 
   const handleRefresh = () => {
     pendingSelectionRef.current = null;
+    skipAutoSelectRef.current = false;
     setSelectedTask(null);
     onRefresh();
   };
@@ -658,6 +717,10 @@ const ExecutionsView: React.FC<ExecutionsViewProps> = ({
     return statusUpper || undefined;
   };
 
+  // A terminal run has nothing in progress and nothing awaiting a human — it gates both
+  // the progress pill and the approval form (#36358).
+  const isSelectedExecutionLive = !!selectedExecution && !isExecutionCompleted(selectedExecution.status);
+
   // Only use tasks when they belong to the currently selected execution.
   // Prevents stale tasks of a previous execution from overlaying the canvas
   // while a new execution's tasks are still loading.
@@ -673,6 +736,11 @@ const ExecutionsView: React.FC<ExecutionsViewProps> = ({
   // executions (the live snapshot at backfill time). Only fall back to
   // editorNodes when even the live snapshot is unavailable (`live_fallback`).
   const executionDefinitionGraph = useMemo<{ nodes: Node[]; edges: Edge[] }>(() => {
+    // Nothing selected (right after a filter was applied), or the selected
+    // execution's detail hasn't landed yet (switching executions): render an
+    // empty canvas. The editor fallback below would otherwise paint the current
+    // draft, which reads as "this is the execution's graph" when it isn't.
+    if (!selectedExecution?.id || !executionData) return { nodes: [], edges: [] };
     const usableSnapshot =
       executionData?.definition &&
       (executionData.definition_source === 'version' ||
@@ -687,7 +755,15 @@ const ExecutionsView: React.FC<ExecutionsViewProps> = ({
       }
     }
     return { nodes: editorNodes, edges: editorEdges };
-  }, [executionData?.definition, executionData?.definition_source, editorNodes, editorEdges, taskDefinitions]);
+  }, [
+    selectedExecution?.id,
+    executionData?.id,
+    executionData?.definition,
+    executionData?.definition_source,
+    editorNodes,
+    editorEdges,
+    taskDefinitions,
+  ]);
 
   const overlayBaseNodes = executionDefinitionGraph.nodes;
   const overlayBaseEdges = executionDefinitionGraph.edges;
@@ -962,7 +1038,7 @@ const ExecutionsView: React.FC<ExecutionsViewProps> = ({
     }
 
     return (
-      <Box sx={{ fontFamily: 'monospace', fontSize: 'var(--ds-text-body)', color: ds.gray[700] }}>
+      <Box sx={{ fontFamily: ds.font.mono, fontSize: 'var(--ds-text-body)', color: ds.gray[700] }}>
         {typeof data === 'string' ? data : JSON.stringify(data, null, 2)}
       </Box>
     );
@@ -1094,7 +1170,7 @@ const ExecutionsView: React.FC<ExecutionsViewProps> = ({
                     fontSize: 'var(--ds-text-title)',
                     fontWeight: 'var(--ds-font-weight-semibold)',
                     color: ds.gray[700],
-                    fontFamily: 'Poppins, sans-serif',
+                    fontFamily: ds.font.display,
                     letterSpacing: '-0.2px',
                   }}
                 >
@@ -1124,7 +1200,11 @@ const ExecutionsView: React.FC<ExecutionsViewProps> = ({
                     clearable={false}
                     value={selectedStatus}
                     options={['All', 'Running', 'Completed', 'Failed', 'Canceled', 'Terminated', 'Timed Out', 'Continued As New', 'Unspecified']}
-                    onChange={(next) => onStatusChange(next)}
+                    onChange={(next) => {
+                      if (next === selectedStatus) return;
+                      clearExecutionSelection();
+                      onStatusChange(next);
+                    }}
                   />
                 </Box>
                 <Box sx={{ display: 'flex', alignItems: 'center', gap: 'var(--ds-space-1)' }}>
@@ -1137,7 +1217,11 @@ const ExecutionsView: React.FC<ExecutionsViewProps> = ({
                     clearable={false}
                     value={selectedVersion}
                     options={['All', ...distinctVersions.map((v) => ({ value: v, label: `v${v}` }))]}
-                    onChange={(next) => setSelectedVersion(next)}
+                    onChange={(next) => {
+                      if (next === selectedVersion) return;
+                      clearExecutionSelection();
+                      setSelectedVersion(next);
+                    }}
                   />
                 </Box>
               </Box>
@@ -1163,6 +1247,7 @@ const ExecutionsView: React.FC<ExecutionsViewProps> = ({
                     <Box
                       key={execution.id}
                       onClick={() => {
+                        skipAutoSelectRef.current = false;
                         setSelectedExecution(execution);
                         setSelectedTask(null);
                       }}
@@ -1249,7 +1334,7 @@ const ExecutionsView: React.FC<ExecutionsViewProps> = ({
                               sx={{
                                 fontSize: 'var(--ds-text-caption)',
                                 color: ds.gray[600],
-                                fontFamily: 'monospace',
+                                fontFamily: ds.font.mono,
                                 backgroundColor: 'var(--ds-gray-100)',
                                 border: '1px solid var(--ds-gray-200)',
                                 borderRadius: 'var(--ds-radius-sm)',
@@ -1270,10 +1355,27 @@ const ExecutionsView: React.FC<ExecutionsViewProps> = ({
 
                 {(hasMore || hasPrevious) && (
                   <Box sx={{ display: 'flex', justifyContent: 'center', gap: 1, padding: 'var(--ds-space-3) var(--ds-space-4)' }}>
-                    <Button tone='secondary' size='sm' onClick={onPrevious} disabled={!hasPrevious || loadingMore}>
+                    <Button
+                      tone='secondary'
+                      size='sm'
+                      onClick={() => {
+                        skipAutoSelectRef.current = false;
+                        onPrevious?.();
+                      }}
+                      disabled={!hasPrevious || loadingMore}
+                    >
                       Previous
                     </Button>
-                    <Button tone='secondary' size='sm' onClick={onNext} disabled={!hasMore || loadingMore} loading={loadingMore}>
+                    <Button
+                      tone='secondary'
+                      size='sm'
+                      onClick={() => {
+                        skipAutoSelectRef.current = false;
+                        onNext?.();
+                      }}
+                      disabled={!hasMore || loadingMore}
+                      loading={loadingMore}
+                    >
                       {loadingMore ? 'Loading...' : 'Next'}
                     </Button>
                   </Box>
@@ -1443,7 +1545,7 @@ const ExecutionsView: React.FC<ExecutionsViewProps> = ({
                         body: (
                           <Box
                             sx={{
-                              fontFamily: 'monospace',
+                              fontFamily: ds.font.mono,
                               fontSize: 'var(--ds-text-caption)',
                               color: 'var(--ds-red-600)',
                               wordBreak: 'break-word',
@@ -1481,7 +1583,7 @@ const ExecutionsView: React.FC<ExecutionsViewProps> = ({
                                 <FormCard title='Inputs' description={''} icon={null} number={''} columns={1}>
                                   <Box
                                     sx={{
-                                      fontFamily: 'monospace',
+                                      fontFamily: ds.font.mono,
                                       fontSize: 'var(--ds-text-caption)',
                                       color: ds.gray[700],
                                       wordBreak: 'break-word',
@@ -1522,7 +1624,7 @@ const ExecutionsView: React.FC<ExecutionsViewProps> = ({
                                 <FormCard title='Result' description={''} icon={null} number={''} columns={1}>
                                   <Box
                                     sx={{
-                                      fontFamily: 'monospace',
+                                      fontFamily: ds.font.mono,
                                       fontSize: 'var(--ds-text-caption)',
                                       color: ds.gray[700],
                                       wordBreak: 'break-word',
@@ -1571,7 +1673,7 @@ const ExecutionsView: React.FC<ExecutionsViewProps> = ({
           {/* Execution Status Bar - floating pill with approval prompt when an approval task is waiting */}
           <ExecutionStatusBar
             top={140}
-            visible={!!selectedExecution && !isExecutionCompleted(selectedExecution.status)}
+            visible={isSelectedExecutionLive}
             completedTasks={
               effectiveTasks.filter((t) => {
                 const s = String(t.status ?? '').toUpperCase();
@@ -1580,14 +1682,12 @@ const ExecutionsView: React.FC<ExecutionsViewProps> = ({
             }
             totalTasks={effectiveTasks.length}
             pendingApprovals={
-              hasWriteAccess(accountId)
+              isSelectedExecutionLive && hasWriteAccess(accountId)
                 ? effectiveTasks
                     .filter((t) => t.type === 'core.approval' && String(t.status ?? '').toUpperCase() === 'SCHEDULED' && !!t.id)
                     .map<PendingApproval>((t) => ({
                       taskId: t.id as string,
-                      options: Array.isArray((t as any).input?.approval_options)
-                        ? (t as any).input.approval_options.filter((o: any) => typeof o === 'string' && o.length > 0)
-                        : [],
+                      options: resolveApprovalOptions((t as any).input, undefined),
                     }))
                 : []
             }
@@ -1604,21 +1704,57 @@ const ExecutionsView: React.FC<ExecutionsViewProps> = ({
                   falls back to the current draft and may differ from what
                   actually ran. */}
           {executionData?.definition_source === 'draft_run' && (
-            <Alert severity='info' sx={{ margin: 'var(--ds-space-2) var(--ds-space-4)' }}>
-              This was a draft run (“Run current”) of an unpublished definition. The canvas shows the exact draft that ran, not the live version.
-            </Alert>
+            <Box sx={{ margin: 'var(--ds-space-2) var(--ds-space-4)' }}>
+              <Banner
+                tone='info'
+                surface='section'
+                message='This was a draft run (“Run current”) of an unpublished definition. The canvas shows the exact draft that ran, not the live version.'
+              />
+            </Box>
           )}
           {executionData?.definition_source === 'legacy_live_snapshot' && (
-            <Alert severity='info' sx={{ margin: 'var(--ds-space-2) var(--ds-space-4)' }}>
-              This execution predates version tracking — showing the live version snapshot taken at backfill time, which may differ from the exact
-              definition that ran.
-            </Alert>
+            <Box sx={{ margin: 'var(--ds-space-2) var(--ds-space-4)' }}>
+              <Banner
+                tone='info'
+                surface='section'
+                message='This execution predates version tracking — showing the live version snapshot taken at backfill time, which may differ from the exact definition that ran.'
+              />
+            </Box>
           )}
           {executionData?.definition_source === 'live_fallback' && (
-            <Alert severity='warning' sx={{ margin: 'var(--ds-space-2) var(--ds-space-4)' }}>
-              This execution predates version tracking and the live snapshot is unavailable — the canvas below reflects the current workflow draft and
-              may differ from what actually ran.
-            </Alert>
+            <Box sx={{ margin: 'var(--ds-space-2) var(--ds-space-4)' }}>
+              <Banner
+                tone='warning'
+                surface='section'
+                message='This execution predates version tracking and the live snapshot is unavailable — the canvas below reflects the current workflow draft and may differ from what actually ran.'
+              />
+            </Box>
+          )}
+
+          {/* Canvas has nothing to draw: either no execution is selected (most
+              commonly right after a status/version filter was applied), or the
+              selected one's definition is still in flight. */}
+          {(!selectedExecution || !executionData) && !loading && (
+            <Box
+              data-testid='execution-no-selection'
+              sx={{
+                position: 'absolute',
+                inset: 0,
+                zIndex: 4,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                pointerEvents: 'none',
+              }}
+            >
+              <Typography sx={{ fontSize: 'var(--ds-text-body-lg)', color: ds.gray[600] }}>
+                {selectedExecution
+                  ? 'Loading execution…'
+                  : filteredExecutions.length === 0
+                  ? 'No executions match the selected filters.'
+                  : 'Select an execution to view its run.'}
+              </Typography>
+            </Box>
           )}
 
           {/* ReactFlow Canvas */}
@@ -1913,7 +2049,7 @@ const ExecutionsView: React.FC<ExecutionsViewProps> = ({
                               fontSize: 'var(--ds-text-small)',
                               fontWeight: 'var(--ds-font-weight-semibold)',
                               color: ds.gray[700],
-                              fontFamily: 'Poppins, sans-serif',
+                              fontFamily: ds.font.display,
                             }}
                           >
                             Input
@@ -1978,7 +2114,7 @@ const ExecutionsView: React.FC<ExecutionsViewProps> = ({
                         {inlineInputViewMode === 'formatted' ? (
                           renderFormattedField(selectedTaskData.rendered_params ?? selectedTaskData.input ?? {}, 'input')
                         ) : (
-                          <Box sx={{ fontFamily: 'monospace', fontSize: 'var(--ds-text-body)', color: ds.gray[700], whiteSpace: 'pre-wrap' }}>
+                          <Box sx={{ fontFamily: ds.font.mono, fontSize: 'var(--ds-text-body)', color: ds.gray[700], whiteSpace: 'pre-wrap' }}>
                             {JSON.stringify(selectedTaskData.rendered_params ?? selectedTaskData.input ?? {}, null, 2)}
                           </Box>
                         )}
@@ -2005,7 +2141,7 @@ const ExecutionsView: React.FC<ExecutionsViewProps> = ({
                               fontSize: 'var(--ds-text-small)',
                               fontWeight: 'var(--ds-font-weight-semibold)',
                               color: ds.gray[700],
-                              fontFamily: 'Poppins, sans-serif',
+                              fontFamily: ds.font.display,
                             }}
                           >
                             Output
@@ -2075,7 +2211,7 @@ const ExecutionsView: React.FC<ExecutionsViewProps> = ({
                           {inlineOutputViewMode === 'formatted' ? (
                             renderFormattedField(selectedTaskData.output, 'output')
                           ) : (
-                            <Box sx={{ fontFamily: 'monospace', fontSize: 'var(--ds-text-body)', color: ds.gray[700], whiteSpace: 'pre-wrap' }}>
+                            <Box sx={{ fontFamily: ds.font.mono, fontSize: 'var(--ds-text-body)', color: ds.gray[700], whiteSpace: 'pre-wrap' }}>
                               {typeof selectedTaskData.output === 'string'
                                 ? selectedTaskData.output
                                 : JSON.stringify(selectedTaskData.output, null, 2)}
@@ -2115,7 +2251,7 @@ const ExecutionsView: React.FC<ExecutionsViewProps> = ({
                                 fontSize: 'var(--ds-text-small)',
                                 fontWeight: 'var(--ds-font-weight-semibold)',
                                 color: ds.red[600],
-                                fontFamily: 'Poppins, sans-serif',
+                                fontFamily: ds.font.display,
                               }}
                             >
                               Error
@@ -2146,7 +2282,7 @@ const ExecutionsView: React.FC<ExecutionsViewProps> = ({
                                 border: `1px solid ${ds.red[200]}`,
                                 borderRadius: 'var(--ds-radius-md)',
                                 padding: 'var(--ds-space-3)',
-                                fontFamily: 'monospace',
+                                fontFamily: ds.font.mono,
                                 fontSize: 'var(--ds-text-body)',
                                 wordBreak: 'break-word',
                                 whiteSpace: 'pre-wrap',

@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"log/slog"
+	"nudgebee/llm/agents"
 	"nudgebee/llm/common"
 	"nudgebee/llm/config"
 	"nudgebee/llm/tools/core"
@@ -38,9 +39,8 @@ func init() {
 		panic("cache-invalidation: ServerName must be set; check the LLM_SERVER_NAME / HOSTNAME env var")
 	}
 
-	// "starting" log so a hang inside MqFanoutSubscribe (TCP dial / AMQP
-	// handshake / queue declare) is visible in container logs even if
-	// the "registered" line below never prints.
+	// MqFanoutSubscribe only registers a supervisor; connecting and consuming
+	// happen in the background ("rbmq: consumer running" / GET /health/mq).
 	slog.Info("cache-invalidation: registering fanout consumer",
 		"exchange", config.Config.RabbitMqLLMCacheInvalidationExchange,
 		"server_name", config.Config.ServerName)
@@ -52,7 +52,7 @@ func init() {
 			"exchange", config.Config.RabbitMqLLMCacheInvalidationExchange, "error", err)
 		return
 	}
-	slog.Info("cache-invalidation: fanout consumer registered",
+	slog.Info("cache-invalidation: fanout consumer supervisor started",
 		"exchange", config.Config.RabbitMqLLMCacheInvalidationExchange)
 }
 
@@ -90,6 +90,11 @@ func processCacheInvalidationMessage(_ context.Context, data []byte) error {
 		}
 		seen[id] = struct{}{}
 		core.InvalidateAccountIntegrationCache(id)
+		// The FinOps system prompt embeds the account's footprint (providers,
+		// integrations, K8s agent connected?) in a block cached for hours, so it
+		// needs busting here too — the AccountConfigSummary invalidation above
+		// does not reach a render that already happened.
+		agents.InvalidateFinOpsAccountContext(id)
 		// Best-effort: kick the per-account KB-sync fast path so a freshly-
 		// saved integration with sync_knowledge_base=true (or any confluence
 		// integration) starts indexing within seconds instead of waiting up

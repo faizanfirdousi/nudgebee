@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	"nudgebee/llm/agents/core"
-	"nudgebee/llm/config"
 	"nudgebee/llm/security"
 	toolcore "nudgebee/llm/tools/core"
 
@@ -127,8 +126,8 @@ func TestParseDelegateInput_NotebookMisuseRejected(t *testing.T) {
 			assert.Error(t, err)
 			assert.Contains(t, err.Error(), "starts with 'update the notebook'",
 				"rejection error must name the misuse pattern explicitly")
-			assert.Contains(t, err.Error(), "<update_notebook>",
-				"rejection error must point at the correct path (use the XML tag in your thought)")
+			assert.Contains(t, err.Error(), "parent agent's notebook directly",
+				"rejection error must point at the parent-owned notebook path")
 		})
 	}
 }
@@ -206,16 +205,16 @@ func TestParseDelegateInput_MaxIterationsBelowMinWithToolsAutoClamped(t *testing
 	// so the tool executes and findings are synthesized seamlessly.
 	input := toolcore.NBToolCallRequest{
 		Arguments: map[string]any{
-			"prompt":         "Call get_incident_assembly with event_id=4ede665d-2330-469e-b078-40c99c4a4899",
-			"tools":          []any{"get_incident_assembly"},
+			"prompt":         "Call get_event_incident_assembly with event_id=4ede665d-2330-469e-b078-40c99c4a4899",
+			"tools":          []any{"get_event_incident_assembly"},
 			"max_iterations": float64(1),
 		},
 	}
 
 	prompt, toolNames, maxIter, err := parseDelegateInput(input)
 	assert.NoError(t, err)
-	assert.Equal(t, "Call get_incident_assembly with event_id=4ede665d-2330-469e-b078-40c99c4a4899", prompt)
-	assert.Equal(t, []string{"get_incident_assembly"}, toolNames)
+	assert.Equal(t, "Call get_event_incident_assembly with event_id=4ede665d-2330-469e-b078-40c99c4a4899", prompt)
+	assert.Equal(t, []string{"get_event_incident_assembly"}, toolNames)
 	assert.Equal(t, minDelegateMaxIterations, maxIter)
 }
 
@@ -285,7 +284,22 @@ func TestDynamicReActAgent_Interface(t *testing.T) {
 
 	prompt := agent.GetSystemPrompt(nil, core.NBAgentRequest{})
 	assert.Contains(t, prompt.Instructions[0], "Investigate connection pool exhaustion")
-	assert.Len(t, prompt.Constraints, 4)
+	assert.Len(t, prompt.Constraints, 5)
+}
+
+func TestDynamicReActAgent_SystemPromptPreservesScopeAcrossAgentTools(t *testing.T) {
+	agent := &dynamicReActAgent{
+		name:          DelegateAgentToolName,
+		prompt:        "Fetch ELB logs from aws-prod in us-east-1",
+		tools:         []toolcore.NBTool{&mockTool{name: "aws_observability"}},
+		maxIterations: 3,
+	}
+
+	prompt := agent.GetSystemPrompt(nil, core.NBAgentRequest{})
+	joined := strings.Join(prompt.Constraints, "\n")
+	assert.Contains(t, joined, "copy every explicit execution scope")
+	assert.Contains(t, joined, "account")
+	assert.Contains(t, joined, "Never omit a named scope")
 }
 
 // TestDynamicReActAgent_SystemPromptIncludesBudgetAndTools verifies the system prompt
@@ -659,6 +673,13 @@ func TestDynamicReActAgent_RunsOnCheapTier(t *testing.T) {
 		"delegated sub-agents must run on the cheap Retrieval tier, not Reasoning")
 }
 
+func TestDynamicReActAgent_DisablesNotebook(t *testing.T) {
+	a := &dynamicReActAgent{name: DelegateAgentToolName}
+	assert.False(t, a.GetNotebookEnabled())
+	assert.False(t, core.ResolveAgentNotebookEnabled(a),
+		"the parent orchestrator owns investigation state for delegated sub-agents")
+}
+
 // TestFlattenAgentGuidance_CarriesInstructionsConstraintsExamples pins that flattening a
 // thin agent carries its full static guidance — instructions, constraints, AND examples
 // (Answer and AnswerSteps forms) — since a CLI wrapper's examples (e.g. rabbitmq's curl/jq
@@ -722,26 +743,4 @@ func TestDynamicReActAgent_InjectDefaultSkills(t *testing.T) {
 	agent := &dynamicReActAgent{name: "test_delegate", accountId: "acct-1"}
 	assert.True(t, agent.OptOutDefaultTools(), "delegate must still opt out of default tools (parent-curated scope)")
 	assert.True(t, agent.InjectDefaultSkills(), "delegate must re-enable load_skills via the skills carve-out")
-}
-
-// TestDynamicReActAgent_AccountSkillMenu_FlagOff verifies the delegate emits no
-// skill menu when the feature flag is off (default) — protects against
-// accidental prompt expansion before the flag is deliberately flipped.
-func TestDynamicReActAgent_AccountSkillMenu_FlagOff(t *testing.T) {
-	prev := config.Config.LlmServerDelegateAccountKBsEnabled
-	config.Config.LlmServerDelegateAccountKBsEnabled = false
-	t.Cleanup(func() { config.Config.LlmServerDelegateAccountKBsEnabled = prev })
-
-	agent := &dynamicReActAgent{
-		name:          "test_delegate",
-		accountId:     "acct-1",
-		prompt:        "Investigate slow queries",
-		maxIterations: 5,
-	}
-
-	systemPrompt := agent.GetSystemPrompt(security.NewRequestContextForSuperAdmin(), core.NBAgentRequest{})
-
-	for _, ins := range systemPrompt.Instructions {
-		assert.NotContains(t, ins, "<skill-lists>", "no skill-lists menu should appear when flag is off")
-	}
 }

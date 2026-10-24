@@ -31,7 +31,9 @@ const ExecutionStatusBar: React.FC<ExecutionStatusBarProps> = ({
   const [commentsByTask, setCommentsByTask] = useState<Record<string, string>>({});
 
   const hasPendingApproval = pendingApprovals.length > 0;
-  if (!visible && !hasPendingApproval) {
+  // `visible` is authoritative: a task left at SCHEDULED by a canceled run must not
+  // resurrect the approve/reject form, which would only 409 (#36358).
+  if (!visible) {
     return null;
   }
 
@@ -139,13 +141,27 @@ const ExecutionStatusBar: React.FC<ExecutionStatusBarProps> = ({
                 No approval_options configured on this task.
               </Typography>
             ) : (
-              <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 'var(--ds-space-2)' }}>
+              <Box
+                sx={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 'var(--ds-space-2)',
+                  maxHeight: '240px',
+                  overflowY: 'auto',
+                  // Room for the focus ring, which the scroll container would otherwise clip.
+                  padding: 'var(--ds-space-1)',
+                  // Long options (e.g. subnet descriptions) ellipsize instead of overflowing the card.
+                  '& .MuiButtonBase-root > span:not(.MuiCircularProgress-root)': { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' },
+                }}
+              >
                 {pa.options.map((opt, i) => {
                   const key = `${pa.taskId}:${opt}`;
                   return (
                     <Button
                       key={opt}
                       id={`workflow-approval-${opt}-btn`}
+                      title={opt}
+                      fullWidth
                       tone={i === 0 ? 'primary' : 'secondary'}
                       size='sm'
                       disabled={approvalLoading !== null}

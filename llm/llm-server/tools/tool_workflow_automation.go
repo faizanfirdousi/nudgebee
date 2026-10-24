@@ -98,6 +98,11 @@ type automationTool struct {
 	// reasonArg is the parameter name this tool uses for the required reasoning
 	// field, resolved per automation so a declared input never loses to it.
 	reasonArg string
+	// autoApprove is the author's decision that this automation may run without
+	// the confirmation card. It comes from the workflow row, refreshed on the
+	// same automationToolCacheTTL as everything else here, so withdrawing it
+	// takes at most that long to stop suppressing the prompt.
+	autoApprove bool
 }
 
 type automationInput struct {
@@ -114,6 +119,7 @@ type automationCandidate struct {
 	Description    string            `json:"description,omitempty"`
 	LLMDescription string            `json:"llm_description"`
 	Inputs         []automationInput `json:"inputs,omitempty"`
+	AutoApprove    bool              `json:"auto_approve,omitempty"`
 }
 
 type automationSearchResponse struct {
@@ -265,6 +271,7 @@ func buildAutomationTools(accountId string, candidates []automationCandidate) []
 			humanDesc:   c.Description,
 			inputs:      c.Inputs,
 			reasonArg:   reasonArgFor(c.Inputs),
+			autoApprove: c.AutoApprove,
 		})
 	}
 	return tools
@@ -343,9 +350,25 @@ func (t *automationTool) Description() string {
 	if summary := strings.TrimSpace(t.humanDesc); summary != "" {
 		fmt.Fprintf(&sb, " (%s)", summary)
 	}
-	sb.WriteString(" Runs with the user's own permissions after they confirm, and waits for the result.")
+	if t.autoApprove {
+		// Say so in the description: the model is about to take an action the
+		// user will not be asked about, and it should weigh that when choosing.
+		sb.WriteString(" Its author has allowed it to run WITHOUT asking the user to confirm, so treat calling it as taking the action — say what you are about to run and why in the same turn. Runs with the user's own permissions and waits for the result.")
+	} else {
+		sb.WriteString(" Runs with the user's own permissions after they confirm, and waits for the result.")
+	}
 	return sb.String()
 }
+
+// SkipWriteConfirmation suppresses the confirmation card when the automation's
+// author opted it in to unattended AI invocation (workflows.ai_auto_approve).
+//
+// The classification above stays ToolRequestTypeCreate, so this changes exactly
+// one thing: whether the user is asked. The RBAC check and the server-side
+// assertAIInvocationAllowed gate both still run, and neither consults this
+// flag — an automation the assistant may not invoke is still refused, silently
+// approved or not.
+func (t *automationTool) SkipWriteConfirmation(_ string) bool { return t.autoApprove }
 
 // InferToolRequestType classifies running an automation as a create so the
 // executor gates it behind the ask-before-run confirmation and the create RBAC
@@ -386,10 +409,16 @@ func (t *automationTool) InputSchema() core.ToolSchema {
 		if in.ID == "" {
 			continue
 		}
+		schemaType := automationInputSchemaType(in.Type)
+		var items map[string]any
+		if schemaType == core.ToolSchemaTypeArray {
+			items = map[string]any{"type": "string"}
+		}
 		props[in.ID] = core.ToolSchemaProperty{
-			Type:        automationInputSchemaType(in.Type),
+			Type:        schemaType,
 			Description: in.Description,
 			Default:     in.Default,
+			Items:       items,
 		}
 		// An input with no default is required of the AI whether or not the author
 		// ticked "required". Unticked-and-undefaulted is optional only in the sense
@@ -483,6 +512,14 @@ func (t *automationTool) Call(ctx core.NbToolContext, input core.NBToolCallReque
 		return core.NBToolResponse{}, fmt.Errorf(
 			"%s: unknown parameter(s) %s — %s (plus the required %s). Re-issue the call using those exact names",
 			t.toolName, strings.Join(unknown, ", "), accepts, t.reasonArg)
+	}
+
+	// Tags the run with the event under investigation so it surfaces in that
+	// event's automation history (executor.go keys the nb_event_id search
+	// attribute off this "event" map) — same mechanism a human triggering the
+	// automation from the event page gets via workflow's own event input.
+	if ctx.QueryConfig.EventId != "" {
+		inputs["event"] = map[string]any{"id": ctx.QueryConfig.EventId}
 	}
 
 	ctx.Ctx.GetLogger().Info("automation tool: running automation",

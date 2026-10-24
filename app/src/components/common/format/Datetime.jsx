@@ -10,7 +10,7 @@ const ONE_DAY = 24 * ONE_HOUR;
 const MONTH_ABBR = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 const pad2 = (n) => String(n).padStart(2, '0');
 
-function parseDateValue(value) {
+export function parseDateValue(value) {
   if (value instanceof Date) return value;
   if (typeof value === 'string') {
     const timezoneRegex = /([Zz]|[+-]\d{2}:?\d{2})$/;
@@ -25,18 +25,47 @@ function parseDateValue(value) {
   return new Date(value);
 }
 
-function formatDateShort(date) {
-  return `${pad2(date.getDate())}-${MONTH_ABBR[date.getMonth()]}`;
+// The year is carried only when it differs from the reference year, so this
+// year's dates stay narrow in tight table columns while an older one can no
+// longer be mistaken for a recent date. alwaysShowYear opts out of that for
+// sparse lists (e.g. certificate expiries) where "07-Nov" alone is ambiguous.
+function formatDateShort(date, refDate, alwaysShowYear = false) {
+  const base = `${pad2(date.getDate())}-${MONTH_ABBR[date.getMonth()]}`;
+  return !alwaysShowYear && date.getFullYear() === refDate.getFullYear() ? base : `${base}-${date.getFullYear()}`;
 }
 
-function formatTooltip(date) {
+export function formatTooltip(date) {
   const hh = pad2(date.getHours());
   const mm = pad2(date.getMinutes());
   const dd = pad2(date.getDate());
   const mmm = MONTH_ABBR[date.getMonth()];
   const tzPart = new Intl.DateTimeFormat(undefined, { timeZoneName: 'short' }).formatToParts(date).find((p) => p.type === 'timeZoneName');
   const tz = tzPart ? tzPart.value : '';
-  return `${hh}:${mm} ${tz}, ${dd}-${mmm}`;
+  return `${hh}:${mm} ${tz}, ${dd}-${mmm}-${date.getFullYear()}`;
+}
+
+// formatTooltip for a raw server value, guarded. The component below falls back
+// to its empty value on an unparseable date; callers using the formatter on its
+// own had no such guard and would render "NaN:NaN , NaN-undefined-NaN".
+export function formatClock(value, emptyValue = '') {
+  // parseDateValue(null) is the epoch, not an invalid date — check first.
+  if (value === null || value === undefined || value === '') return emptyValue;
+  const parsed = parseDateValue(value);
+  if (!parsed || Number.isNaN(parsed.getTime())) return emptyValue;
+  return formatTooltip(parsed);
+}
+
+// The same moment, short enough to sit inline next to the relative time:
+// "17 Sep 07:32", with the year only when it isn't the current one. Viewer's own
+// timezone; the zone name and full date belong in the hover, not in a sidebar
+// row that has to wrap to fit them.
+export function formatClockCompact(value, emptyValue = '') {
+  if (value === null || value === undefined || value === '') return emptyValue;
+  const parsed = parseDateValue(value);
+  if (!parsed || Number.isNaN(parsed.getTime())) return emptyValue;
+  const day = `${pad2(parsed.getDate())} ${MONTH_ABBR[parsed.getMonth()]}`;
+  const year = parsed.getFullYear() === new Date().getFullYear() ? '' : ` ${parsed.getFullYear()}`;
+  return `${day}${year} ${pad2(parsed.getHours())}:${pad2(parsed.getMinutes())}`;
 }
 
 // Buckets per redesign:
@@ -45,7 +74,7 @@ function formatTooltip(date) {
 //   < 1 hour  → "X m"            + ago/in
 //   < 1 day   → "X hr[s] [Y m]"  + ago/in   (drops "0 m" when minutes are zero)
 //   < 3 days  → "X d"            + ago/in
-//   ≥ 3 days  → "dd-mmm"          (absolute, no ago/in)
+//   ≥ 3 days  → "dd-mmm"          (absolute, no ago/in; "dd-mmm-yyyy" off-year or with alwaysShowYear)
 function formatRelative(deltaMs) {
   if (deltaMs < ONE_SEC) {
     return { mainText: 'now', useRelativeAffix: false };
@@ -89,8 +118,12 @@ export default function Datetime({
   sxSuffixSecondary = true,
   sxSecondary = false,
   sxPrefixSecondary = true,
+  alwaysShowYear = false,
 }) {
-  if (!value) {
+  const parsed = value ? parseDateValue(value) : null;
+  // An unparseable value falls back to the same placeholder as a missing one;
+  // it used to reach the formatters and render as "NaN-undefined".
+  if (!parsed || Number.isNaN(parsed.getTime())) {
     return (
       <Typography
         key='empty'
@@ -108,14 +141,14 @@ export default function Datetime({
     );
   }
 
-  const dateValue = parseDateValue(value);
+  const dateValue = parsed;
   const ref = baseDate || new Date();
   const deltaMs = Math.abs(ref.getTime() - dateValue.getTime());
   const isFuture = dateValue > ref;
 
   const { mainText: relativeText, useRelativeAffix } = formatRelative(deltaMs);
   const isAbsolute = relativeText === null;
-  const mainText = isAbsolute ? formatDateShort(dateValue) : relativeText;
+  const mainText = isAbsolute ? formatDateShort(dateValue, ref, alwaysShowYear) : relativeText;
 
   const valueStyle = {
     color: sxSecondary ? 'var(--ds-gray-500)' : 'var(--ds-gray-700)',
@@ -186,4 +219,5 @@ Datetime.propTypes = {
   sxSecondary: PropTypes.bool,
   sxPrefixSecondary: PropTypes.bool,
   sxPrefix: PropTypes.object,
+  alwaysShowYear: PropTypes.bool,
 };

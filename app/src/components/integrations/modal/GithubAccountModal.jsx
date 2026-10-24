@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Modal } from '@ui/Modal';
+import { useBrandingConfig } from '@hooks/useTenantBranding';
 import { Typography, Box } from '@mui/material';
 import { Input } from '@ui/Input';
 import { Button } from '@ui/Button';
@@ -13,6 +14,7 @@ import Tooltip from '@ui/Tooltip';
 import SafeIcon from '@shared/icons/SafeIcon';
 import { toast as snackbar } from '@ui/Toast';
 import { ds } from 'src/utils/colors';
+import { getIntegrationDescription } from '@lib/integrationDescriptions';
 
 const HELPER_TEXT_SX = {
   color: 'var(--ds-gray-500)',
@@ -26,6 +28,7 @@ const HELPER_TEXT_SX = {
 const TOKEN_PLACEHOLDER = '••••••••';
 
 const GithubAccountModal = ({ openModal, handleClose, editConfig = null }) => {
+  const { title: baseTitle } = useBrandingConfig();
   const isEdit = !!editConfig;
   const [githubName, setGithubName] = useState('');
   const [githubToken, setGithubToken] = useState('');
@@ -268,6 +271,7 @@ const GithubAccountModal = ({ openModal, handleClose, editConfig = null }) => {
       open={openModal}
       handleClose={() => handleCloseGithubModal()}
       title={isEdit ? 'Edit Github Account' : 'Add Github Account'}
+      subtitle={getIntegrationDescription('GITHUB')}
       loader={isSubmitting}
     >
       <Box sx={{ minHeight: ds.space.mul(0, 100), pt: ds.space[5], pb: ds.space[2] }}>
@@ -302,7 +306,7 @@ const GithubAccountModal = ({ openModal, handleClose, editConfig = null }) => {
           {authType === 'github-app' && !isEdit && (
             <Box sx={{ display: 'flex', flexDirection: 'column', gap: ds.space[4] }}>
               <Typography component='span' sx={HELPER_TEXT_SX}>
-                Click the button below to authenticate with nudgebee GitHub App. This will open a popup window to complete the authentication process.
+                {`Click the button below to authenticate with the ${baseTitle} GitHub App. This will open a popup window to complete the authentication process.`}
               </Typography>
               <Box
                 sx={{

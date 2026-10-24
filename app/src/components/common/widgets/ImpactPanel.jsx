@@ -98,11 +98,28 @@ const relationLabel = (relation, seedName) => {
 
 const shortName = (item) => (item.subject ? item.subject.split('|').pop() : '') || item.title || 'unknown';
 
+// A config change can be an edit to a ConfigMap or an Ingress the workload
+// merely reads, not a rollout of the workload itself. Saying "was deployed"
+// about a ConfigMap edit is what made the cause card unreadable: three
+// different objects all reported as the workload being redeployed.
+const WORKLOAD_SUBJECT_TYPES = new Set(['deployment', 'statefulset', 'daemonset', 'rollout', 'replicaset', 'job', 'cronjob']);
+const KIND_LABELS = {
+  configmap: 'ConfigMap',
+  secret: 'Secret',
+  ingress: 'Ingress',
+  service: 'Service',
+};
+const changeLabel = (item) => {
+  const t = (item.subject_type || '').toLowerCase();
+  if (!t || WORKLOAD_SUBJECT_TYPES.has(t)) return 'was deployed / changed';
+  return `${KIND_LABELS[t] || t} was changed`;
+};
+
 const AggChip = ({ label }) => (
   <Box
     component='span'
     sx={{
-      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+      fontFamily: 'var(--ds-font-mono)',
       fontSize: 10.5,
       color: 'var(--ds-gray-600)',
       bgcolor: 'var(--ds-background-100)',
@@ -128,7 +145,7 @@ const TierRow = ({ item, color, goTo, showRarity, isChange, folded, seedName }) 
         borderLeft: `3px solid ${color}`,
         bgcolor: folded ? 'var(--ds-gray-100)' : 'var(--ds-background-100)',
         borderRadius: 'var(--ds-radius-sm)',
-        boxShadow: folded ? 'none' : '0 1px 2px rgba(0,0,0,0.05)',
+        boxShadow: folded ? 'none' : '0 1px 2px var(--ds-gray-alpha-100)',
         p: 1,
         mb: 0.75,
         cursor: item.event_id ? 'pointer' : 'default',
@@ -138,7 +155,7 @@ const TierRow = ({ item, color, goTo, showRarity, isChange, folded, seedName }) 
     >
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, flexWrap: 'wrap' }}>
         <Typography sx={{ fontWeight: 620, fontSize: 13.5 }}>{shortName(item)}</Typography>
-        {isChange && <AggChip label='was deployed / changed' />}
+        {isChange && <AggChip label={changeLabel(item)} />}
         {item.occurrence_count > 1 && (
           <Typography sx={{ fontSize: 11.5, fontWeight: 700, color: 'var(--ds-gray-500)' }}>happened {item.occurrence_count} times</Typography>
         )}
@@ -165,10 +182,10 @@ const TierRow = ({ item, color, goTo, showRarity, isChange, folded, seedName }) 
               height: 17,
               px: 0.75,
               fontSize: 10.5,
-              fontWeight: 600,
+              fontWeight: 'var(--ds-font-weight-semibold)',
               color: badge.fg,
               bgcolor: badge.bg,
-              borderRadius: '999px',
+              borderRadius: 'var(--ds-radius-pill)',
             }}
           >
             {badge.label}
@@ -180,11 +197,23 @@ const TierRow = ({ item, color, goTo, showRarity, isChange, folded, seedName }) 
 };
 
 // TierSection renders a labelled tier with a colored dot, a plain count, and its rows.
+const plural = (n, noun) => `${n} ${noun}${n === 1 ? '' : 's'}`;
+
 // `label` overrides the tier's default heading (used to name the service explicitly);
 // `unit` is the singular noun for the count ("alert" -> "3 alerts").
-const TierSection = ({ tierKey, label, unit = 'alert', note, items, goTo, showRarity, folded, seedName }) => {
+//
+// `subjectUnit` makes the count honest when a tier holds one row per ALERT but is
+// describing services. The impact tier does: two machines each firing several alarms
+// rendered as "8 services", which reads as eight things broken when two did. A
+// customer who checks that number once and finds it wrong stops trusting the card the
+// number exists to summarise. Both figures are worth showing — the services are the
+// blast radius, the alerts are the evidence — so say both rather than pick one.
+const TierSection = ({ tierKey, label, unit = 'alert', subjectUnit, note, items, goTo, showRarity, folded, seedName }) => {
   if (!items || items.length === 0) return null;
   const t = TIERS[tierKey];
+  // Rows carry the subject they fired on; fall back to the row itself so an item
+  // without one is never silently merged into another subject's count.
+  const subjects = subjectUnit ? new Set(items.map((it, i) => it.subject || `#${i}`)).size : 0;
   return (
     <Box sx={{ mt: 1.75 }}>
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, mb: 0.5 }}>
@@ -193,8 +222,9 @@ const TierSection = ({ tierKey, label, unit = 'alert', note, items, goTo, showRa
           {label || t.label}
         </Typography>
         <Typography sx={{ ml: 'auto', fontSize: 11, color: 'var(--ds-gray-400)' }}>
-          {items.length} {unit}
-          {items.length === 1 ? '' : 's'}
+          {subjectUnit && subjects !== items.length
+            ? `${plural(subjects, subjectUnit)}, ${plural(items.length, unit)}`
+            : plural(items.length, subjectUnit || unit)}
         </Typography>
       </Box>
       {note && <Typography sx={{ fontSize: 11.5, color: 'var(--ds-gray-400)', mb: 0.75 }}>{note}</Typography>}
@@ -342,8 +372,12 @@ const ImpactPanel = ({ eventId, prefetched }) => {
     return (
       <Box sx={{ p: 1 }}>
         <Box sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 1, mb: 0.5 }}>
-          <Chip size='small' label='ROOT' sx={{ bgcolor: 'var(--ds-red-500)', color: '#fff', fontWeight: 700, height: 20, letterSpacing: 0.5 }} />
-          <Typography sx={{ fontWeight: 700 }}>{seed.name}</Typography>
+          <Chip
+            size='small'
+            label='ROOT'
+            sx={{ bgcolor: 'var(--ds-pink-200)', color: 'var(--ds-red-700)', fontWeight: 700, height: 18, fontSize: 11, letterSpacing: 0.5 }}
+          />
+          <Typography sx={{ fontWeight: 620, fontSize: 14 }}>{seed.name}</Typography>
           <Typography sx={{ color: 'var(--ds-gray-500)', fontSize: 13 }}>
             · {seed.namespace} · {seed.type}
           </Typography>
@@ -402,7 +436,8 @@ const ImpactPanel = ({ eventId, prefetched }) => {
 
         <TierSection
           tierKey='impact'
-          unit='service'
+          unit='alert'
+          subjectUnit='service'
           note='These broke after this one did. How often each normally alerts is shown on the right.'
           items={a.impact}
           seedName={seed.name}
@@ -489,14 +524,20 @@ const ImpactPanel = ({ eventId, prefetched }) => {
 
   const impacted = Array.isArray(data.impacted) ? data.impacted : [];
   const dependsOn = Array.isArray(data.depends_on) ? data.depends_on : [];
-  const correlated = impacted.filter((s) => s.alerting);
+  const infraAll = Array.isArray(data.infrastructure_impacted) ? data.infrastructure_impacted : [];
+  // An alerting dependent belongs in the incident whichever list it came back in.
+  // On a cloud stack every dependent is infrastructure, so reading only `impacted`
+  // here meant the correlated section stayed empty no matter how loudly the
+  // instances in front of the resource were alarming.
+  const correlated = [...impacted.filter((s) => s.alerting), ...infraAll.filter((s) => s.alerting)];
   const potential = impacted.filter((s) => !s.alerting);
   // Dependents that are not application-level types. They are reported separately by the
   // API so they cannot inflate dependent_count, which feeds recommendation safety scoring
   // — but they must still be shown: on a VM or serverless stack the instance calling this
   // resource IS the application, and hiding it makes a real blast radius read as "nothing
   // was affected".
-  const infrastructure = Array.isArray(data.infrastructure_impacted) ? data.infrastructure_impacted : [];
+  // Only the ones not already listed above as correlated incidents.
+  const infrastructure = infraAll.filter((s) => !s.alerting);
   const lowCoverage = data.coverage_confidence === 'none' || data.coverage_confidence === 'low';
   const goTo = (evId) => evId && router.push(`/investigate?id=${evId}&accountId=${accountId}`);
 
@@ -504,8 +545,12 @@ const ImpactPanel = ({ eventId, prefetched }) => {
     <Box sx={{ p: 1 }}>
       {/* Root + one-line summary */}
       <Box sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 1, mb: 0.5 }}>
-        <Chip size='small' label='ROOT' sx={{ bgcolor: 'var(--ds-red-500)', color: '#fff', fontWeight: 700, height: 20, letterSpacing: 0.5 }} />
-        <Typography sx={{ fontWeight: 700 }}>{seed.name}</Typography>
+        <Chip
+          size='small'
+          label='ROOT'
+          sx={{ bgcolor: 'var(--ds-pink-200)', color: 'var(--ds-red-700)', fontWeight: 700, height: 18, fontSize: 11, letterSpacing: 0.5 }}
+        />
+        <Typography sx={{ fontWeight: 620, fontSize: 14 }}>{seed.name}</Typography>
         <Typography sx={{ color: 'var(--ds-gray-500)', fontSize: 13 }}>
           · {seed.namespace} · {seed.type}
         </Typography>
@@ -547,7 +592,7 @@ const ImpactPanel = ({ eventId, prefetched }) => {
             }}
           >
             <Box sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 0.75, mb: 0.25 }}>
-              <Typography sx={{ fontWeight: 600, fontSize: 13.5 }}>{s.name}</Typography>
+              <Typography sx={{ fontWeight: 'var(--ds-font-weight-semibold)', fontSize: 13.5 }}>{s.name}</Typography>
               <MetaChip label={s.node_type} />
               <MetaChip label={`${s.hops_away}-hop`} />
               <MetaChip label={`via ${s.relationship}`} />

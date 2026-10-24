@@ -67,6 +67,22 @@ MSG_DM_SENT_SUCCESS = "Direct message sent successfully"
 # surrounding conversation. Callers that need the question alone split on this.
 THREAD_CONTEXT_MARKER = "\n--- context ---"
 
+EVENT_CONVERSATION_PREFIX = "event-"
+# The RCA-report session prefix ("event-rca-"), layered on the plain "event-"
+# every other session uses -- must be checked first, or "rca-" leaks into the
+# extracted fingerprint.
+EVENT_RCA_CONVERSATION_PREFIX = "event-rca-"
+
+
+def extract_event_fingerprint(conversation_id: str) -> str:
+    """Recover the alert fingerprint from an llm-server event-conversation
+    session id ("event-<fingerprint>" or "event-rca-<fingerprint>")."""
+    if conversation_id.startswith(EVENT_RCA_CONVERSATION_PREFIX):
+        return conversation_id[len(EVENT_RCA_CONVERSATION_PREFIX) :]
+    if conversation_id.startswith(EVENT_CONVERSATION_PREFIX):
+        return conversation_id[len(EVENT_CONVERSATION_PREFIX) :]
+    return conversation_id
+
 
 class CommonService:
     def __init__(self, engine, slack_app, teams_app):
@@ -385,7 +401,7 @@ class CommonService:
                     return {"error": {"message": f"Failed to join channel: {error_msg}"}}
 
             except SlackApiError as e:
-                error_msg = e.response.get("error", str(e))
+                error_msg = e.response.get("error") or "slack_api_error"
                 LOG.error(f"Slack API error joining channel {channel_id}: {error_msg}")
 
                 return self._check_error_msg(error_msg, "channels:join")
@@ -635,7 +651,7 @@ class CommonService:
                 LOG.error("Failed to create Slack channel %s: %s", normalized, error_msg)
                 return self._check_error_msg(error_msg, scope)
         except SlackApiError as e:
-            error_msg = e.response.get("error", str(e))
+            error_msg = e.response.get("error") or "slack_api_error"
             # Race: another caller created it between our lookup and create.
             if error_msg == "name_taken":
                 found = self._find_slack_channel(messaging_platform, normalized)
@@ -767,7 +783,7 @@ class CommonService:
                     continue
                 error_msg = response.get("error", ERR_UNKNOWN)
             except SlackApiError as e:
-                error_msg = e.response.get("error", str(e))
+                error_msg = e.response.get("error") or "slack_api_error"
 
             if error_msg in ("already_in_channel", "already_in_group"):
                 already_members.append(user_id)
@@ -957,7 +973,7 @@ class CommonService:
                 }
 
             except SlackApiError as e:
-                error_msg = e.response.get("error", str(e))
+                error_msg = e.response.get("error") or "slack_api_error"
                 LOG.error(f"Slack API error sending message to channel {channel_id}: {error_msg}")
 
                 return self._check_error_msg(error_msg, "chat:write")
@@ -1028,7 +1044,7 @@ class CommonService:
             }
 
         except SlackApiError as e:
-            error_msg = e.response.get("error", str(e))
+            error_msg = e.response.get("error") or "slack_api_error"
             LOG.error(f"Slack API error sending DM to user {user_id}: {error_msg}")
             return self._check_dm_error_msg(error_msg)
 
@@ -1089,33 +1105,62 @@ class CommonService:
         else:
             return {"error": {"message": f"Failed: {error_msg}"}}
 
-    def get_incident_details_and_reply_on_channel(self, incident_uuid, payload):
+    def resolve_incident_channel_and_thread(self, incident_uuid):
+        """Fallback for channels bound via slack.join_channel's
+        bind_session_id, which sent_notifications never sees (#37885). Lazily
+        posts a one-time anchor message to get a real thread_ts, since a
+        fresh channel has no thread yet; later calls reuse it. Small race if
+        two first-responses land at once -- accepted, not locked."""
         try:
             incident = cache.get_event_entry(incident_uuid)
             if not incident:
                 LOG.warning(f"No cached incident found for UUID: {incident_uuid}")
-                return
+                return None, None, None, None
 
             platform = incident.get("platform", "slack")
+            if platform != "slack":
+                LOG.warning(f"Unsupported platform: {platform} for incident {incident_uuid}")
+                return None, None, None, None
+
             tenant_id = incident.get("tenant_id")
             team_id = incident.get("team_id")
             channel_id = incident.get("channel_id")
-            message = payload.response
+            account_id = incident.get("account_id")
 
-            if not all([tenant_id, team_id, channel_id, message]):
+            if not all([tenant_id, team_id, channel_id]):
                 LOG.error(
                     f"Missing required fields for incident {incident_uuid}: "
-                    f"tenant_id={tenant_id}, team_id={team_id}, channel_id={channel_id}, has_message={bool(message)}"
+                    f"tenant_id={tenant_id}, team_id={team_id}, channel_id={channel_id}"
                 )
-                return
+                return None, None, None, None
 
-            if platform == "slack":
-                self.send_channel_message(platform, tenant_id, channel_id, incident_uuid, message, team_id=team_id)
-            else:
-                LOG.warning(f"Unsupported platform: {platform} for incident {incident_uuid}")
+            thread_ts = incident.get("thread_ts")
+            if thread_ts:
+                return channel_id, thread_ts, team_id, account_id
+
+            result = self.send_channel_message(
+                platform,
+                tenant_id,
+                channel_id,
+                incident_uuid,
+                "🧵 Investigation updates for this event will appear in this thread.",
+                team_id=team_id,
+            )
+            new_thread_ts = (result or {}).get("data", {}).get("message_ts")
+            if not new_thread_ts:
+                LOG.error(f"Failed to post anchor message for incident {incident_uuid}: {result}")
+                return None, None, None, None
+
+            # update_event_entry's own key-param is itself named thread_ts, which
+            # collides with a thread_ts= kwarg -- overwrite via the already-fetched
+            # dict instead of that merge helper.
+            incident["thread_ts"] = new_thread_ts
+            cache.cache_event_entry(incident_uuid, incident)
+            return channel_id, new_thread_ts, team_id, account_id
 
         except Exception as e:
-            LOG.exception(f"Error replying to incident channel for {incident_uuid}: {e}")
+            LOG.exception(f"Error resolving incident channel/thread for {incident_uuid}: {e}")
+            return None, None, None, None
 
     @staticmethod
     def _check_error_msg(error_msg, scope):
@@ -1166,7 +1211,11 @@ class CommonService:
                 raise ValueError("Unable to get user info. Please check your Slack app configuration and permissions.")
         return None
 
-    def slack_reply_in_thread(self, channel_id, team_id, message_ts, message, transform_to_markdown=True):
+    # No link previews by default: the bot's links point at the app, and Slack builds the
+    # preview from the page's build-time meta tags, which carry the default brand.
+    def slack_reply_in_thread(
+        self, channel_id, team_id, message_ts, message, transform_to_markdown=True, unfurl_links=False
+    ):
         bot = self.get_slack_installation(team_id)
         if transform_to_markdown:
             output_blocks = Transformer.to_slack(MarkdownBlock(text=message))
@@ -1180,6 +1229,8 @@ class CommonService:
             response_type="in_channel",
             replace_original=True,
             blocks=output_blocks,
+            unfurl_links=unfurl_links,
+            unfurl_media=unfurl_links,
         )
 
     def slack_reply_in_thread_with_context(
@@ -1220,7 +1271,25 @@ class CommonService:
         )
         return response.get("ts") if response else None
 
-    def update_slack_message(self, channel_id, team_id, message_ts, new_text, blocks=None):
+    def upload_file_for_inline_embed(self, team_id, filename, contents):
+        """Upload a file (e.g. a rendered diagram image) to Slack WITHOUT
+        posting it anywhere - no `channel`, so nothing shows up on its own.
+        Returns the resulting Slack file id, for embedding inline via a
+        Block Kit `image` block's `slack_file` field in a message the caller
+        builds and sends itself (see mermaid_chart.py's SlackFileImageBlock
+        / rich_text_blocks.py's render_rich_segments). Returns None if the
+        upload didn't return a usable file id."""
+        bot = self.get_slack_installation(team_id)
+        response = self.slack_app.client.file_upload(
+            token=bot.token,
+            title=filename,
+            fname=contents,
+            filename=filename,
+        )
+        file_info = response.get("file") or (response.get("files") or [{}])[0]
+        return file_info.get("id")
+
+    def update_slack_message(self, channel_id, team_id, message_ts, new_text, blocks=None, unfurl_links=True):
         """Update an existing Slack message with new content."""
         try:
             bot = self.get_slack_installation(team_id)
@@ -1232,6 +1301,8 @@ class CommonService:
                 ts=message_ts,
                 text=new_text,
                 blocks=blocks,
+                unfurl_links=unfurl_links,
+                unfurl_media=unfurl_links,
             )
             return True
         except Exception as e:
@@ -1377,8 +1448,10 @@ class CommonService:
                 "reaction": emoji,
             }
         except SlackApiError as e:
-            error_msg = e.response.get("error", str(e))
-            LOG.error("Slack API error adding reaction: %s", error_msg)
+            # Slack's error code (e.g. "channel_not_found") is safe to return; never fall
+            # back to the exception text, which the caller would pass to its client.
+            error_msg = e.response.get("error") or "slack_api_error"
+            LOG.error("Slack API error adding reaction: %s", e)
             return {"success": False, "provider": "slack", "error": error_msg}
 
     def _add_teams_reaction(self, messaging_platform, channel_id, message_id, emoji, team_id, tenant_id):
@@ -1607,9 +1680,9 @@ class CommonService:
                 await send_email_async(email_msg)
                 sent_to.append(recipient)
                 LOG.info("Email sent successfully to %s", recipient)
-            except Exception as e:
-                LOG.error("Failed to send email to %s: %s", recipient, e)
-                errors.append({"recipient": recipient, "error": str(e)})
+            except Exception:
+                LOG.exception("Failed to send email to %s", recipient)
+                errors.append({"recipient": recipient, "error": "Unexpected error; see server logs"})
 
         return sent_to, errors
 
@@ -1641,9 +1714,9 @@ class CommonService:
                 len(bcc_list or []),
             )
             return envelope, []
-        except Exception as e:
-            LOG.error("Failed to send combined email: %s", e)
-            return [], [{"recipients": envelope, "error": str(e)}]
+        except Exception:
+            LOG.exception("Failed to send combined email")
+            return [], [{"recipients": envelope, "error": "Unexpected error; see server logs"}]
 
     @staticmethod
     def _build_email_response(sent_to, errors):
@@ -1733,11 +1806,18 @@ class CommonService:
     def _extract_meaningful_text(self, msg, bot):
         parts = []
 
-        if msg.get("text"):
+        # Blocks come before attachments (matches Slack's own render order);
+        # "text" is only a fallback when blocks yielded nothing, since Slack
+        # sets it as a redundant mirror of blocks when both are present.
+        block_parts = []
+        self._extract_text_from_blocks(msg, block_parts)
+
+        if block_parts:
+            parts.extend(block_parts)
+        elif msg.get("text"):
             parts.append(msg["text"])
 
         self._extract_text_from_attachments(msg, parts)
-        self._extract_text_from_blocks(msg, parts)
 
         text = "\n".join(p for p in parts if p)
         text = self._replace_user_ids_with_names(text, bot)
@@ -1746,11 +1826,24 @@ class CommonService:
 
     @staticmethod
     def _extract_text_from_blocks(msg, parts):
-        if "blocks" in msg:
-            for block in msg["blocks"]:
-                if block.get("text"):
-                    parts.append(block["text"].get("text", ""))
-                CommonService._extract_text_from_elements(block, parts)
+        CommonService._extract_text_from_block_list(msg.get("blocks", []), parts)
+
+    @staticmethod
+    def _extract_text_from_block_list(blocks, parts):
+        for block in blocks:
+            if block.get("type") == "rich_text":
+                CommonService._extract_text_from_rich_text_block(block, parts)
+                continue
+            if block.get("text"):
+                parts.append(block["text"].get("text", ""))
+            CommonService._extract_text_from_fields(block, parts)
+            CommonService._extract_text_from_elements(block, parts)
+
+    @staticmethod
+    def _extract_text_from_fields(block, parts):
+        for field in block.get("fields", []):
+            if field.get("text"):
+                parts.append(field["text"])
 
     @staticmethod
     def _extract_text_from_elements(block, parts):
@@ -1762,27 +1855,81 @@ class CommonService:
                     parts.append(el["text"])
 
     @staticmethod
+    def _extract_text_from_rich_text_block(block, parts):
+        lines = []
+        for container in block.get("elements", []):
+            container_type = container.get("type")
+            if container_type == "rich_text_list":
+                style = container.get("style", "bullet")
+                for idx, item in enumerate(container.get("elements", [])):
+                    item_text = CommonService._flatten_rich_text_runs(item.get("elements", []))
+                    if item_text:
+                        prefix = f"{idx + 1}." if style == "ordered" else "-"
+                        lines.append(f"{prefix} {item_text}")
+            elif container_type == "rich_text_quote":
+                line = CommonService._flatten_rich_text_runs(container.get("elements", []))
+                if line:
+                    lines.append(f"> {line}")
+            elif container_type == "rich_text_preformatted":
+                line = CommonService._flatten_rich_text_runs(container.get("elements", []))
+                if line:
+                    lines.append(f"```\n{line}\n```")
+            elif container_type == "rich_text_section":
+                line = CommonService._flatten_rich_text_runs(container.get("elements", []))
+                if line:
+                    lines.append(line)
+
+        if lines:
+            parts.append("\n".join(lines))
+
+    @staticmethod
+    def _flatten_rich_text_runs(elements):
+        runs = []
+        for el in elements:
+            el_type = el.get("type")
+            if el_type == "text":
+                runs.append(el.get("text", ""))
+            elif el_type == "emoji":
+                name = el.get("name")
+                if name:
+                    runs.append(f":{name}:")
+            elif el_type == "link":
+                runs.append(el.get("text") or el.get("url", ""))
+        return "".join(runs)
+
+    @staticmethod
     def _extract_text_from_attachments(msg, parts):
         attachments = msg.get("attachments", [])
         for att in attachments:
-            for key in ("pretext", "title", "text"):
-                value = att.get(key)
-                if value:
-                    parts.append(value)
+            block_parts = []
+            CommonService._extract_text_from_block_list(att.get("blocks", []), block_parts)
 
-            if not att.get("title") and not att.get("text"):
-                fallback = att.get("fallback")
-                if fallback:
-                    parts.append(fallback)
+            if block_parts:
+                parts.extend(block_parts)
+            else:
+                for key in ("pretext", "title", "text"):
+                    value = att.get(key)
+                    if value:
+                        parts.append(value)
+
+                if not att.get("title") and not att.get("text"):
+                    fallback = att.get("fallback")
+                    if fallback:
+                        parts.append(fallback)
+
+                for field in att.get("fields", []):
+                    title = field.get("title")
+                    value = field.get("value")
+                    if value:
+                        parts.append(f"{title}: {value}" if title else value)
 
             footer = att.get("footer")
             if footer:
                 parts.append(f"({footer})")
 
-    # Marker for selection-confirmation messages ("I asked: ...") emitted by
-    # get_account_selected_with_context / get_followup_selection_confirmation.
-    # These are UX scaffolding, not conversation content, so skip them even on first read.
+    # UX scaffolding, not conversation content — skip even on first read.
     _SELECTION_CONFIRMATION_PREFIX = "> _I asked:_"
+    _WORKING_CONFIRMATION_PREFIX = "Got it! Working with "
 
     @classmethod
     def _should_skip_message(cls, msg, already_sent_messages, bot, is_first_read=False):
@@ -1792,7 +1939,7 @@ class CommonService:
         is_own_bot_msg = bool(msg.get("bot_id") and bot.bot_id and msg["bot_id"] == bot.bot_id)
         if is_own_bot_msg:
             text = (msg.get("text") or "").lstrip()
-            if text.startswith(cls._SELECTION_CONFIRMATION_PREFIX):
+            if text.startswith(cls._SELECTION_CONFIRMATION_PREFIX) or text.startswith(cls._WORKING_CONFIRMATION_PREFIX):
                 return True
             if not is_first_read:
                 return True
@@ -1927,7 +2074,7 @@ class CommonService:
             }
 
         except SlackApiError as e:
-            error_msg = e.response.get("error", str(e))
+            error_msg = e.response.get("error") or "slack_api_error"
             LOG.error(f"Slack API error fetching thread messages {channel_id}/{thread_ts}: {error_msg}")
             return {"success": False, "error": self._get_thread_error_message(error_msg)}
 
@@ -2025,8 +2172,7 @@ class CommonService:
         if not conversation_id or not isinstance(conversation_id, str):
             return None, None, None, None
 
-        parts = conversation_id.split("-", 1)
-        fingerprint = parts[1] if len(parts) > 1 else parts[0]
+        fingerprint = extract_event_fingerprint(conversation_id)
         try:
             # A tenant can have Slack, Discord, and MS Teams all enabled at once;
             # send_finding_notification writes one sent_notifications row per
@@ -2458,7 +2604,7 @@ class CommonService:
                 "discord": "Discord",
             }.get(platform, platform)
             test_message = (
-                f"This is a test notification from Nudgebee. "
+                f"This is a test notification from {settings.urls.branding_name}. "
                 f"Your {platform_display} integration is working correctly!"
             )
 
@@ -2488,7 +2634,7 @@ class CommonService:
                 return {"success": False, "platform": "slack", "error": error_msg}
             return {"success": True, "platform": "slack"}
         except SlackApiError as e:
-            error_msg = e.response.get("error", str(e))
+            error_msg = e.response.get("error") or "slack_api_error"
             LOG.error("Slack API error sending test notification: %s", error_msg)
             return {"success": False, "platform": "slack", "error": error_msg}
 
@@ -2513,11 +2659,13 @@ class CommonService:
             )
             if resp and resp.status_code < 400:
                 return {"success": True, "platform": "ms_teams"}
-            error_detail = resp.text if resp else "No response"
-            return {"success": False, "platform": "ms_teams", "error": error_detail}
-        except Exception as e:
-            LOG.error("MS Teams test notification error: %s", e)
-            return {"success": False, "platform": "ms_teams", "error": str(e)}
+            if resp is None:
+                return {"success": False, "platform": "ms_teams", "error": "No response"}
+            LOG.warning("MS Teams test notification failed: %s - %s", resp.status_code, resp.text)
+            return {"success": False, "platform": "ms_teams", "error": f"HTTP {resp.status_code}"}
+        except Exception:
+            LOG.exception("MS Teams test notification error")
+            return {"success": False, "platform": "ms_teams", "error": "Unexpected error; see server logs"}
 
     def _send_test_discord(self, messaging_platform, channel_id, message):
         from notifications_server.clients.discord_client import DiscordClient
@@ -2529,9 +2677,9 @@ class CommonService:
             if not response.get("ok"):
                 return {"success": False, "platform": "discord", "error": response.get("error", "Unknown error")}
             return {"success": True, "platform": "discord"}
-        except Exception as e:
-            LOG.error("Error sending Discord test notification: %s", e)
-            return {"success": False, "platform": "discord", "error": str(e)}
+        except Exception:
+            LOG.exception("Error sending Discord test notification")
+            return {"success": False, "platform": "discord", "error": "Unexpected error; see server logs"}
 
     def _send_test_google_chat(self, messaging_platform, channel_id, message, tenant_id):
         error = self._refresh_google_chat_token(messaging_platform)
@@ -2548,9 +2696,9 @@ class CommonService:
             if result and result.get("success"):
                 return {"success": True, "platform": "google_chat"}
             return {"success": False, "platform": "google_chat", "error": "Failed to post message"}
-        except Exception as e:
-            LOG.error("Google Chat test notification error: %s", e)
-            return {"success": False, "platform": "google_chat", "error": str(e)}
+        except Exception:
+            LOG.exception("Google Chat test notification error")
+            return {"success": False, "platform": "google_chat", "error": "Unexpected error; see server logs"}
 
     async def teams_send_welcome_message(self, activity: Activity) -> bool:
         """Send welcome message when bot is added to a Teams conversation."""

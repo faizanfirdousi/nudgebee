@@ -69,7 +69,7 @@ func (s *K8sSource) fetchK8sPVsFromRelay(ctx context.Context, req *core.SourceBu
 
 	relayResponse, err := relay.Execute(relayRequest)
 	if err != nil {
-		s.logger.Error("failed to execute relay request for PVs", "error", err)
+		// Soft failure: BuildGraph logs this at WARN and continues without it.
 		return nil, fmt.Errorf("failed to execute relay request for PVs: %w", err)
 	}
 
@@ -253,4 +253,10 @@ func (s *K8sSource) createNodeFromK8sPV(pv *K8sPVFromRelay, clusterName string, 
 	uniqueKey := s.GenerateUniqueKey(tempNode)
 
 	return core.NewNode(core.NodeTypePV, uniqueKey, properties, req.TenantID, req.CloudAccountID, "k8s")
+}
+
+// A persistent volume is scoped to the cluster, not to a namespace (see
+// kinds.go).
+func init() {
+	registerClusterScopedKind(core.NodeTypePV, clusterScopedKeyRule{})
 }

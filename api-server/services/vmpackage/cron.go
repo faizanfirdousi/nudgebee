@@ -71,13 +71,11 @@ func eligibleDiscoveryLabels(raw string) (DiscoveryLabels, bool) {
 // actually serve discovery_sweep. There is no separate feature flag —
 // forager reporting a discovery-proxy datasource at all is the opt-in.
 //
-// Joins through integrations_cloud_accounts rather than filtering on
-// integrations.account_id: the relay's auto-registration
-// (UpsertAgentDatasources) never sets that scalar column for agent-sourced
-// integrations, only the tenant_id column and the integrations_cloud_accounts
-// mapping row — unlike vm_agent-style integrations created through the UI
-// config flow, which do set it. resolveDatasourceKey's i.account_id filter
-// would silently match nothing here.
+// Joins through integrations_cloud_accounts: integrations has no account_id
+// column (dropped in V573), so that mapping table is the only record of which
+// account an integration belongs to — the relay's auto-registration
+// (UpsertAgentDatasources) writes the tenant_id column and an
+// integrations_cloud_accounts row, nothing else.
 //
 // The join is split by link_role rather than left unfiltered: an integration
 // can carry two integrations_cloud_accounts rows (the agent's own account,
@@ -140,6 +138,81 @@ func ListDiscoveryDatasources(dbms *database.DatabaseManager) ([]DiscoveryDataso
 	return datasources, nil
 }
 
+// ListDiscoveryDatasourcesForAccount is ListDiscoveryDatasources scoped to a
+// single account, used by the manual account-wide scan trigger so one
+// account's scan request doesn't have to list every tenant's datasources
+// first.
+//
+// A datasource matches accountID when it explicitly targets that account
+// (link_role='discovery_target'), or — only when it has no explicit target —
+// when it runs in that account (link_role='own'). The 'own' fallback is what
+// makes the manual button consistent with the daily cron
+// (ListDiscoveryDatasources, which sweeps every enabled discovery datasource
+// regardless of an explicit target): an auto-registered forager discovery
+// datasource that has not yet had a target defaulted onto it (the relay's
+// UpsertAgentDatasources does that on the next agent reconnect) would
+// otherwise be rejected with "no discovery agent is configured to scan this
+// account" even though the cron would happily scan it.
+//
+// The target, when present, wins outright: a datasource with own=A and an
+// explicit target=B scans and files findings for B (see
+// ScanDiscoveryDatasource → resolveTargets against ds.TargetAccountID), so it
+// must match a scan request for B, never one for A — matching it for A would
+// both mis-scan (A left untouched, B's findings rewritten) and let a caller
+// with access to A only trigger a scan on B.
+// The second return value is how many enabled discovery integrations
+// matched the account but were filtered out by eligibleDiscoveryLabels
+// (empty/malformed labels) — distinct from zero rows matching at all. See
+// #38718: an agent that has connected but hasn't yet reported labels looks
+// identical to "no agent configured" without this count, which sends
+// whoever hits the resulting error down the wrong debugging path.
+func ListDiscoveryDatasourcesForAccount(dbms *database.DatabaseManager, accountID string) ([]DiscoveryDatasource, int, error) {
+	var rows []struct {
+		IntegrationID   string         `db:"integration_id"`
+		TenantID        string         `db:"tenant_id"`
+		AccountID       string         `db:"account_id"`
+		TargetAccountID sql.NullString `db:"target_account_id"`
+		Labels          string         `db:"labels"`
+	}
+	err := dbms.Db.Select(&rows, `
+		SELECT i.id::text AS integration_id, i.tenant_id::varchar AS tenant_id,
+		       own.cloud_account_id::varchar AS account_id,
+		       target.cloud_account_id::varchar AS target_account_id,
+		       i.labels::text AS labels
+		FROM integrations i
+		JOIN integrations_cloud_accounts own ON own.integration_id = i.id AND own.link_role = 'own'
+		LEFT JOIN (
+			SELECT DISTINCT ON (integration_id) integration_id, cloud_account_id
+			FROM integrations_cloud_accounts
+			WHERE link_role = 'discovery_target'
+			ORDER BY integration_id, id DESC
+		) target ON target.integration_id = i.id
+		WHERE i.type = 'discovery' AND i.status = 'enabled'
+		  AND (target.cloud_account_id = $1
+		       OR (target.cloud_account_id IS NULL AND own.cloud_account_id = $1))`, accountID)
+	if err != nil {
+		return nil, 0, fmt.Errorf("vmpackage: list discovery datasources for account %s: %w", accountID, err)
+	}
+
+	datasources := make([]DiscoveryDatasource, 0, len(rows))
+	ineligible := 0
+	for _, r := range rows {
+		labels, ok := eligibleDiscoveryLabels(r.Labels)
+		if !ok {
+			ineligible++
+			continue
+		}
+		datasources = append(datasources, DiscoveryDatasource{
+			IntegrationID:   r.IntegrationID,
+			TenantID:        r.TenantID,
+			AccountID:       r.AccountID,
+			TargetAccountID: r.TargetAccountID.String,
+			Labels:          labels,
+		})
+	}
+	return datasources, ineligible, nil
+}
+
 // GetDiscoveryDatasourceByID re-resolves a single discovery datasource by
 // integration+account id, for the queue consumer to pick up current labels
 // right before scanning rather than trusting a possibly-stale copy carried
@@ -185,9 +258,9 @@ func GetDiscoveryDatasourceByID(dbms *database.DatabaseManager, integrationID, a
 // resolveDiscoveryDatasourceKey resolves a discovery integration's own id
 // (not an agent access_key or a caller-supplied datasource_id) to its
 // forager-side datasource_key — the same integration_config_values lookup
-// resolveDatasourceKey uses, minus the account_id/tenant_id filter that
-// column doesn't carry for these auto-registered rows (see
-// listDiscoveryDatasources).
+// resolveScanDatasource uses, minus its account/tenant scoping: the
+// integration id here comes from ListDiscoveryDatasources, already scoped,
+// not from a caller.
 func resolveDiscoveryDatasourceKey(dbms *database.DatabaseManager, integrationID string) (string, error) {
 	var datasourceKey string
 	err := dbms.Db.Get(&datasourceKey,
@@ -355,7 +428,12 @@ func scanTargetSafely(tenantCtx *security.RequestContext, dbms *database.Databas
 		resolvedAccountID = ds.AccountID
 	}
 
-	if err := runScan(tenantCtx, resolvedAccountID, ds.TenantID, cloudResourceID, target); err != nil {
+	attemptID := startScanAttempt(ds.TenantID, resolvedAccountID, cloudResourceID)
+	result, err := runScan(tenantCtx, resolvedAccountID, ds.TenantID, cloudResourceID, target)
+	if err != nil {
 		tenantCtx.GetLogger().Error("vmpackage: scan failed", "cloud_resource_id", cloudResourceID, "host", target.Host, "error", err)
+		finishScanAttempt(cloudResourceID, attemptID, ScanStatusFailed, err, result.PackageCount, result.FindingCount)
+		return
 	}
+	finishScanAttempt(cloudResourceID, attemptID, ScanStatusCompleted, nil, result.PackageCount, result.FindingCount)
 }

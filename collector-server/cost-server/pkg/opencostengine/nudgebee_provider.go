@@ -16,6 +16,7 @@ import (
 	"github.com/opencost/opencost/core/pkg/util"
 	"github.com/opencost/opencost/pkg/cloud/models"
 	"github.com/opencost/opencost/pkg/cloud/provider"
+	v1 "k8s.io/api/core/v1"
 )
 
 // Default cost ratios from GCP us-central1 E2 pricing.
@@ -23,7 +24,6 @@ const (
 	defaultCPUCostPerHr = 0.021811
 	defaultRAMCostPerHr = 0.002923
 	defaultGPUCostPerHr = 0.95
-	defaultStorageCost  = "0.00005479452"
 )
 
 // Spot label constants across cloud providers.
@@ -43,6 +43,10 @@ type NudgebeeProvider struct {
 	DownloadPricingDataLock sync.RWMutex
 	ClusterRegion           string
 	ClusterAccountID        string
+	// CloudProvider is the cluster's canonical cloud ("aws"/"gcp"/"azure",
+	// "" when unknown), resolved by DownloadPricingData. Guarded by
+	// DownloadPricingDataLock; PVPricing reads it to price by storage class.
+	CloudProvider string
 }
 
 func NewNudgebeeProvider(db *DB, clusterID string) (*NudgebeeProvider, error) {
@@ -81,6 +85,7 @@ func (np *NudgebeeProvider) DownloadPricingData() error {
 	if cloudProviderName == "k8s" {
 		cloudProviderName = np.detectCloudFromNodes()
 	}
+	np.CloudProvider = cloudProviderName
 
 	np.Pricing = make(map[string]*provider.NodePrice)
 
@@ -342,7 +347,18 @@ func (np *NudgebeeProvider) ClusterInfo() (map[string]string, error) {
 }
 
 func (np *NudgebeeProvider) PVPricing(pvk models.PVKey) (*models.PV, error) {
-	return &models.PV{Cost: defaultStorageCost}, nil
+	np.DownloadPricingDataLock.RLock()
+	cloudProvider := np.CloudProvider
+	np.DownloadPricingDataLock.RUnlock()
+
+	var parameters map[string]string
+	var capacityGB float64
+	if k, ok := pvk.(*nudgebeePVKey); ok {
+		parameters = k.Parameters
+		capacityGB = k.CapacityGB
+	}
+	rate := resolveStorageRatePerGBMonth(pvk.GetStorageClass(), parameters, cloudProvider, capacityGB)
+	return &models.PV{Cost: strconv.FormatFloat(rate/hoursPerMonth, 'f', 11, 64)}, nil
 }
 
 func (np *NudgebeeProvider) NetworkPricing() (*models.Network, error) {
@@ -358,7 +374,17 @@ func (np *NudgebeeProvider) LoadBalancerPricing() (*models.LoadBalancer, error) 
 }
 
 func (np *NudgebeeProvider) GetPVKey(pv *clustercache.PersistentVolume, parameters map[string]string, defaultRegion string) models.PVKey {
-	return &nudgebeePVKey{Labels: pv.Labels, StorageClassName: pv.Spec.StorageClassName, DefaultRegion: defaultRegion}
+	var capacityGB float64
+	if q, ok := pv.Spec.Capacity[v1.ResourceStorage]; ok {
+		capacityGB = float64(q.Value()) / (1 << 30)
+	}
+	return &nudgebeePVKey{
+		Labels:           pv.Labels,
+		StorageClassName: pv.Spec.StorageClassName,
+		DefaultRegion:    defaultRegion,
+		Parameters:       parameters,
+		CapacityGB:       capacityGB,
+	}
 }
 
 func (np *NudgebeeProvider) PricingSourceSummary() interface{} { return np.Pricing }
@@ -422,6 +448,15 @@ type nudgebeePVKey struct {
 	Labels           map[string]string
 	StorageClassName string
 	DefaultRegion    string
+	// Parameters are the PV's StorageClass parameters (type / skuName),
+	// handed to GetPVKey by OpenCost's cost model — the pricing signal
+	// PVPricing resolves the per-class rate from.
+	Parameters map[string]string
+	// CapacityGB is the PV's provisioned size. Azure bills managed disks
+	// per size band rather than per GB, so the rate PVPricing returns
+	// depends on it; OpenCost then multiplies that rate back by this same
+	// capacity, which is what makes the effective rate come out right.
+	CapacityGB float64
 }
 
 func (k *nudgebeePVKey) ID() string              { return "" }

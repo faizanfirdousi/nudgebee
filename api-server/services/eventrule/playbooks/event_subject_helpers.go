@@ -1,10 +1,12 @@
 package playbooks
 
 import (
-	"nudgebee/services/common"
-	"nudgebee/services/relay"
+	"net"
 	"strings"
 	"time"
+
+	"nudgebee/services/common"
+	"nudgebee/services/relay"
 )
 
 // Shared resolvers for the trigger-matched enricher chain. They read the
@@ -12,9 +14,9 @@ import (
 // / SubjectType / Labels) and fall back to a relay `get_resource` lookup when
 // the agent-side payload didn't carry enough context.
 
-// subjectPodNamespace extracts (name, namespace) for a pod-subject event.
+// SubjectPodNamespace extracts (name, namespace) for a pod-subject event.
 // Returns empty strings when the event's subject is not a pod.
-func subjectPodNamespace(event PlaybookEvent) (string, string) {
+func SubjectPodNamespace(event PlaybookEvent) (string, string) {
 	if !strings.EqualFold(event.SubjectType, "pod") {
 		// Trigger-matched k8s events set SubjectType="pod"; alertmanager alerts
 		// may not, so fall back to a "pod" label when present.
@@ -31,6 +33,14 @@ func subjectPodNamespace(event PlaybookEvent) (string, string) {
 		namespace = event.Labels["namespace"]
 	}
 	return name, namespace
+}
+
+// PodNamespaceFromEvent is SubjectPodNamespace exported for the provider-agnostic
+// actions that live in the observability package. Those cannot be defined here:
+// observability imports this package to register actions, so a playbook action that
+// needs a metrics provider has to be registered from that side of the dependency.
+func PodNamespaceFromEvent(event PlaybookEvent) (string, string) {
+	return SubjectPodNamespace(event)
 }
 
 // subjectJobName extracts the K8s Job name for job-subject events. Empty when
@@ -71,16 +81,22 @@ func nodeNameFromPodDict(p map[string]any) string {
 	return ""
 }
 
-// subjectNodeName extracts the node name for an event. Order:
+// SubjectNodeName extracts the node name for an event. Order:
 //  1. canonical event.SubjectNode field — populated by the collector from
 //     the kubewatch payload (events.subject_node column).
 //  2. SubjectName when SubjectType=="node" (the subject IS the node).
-//  3. label fallback ("node" / "instance") for alert-driven events that
+//  3. label fallback ("node", then "instance") for alert-driven events that
 //     don't have a subject_node column.
+//
+// The `instance` fallback is only taken when the value is not a scrape target.
+// Prometheus writes `instance` as `<host>:<port>` ("10.128.0.14:9100"), which is
+// not a node name: passing it on sends the node enrichers to the relay with a
+// name no node ever has, and they come back "node not found". A bare `instance`
+// with no port is kept — some rules relabel a real node name into it.
 //
 // Enrichers that need the host node should always call this rather than
 // re-fetching the Pod via relay — the data is already in hand.
-func subjectNodeName(event PlaybookEvent) string {
+func SubjectNodeName(event PlaybookEvent) string {
 	if event.SubjectNode != "" {
 		return event.SubjectNode
 	}
@@ -93,7 +109,29 @@ func subjectNodeName(event PlaybookEvent) string {
 	if v := event.Labels["node"]; v != "" {
 		return v
 	}
-	return event.Labels["instance"]
+	// A value that parses as host:port is a scrape target, not a node. Checked
+	// with net.SplitHostPort rather than looking for a colon, because a bare IPv6
+	// address ("fe80::1") is full of colons and carries no port.
+	if v := event.Labels["instance"]; v != "" {
+		if _, _, err := net.SplitHostPort(v); err != nil {
+			return v
+		}
+	}
+	return ""
+}
+
+// EventIsAboutNode reports whether an event's subject is a node, so the
+// node-scoped enrichers can decide to run from the event's shape rather than
+// from one hardcoded aggregation key.
+//
+// `node_not_ready` stays named explicitly: it is the kubewatch-sourced event
+// these enrichers were originally written for, and it is the one case where the
+// subject can be a node without subject_type saying so.
+func EventIsAboutNode(event PlaybookEvent) bool {
+	if SubjectNodeName(event) == "" {
+		return false
+	}
+	return strings.EqualFold(event.SubjectType, "node") || event.AggregationKey == "node_not_ready"
 }
 
 // getResourceViaRelay is a small wrapper around the get_resource action used
@@ -137,9 +175,14 @@ func getResourceViaRelay(ctx PlaybookActionContext, params map[string]any) (any,
 // endsAt for firing alerts. An unclamped end puts the whole window past "now"
 // for short lookbacks, and Prometheus correctly returns zero series — this is
 // what kept the Noisy Neighbours card empty on every OOM event.
-func rangeQueryWindow(event PlaybookEvent, lookbackMinutes int, now time.Time) (time.Time, time.Time) {
+// RangeQueryWindow is exported for the observability actions that run their
+// PromQL through the metrics layer and need the same event-centred window.
+func RangeQueryWindow(event PlaybookEvent, lookbackMinutes int, now time.Time) (time.Time, time.Time) {
 	end := now
-	if t := event.EndedAt; t != nil && !t.IsZero() {
+	if t := event.IncidentAt; t != nil && !t.IsZero() {
+		// See PlaybookEvent.IncidentAt — the failure time, not the detection time.
+		end = t.UTC()
+	} else if t := event.EndedAt; t != nil && !t.IsZero() {
 		end = t.UTC()
 	} else if t := event.StartedAt; t != nil && !t.IsZero() {
 		end = t.UTC()
@@ -148,53 +191,4 @@ func rangeQueryWindow(event PlaybookEvent, lookbackMinutes int, now time.Time) (
 		end = now
 	}
 	return end.Add(-time.Duration(lookbackMinutes) * time.Minute), end
-}
-
-// promRangeQueries fires N named range queries against prometheus_queries_enricher
-// over the given lookback duration (minutes). Returns the per-key payload —
-// each value is the {result_type, series_list_result, vector_result, …}
-// envelope the relay produces.
-//
-// Window resolution: when the event carries timestamps (StartedAt / EndedAt
-// set by the trigger engine for k8s events, or by the AlertManager webhook
-// for alerts) we centre the window on the event so the graph reflects
-// cluster state AT incident time, not at investigation time. Falls back to
-// (now - lookback, now) for ad-hoc / manual playbook runs.
-func promRangeQueries(ctx PlaybookActionContext, queries []NamedQuery, lookbackMinutes int) (map[string]any, error) {
-	if lookbackMinutes <= 0 {
-		lookbackMinutes = 60
-	}
-	start, end := rangeQueryWindow(ctx.GetEvent(), lookbackMinutes, time.Now().UTC())
-	rel := relay.RelayExecuteRequest{
-		Body: relay.ActionExecuteBody{
-			AccountID:  ctx.GetAccountId(),
-			ActionName: "prometheus_queries_enricher",
-			ActionParams: map[string]any{
-				"duration": map[string]any{
-					"starts_at": start.Format("2006-01-02 15:04:05 UTC"),
-					"ends_at":   end.Format("2006-01-02 15:04:05 UTC"),
-				},
-				"instant":        false,
-				"step":           "30s",
-				"promql_queries": queries,
-			},
-			Origin: "services-server",
-		},
-		NoSinks: true,
-		Cache:   false,
-	}
-	resp, _, err := relay.ExecuteAndExtractResponse(rel)
-	if err != nil {
-		return nil, err
-	}
-	result := map[string]any{}
-	switch d := resp["data"].(type) {
-	case map[string]any:
-		result = d
-	case string:
-		if err := common.UnmarshalJson([]byte(d), &result); err != nil {
-			return nil, err
-		}
-	}
-	return result, nil
 }

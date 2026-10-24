@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { describeResolution } from '@components/k8s/investigate/resolutionStatus';
 import Typography from '@mui/material/Typography';
 import { IconButton, Box, Grid, Avatar, Collapse, ListItem } from '@mui/material';
 import KeyboardArrowDownIcon from '@mui/icons-material/KeyboardArrowDown';
@@ -12,9 +13,20 @@ import { useRouter } from 'next/router';
 import SafeIcon from '@shared/icons/SafeIcon';
 import Label from '@ui/Label';
 import { Link } from '@ui/Link';
-import CustomBorderCard from '@ui/CustomBorderCard';
+import { Card } from '@ui/Card';
 import { ds } from '@utils/colors';
 import { safeJSONParse } from '@utils/common';
+
+// Same destination the "Triggered for this event" menu uses, so a card and that
+// menu resolve to the identical run. accountId is omitted when the page has none
+// rather than sent as "undefined".
+export function buildAutomationRunHref(sourceWorkflow, accountId) {
+  const params = new URLSearchParams();
+  if (accountId) params.set('accountId', accountId);
+  if (sourceWorkflow.execution_id) params.set('executionId', sourceWorkflow.execution_id);
+  const query = params.toString();
+  return `/automation/${sourceWorkflow.workflow_id}${query ? `?${query}` : ''}#executions`;
+}
 
 function CollapsableCard({
   id,
@@ -34,7 +46,12 @@ function CollapsableCard({
   maxWidth = ds.space.mul(0, 750),
   eventResolution = null,
   onCloseResolveComponent,
+  sourceWorkflow = null,
+  authoredByAutomation = false,
 }) {
+  // Computed once: the same status is rendered in two places on this card, and describeResolution
+  // was being called for each field of each.
+  const resolutionOutcome = eventResolution ? describeResolution(eventResolution) : null;
   const [openResolveComponent, setOpenResolveComponent] = useState(false);
   const [showAll, setShowAll] = useState(false);
 
@@ -170,6 +187,34 @@ function CollapsableCard({
               {text}
             </Typography>
             {isBeta && <SafeIcon src={BetaIcon} alt='beta-icon' priority={true} />}
+            {/* Present only on evidence an automation attached (stamped server-side by
+                event.AddEvidence). Enricher cards carry no stamp and render unchanged.
+                Sits in the header rather than the body so the answer to "where did this
+                card come from" survives the card being collapsed. */}
+            {sourceWorkflow?.workflow_id && sourceWorkflow?.workflow_name ? (
+              // The testid sits on the wrapper, not on Link: Link takes a fixed prop
+              // list and does not spread the rest, so a data-* passed to it never
+              // reaches the DOM. Link also stops click propagation itself, which is
+              // what keeps opening the run from collapsing the card behind it.
+              <Box component='span' data-testid='card-source-workflow-link' sx={{ display: 'inline-flex', minWidth: 0 }}>
+                <Link href={buildAutomationRunHref(sourceWorkflow, accountId)} openInNew secondaryText maxWidth={ds.space.mul(0, 160)}>
+                  via {sourceWorkflow.workflow_name}
+                </Link>
+              </Box>
+            ) : (
+              // Running one step on its own (the builder's Run Task) has no workflow
+              // run to open, so the card says where it came from in plain text
+              // rather than leaving the reader to guess.
+              authoredByAutomation && (
+                <Typography
+                  component='span'
+                  data-testid='card-source-automation-label'
+                  sx={{ fontSize: 'var(--ds-text-caption)', color: ds.gray[600], whiteSpace: 'nowrap' }}
+                >
+                  added by an automation step
+                </Typography>
+              )
+            )}
           </Grid>
 
           {highlightsData.length > 0 ? (
@@ -230,8 +275,11 @@ function CollapsableCard({
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 'var(--ds-space-1)', minWidth: 0 }}>
               <SearchOutlined style={{ width: ds.space[4], height: ds.space[4], color: 'var(--ds-gray-400)' }} />
               <Box component='div' sx={{ flex: 1, minWidth: 0, overflow: 'hidden' }}>
+                {/* This line is shown when a card produced no highlight, which says nothing about
+                    whether the card is empty — several cards hold the root cause and highlight
+                    nothing. So it asks the reader to look instead of claiming there is nothing there. */}
                 <Text
-                  value={'Nothing major to show. Check the card for more.'}
+                  value={'Open the card to see what it holds.'}
                   showAutoEllipsis
                   sx={{
                     gap: 'var(--ds-space-1)',
@@ -246,9 +294,7 @@ function CollapsableCard({
             </Box>
           )}
           <Box display='flex' alignItems='center' justifyContent='flex-end' gap={'var(--ds-space-2)'} textAlign={'end'}>
-            {resolveButton && eventResolution && (
-              <Label text={eventResolution.status === 'InProgress' ? 'In Progress' : eventResolution.status} height={ds.space[5]} />
-            )}
+            {resolveButton && eventResolution && <Label tone={resolutionOutcome.tone} text={resolutionOutcome.label} height={ds.space[5]} />}
             {resolveButton &&
               eventResolution &&
               eventResolution.type === 'PullRequest' &&
@@ -315,15 +361,16 @@ function CollapsableCard({
           }}
         >
           {isExpanded && eventResolution && (
-            <CustomBorderCard
-              borderLeftColor={eventResolution.status === 'Failed' ? 'var(--ds-red-500)' : 'var(--ds-blue-400)'}
-              borderLeftWidth={ds.space[0]}
-              padding={`${ds.space.mul(0, 5)} ${ds.space[4]}`}
-              sx={{ mb: 'var(--ds-space-3)', bgcolor: 'var(--ds-background-200)' }}
+            <Card
+              variant='accent'
+              tone={eventResolution.status === 'Failed' ? 'danger' : 'info'}
+              size='sm'
+              elevation='flat'
+              sx={{ mb: 'var(--ds-space-3)' }}
             >
               <Box sx={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 'var(--ds-space-2)' }}>
                 <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 'var(--ds-space-2)' }}>
-                  <Label text={eventResolution.status === 'InProgress' ? 'In Progress' : eventResolution.status} height={ds.space.mul(0, 11)} />
+                  <Label tone={resolutionOutcome.tone} text={resolutionOutcome.label} height={ds.space.mul(0, 11)} />
                   <Box sx={{ display: 'flex', flexDirection: 'column', gap: 'var(--ds-space-1)' }}>
                     {getResolutionDescription(eventResolution)
                       .split('\n')
@@ -359,7 +406,7 @@ function CollapsableCard({
                   </Box>
                 )}
               </Box>
-            </CustomBorderCard>
+            </Card>
           )}
           {isExpanded && contentComponents.map((Component, index) => <Component key={index} />)}
         </Box>
@@ -377,6 +424,8 @@ export default React.memo(CollapsableCard, (prevProps, nextProps) => {
   return (
     prevIsExpanded === nextIsExpanded &&
     prevProps.collapsedObj[prevProps.idx] === nextProps.collapsedObj[nextProps.idx] &&
-    prevProps.eventResolution === nextProps.eventResolution
+    prevProps.eventResolution === nextProps.eventResolution &&
+    prevProps.sourceWorkflow === nextProps.sourceWorkflow &&
+    prevProps.authoredByAutomation === nextProps.authoredByAutomation
   );
 });

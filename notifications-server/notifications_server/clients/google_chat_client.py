@@ -1,7 +1,7 @@
 import json
 import logging
 import time
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import httplib2
 import requests
@@ -16,6 +16,7 @@ LOG = logging.getLogger(__name__)
 
 # Constants
 USER_AGENT = "my-user-agent/1.0"
+CONTENT_TYPE_JSON = "application/json"
 
 
 def _build_chat_service(credentials):
@@ -48,7 +49,9 @@ def parse_http_error(error: HttpError) -> Tuple[int, Optional[str], str]:
     """
     status_code = error.resp.status if error.resp else 0
     error_status = None
-    error_message = str(error)
+    # Not str(error): it embeds the request URL and is exception text. The API's own
+    # message from the response body replaces this when present.
+    error_message = f"Google Chat API error (HTTP {status_code})"
 
     try:
         # HttpError.content contains the JSON error response
@@ -249,9 +252,14 @@ class GoogleChatClient:
                 if not _handle_retryable_error(e, attempt + 1, max_retries, retry_sleep, tenant):
                     break
 
-            except Exception as e:
+            except Exception:
                 LOG.exception("Unexpected error sending Google Chat message for tenant %s", tenant)
-                return {"success": False, "channel_id": space_id, "reason": "unexpected_error", "error": str(e)}
+                return {
+                    "success": False,
+                    "channel_id": space_id,
+                    "reason": "unexpected_error",
+                    "error": "Unexpected error; see server logs",
+                }
 
         return {
             "success": False,
@@ -259,6 +267,44 @@ class GoogleChatClient:
             "reason": "rate_limit_exceeded",
             "error": last_error_message or "Max retries exceeded",
         }
+
+    @staticmethod
+    def post_to_google_chat_webhook(
+        webhook_url: str,
+        message: Any,
+        tenant: Optional[str] = None,
+        timeout: int = 15,
+    ) -> Optional[requests.Response]:
+        """Post a text or card message directly to a Google Chat Incoming Webhook.
+        No credentials - the key/token query params on the URL are the secret,
+        and it's bound to one space. Returns the raw response, or None on a
+        transport failure so one dead webhook doesn't abort the fan-out. The
+        caller decides success (2xx). Timeout is explicit and short: an
+        unbounded Google Chat call has previously frozen this service's health
+        check (see the service-account client's rationale)."""
+        message_body = message if isinstance(message, dict) else {"text": message}
+        try:
+            # requests.post, not a shared Session: this runs concurrently across
+            # threads via asyncio.to_thread, and a Session isn't thread-safe.
+            response = requests.post(
+                webhook_url,
+                headers={"Content-Type": CONTENT_TYPE_JSON},
+                json=message_body,
+                timeout=timeout,
+            )
+        except requests.exceptions.RequestException as exc:
+            LOG.warning("Google Chat webhook connection failed for tenant %s: %s", tenant, exc)
+            return None
+        if response.status_code >= 400:
+            LOG.warning(
+                "Google Chat webhook delivery failed for tenant %s: %s - %s",
+                tenant,
+                response.status_code,
+                response.text[:512],
+            )
+        else:
+            LOG.debug("Google Chat webhook notification sent for tenant %s", tenant)
+        return response
 
     @staticmethod
     def create_reaction(token, space_id, message_id, emoji, tenant=None):
@@ -317,9 +363,10 @@ class GoogleChatClient:
                 if not _handle_retryable_error(e, attempt + 1, max_retries, retry_sleep, tenant):
                     break
 
-            except Exception as e:
+            except Exception:
                 LOG.exception("Unexpected error adding Google Chat reaction for tenant %s", tenant)
-                return {"success": False, "provider": "google_chat", "error": str(e)}
+                # The detail is in the log; callers get a stable message, not exception text.
+                return {"success": False, "provider": "google_chat", "error": "Unexpected error while adding reaction"}
 
         return {"success": False, "provider": "google_chat", "error": last_error_message or "rate_limit_exceeded"}
 
@@ -455,9 +502,9 @@ class GoogleChatClient:
             if not setup_result.get("success"):
                 return None, setup_result
             return setup_result.get("space_id"), None
-        except Exception as e:
-            LOG.error("Failed to setup DM with user %s: %s", user_id, e)
-            return None, {"success": False, "error": f"Failed to setup DM: {str(e)}"}
+        except Exception:
+            LOG.exception("Failed to setup DM with user %s", user_id)
+            return None, {"success": False, "error": "Failed to set up the DM space"}
 
     @staticmethod
     def send_direct_message(token, user_id, message, tenant=None):
@@ -515,9 +562,9 @@ class GoogleChatClient:
                 if not _handle_retryable_error(e, attempt + 1, max_retries, retry_sleep, tenant):
                     break
 
-            except Exception as e:
+            except Exception:
                 LOG.exception("Unexpected error sending Google Chat DM for tenant %s", tenant)
-                return {"success": False, "error": str(e)}
+                return {"success": False, "error": "Unexpected error; see server logs"}
 
         return {"success": False, "error": "Rate limit exceeded"}
 

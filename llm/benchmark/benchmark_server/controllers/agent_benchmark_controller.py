@@ -443,6 +443,12 @@ async def run_agent_benchmark_and_notify(  # noqa: C901
                 llm_tier_models=llm_tier_models,
             )
 
+            # Verdicts run in the background; give them a bounded
+            # window so the run isn't marked complete with verdicts missing.
+            from llm.agents.common.verdict_judge import wait_for_verdicts
+
+            await asyncio.to_thread(wait_for_verdicts, run_id, 300)
+
             # Report & email (same as pytest path)
             run_manager.set_phase(run_id, run_manager.RunPhase.SENDING_REPORT)
             # complete_run does sync DB + HTTP I/O via reconcile_waiting_tests.
@@ -970,6 +976,21 @@ async def list_agent_tests(agent_name: str, tag_filter: Optional[str] = None):
             }
         )
     return {"agent": agent_name, "tests": tests, "total": len(tests)}
+
+
+@router.get("/config")
+async def get_frontend_config():
+    """Non-secret runtime config the dashboard JS needs at startup.
+
+    ``ask_nudgebee_base_url`` is the base URL for "open this conversation in
+    the app" links (Compare Reports per-query table + its Excel export).
+    Deliberately env-driven rather than a literal in index.html: the
+    internal staging hostname must never appear in committed source (see
+    .gitleaks-internal.toml's internal-pollux-hostname rule) — an operator
+    sets ASK_NUDGEBEE_BASE_URL per environment instead. Empty string when
+    unset; the frontend disables the links rather than building a broken URL.
+    """
+    return {"ask_nudgebee_base_url": os.environ.get("ASK_NUDGEBEE_BASE_URL", "")}
 
 
 @router.get("/agents")
@@ -2318,7 +2339,10 @@ async def _run_followup_task(  # noqa: C901
                 "answer_relevancy": rel_score,
                 "planner_relevancy": planner_score,
                 "score_reason": score_reason.strip(),
-                "duration_seconds": 0.0,
+                # No duration here: store_test_result derives it from the
+                # conversation. This path used to write a literal 0.0, which is
+                # how every followup-completed test landed in the report with no
+                # duration at all.
                 "cost": token_metrics.get("cost", 0.0),
                 "total_tokens": token_metrics.get("total_tokens", 0),
                 "input_tokens": token_metrics.get("input_tokens", 0),
@@ -2705,6 +2729,32 @@ def _run_re_evaluation(run_id: str):
             except Exception as e:
                 logger.warning("Planner eval failed for test %s: %s", tr["test_id"], e)
 
+        # --- Verdict: independent qualitative judge ---
+        # Inline here: re-evaluation is already a background job. Rows here
+        # are status="pass", so there's always an answer to judge.
+        verdict_update = {}
+        try:
+            from llm.agents.common.verdict_judge import (
+                evaluate_verdict,
+                verdict_fields,
+            )
+
+            verdict_update = verdict_fields(
+                evaluate_verdict(
+                    {
+                        "test_id": tr["test_id"],
+                        "query": tr.get("query", ""),
+                        "expected_answer": tr.get("expected_answer", ""),
+                        "actual_answer": tr.get("actual_answer", ""),
+                        "execution_trace": trace,
+                        "status": "pass",
+                    },
+                    llm,
+                )
+            )
+        except Exception as e:
+            logger.warning("Verdict judge failed for test %s: %s", tr["test_id"], e)
+
         # --- Refetch token metrics ---
         # polling_conversation_id stores the session_id needed by the metrics API.
         # Fallback: if missing (old runs), look up session_id from conversation_id (DB UUID).
@@ -2755,6 +2805,7 @@ def _run_re_evaluation(run_id: str):
             score_reason=tr.get("_reason"),
             execution_trace=tr.get("_trace"),
             **token_update,
+            verdict=verdict_update or None,
         )
         logger.info(
             "Updated test %s (index %d): sim=%s rel=%s planner=%s tokens=%s",
@@ -2977,12 +3028,14 @@ async def compare_benchmark_runs(
         "baseline": {
             "run_id": request.baseline_run_id,
             "agent": b_meta.get("agent", ""),
+            "account_id": b_meta.get("account_id", ""),
             "total_queries": b_meta.get("total_queries", 0),
             "timestamp": b_meta.get("timestamp", ""),
         },
         "candidate": {
             "run_id": request.candidate_run_id,
             "agent": c_meta.get("agent", ""),
+            "account_id": c_meta.get("account_id", ""),
             "total_queries": c_meta.get("total_queries", 0),
             "timestamp": c_meta.get("timestamp", ""),
         },

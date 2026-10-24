@@ -2,10 +2,13 @@ import { Page, Locator } from "@playwright/test";
 import { CommonLocators } from "../GlobalLocators";
 
 // Global Optimize page (/optimise) — sub-tabs rendered by AnchorComponent as `#anchor-tab-<id>`.
+// Values are URL fragments; the Cost tab's fragment is `cost` while its anchor id stays
+// `recommendations` (RecommendationsTab locates it by the id).
 export const OptimizeTabs = {
     summary: "summary",
-    recommendations: "recommendations",
+    recommendations: "cost",
     resolutions: "resolutions",
+    configuration: "configuration",
     autoOptimize: "auto-optimize",
 } as const;
 
@@ -16,6 +19,7 @@ export class OptimizeLocators extends CommonLocators {
     readonly SummaryTab: Locator;
     readonly RecommendationsTab: Locator;
     readonly ResolutionsTab: Locator;
+    readonly ConfigurationTab: Locator;
     readonly AutoOptimizeTab: Locator;
 
     constructor(page: Page) {
@@ -23,6 +27,7 @@ export class OptimizeLocators extends CommonLocators {
         this.SummaryTab = page.locator("#anchor-tab-summary");
         this.RecommendationsTab = page.locator("#anchor-tab-recommendations");
         this.ResolutionsTab = page.locator("#anchor-tab-resolutions");
+        this.ConfigurationTab = page.locator("#anchor-tab-configuration");
         this.AutoOptimizeTab = page.locator("#anchor-tab-auto-optimize");
     }
 
@@ -35,6 +40,8 @@ export class OptimizeLocators extends CommonLocators {
                 return this.RecommendationsTab;
             case OptimizeTabs.resolutions:
                 return this.ResolutionsTab;
+            case OptimizeTabs.configuration:
+                return this.ConfigurationTab;
             case OptimizeTabs.autoOptimize:
                 return this.AutoOptimizeTab;
         }

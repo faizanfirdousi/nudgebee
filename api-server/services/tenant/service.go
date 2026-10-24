@@ -27,6 +27,10 @@ import (
 
 const featureFlagCacheSentinelDefault = "default"
 
+// FeatureFlagStatusDefault is accepted by UpsertFeatureFlags to mean "delete
+// any explicit row for this tenant", returning the flag to its catalog default.
+const FeatureFlagStatusDefault = "default"
+
 const FEATURE_RBACK_K8S_ACCESS = "RBAC_K8S"
 const FEATURE_EVENT_AUTO_AI_SUMMARY = "EVENT_AUTO_AI_SUMMARY"
 const FEATURE_ANOMALY_DETECTION = "ANOMALY_DETECTION"
@@ -35,8 +39,6 @@ const FEATURE_ANOMALY_DETECTION_ERROR_RATE = "ANOMALY_DETECTION_ERROR_RATE"
 // FEATURE_TRIAGE_LLM_SCORING gates the LLM-assisted per-class triage scoring path (real P0–P3)
 // vs the legacy severity×environment formula. Rolled out per-tenant via Tenant Settings.
 const FEATURE_TRIAGE_LLM_SCORING = "TRIAGE_LLM_SCORING"
-const FEATURE_TICKETS_ADD_EVENT_COMMENTS = "TICKETS_ADD_EVENT_COMMENTS"
-const FEATURE_VERTICAL_RIGHTSIZING = "VERTICAL_RIGHTSIZING"
 const FEATURE_WEBHOOK_LLM_RESOLUTION = "WEBHOOK_LLM_RESOLUTION"
 
 // FEATURE_OPENCOST_SERVER_SIDE_SPEND is a default-ON kill-switch for the
@@ -95,7 +97,7 @@ func ListTenantsWithActiveAccounts(context *security.RequestContext) ([]models.T
 	if err != nil {
 		return []models.Tenant{}, err
 	}
-	rows, err := manager.Db.Queryx("SELECT DISTINCT t.id, t.name FROM tenant t JOIN cloud_accounts ca ON t.id = ca.tenant JOIN agent ag ON ca.id = ag.cloud_account_id WHERE ca.cloud_provider = 'K8s' AND ag.status = 'CONNECTED'")
+	rows, err := manager.Db.Queryx("SELECT DISTINCT t.id, t.name FROM tenant t JOIN cloud_accounts ca ON t.id = ca.tenant JOIN agent ag ON ca.id = ag.cloud_account_id WHERE ca.cloud_provider = 'K8s' AND ca.status = 'active' AND ag.status = 'CONNECTED'")
 	if err != nil {
 		return []models.Tenant{}, err
 	}
@@ -532,15 +534,17 @@ func UpsertTenantUserRole(ctx *security.RequestContext, request TenantUserRoleUp
 
 	defer func() {
 		ctx.GetLogger().Info("Invalidating cache for user")
-		err := ctx.GetSecurityContext().InvalidateCache()
+		// The target user's roles changed, not the caller's — drop the target's
+		// cached security context, or the old roles stay in force for its 30m TTL.
+		err := security.InvalidateCacheForUser(request.UserId)
 		if err != nil {
-			slog.Error("Error invalidating cache", "error", err, "user_id", request.UserId)
+			ctx.GetLogger().Error("Error invalidating cache", "error", err, "user_id", request.UserId)
 		}
 	}()
 
 	// remove all roles and return success
 	if request.Role == "" {
-		_, err = manager.Db.Exec("DELETE FROM user_roles WHERE entity_type = 'tenant' AND user_id = $1", request.UserId)
+		_, err = manager.Db.Exec("DELETE FROM user_roles WHERE entity_type = 'tenant' AND user_id = $1 AND tenant_id = $2", request.UserId, ctx.GetSecurityContext().GetTenantId())
 		if err != nil {
 			ctx.GetLogger().Error("Error deleting group role", "error", err)
 			return TenantUserRoleUpsertResponse{}, common.ErrorInternal("Error updating group role")
@@ -827,14 +831,18 @@ func UpsertAccountUserRole(ctx *security.RequestContext, request AccountUserRole
 
 	defer func() {
 		ctx.GetLogger().Info("Invalidating cache for user, because account role is updated")
-		err := ctx.GetSecurityContext().InvalidateCache()
+		err := security.InvalidateCacheForUser(request.UserId)
 		if err != nil {
-			slog.Error("Error invalidating cache", "error", err, "user_id", request.UserId)
+			ctx.GetLogger().Error("Error invalidating cache", "error", err, "user_id", request.UserId)
 		}
 	}()
 
-	// if empty then remove all roles
-	_, err = manager.Db.Exec("DELETE FROM user_roles WHERE entity_type = $2 AND user_id = $1", request.UserId, security.RBAC_ENTITY_TYPE_ACCOUNT)
+	// if empty then remove all roles — in this tenant only; the user's account
+	// roles in other tenants are not the caller's to replace. Rows with a NULL
+	// tenant_id predate V325 (which backfilled tenant roles only): they grant
+	// nothing, but still hold the (role, user_id, entity_type, entity_id) unique
+	// key, so leaving them would make the re-insert below fail.
+	_, err = manager.Db.Exec("DELETE FROM user_roles WHERE entity_type = $2 AND user_id = $1 AND (tenant_id = $3 OR tenant_id IS NULL)", request.UserId, security.RBAC_ENTITY_TYPE_ACCOUNT, ctx.GetSecurityContext().GetTenantId())
 	if err != nil {
 		ctx.GetLogger().Error("Error deleting user role", "error", err)
 		return AccountUserRoleUpsertResponse{}, common.ErrorInternal("Error updating user role")
@@ -1057,14 +1065,18 @@ func UpsertK8sAccountNamespaceUserRole(ctx *security.RequestContext, request K8s
 
 	defer func() {
 		ctx.GetLogger().Info("Invalidating cache for user, because namespace role is updated")
-		err := ctx.GetSecurityContext().InvalidateCache()
+		err := security.InvalidateCacheForUser(request.UserId)
 		if err != nil {
-			slog.Error("Error invalidating cache", "error", err, "user_id", request.UserId)
+			ctx.GetLogger().Error("Error invalidating cache", "error", err, "user_id", request.UserId)
 		}
 	}()
 
-	// if empty then remove all roles
-	_, err = manager.Db.Exec("DELETE FROM user_roles WHERE entity_type = $2 AND user_id = $1", request.UserId, security.RBAC_ENTITY_TYPE_K8S_NAMESPACE)
+	// if empty then remove all roles — in this tenant only; the user's namespace
+	// roles in other tenants are not the caller's to replace. Rows with a NULL
+	// tenant_id predate V325 (which backfilled tenant roles only): they grant
+	// nothing, but still hold the (role, user_id, entity_type, entity_id) unique
+	// key, so leaving them would make the re-insert below fail.
+	_, err = manager.Db.Exec("DELETE FROM user_roles WHERE entity_type = $2 AND user_id = $1 AND (tenant_id = $3 OR tenant_id IS NULL)", request.UserId, security.RBAC_ENTITY_TYPE_K8S_NAMESPACE, ctx.GetSecurityContext().GetTenantId())
 	if err != nil {
 		ctx.GetLogger().Error("Error deleting user role", "error", err)
 		return AccountUserRoleUpsertResponse{}, common.ErrorInternal("Error updating user role")
@@ -1579,6 +1591,30 @@ func UpsertFeatureFlags(ctx *security.RequestContext, request FeatureFlagUpsertR
 	defer func() { _ = tx.Rollback() }()
 
 	for _, f := range request.Features {
+		// "default" is not a stored status: it means the tenant has expressed no
+		// preference, which the schema represents as the absence of a row. The
+		// settings screen offers it as the third state so an explicit choice can
+		// be taken back -- without it, a flag set once could never return to the
+		// behaviour described by feature.polarity.
+		if f.Status == FeatureFlagStatusDefault {
+			if f.AccountId != "" {
+				_, err = tx.Exec(
+					`DELETE FROM feature_flag WHERE feature_id = $1 AND tenant_id = $2 AND account_id = $3`,
+					f.FeatureId, tenantId, f.AccountId,
+				)
+			} else {
+				_, err = tx.Exec(
+					`DELETE FROM feature_flag WHERE feature_id = $1 AND tenant_id = $2 AND account_id IS NULL`,
+					f.FeatureId, tenantId,
+				)
+			}
+			if err != nil {
+				ctx.GetLogger().Error("Error clearing feature flag", "error", err, "feature_id", f.FeatureId)
+				return FeatureFlagUpsertResponse{}, common.ErrorInternal("Error clearing feature flag")
+			}
+			continue
+		}
+
 		if f.AccountId != "" {
 			// Account-level feature flag
 			_, err = tx.Exec(
@@ -1821,6 +1857,40 @@ func DeleteNotificationRule(ctx *security.RequestContext, request NotificationRu
 	return NotificationRuleDeleteResponse(request), nil
 }
 
+// conflictingChannelMapping looks up the account and tenant that already own
+// (platform, teamID, channelID), for a specific unique-violation message.
+// excludeID skips a given mapping id (an update never conflicts with itself).
+// Returns empty strings if the owning row can't be resolved (e.g. dangling FK).
+func conflictingChannelMapping(manager *database.DatabaseManager, platform, teamID, channelID, excludeID string) (accountName, tenantName string) {
+	query := `SELECT ca.account_name, t.name
+		FROM notification_channel_account_mappings m
+		JOIN cloud_accounts ca ON ca.id = m.account_id
+		JOIN tenant t ON t.id = m.tenant_id
+		WHERE m.platform = $1 AND m.team_id = $2 AND m.channel_id = $3`
+	args := []any{platform, teamID, channelID}
+	if excludeID != "" {
+		query += " AND m.id != $4"
+		args = append(args, excludeID)
+	}
+	query += " LIMIT 1"
+	if err := manager.Db.QueryRowx(query, args...).Scan(&accountName, &tenantName); err != nil {
+		return "", ""
+	}
+	return accountName, tenantName
+}
+
+// channelMappingConflictError builds the "already mapped" message for a
+// unique-violation on notification_channel_account_mappings, naming the
+// account and tenant that already hold the mapping when they can be
+// resolved, falling back to a generic message otherwise.
+func channelMappingConflictError(manager *database.DatabaseManager, platform, teamID, channelID, excludeID string) error {
+	accountName, tenantName := conflictingChannelMapping(manager, platform, teamID, channelID, excludeID)
+	if accountName == "" {
+		return common.ErrorConflict("This channel is already mapped")
+	}
+	return common.ErrorConflict(fmt.Sprintf("%s is already mapped with account %s in %s tenant", channelID, accountName, tenantName))
+}
+
 func CreateNotificationChannelMapping(ctx *security.RequestContext, request NotificationChannelMappingCreateRequest) (NotificationChannelMappingCreateResponse, error) {
 	if !ctx.GetSecurityContext().CanManage("messagingplatforms", "Write") {
 		return NotificationChannelMappingCreateResponse{}, common.ErrorUnauthorized("Not Allowed")
@@ -1844,6 +1914,9 @@ func CreateNotificationChannelMapping(ctx *security.RequestContext, request Noti
 		ctx.GetSecurityContext().GetUserId(), ctx.GetSecurityContext().GetTenantId(),
 	).StructScan(&resp)
 	if err != nil {
+		if pgUniqueViolation(err) {
+			return NotificationChannelMappingCreateResponse{}, channelMappingConflictError(manager, request.Platform, request.TeamId, request.ChannelId, "")
+		}
 		ctx.GetLogger().Error("Error creating notification channel mapping", "error", err)
 		return NotificationChannelMappingCreateResponse{}, common.ErrorInternal("Error creating notification channel mapping")
 	}
@@ -1906,6 +1979,13 @@ func UpdateNotificationChannelMapping(ctx *security.RequestContext, request Noti
 		request.Id, ctx.GetSecurityContext().GetTenantId(),
 	).StructScan(&resp)
 	if err != nil {
+		if pgUniqueViolation(err) {
+			// Platform isn't part of the update request (it never changes), so
+			// resolve it from the row being updated to look up the conflict.
+			var platform string
+			_ = manager.Db.Get(&platform, "SELECT platform FROM notification_channel_account_mappings WHERE id = $1", request.Id)
+			return NotificationChannelMappingUpdateResponse{}, channelMappingConflictError(manager, platform, request.TeamId, request.ChannelId, request.Id)
+		}
 		ctx.GetLogger().Error("Error updating notification channel mapping", "error", err)
 		return NotificationChannelMappingUpdateResponse{}, common.ErrorInternal("Error updating notification channel mapping")
 	}
@@ -2347,6 +2427,7 @@ func DeleteTenant(ctx *security.RequestContext, request TenantDeleteRequest) (Te
 		{name: "notification_channel_account_mappings"},
 		{name: "notification_rule_mappings"},
 		{name: "notification_rules"},
+		{name: "notification_default_policies"},
 		{name: "notifications", tenantColumn: "tenant"},
 		// knowledge graph
 		{name: "knowledge_graph_edge"},
@@ -2354,6 +2435,7 @@ func DeleteTenant(ctx *security.RequestContext, request TenantDeleteRequest) (Te
 		{name: "knowledge_graph_node"},
 		{name: "knowledge_graph_tenant_filters"},
 		// llm
+		{name: "ai_cost_report_dispatch_log"},
 		{name: "llm_conversations"},
 		{name: "llm_global_contexts"},
 		{name: "llm_knowledgebases"},

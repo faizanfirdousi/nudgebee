@@ -9,6 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
+	"nudgebee/llm/config"
 	"nudgebee/llm/security/egressfilter"
 )
 
@@ -29,6 +30,7 @@ import (
 const (
 	maxAllowlistEntries          = 500
 	maxDisabledRulesEntries      = 100
+	maxDisabledAgentsEntries     = 50
 	maxPIIDisabledCategoryValues = 8 // hard cap; the ml-k8s token namespace has ~4 today
 )
 
@@ -104,10 +106,13 @@ func listTenantConfigs(c *gin.Context) {
 // --- Write -------------------------------------------------------------------
 
 type upsertBody struct {
-	Mode          *string  `json:"mode,omitempty"`
-	Enabled       *bool    `json:"enabled,omitempty"`
-	Allowlist     []string `json:"allowlist,omitempty"`
-	DisabledRules []string `json:"disabled_rules,omitempty"`
+	Mode           *string  `json:"mode,omitempty"`
+	Enabled        *bool    `json:"enabled,omitempty"`
+	EntropyEnabled *bool    `json:"entropy_enabled,omitempty"`
+	Allowlist      []string `json:"allowlist,omitempty"`
+	DisabledRules  []string `json:"disabled_rules,omitempty"`
+	// Agents skipping detection -> see TenantConfig.DisabledAgents.
+	DisabledAgents []string `json:"disabled_agents,omitempty"`
 	// PII sibling detector (V827). All fields optional; omitting them
 	// leaves the tenant's existing PII posture untouched (nil-ish values
 	// mean "inherit env" on the wrapper side).
@@ -129,11 +134,16 @@ func upsertTenantConfig(c *gin.Context) {
 	}
 
 	cfg := &egressfilter.TenantConfig{
-		TenantID:      tenantID,
-		Mode:          egressfilter.ModeDetect, // default
-		Enabled:       true,
-		Allowlist:     cleanStrings(body.Allowlist),
-		DisabledRules: cleanStrings(body.DisabledRules),
+		TenantID:       tenantID,
+		Mode:           egressfilter.ModeDetect, // default
+		Enabled:        true,
+		EntropyEnabled: config.Config.LlmServerEgressFilterEntropyEnabled,
+		Allowlist:      cleanStrings(body.Allowlist),
+		DisabledRules:  cleanStrings(body.DisabledRules),
+		DisabledAgents: cleanStrings(body.DisabledAgents),
+	}
+	if body.EntropyEnabled != nil {
+		cfg.EntropyEnabled = *body.EntropyEnabled
 	}
 	if body.Mode != nil {
 		mode, errResp := parseMode(*body.Mode)
@@ -165,15 +175,18 @@ func upsertTenantConfig(c *gin.Context) {
 }
 
 type patchBody struct {
-	Mode    *string `json:"mode,omitempty"`
-	Enabled *bool   `json:"enabled,omitempty"`
+	Mode           *string `json:"mode,omitempty"`
+	Enabled        *bool   `json:"enabled,omitempty"`
+	EntropyEnabled *bool   `json:"entropy_enabled,omitempty"`
 	// Additive operations on the array-shaped columns. *_add and *_remove
 	// arrive simultaneously: server applies removes first, then adds, so the
 	// caller doesn't have to think about ordering.
-	AllowlistAdd        []string `json:"allowlist_add,omitempty"`
-	AllowlistRemove     []string `json:"allowlist_remove,omitempty"`
-	DisabledRulesAdd    []string `json:"disabled_rules_add,omitempty"`
-	DisabledRulesRemove []string `json:"disabled_rules_remove,omitempty"`
+	AllowlistAdd         []string `json:"allowlist_add,omitempty"`
+	AllowlistRemove      []string `json:"allowlist_remove,omitempty"`
+	DisabledRulesAdd     []string `json:"disabled_rules_add,omitempty"`
+	DisabledRulesRemove  []string `json:"disabled_rules_remove,omitempty"`
+	DisabledAgentsAdd    []string `json:"disabled_agents_add,omitempty"`
+	DisabledAgentsRemove []string `json:"disabled_agents_remove,omitempty"`
 	// PII sibling detector (V827). PATCH tri-state semantics via IsPresent:
 	//   - field absent            → leave existing DB value
 	//   - field present, non-null → replace with value
@@ -246,9 +259,10 @@ func patchTenantConfig(c *gin.Context) {
 	}
 	if cfg == nil {
 		cfg = &egressfilter.TenantConfig{
-			TenantID: tenantID,
-			Mode:     egressfilter.ModeDetect,
-			Enabled:  true,
+			TenantID:       tenantID,
+			Mode:           egressfilter.ModeDetect,
+			Enabled:        true,
+			EntropyEnabled: config.Config.LlmServerEgressFilterEntropyEnabled,
 		}
 	}
 
@@ -263,8 +277,12 @@ func patchTenantConfig(c *gin.Context) {
 	if body.Enabled != nil {
 		cfg.Enabled = *body.Enabled
 	}
+	if body.EntropyEnabled != nil {
+		cfg.EntropyEnabled = *body.EntropyEnabled
+	}
 	cfg.Allowlist = applyAddRemove(cfg.Allowlist, body.AllowlistAdd, body.AllowlistRemove)
 	cfg.DisabledRules = applyAddRemove(cfg.DisabledRules, body.DisabledRulesAdd, body.DisabledRulesRemove)
+	cfg.DisabledAgents = applyAddRemove(cfg.DisabledAgents, body.DisabledAgentsAdd, body.DisabledAgentsRemove)
 
 	// PATCH tri-state semantics: absent = leave; present-value = set;
 	// present-null = clear back to "inherit env". applyPIIToConfig can't
@@ -422,6 +440,9 @@ func validateBudgets(cfg *egressfilter.TenantConfig) string {
 	if len(cfg.DisabledRules) > maxDisabledRulesEntries {
 		return "disabled_rules exceeds max entries (100)"
 	}
+	if len(cfg.DisabledAgents) > maxDisabledAgentsEntries {
+		return "disabled_agents exceeds max entries (50)"
+	}
 	if len(cfg.PIIDisabledCategories) > maxPIIDisabledCategoryValues {
 		return "pii_disabled_categories exceeds max entries (8)"
 	}
@@ -516,8 +537,10 @@ func configResponse(cfg *egressfilter.TenantConfig) gin.H {
 		"tenant_id":               cfg.TenantID.String(),
 		"mode":                    string(cfg.Mode),
 		"enabled":                 cfg.Enabled,
+		"entropy_enabled":         cfg.EntropyEnabled,
 		"allowlist":               cfg.Allowlist,
 		"disabled_rules":          cfg.DisabledRules,
+		"disabled_agents":         cfg.DisabledAgents,
 		"pii_mode":                cfg.PIIMode, // "" = inherit env
 		"pii_disabled_categories": cfg.PIIDisabledCategories,
 		"updated_at":              cfg.UpdatedAt,

@@ -16,6 +16,7 @@ import (
 	"nudgebee/llm/security"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,8 +34,26 @@ import (
 )
 
 const imageAnnotationKey = "nudgebee.com/code-agent-image"
+const workspaceSpecAnnotationKey = "nudgebee.com/workspace-spec-version"
+
+// workspaceSpecVersion is bumped whenever an existing healthy workspace pod
+// must be recreated to pick up a pod-spec-only change. CreateWorkspace checks
+// it during recovery, while the leader sweep upgrades a bounded batch at a time.
+const workspaceSpecVersion = "workspace-readonly-rootfs-v3"
+
+const workspaceSpecUpgradeBatchSize = 5
 
 const CacheNamespaceWorkspaceTokens = "workspace_tokens"
+
+// ErrWorkspaceRunLost marks a workspace API failure that CONFIRMS — not merely
+// suspects — that whatever the caller previously dispatched against this pod
+// (an async analysis, a followup run) is gone: either the pod is in a terminal
+// k8s phase (isPodInTerminalState), or a reachable pod answered with 404 for
+// the specific resource, meaning the pod now serving this account has no
+// memory of it. This is a stronger signal than an ordinary timeout/connection
+// error, where the old pod may still be working and the caller should not
+// assume it is safe to retry. See callWorkspaceAPIWithClient (#38994).
+var ErrWorkspaceRunLost = stderrors.New("workspace: run is confirmed lost (pod replaced or terminal)")
 
 const ENV_NB_LLM_SERVER_URL = "NB_LLM_SERVER_URL"
 const ENV_NB_ACCOUNT_ID = "NB_ACCOUNT_ID"
@@ -50,9 +69,32 @@ func init() {
 }
 
 type WorkspaceTokenClaims struct {
-	AccountId string `json:"account_id"`
-	TenantId  string `json:"tenant_id"`
+	AccountId       string `json:"account_id"`
+	TenantId        string `json:"tenant_id"`
+	TargetAccountId string `json:"target_account_id,omitempty"`
+	// Grants is set only on execution tokens (audience AudienceWorkspaceExecute):
+	// the authority of the user whose command is running.
+	Grants *security.WorkspaceGrants `json:"grants,omitempty"`
 	jwt.RegisteredClaims
+}
+
+func signWorkspaceToken(accountID, tenantID string) (string, error) {
+	claims := WorkspaceTokenClaims{
+		AccountId: accountID,
+		TenantId:  tenantID,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Audience:  jwt.ClaimStrings{AudienceWorkspacePod},
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(workspaceTokenLifetime)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			Issuer:    "llm-server",
+		},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, err := token.SignedString([]byte(config.Config.LlmServerJwtSecret))
+	if err != nil {
+		return "", fmt.Errorf("failed to sign workspace token: %w", err)
+	}
+	return signed, nil
 }
 
 type WorkspaceManager interface {
@@ -149,6 +191,9 @@ func (w *workspaceManager) isRecoverableError(err error) bool {
 	if errors.IsNotFound(err) || errors.IsServiceUnavailable(err) || errors.IsTimeout(err) {
 		return true
 	}
+	if stderrors.Is(err, errDockerWorkspaceNotFound) || stderrors.Is(err, errDockerWorkspaceTokenInvalid) {
+		return true
+	}
 
 	// Check error string for connectivity issues or readiness failures
 	errMsg := strings.ToLower(err.Error())
@@ -213,6 +258,28 @@ func (w *workspaceManager) WaitForReady(ctx *security.RequestContext, accountId 
 	if accountId == "" {
 		ctx.GetLogger().Error("workspace: accountId is required for wait")
 		return fmt.Errorf("workspace: accountId is required")
+	}
+
+	if dockerMode() {
+		deadline := time.Now().Add(300 * time.Second)
+		if ctxDeadline, ok := ctx.GetContext().Deadline(); ok && ctxDeadline.Before(deadline) {
+			deadline = ctxDeadline
+		}
+		for time.Now().Before(deadline) {
+			resp, healthErr := dockerAPIRequest(ctx.GetContext(), w.httpClient, accountId, http.MethodGet, "/health", nil, nil)
+			if healthErr == nil {
+				_ = resp.Body.Close()
+				if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+					return nil
+				}
+			}
+			select {
+			case <-ctx.GetContext().Done():
+				return ctx.GetContext().Err()
+			case <-time.After(2 * time.Second):
+			}
+		}
+		return fmt.Errorf("timed out waiting for Docker workspace %s to be ready", dockerWorkspaceName(accountId))
 	}
 
 	clientset, err := getKubeClient(100, 200)
@@ -295,7 +362,20 @@ func (w *workspaceManager) CreateWorkspace(ctx *security.RequestContext, account
 		return fmt.Errorf("workspace: accountId is required")
 	}
 
+	storageLimit, err := workspaceStorageSizeLimit()
+	if err != nil {
+		ctx.GetLogger().Error("workspace: invalid ephemeral storage limit", "error", err)
+		return fmt.Errorf("workspace: invalid ephemeral storage limit: %w", err)
+	}
+
 	logger := ctx.GetLogger()
+	if dockerMode() {
+		runtime, err := newDockerRuntime()
+		if err != nil {
+			return err
+		}
+		return runtime.create(ctx, accountId)
+	}
 
 	clientset, err := getKubeClient(100, 200)
 	if err != nil {
@@ -322,12 +402,24 @@ func (w *workspaceManager) CreateWorkspace(ctx *security.RequestContext, account
 			// kubeconfig and must not stomp on pods owned by the real
 			// in-cluster llm-server (e.g. if the developer's local
 			// LLM_SERVER_CODE_AGENT_IMAGE differs from what's deployed).
-			if _, inClusterErr := rest.InClusterConfig(); inClusterErr == nil {
+			if config.IsInCluster() {
 				needsReplace = true
 				replaceReason = fmt.Sprintf("image mismatch (pod=%s, expected=%s)", podImage, image)
 			} else {
 				logger.Warn("workspace: skipping image-mismatch replacement (not running in-cluster), reusing existing pod",
 					"pod_name", podName, "pod_image", podImage, "expected_image", image)
+			}
+		} else if !hasCurrentWorkspaceSpec(existingPod) {
+			podSpecVersion := existingPod.Annotations[workspaceSpecAnnotationKey]
+			// Apply pod-spec-only security changes lazily when the workspace is next
+			// used. Local llm-server processes may point at a shared cluster and must
+			// not replace pods owned by the in-cluster deployment.
+			if config.IsInCluster() {
+				needsReplace = true
+				replaceReason = fmt.Sprintf("workspace spec mismatch (pod=%s, expected=%s)", podSpecVersion, workspaceSpecVersion)
+			} else {
+				logger.Warn("workspace: skipping spec-mismatch replacement (not running in-cluster), reusing existing pod",
+					"pod_name", podName, "pod_spec_version", podSpecVersion, "expected_spec_version", workspaceSpecVersion)
 			}
 		}
 
@@ -366,17 +458,7 @@ func (w *workspaceManager) CreateWorkspace(ctx *security.RequestContext, account
 	}
 
 	// Generate JWT workspace token
-	claims := WorkspaceTokenClaims{
-		AccountId: accountId,
-		TenantId:  tenantId,
-		RegisteredClaims: jwt.RegisteredClaims{
-			ExpiresAt: jwt.NewNumericDate(time.Now().Add(workspaceTokenLifetime)),
-			IssuedAt:  jwt.NewNumericDate(time.Now()),
-			Issuer:    "llm-server",
-		},
-	}
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	workspaceToken, err := token.SignedString([]byte(config.Config.LlmServerJwtSecret))
+	workspaceToken, err := signWorkspaceToken(accountId, tenantId)
 	if err != nil {
 		logger.Error("workspace: failed to sign workspace token", "error", err)
 		return fmt.Errorf("failed to sign workspace token: %w", err)
@@ -385,10 +467,7 @@ func (w *workspaceManager) CreateWorkspace(ctx *security.RequestContext, account
 	// Command to start server (no arguments usually starts server, based on main.go)
 	args := []string{"/app/code-analysis-agent", "--server"}
 
-	runAsUser := int64(1000)
-	runAsGroup := int64(3000)
-	runAsNonRoot := true
-
+	volumes, volumeMounts := workspaceWritableLayout(storageLimit)
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      podName,
@@ -398,15 +477,12 @@ func (w *workspaceManager) CreateWorkspace(ctx *security.RequestContext, account
 				"account_id": strings.ToLower(accountId),
 			},
 			Annotations: map[string]string{
-				imageAnnotationKey: image,
+				imageAnnotationKey:         image,
+				workspaceSpecAnnotationKey: workspaceSpecVersion,
 			},
 		},
 		Spec: corev1.PodSpec{
-			SecurityContext: &corev1.PodSecurityContext{
-				RunAsUser:    &runAsUser,
-				RunAsGroup:   &runAsGroup,
-				RunAsNonRoot: &runAsNonRoot,
-			},
+			Volumes: volumes,
 			// GKE resolves metadata.google.internal to the real metadata IP
 			// (169.254.169.254) inside pods, but the NetworkPolicy blackholes
 			// that IP to prevent IMDS credential theft — silently dropping
@@ -437,7 +513,8 @@ func (w *workspaceManager) CreateWorkspace(ctx *security.RequestContext, account
 							Name:          "http",
 						},
 					},
-					Resources: buildWorkspaceResources(),
+					Resources:    buildWorkspaceResources(),
+					VolumeMounts: volumeMounts,
 					ReadinessProbe: &corev1.Probe{
 						ProbeHandler: corev1.ProbeHandler{
 							HTTPGet: &corev1.HTTPGetAction{
@@ -474,38 +551,26 @@ func (w *workspaceManager) CreateWorkspace(ctx *security.RequestContext, account
 							Name:  "SERVER_WRITE_TIMEOUT",
 							Value: config.Config.LlmServerWorkspaceCommandTimeout,
 						},
+						{
+							// The pod's ephemeral-storage budget, same value as the
+							// workspace-storage emptyDir sizeLimit. code-analysis's
+							// cache GC measures the workspace tree against this;
+							// syscall.Statfs inside the pod would report the node
+							// filesystem instead and never trip its threshold.
+							Name:  "WORKSPACE_STORAGE_LIMIT_BYTES",
+							Value: strconv.FormatInt(storageLimit.Value(), 10),
+						},
 					},
 				},
 			},
 			RestartPolicy: corev1.RestartPolicyAlways, // Server should restart
 		},
 	}
+	applyWorkspaceSecurityDefaults(pod)
 
 	// Pass only required secret keys as env vars instead of mounting the entire secret
 	if config.Config.LlmServerCodeAgentSecret != "" {
-		secretName := config.Config.LlmServerCodeAgentSecret
-		optional := true
-		secretEnvVars := []corev1.EnvVar{
-			{Name: "LLM_PROVIDER", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: secretName}, Key: "LLM_PROVIDER", Optional: &optional}}},
-			{Name: "LLM_MODEL_NAME", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: secretName}, Key: "LLM_MODEL_NAME", Optional: &optional}}},
-			{Name: "LLM_PROVIDER_API_KEY", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: secretName}, Key: "LLM_PROVIDER_API_KEY", Optional: &optional}}},
-			{Name: "LLM_PROVIDER_API_ENDPOINT", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: secretName}, Key: "LLM_PROVIDER_API_ENDPOINT", Optional: &optional}}},
-			{Name: "LLM_PROVIDER_REGION", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: secretName}, Key: "LLM_PROVIDER_REGION", Optional: &optional}}},
-			{Name: "LLM_PROVIDER_API_VERSION", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: secretName}, Key: "LLM_PROVIDER_API_VERSION", Optional: &optional}}},
-			{Name: "LLM_PROVIDER_API_TYPE", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: secretName}, Key: "LLM_PROVIDER_API_TYPE", Optional: &optional}}},
-			{Name: "LLM_PROVIDER_MAX_RETRIES", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: secretName}, Key: "LLM_PROVIDER_MAX_RETRIES", Optional: &optional}}},
-			// BASE_URL is the public frontend URL the code-analysis orchestrator uses
-			// to build PR/workflow links (e.g. "View Workflow"). It is non-sensitive,
-			// so it does not widen the blast radius the comment below guards against;
-			// without it the pod falls back to the prod default (app.nudgebee.com).
-			{Name: "BASE_URL", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: secretName}, Key: "BASE_URL", Optional: &optional}}},
-			// NUDGEBEE_ENCRYPTION_KEY intentionally NOT mounted (B4).
-			// The workspace pod's decrypt path was dead code — llm-server
-			// already decrypts integration credentials upstream and sends
-			// plaintext `type: "token"` in git_credentials. Removing the
-			// key from the pod env narrows the master-key blast radius.
-		}
-		pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, secretEnvVars...)
+		pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, LLMSecretEnvVars(config.Config.LlmServerCodeAgentSecret)...)
 	}
 
 	// Operator-configured extra env (comma-separated KEY=VALUE) — the rollout
@@ -532,6 +597,82 @@ func (w *workspaceManager) CreateWorkspace(ctx *security.RequestContext, account
 	}
 	logger.Info("workspace pod created", "pod_name", podName)
 	return nil
+}
+
+func hasCurrentWorkspaceSpec(pod *corev1.Pod) bool {
+	return pod != nil && pod.Annotations[workspaceSpecAnnotationKey] == workspaceSpecVersion
+}
+
+// applyWorkspaceSecurityDefaults establishes the portable baseline for every
+// workspace container. Runtime writes are confined to the explicit emptyDir
+// mounts returned by workspaceWritableLayout.
+func applyWorkspaceSecurityDefaults(pod *corev1.Pod) {
+	runAsUser := int64(1000)
+	runAsGroup := int64(3000)
+	runAsNonRoot := true
+	disabled := false
+
+	pod.Spec.AutomountServiceAccountToken = &disabled
+	pod.Spec.EnableServiceLinks = &disabled
+	if pod.Spec.SecurityContext == nil {
+		pod.Spec.SecurityContext = &corev1.PodSecurityContext{}
+	}
+	pod.Spec.SecurityContext.RunAsUser = &runAsUser
+	pod.Spec.SecurityContext.RunAsGroup = &runAsGroup
+	pod.Spec.SecurityContext.RunAsNonRoot = &runAsNonRoot
+	pod.Spec.SecurityContext.SeccompProfile = &corev1.SeccompProfile{
+		Type: corev1.SeccompProfileTypeRuntimeDefault,
+	}
+
+	applyContainerSecurityDefaults(pod.Spec.InitContainers)
+	applyContainerSecurityDefaults(pod.Spec.Containers)
+}
+
+func applyContainerSecurityDefaults(containers []corev1.Container) {
+	for i := range containers {
+		containerRunAsNonRoot := true
+		privileged := false
+		allowPrivilegeEscalation := false
+		readOnlyRootFilesystem := true
+		if containers[i].SecurityContext == nil {
+			containers[i].SecurityContext = &corev1.SecurityContext{}
+		}
+		securityContext := containers[i].SecurityContext
+		securityContext.RunAsNonRoot = &containerRunAsNonRoot
+		securityContext.Privileged = &privileged
+		securityContext.AllowPrivilegeEscalation = &allowPrivilegeEscalation
+		securityContext.ReadOnlyRootFilesystem = &readOnlyRootFilesystem
+		securityContext.Capabilities = &corev1.Capabilities{
+			Drop: []corev1.Capability{"ALL"},
+		}
+	}
+}
+
+// workspaceWritableLayout keeps runtime state writable without leaving the
+// image layer mutable. /tmp is required by os.TempDir users and provider CLIs;
+// HOME carries user-level Git/SSH/tool state. The nested workspace mount keeps
+// repositories and shared build caches on their existing independently
+// size-limited volume.
+func workspaceWritableLayout(storageLimit *resource.Quantity) ([]corev1.Volume, []corev1.VolumeMount) {
+	emptyDir := func() *corev1.EmptyDirVolumeSource {
+		volume := &corev1.EmptyDirVolumeSource{}
+		if storageLimit != nil {
+			limit := storageLimit.DeepCopy()
+			volume.SizeLimit = &limit
+		}
+		return volume
+	}
+	volumes := []corev1.Volume{
+		{Name: "runtime-tmp", VolumeSource: corev1.VolumeSource{EmptyDir: emptyDir()}},
+		{Name: "runtime-home", VolumeSource: corev1.VolumeSource{EmptyDir: emptyDir()}},
+		{Name: "workspace-storage", VolumeSource: corev1.VolumeSource{EmptyDir: emptyDir()}},
+	}
+	mounts := []corev1.VolumeMount{
+		{Name: "runtime-tmp", MountPath: "/tmp"},
+		{Name: "runtime-home", MountPath: "/home/appuser"},
+		{Name: "workspace-storage", MountPath: "/tmp/code-analysis"},
+	}
+	return volumes, mounts
 }
 
 // extraEnvKeyRe matches valid env var names. Anything else is skipped: an
@@ -573,11 +714,29 @@ func LLMSecretEnvVars(secretName string) []corev1.EnvVar {
 		}}}
 	}
 	return []corev1.EnvVar{
-		ref("LLM_PROVIDER"), ref("LLM_MODEL_NAME"), ref("LLM_PROVIDER_API_KEY"),
+		ref("LLM_PROVIDER"), ref("LLM_MODEL_NAME"),
 		ref("LLM_PROVIDER_API_ENDPOINT"), ref("LLM_PROVIDER_REGION"),
 		ref("LLM_PROVIDER_API_VERSION"), ref("LLM_PROVIDER_API_TYPE"),
 		ref("LLM_PROVIDER_MAX_RETRIES"), ref("BASE_URL"),
 	}
+}
+
+// defaultWorkspaceStorageLimit caps workspace ephemeral storage when the
+// operator has not configured a value. A nil SizeLimit would leave the emptyDir
+// unbounded, letting one workspace pod fill the node disk and evict unrelated
+// pods, so we always return a concrete limit.
+const defaultWorkspaceStorageLimit = "5Gi"
+
+func workspaceStorageSizeLimit() (*resource.Quantity, error) {
+	raw := config.Config.LlmServerWorkspaceResourceLimitStorage
+	if raw == "" {
+		raw = defaultWorkspaceStorageLimit
+	}
+	limit, err := resource.ParseQuantity(raw)
+	if err != nil {
+		return nil, err
+	}
+	return &limit, nil
 }
 
 func buildWorkspaceResources() corev1.ResourceRequirements {
@@ -587,11 +746,16 @@ func buildWorkspaceResources() corev1.ResourceRequirements {
 			corev1.ResourceMemory: resource.MustParse(config.Config.LlmServerWorkspaceResourceRequestMemory),
 		},
 	}
-	if config.Config.LlmServerWorkspaceResourceLimitCpu != "" && config.Config.LlmServerWorkspaceResourceLimitMemory != "" {
-		resources.Limits = corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse(config.Config.LlmServerWorkspaceResourceLimitCpu),
-			corev1.ResourceMemory: resource.MustParse(config.Config.LlmServerWorkspaceResourceLimitMemory),
-		}
+	resources.Limits = corev1.ResourceList{}
+	if config.Config.LlmServerWorkspaceResourceLimitCpu != "" {
+		resources.Limits[corev1.ResourceCPU] = resource.MustParse(config.Config.LlmServerWorkspaceResourceLimitCpu)
+	}
+	if config.Config.LlmServerWorkspaceResourceLimitMemory != "" {
+		resources.Limits[corev1.ResourceMemory] = resource.MustParse(config.Config.LlmServerWorkspaceResourceLimitMemory)
+	}
+	if storageLimit, err := workspaceStorageSizeLimit(); err == nil && storageLimit != nil {
+		resources.Requests[corev1.ResourceEphemeralStorage] = storageLimit.DeepCopy()
+		resources.Limits[corev1.ResourceEphemeralStorage] = *storageLimit
 	}
 	return resources
 }
@@ -600,6 +764,21 @@ func (w *workspaceManager) IsWorkspaceExists(ctx *security.RequestContext, accou
 	if accountId == "" {
 		ctx.GetLogger().Error("workspace: accountId is required for exists check")
 		return false, fmt.Errorf("workspace: accountId is required")
+	}
+
+	if dockerMode() {
+		runtime, err := newDockerRuntime()
+		if err != nil {
+			return false, err
+		}
+		container, err := runtime.inspect(ctx.GetContext(), accountId)
+		if err != nil {
+			if stderrors.Is(err, errDockerWorkspaceNotFound) {
+				return false, nil
+			}
+			return false, err
+		}
+		return container.Config.Labels[dockerManagedLabel] == "true", nil
 	}
 
 	clientset, err := getKubeClient(100, 200)
@@ -635,23 +814,35 @@ func isPodInCrashLoop(pod *corev1.Pod) bool {
 // crash loop.  Callers should treat the returned error as recoverable so that
 // lazy-create can spin up a replacement.
 func isPodInTerminalState(pod *corev1.Pod) (bool, string) {
+	// pod.Status.Reason/Message carry the kubelet's own explanation for a
+	// Failed pod (e.g. Reason="Evicted", Message="...node had condition:
+	// [DiskPressure]..."). Appended below so a poller's error names the
+	// actual cause instead of just the phase — previously only visible by
+	// querying the DB and cross-referencing a stale k8s event (#38994).
+	detail := ""
+	if pod.Status.Reason != "" {
+		detail = ": " + pod.Status.Reason
+		if pod.Status.Message != "" {
+			detail += " (" + pod.Status.Message + ")"
+		}
+	}
 	if pod.DeletionTimestamp != nil {
-		return true, "pod is terminating"
+		return true, "pod is terminating" + detail
 	}
 	if pod.Status.Phase == corev1.PodSucceeded {
-		return true, "pod has completed (Succeeded phase)"
+		return true, "pod has completed (Succeeded phase)" + detail
 	}
 	if pod.Status.Phase == corev1.PodFailed {
-		return true, "pod has failed (Failed phase)"
+		return true, "pod has failed (Failed phase)" + detail
 	}
 	if isPodInCrashLoop(pod) {
-		return true, "pod is in CrashLoopBackOff"
+		return true, "pod is in CrashLoopBackOff" + detail
 	}
 	// Check if the container exited but hasn't restarted yet (brief window
 	// between termination and kubelet restart with RestartPolicy=Always).
 	for _, cs := range pod.Status.ContainerStatuses {
 		if cs.State.Terminated != nil && cs.State.Terminated.Reason == "Completed" {
-			return true, "container has terminated (Completed)"
+			return true, "container has terminated (Completed)" + detail
 		}
 	}
 	return false, ""
@@ -686,6 +877,29 @@ func (w *workspaceManager) TerminateWorkspace(ctx *security.RequestContext, acco
 	if accountId == "" {
 		ctx.GetLogger().Error("workspace: accountId is required for termination")
 		return fmt.Errorf("workspace: accountId is required")
+	}
+
+	if dockerMode() {
+		runtime, err := newDockerRuntime()
+		if err != nil {
+			return err
+		}
+		container, inspectErr := runtime.inspect(ctx.GetContext(), accountId)
+		if stderrors.Is(inspectErr, errDockerWorkspaceNotFound) {
+			return nil
+		}
+		if inspectErr != nil {
+			return inspectErr
+		}
+		if err := validateDockerWorkspaceOwnership(container, accountId); err != nil {
+			return err
+		}
+		if token := dockerEnvValue(container.Config.Env, ENV_NB_WORKSPACE_TOKEN); token != "" {
+			if err := common.CacheSet(CacheNamespaceWorkspaceTokens, token, []byte("revoked"), common.CacheSetWithExpiration(workspaceTokenLifetime)); err != nil {
+				ctx.GetLogger().Warn("workspace: failed to revoke token", "error", err)
+			}
+		}
+		return runtime.delete(ctx.GetContext(), accountId)
 	}
 
 	clientset, err := getKubeClient(100, 200)
@@ -723,13 +937,19 @@ func (w *workspaceManager) TerminateWorkspace(ctx *security.RequestContext, acco
 	return nil
 }
 
-// CleanupStaleWorkspaces deletes workspace pods running an outdated image.
+// CleanupStaleWorkspaces deletes workspace pods running an outdated image or
+// pod spec. Image changes retain the existing immediate behavior; spec-only
+// changes are bounded per sweep to avoid restarting the whole fleet at once.
 // Called on startup AND on a periodic leader schedule: the lazy-create path is
 // optimistic (a healthy pod's image is never re-checked), so without the
 // periodic sweep a long-lived pod keeps serving a stale image until its first
 // API failure — observed to delay code-analysis fixes by nearly two weeks.
 // Deleted pods are recreated lazily by CreateWorkspace on next use.
 func CleanupStaleWorkspaces(ctx context.Context) {
+	if dockerMode() {
+		cleanupDockerWorkspaces(ctx)
+		return
+	}
 	// Skip cleanup when running outside K8s (local development).
 	// Only treat rest.ErrNotInCluster as "not in K8s"; log other errors as warnings.
 	if _, err := rest.InClusterConfig(); err != nil {
@@ -769,8 +989,41 @@ func CleanupStaleWorkspaces(ctx context.Context) {
 				slog.Warn("workspace: failed to delete stale workspace pod; it keeps serving the old image until the next sweep",
 					"pod", pod.Name, "error", err)
 			}
+			continue
 		}
 	}
+
+	for _, pod := range selectWorkspaceSpecUpgrades(pods.Items, currentImage, workspaceSpecUpgradeBatchSize) {
+		slog.Info("workspace: deleting workspace pod with outdated spec",
+			"pod", pod.Name,
+			"pod_spec_version", pod.Annotations[workspaceSpecAnnotationKey],
+			"current_spec_version", workspaceSpecVersion)
+		gracePeriod := int64(0)
+		if err := clientset.CoreV1().Pods(namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{
+			GracePeriodSeconds: &gracePeriod,
+		}); err != nil && !errors.IsNotFound(err) {
+			slog.Warn("workspace: failed to delete workspace pod with outdated spec; it will be retried on the next sweep",
+				"pod", pod.Name, "error", err)
+		}
+	}
+}
+
+func selectWorkspaceSpecUpgrades(pods []corev1.Pod, currentImage string, limit int) []*corev1.Pod {
+	if limit <= 0 {
+		return nil
+	}
+
+	selected := make([]*corev1.Pod, 0, min(limit, len(pods)))
+	for i := range pods {
+		if pods[i].DeletionTimestamp != nil || pods[i].Annotations[imageAnnotationKey] != currentImage || hasCurrentWorkspaceSpec(&pods[i]) {
+			continue
+		}
+		selected = append(selected, &pods[i])
+		if len(selected) == limit {
+			break
+		}
+	}
+	return selected
 }
 
 type executePayload struct {
@@ -819,11 +1072,48 @@ func (e *CommandFailure) Is(target error) bool {
 // single update site.
 const stderrExitStatus1 = "exit status 1"
 
+// exitStatusRe matches the agent's report of a process that actually
+// ran. It is the only failure shape the agent produces from cmd.Run();
+// every other command_status:"failed" is a pre-execution rejection
+// (empty command, bad workspace path, security validation), where
+// nothing ran and there is no exit code to speak of. The trailing
+// remainder is optional because "exit status 1: something" is a shape
+// callers already treat as reachable.
+var exitStatusRe = regexp.MustCompile(`^exit status (\d+)(?::.*)?$`)
+
+// ExitCodeFromFailure returns the process exit code the agent reported,
+// and whether err carried one at all. A false second return means the
+// command did not run (or did not fail through the agent), so callers
+// must not present an exit code for it -- reporting a flat 1 there
+// states a specific wrong number instead of an honest unknown.
+//
+// Lives here beside stderrExitStatus1 for the reason that constant
+// gives: one update site if the agent's format ever changes.
+func ExitCodeFromFailure(err error) (int, bool) {
+	var cf *CommandFailure
+	if !stderrors.As(err, &cf) {
+		return 0, false
+	}
+	m := exitStatusRe.FindStringSubmatch(strings.TrimSpace(cf.StdErr))
+	if m == nil {
+		return 0, false
+	}
+	code, convErr := strconv.Atoi(m[1])
+	if convErr != nil {
+		return 0, false
+	}
+	return code, true
+}
+
 // IsExitStatus1Failure reports whether err is a *CommandFailure whose
 // stderr is exactly "exit status 1" (after trimming surrounding
 // whitespace). Used by the shell tool to distinguish the grep-family
 // no-match exit from richer command failures without exposing the
 // literal string to every caller.
+//
+// Deliberately stricter than ExitCodeFromFailure: it stays an exact
+// match on stderrExitStatus1, because "exit status 1: something" is a
+// richer failure that must NOT be reclassified as a grep no-match.
 func IsExitStatus1Failure(err error) bool {
 	var cf *CommandFailure
 	if !stderrors.As(err, &cf) {
@@ -862,12 +1152,40 @@ func (w *workspaceManager) ExecuteCommand(ctx *security.RequestContext, accountI
 	}
 	logger.Info("workspace: executing command", "command_preview", cmdLog, "account_id", accountId, "conversation_id", conversationId)
 
-	if env == nil {
-		env = make(map[string]string)
+	env, err := w.commandEnv(ctx, accountId, env)
+	if err != nil {
+		return "", err
 	}
-	env["nb_account_id"] = accountId
-	if ctx.GetSecurityContext() != nil {
-		env["nb_tenant_id"] = ctx.GetSecurityContext().GetTenantId()
+	payload := executePayload{
+		Command:        command,
+		ConversationId: conversationId,
+		Env:            env,
+	}
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal payload: %w", err)
+	}
+	if dockerMode() {
+		resp, err := dockerAPIRequest(ctx.GetContext(), w.httpClient, accountId, http.MethodPost, "/execute", nil, jsonData)
+		if err != nil {
+			return "", err
+		}
+		defer func() { _ = resp.Body.Close() }()
+		resultRaw, readErr := readDockerWorkspaceBody(resp.Body, dockerCommandBodyLimit)
+		if readErr != nil {
+			return "", fmt.Errorf("read Docker workspace response: %w", readErr)
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return "", fmt.Errorf("docker workspace returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(resultRaw)))
+		}
+		var result executeResponse
+		if err := json.Unmarshal(resultRaw, &result); err != nil {
+			return string(resultRaw), fmt.Errorf("failed to decode response: %w", err)
+		}
+		if cmdErr := classifyExecuteResponse(result); cmdErr != nil {
+			return result.Response, cmdErr
+		}
+		return result.Response, nil
 	}
 
 	clientset, err := getKubeClient(100, 200)
@@ -901,18 +1219,6 @@ func (w *workspaceManager) ExecuteCommand(ctx *security.RequestContext, accountI
 			workspaceToken = envVar.Value
 			break
 		}
-	}
-
-	// Prepare payload
-	payload := executePayload{
-		Command:        command,
-		ConversationId: conversationId,
-		Env:            env,
-	}
-
-	jsonData, err := json.Marshal(payload)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal payload: %w", err)
 	}
 
 	// 2. Try Direct IP Execution (Fastest, works in-cluster)
@@ -998,6 +1304,9 @@ func (w *workspaceManager) callWorkspaceAPI(ctx *security.RequestContext, accoun
 
 	logger := ctx.GetLogger()
 	logger.Debug("workspace: calling API", "method", method, "endpoint", endpoint, "account_id", accountId)
+	if dockerMode() {
+		return w.callWorkspaceAPIWithClient(ctx, accountId, method, endpoint, queryParams, body, w.httpClient)
+	}
 
 	clientset, err := getKubeClient(100, 200)
 	if err != nil {
@@ -1122,12 +1431,30 @@ func (w *workspaceManager) callWorkspaceAPIWithClient(ctx *security.RequestConte
 	logger.Debug("workspace: calling API with custom client", "method", method, "endpoint", endpoint, "account_id", accountId)
 
 	var bodyBytes []byte
-	if body != nil {
+	var bodyReader io.ReadSeeker
+	contentType := "application/json"
+	if stream, ok := body.(io.ReadSeeker); ok {
+		bodyReader = stream
+		contentType = "application/octet-stream"
+	} else if body != nil {
 		var err error
 		bodyBytes, err = json.Marshal(body)
 		if err != nil {
 			return nil, fmt.Errorf("failed to marshal body: %w", err)
 		}
+		bodyReader = bytes.NewReader(bodyBytes)
+	}
+	rewind := func() (io.Reader, error) {
+		if bodyReader == nil {
+			return nil, nil
+		}
+		if _, err := bodyReader.Seek(0, io.SeekStart); err != nil {
+			return nil, fmt.Errorf("rewind workspace upload: %w", err)
+		}
+		if contentType == "application/json" {
+			return bodyReader, nil
+		}
+		return io.NopCloser(bodyReader), nil
 	}
 
 	buildURL := func(baseURL string) string {
@@ -1146,15 +1473,38 @@ func (w *workspaceManager) callWorkspaceAPIWithClient(ctx *security.RequestConte
 		return u.String()
 	}
 
+	if dockerMode() {
+		resp, err := dockerAPIRequest(ctx.GetContext(), httpClient, accountId, method, endpoint, queryParams, bodyBytes)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = resp.Body.Close() }()
+		respBody, readErr := readDockerWorkspaceBody(resp.Body, dockerWorkspaceAPIBodyLimit())
+		if readErr != nil {
+			return nil, fmt.Errorf("read Docker workspace response: %w", readErr)
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, fmt.Errorf("docker workspace returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+		}
+		return respBody, nil
+	}
+
 	// Local mode: bypass K8s entirely, call a local code-analysis server directly
 	if localURL := config.Config.LlmServerWorkspaceLocalUrl; localURL != "" {
 		directUrl := buildURL(fmt.Sprintf("%s%s", strings.TrimRight(localURL, "/"), endpoint))
 		logger.Debug("workspace: using local URL", "url", directUrl)
-		req, reqErr := http.NewRequestWithContext(ctx.GetContext(), method, directUrl, bytes.NewBuffer(bodyBytes))
+		reader, rewindErr := rewind()
+		if rewindErr != nil {
+			return nil, rewindErr
+		}
+		req, reqErr := http.NewRequestWithContext(ctx.GetContext(), method, directUrl, reader)
 		if reqErr != nil {
 			return nil, fmt.Errorf("failed to build local request: %w", reqErr)
 		}
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Type", contentType)
+		if localToken := config.Config.LlmServerWorkspaceLocalToken; localToken != "" {
+			req.Header.Set("X-Workspace-Token", localToken)
+		}
 		resp, err := httpClient.Do(req)
 		if err != nil {
 			return nil, fmt.Errorf("local workspace call failed: %w", err)
@@ -1182,7 +1532,11 @@ func (w *workspaceManager) callWorkspaceAPIWithClient(ctx *security.RequestConte
 	}
 
 	if terminal, reason := isPodInTerminalState(pod); terminal {
-		return nil, fmt.Errorf("workspace pod is not ready: %s", reason)
+		// The k8s API confirms the pod backing this account is gone — not
+		// merely unreachable — so a caller polling a previously dispatched
+		// async run can treat this as proof there is nothing left running to
+		// collide with (#38994).
+		return nil, fmt.Errorf("%w: workspace pod is not ready: %s", ErrWorkspaceRunLost, reason)
 	}
 
 	podIP := pod.Status.PodIP
@@ -1211,9 +1565,13 @@ func (w *workspaceManager) callWorkspaceAPIWithClient(ctx *security.RequestConte
 
 	if !isTestMode {
 		directUrl := buildURL(fmt.Sprintf("http://%s:%d%s", podIP, config.Config.LlmServerWorkspacePort, endpoint))
-		req, reqErr := http.NewRequestWithContext(ctx.GetContext(), method, directUrl, bytes.NewBuffer(bodyBytes))
+		reader, rewindErr := rewind()
+		if rewindErr != nil {
+			return nil, rewindErr
+		}
+		req, reqErr := http.NewRequestWithContext(ctx.GetContext(), method, directUrl, reader)
 		if reqErr == nil {
-			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Content-Type", contentType)
 			if workspaceToken != "" {
 				req.Header.Set("X-Workspace-Token", workspaceToken)
 			}
@@ -1226,6 +1584,15 @@ func (w *workspaceManager) callWorkspaceAPIWithClient(ctx *security.RequestConte
 				}
 				errBody, _ := io.ReadAll(resp.Body)
 				logger.Warn("workspace: direct API call returned non-2xx status", "status", resp.StatusCode, "body", string(errBody))
+				if resp.StatusCode == http.StatusNotFound {
+					// A reachable pod that doesn't recognise the requested
+					// resource (an analysis id, a followup run) is the
+					// signature of a pod that was replaced since the caller
+					// dispatched it — as certain a "this run is gone" signal
+					// as isPodInTerminalState above, just discovered a step
+					// later once the pod itself answers (#38994).
+					return nil, fmt.Errorf("%w: status %d: %s", ErrWorkspaceRunLost, resp.StatusCode, string(errBody))
+				}
 				return nil, fmt.Errorf("status %d: %s", resp.StatusCode, string(errBody))
 			}
 			logger.Info("workspace: direct API call failed, falling back to proxy", "error", directErr, "endpoint", endpoint)
@@ -1241,9 +1608,13 @@ func (w *workspaceManager) callWorkspaceAPIWithClient(ctx *security.RequestConte
 		reqProxy.Param(k, v)
 	}
 
-	if bodyBytes != nil {
-		reqProxy.Body(bodyBytes)
-		reqProxy.SetHeader("Content-Type", "application/json")
+	if bodyReader != nil {
+		reader, err := rewind()
+		if err != nil {
+			return nil, err
+		}
+		reqProxy.Body(reader)
+		reqProxy.SetHeader("Content-Type", contentType)
 	}
 	reqProxy.SetHeader("X-Workspace-Token", workspaceToken)
 
@@ -1289,6 +1660,19 @@ func (w *workspaceManager) callWorkspaceAPIStream(ctx *security.RequestContext, 
 		return u.String()
 	}
 
+	if dockerMode() {
+		resp, err := dockerAPIRequest(ctx.GetContext(), common.HttpClient(), accountId, method, endpoint, queryParams, bodyBytes)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, dockerResponseBodyLimit))
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("docker workspace returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(errBody)))
+		}
+		return resp.Body, nil
+	}
+
 	// Local mode: bypass K8s entirely
 	if localURL := config.Config.LlmServerWorkspaceLocalUrl; localURL != "" {
 		directUrl := buildURL(fmt.Sprintf("%s%s", strings.TrimRight(localURL, "/"), endpoint))
@@ -1297,6 +1681,9 @@ func (w *workspaceManager) callWorkspaceAPIStream(ctx *security.RequestContext, 
 			return nil, fmt.Errorf("failed to build local stream request: %w", err)
 		}
 		req.Header.Set("Content-Type", "application/json")
+		if localToken := config.Config.LlmServerWorkspaceLocalToken; localToken != "" {
+			req.Header.Set("X-Workspace-Token", localToken)
+		}
 		localClient := &http.Client{}
 		resp, err := localClient.Do(req)
 		if err != nil {

@@ -118,6 +118,82 @@ func mergeToolResponseMetadata(metadata *toolcore.NBToolResponseMetadata, additi
 	}
 }
 
+// withResolvedToolTarget copies additionalDetails and adds the config this tool
+// call resolved to, plus the strategy that chose it. Returns the input unchanged
+// when no config was involved (tools that need none).
+func withResolvedToolTarget(additionalDetails map[string]any, queryConfig toolcore.NBQueryConfig, toolName string) map[string]any {
+	// The executing tool context is authoritative for WHICH target ran and has
+	// already recorded it; this only adds HOW it was chosen. Falling
+	// back to the request map would attribute a stale name to a call that ran
+	// against something else. Checked before cloning: this runs on every tool
+	// call and most tools need no config at all.
+	if _, ran := additionalDetails[toolcore.MetadataResolvedTarget]; !ran {
+		return additionalDetails
+	}
+	out := maps.Clone(additionalDetails)
+	if meta, ok := queryConfig.ToolConfigMetadata[toolName].(map[string]any); ok {
+		if strategy, ok := meta["strategy"].(string); ok && strategy != "" {
+			out[toolcore.MetadataResolvedBy] = strategy
+		}
+	}
+	return out
+}
+
+func actionExecutionMetadata(action NBAgentPlannerToolAction) map[string]any {
+	if action.ExecutionBatchID == "" && action.PlannerIteration <= 0 {
+		return nil
+	}
+	metadata := map[string]any{}
+	if action.PlannerIteration > 0 {
+		metadata["planner_iteration"] = action.PlannerIteration
+	}
+	if action.ExecutionBatchID != "" {
+		metadata["execution_batch_id"] = action.ExecutionBatchID
+		metadata["execution_mode"] = action.ExecutionMode
+		metadata["execution_batch_size"] = action.ExecutionBatchSize
+	}
+	if action.ExecutionParallelismLimit > 0 {
+		metadata["execution_parallelism_limit"] = action.ExecutionParallelismLimit
+	}
+	if action.SequentialFallbackReason != "" {
+		metadata["sequential_fallback_reason"] = action.SequentialFallbackReason
+	}
+	return metadata
+}
+
+func mergeToolResponseMetadataWithAction(metadata *toolcore.NBToolResponseMetadata, additionalDetails map[string]any, action NBAgentPlannerToolAction) ([]byte, error) {
+	executionMetadata := actionExecutionMetadata(action)
+	if len(additionalDetails) == 0 && len(executionMetadata) == 0 {
+		return mergeToolResponseMetadata(metadata, additionalDetails)
+	}
+	combined := maps.Clone(additionalDetails)
+	if combined == nil {
+		combined = map[string]any{}
+	}
+	for _, key := range []string{
+		"planner_iteration",
+		"execution_batch_id",
+		"execution_mode",
+		"execution_batch_size",
+		"execution_parallelism_limit",
+		"sequential_fallback_reason",
+	} {
+		delete(combined, key)
+	}
+	maps.Copy(combined, executionMetadata)
+	if _, err := common.MarshalJson(combined); err != nil && len(executionMetadata) > 0 {
+		// Tool-supplied AdditionalDetails may contain values encoding/json cannot
+		// marshal. Preserve the executor-owned batch marker even when that optional
+		// telemetry must be discarded.
+		return mergeToolResponseMetadata(metadata, executionMetadata)
+	}
+	out, err := mergeToolResponseMetadata(metadata, combined)
+	if err == nil || len(executionMetadata) == 0 {
+		return out, err
+	}
+	return mergeToolResponseMetadata(metadata, executionMetadata)
+}
+
 func (h *plannerExecutorCallbackHandler) findTool(toolName string) (toolcore.NBTool, bool) {
 	// check if it's a client tool first
 	for _, ct := range h.request.ClientTools {
@@ -131,8 +207,10 @@ func (h *plannerExecutorCallbackHandler) findTool(toolName string) (toolcore.NBT
 		return tool, true
 	}
 
+	canonicalToolName := toolcore.ResolveNBToolAlias(toolName)
+
 	// Handle common aliases and prioritize system tools over custom agents/tools
-	resolvedToolName := toolName
+	resolvedToolName := canonicalToolName
 	if strings.EqualFold(resolvedToolName, "shell") {
 		resolvedToolName = toolcore.ToolExecuteShellCommand
 	}
@@ -186,10 +264,38 @@ func (h *plannerExecutorCallbackHandler) BeforeToolCall(toolcall NBAgentPlannerT
 			memoryRefsJSON = nil
 		}
 	}
-	err := GetConversationDao().SaveConversationToolCall(h.request.ConversationId, h.request.AccountId, userId, h.request.MessageId, h.request.AgentId, toolcall.ToolID, toolcall.Tool, stripNullBytes(parameters), stripNullBytes(log), stripNullBytes(sqlArgs), "", toolcore.NBToolResponseStatusInProgress, tool.GetType(), nil, nil, nil, memoryRefsJSON)
+	metadataJSON, mErr := mergeToolResponseMetadataWithAction(nil, nil, toolcall)
+	if mErr != nil {
+		h.ctx.GetLogger().Warn("toolcallbackhandler: failed to marshal tool execution metadata", "error", mErr)
+	}
+	err := GetConversationDao().SaveConversationToolCall(h.request.ConversationId, h.request.AccountId, userId, h.request.MessageId, h.request.AgentId, toolcall.ToolID, toolcall.Tool, stripNullBytes(parameters), stripNullBytes(log), stripNullBytes(sqlArgs), "", toolcore.NBToolResponseStatusInProgress, tool.GetType(), nil, nil, metadataJSON, memoryRefsJSON)
 	if err != nil {
 		h.ctx.GetLogger().Error("toolcallbackhandler: unable to save tool call", "error", err.Error())
 	}
+}
+
+// skillReferenceMetadata builds the Additional Contexts row for one skill or
+// knowledge-base reference produced by load_skills / search_skills.
+//
+// Description carries the purpose guidance, which is the same sentence for every
+// knowledge base of a category. That is enough for a whole-document knowledge
+// base, whose body the panel reads from the KB row itself — but not for a
+// chunked one (a PDF's pages and figures), where the row would say nothing about
+// WHICH chunk was read. Stamping the retrieved text as "content" mirrors what
+// the pre-step already does, and the panel prefers it over the description.
+func skillReferenceMetadata(kind, tool string, ref toolcore.NBToolResponseReference) map[string]any {
+	metadata := map[string]any{
+		// Skills share reference_type "knowledge_base" with pre-step documents;
+		// kind is what tells them apart.
+		"kind":        kind,
+		"via":         tool,
+		"name":        ref.Text,
+		"description": ref.Description,
+	}
+	if snippet := strings.TrimSpace(ref.Snippet); snippet != "" {
+		metadata["content"] = TruncateHead(snippet, kbRefSnippetMaxChars)
+	}
+	return metadata
 }
 
 func (h *plannerExecutorCallbackHandler) AfterToolCallResponse(tcr NBAgentPlannerToolAction, response toolcore.NBToolResponse) {
@@ -222,7 +328,12 @@ func (h *plannerExecutorCallbackHandler) AfterToolCallResponse(tcr NBAgentPlanne
 	// with the non-internal subset of AdditionalDetails (per-tool extras like
 	// delegate_agent's iterations_used / tools_used). Failure is non-fatal —
 	// log and persist NULL so the row still lands.
-	metadataJSON, mErr := mergeToolResponseMetadata(response.Metadata, response.AdditionalDetails)
+	// Which target this call actually hit, and how it was chosen. Without this a
+	// wrong-target answer is invisible in the transcript: an event investigation
+	// queried another server entirely and the only way to notice was matching its
+	// figures against a different run's output.
+	additionalDetails := withResolvedToolTarget(response.AdditionalDetails, h.request.QueryConfig, tcr.Tool)
+	metadataJSON, mErr := mergeToolResponseMetadataWithAction(response.Metadata, additionalDetails, tcr)
 	if mErr != nil {
 		h.ctx.GetLogger().Warn("toolcallbackhandler: failed to marshal tool metadata", "error", mErr)
 	}
@@ -247,14 +358,15 @@ func (h *plannerExecutorCallbackHandler) AfterToolCallResponse(tcr NBAgentPlanne
 	if (strings.EqualFold(tcr.Tool, "load_skills") || strings.EqualFold(tcr.Tool, "search_skills")) && status == toolcore.NBToolResponseStatusSuccess {
 		var kbRefs []AgentReference
 		for _, ref := range response.References {
-			if ref.Type == "skill" && ref.Url != "" {
+			if (ref.Type == "skill" || ref.Type == "knowledge_base") && ref.Url != "" {
+				kind := AgentReferenceKindSkill
+				if ref.Type == "knowledge_base" {
+					kind = AgentReferenceKindKBDocument
+				}
 				kbRefs = append(kbRefs, AgentReference{
 					Type:        AgentReferenceTypeKB,
 					ReferenceID: ref.Url,
-					Metadata: map[string]any{
-						"name":        ref.Text,
-						"description": ref.Description,
-					},
+					Metadata:    skillReferenceMetadata(kind, tcr.Tool, ref),
 				})
 			}
 		}

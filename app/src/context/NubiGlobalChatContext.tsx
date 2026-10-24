@@ -11,7 +11,7 @@ export const NUBI_GLOBAL_CHAT_SHORTCUT_LABEL = '⌘J';
 
 const NUBI_FULL_PAGE_ROUTES = ['/ask-nudgebee'];
 
-const NUBI_LAUNCHER_HIDDEN_ROUTES = ['/investigate', '/automation/[workflowId]'];
+const NUBI_LAUNCHER_HIDDEN_ROUTES = ['/investigate', '/automation/[workflowId]', '/setup'];
 
 export const isNubiFullPageRoute = (pathname: string): boolean => NUBI_FULL_PAGE_ROUTES.some((route) => pathname.startsWith(route));
 
@@ -24,6 +24,10 @@ export interface NubiChatContext {
   source?: string;
   categorySource?: string;
   aboveModal?: boolean;
+  // The event this chat is scoped to, so a triggered automation gets tagged
+  // back to it (see llm-server's tool_workflow_automation.go) and shows up in
+  // the event's automation history.
+  eventId?: string;
 }
 
 interface NubiGlobalChatContextValue {

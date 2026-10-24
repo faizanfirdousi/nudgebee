@@ -21,8 +21,9 @@ import {
   Storage as ValueIcon,
   WarningAmber as WarningIcon,
   Add as AddIcon,
-  Delete as DeleteIconMui,
 } from '@mui/icons-material';
+import SafeIcon from '@shared/icons/SafeIcon';
+import { DeleteIconRed } from '@assets';
 import { toast as snackbar } from '@ui/Toast';
 import { parseHttpResponseBodyMessage } from 'src/utils/common';
 import observability from '@api1/observability';
@@ -272,7 +273,7 @@ export const PropertyFilterHelp = ({ heading }) => (
           backgroundColor: 'var(--ds-blue-100)',
           borderRadius: 'var(--ds-radius-sm)',
           padding: 'var(--ds-space-1) var(--ds-space-2)',
-          fontFamily: 'monospace',
+          fontFamily: ds.font.mono,
           fontSize: 'var(--ds-text-small)',
           color: 'var(--ds-gray-700)',
         }}
@@ -308,7 +309,7 @@ export const PropertyFilterHelp = ({ heading }) => (
               sx={{
                 fontSize: 'var(--ds-text-caption)',
                 fontWeight: 'var(--ds-font-weight-semibold)',
-                fontFamily: 'monospace',
+                fontFamily: ds.font.mono,
                 color: 'var(--ds-gray-700)',
                 backgroundColor: 'var(--ds-blue-100)',
                 border: '1px solid var(--ds-blue-300)',
@@ -606,25 +607,31 @@ const LogQueryBuilderAutocomplete = ({
         logProvider == 'newrelic' ||
         logProvider == 'dynatrace' ||
         logProvider == 'solarwinds' ||
-        logProvider == 'openobserve') &&
+        logProvider == 'openobserve' ||
+        logProvider == 'cubeapm') &&
       providerType == 'metrics'
     ) {
       const fetchMetrics = async () => {
         setIsMetricsLoading(true);
         try {
-          const cachedPrometheusLabels = cache.getWithSuffix(`${accountId}.${logProvider}.labels`, null, {});
+          // .v2: entries written before the provider was pinned below hold the
+          // ACCOUNT DEFAULT provider's metrics under the selected provider's key.
+          const cachedPrometheusLabels = cache.getWithSuffix(`${accountId}.${logProvider}.labels.v2`, null, {});
           if (cachedPrometheusLabels) {
             setMetricsList(cachedPrometheusLabels);
           } else {
             setMetricsList([]);
-            const res = await observability.metricsList(accountId);
+            // Without metric_provider the backend answers from the account default,
+            // so picking Datadog on a Prometheus-default account listed Prometheus
+            // metrics. Only sent when the caller pinned a provider.
+            const res = await observability.metricsList(accountId, providerOverride ? { metricProvider: providerOverride } : undefined);
             if (res?.errors) {
               snackbar.error(`failed to fetch labels- ${parseHttpResponseBodyMessage(res?.data)}`);
               return;
             }
             const metricsList = res?.data?.data?.metrics_list_names?.map((m) => m.metric) || [];
             if (metricsList.length) {
-              cache.setWithSuffix(`${accountId}.${logProvider}.labels`, metricsList, {}, 60 * 60 * 6);
+              cache.setWithSuffix(`${accountId}.${logProvider}.labels.v2`, metricsList, {}, 60 * 60 * 6);
               setMetricsList(metricsList);
             }
           }
@@ -639,19 +646,23 @@ const LogQueryBuilderAutocomplete = ({
       const fetchIndexes = async () => {
         setIsMetricsLoading(true);
         try {
-          const cachedESIndexes = cache.getWithSuffix(`${accountId}.es.metrics.indexes`, null, {});
+          // .v2: pre-fix entries hold the account default's metric names, not indexes.
+          const cachedESIndexes = cache.getWithSuffix(`${accountId}.es.metrics.indexes.v2`, null, {});
           if (cachedESIndexes) {
             setMetricsList(cachedESIndexes);
           } else {
             setMetricsList([]);
-            const res = await observability.metricsList(accountId);
+            // ES answers metrics_list_names with its data-stream names, which is what
+            // this picker wants — but only when asked as ES. Unpinned, a Prometheus
+            // -default account returned Prometheus metric names into the index list.
+            const res = await observability.metricsList(accountId, providerOverride ? { metricProvider: providerOverride } : undefined);
             if (res?.errors) {
               snackbar.error(`failed to fetch indices- ${parseHttpResponseBodyMessage(res?.data)}`);
               return;
             }
             const indexList = res?.data?.data?.metrics_list_names?.map((m) => m.metric) || [];
             if (indexList.length) {
-              cache.setWithSuffix(`${accountId}.es.metrics.indexes`, indexList, {}, 60 * 60 * 6);
+              cache.setWithSuffix(`${accountId}.es.metrics.indexes.v2`, indexList, {}, 60 * 60 * 6);
               setMetricsList(indexList);
             }
           }
@@ -704,12 +715,17 @@ const LogQueryBuilderAutocomplete = ({
           logProvider == 'newrelic' ||
           logProvider == 'dynatrace' ||
           logProvider == 'solarwinds' ||
-          logProvider == 'openobserve') &&
+          logProvider == 'openobserve' ||
+          logProvider == 'cubeapm') &&
         providerType == 'metrics'
       ) {
         try {
           setLoadingLabels(true);
-          const response = await observability.metricsLabelList(accountId, activeSelectedMetric);
+          const response = await observability.metricsLabelList(
+            accountId,
+            activeSelectedMetric,
+            providerOverride ? { metricProvider: providerOverride } : undefined
+          );
           if (response?.data?.errors) {
             snackbar.error(`Failed to fetch labels - ${response?.data?.error_msg || parseHttpResponseBodyMessage(response?.data)}`);
             return;
@@ -728,7 +744,11 @@ const LogQueryBuilderAutocomplete = ({
       } else if (logProvider == 'ES' && providerType == 'metrics') {
         try {
           setLoadingLabels(true);
-          const response = await observability.metricsLabelList(accountId, activeSelectedMetric);
+          const response = await observability.metricsLabelList(
+            accountId,
+            activeSelectedMetric,
+            providerOverride ? { metricProvider: providerOverride } : undefined
+          );
           if (response?.data?.errors) {
             snackbar.error(`Failed to fetch labels - ${response?.data?.error_msg || parseHttpResponseBodyMessage(response?.data)}`);
             return;
@@ -909,7 +929,9 @@ const LogQueryBuilderAutocomplete = ({
             logProvider == 'dynatrace' ||
             logProvider == 'pinot' ||
             logProvider == 'hive' ||
-            logProvider == 'openobserve') &&
+            logProvider == 'openobserve' ||
+            logProvider == 'cubeapm' ||
+            logProvider == 'splunk_enterprise') &&
           providerType == 'logs'
         ) {
           response = await observability.fetchLogLabelValues({
@@ -927,18 +949,25 @@ const LogQueryBuilderAutocomplete = ({
             logProvider == 'newrelic' ||
             logProvider == 'dynatrace' ||
             logProvider == 'solarwinds' ||
-            logProvider == 'openobserve') &&
+            logProvider == 'openobserve' ||
+            logProvider == 'cubeapm') &&
           providerType == 'metrics'
         ) {
           const activeBlock = getActiveBlock();
-          response = await observability.metricsLabelValueList(accountId, findLabel.label, {
-            metric_name: activeBlock.selectedMetric,
-          });
+          response = await observability.metricsLabelValueList(
+            accountId,
+            findLabel.label,
+            { metric_name: activeBlock.selectedMetric },
+            providerOverride ? { metricProvider: providerOverride } : undefined
+          );
         } else if (logProvider === 'ES' && providerType === 'metrics') {
           const activeBlock = getActiveBlock();
-          response = await observability.metricsLabelValueList(accountId, findLabel.label, {
-            metric_name: activeBlock.selectedMetric,
-          });
+          response = await observability.metricsLabelValueList(
+            accountId,
+            findLabel.label,
+            { metric_name: activeBlock.selectedMetric },
+            providerOverride ? { metricProvider: providerOverride } : undefined
+          );
         } else if (logProvider === 'ES') {
           const activeBlock = getActiveBlock();
           response = await observability.fetchLogLabelValues({
@@ -1591,7 +1620,8 @@ const LogQueryBuilderAutocomplete = ({
                   logProvider === 'newrelic' ||
                   logProvider === 'dynatrace' ||
                   logProvider === 'solarwinds' ||
-                  logProvider === 'openobserve') &&
+                  logProvider === 'openobserve' ||
+                  logProvider === 'cubeapm') &&
                   providerType === 'metrics') ||
                   logProvider === 'ES') && (
                   <FilterDropdown
@@ -1643,10 +1673,11 @@ const LogQueryBuilderAutocomplete = ({
                         ((logProvider === 'prometheus' ||
                           logProvider == 'datadog' ||
                           logProvider == 'ES' ||
-                          // openobserve is scoped to metrics here on purpose: it is also a
-                          // logs provider, where there is no metric selector to satisfy and
-                          // an unconditional gate would disable the logs builder outright.
-                          ((logProvider == 'dynatrace' || logProvider == 'solarwinds' || logProvider == 'openobserve') &&
+                          // openobserve and cubeapm are scoped to metrics here on purpose:
+                          // both are also logs providers, where there is no metric selector to
+                          // satisfy and an unconditional gate would disable the logs builder
+                          // outright.
+                          ((logProvider == 'dynatrace' || logProvider == 'solarwinds' || logProvider == 'openobserve' || logProvider == 'cubeapm') &&
                             providerType === 'metrics')) &&
                           !block.selectedMetric)
                       }
@@ -1907,7 +1938,7 @@ const LogQueryBuilderAutocomplete = ({
                                 backgroundColor: 'var(--ds-blue-100)',
                                 borderRadius: 'var(--ds-radius-sm)',
                                 padding: 'var(--ds-space-1) var(--ds-space-2)',
-                                fontFamily: 'monospace',
+                                fontFamily: ds.font.mono,
                                 fontSize: 'var(--ds-text-small)',
                                 color: 'var(--ds-gray-700)',
                               }}
@@ -1949,7 +1980,7 @@ const LogQueryBuilderAutocomplete = ({
                                     sx={{
                                       fontSize: 'var(--ds-text-caption)',
                                       fontWeight: 'var(--ds-font-weight-semibold)',
-                                      fontFamily: 'monospace',
+                                      fontFamily: ds.font.mono,
                                       color: 'var(--ds-gray-700)',
                                       backgroundColor: 'var(--ds-blue-100)',
                                       border: '1px solid var(--ds-blue-300)',
@@ -2159,11 +2190,11 @@ const LogQueryBuilderAutocomplete = ({
                   </Box>
 
                   <DsButton
-                    tone='danger'
+                    tone='ghost'
                     size='sm'
                     composition='icon-only'
                     aria-label='Delete operation'
-                    icon={<DeleteIconMui fontSize='small' />}
+                    icon={<SafeIcon src={DeleteIconRed} alt='delete' width={14} height={14} />}
                     onClick={() => deleteOperation(op.id)}
                   />
                 </Box>

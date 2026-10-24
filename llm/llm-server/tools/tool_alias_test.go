@@ -52,6 +52,54 @@ func TestToolAlias_NotEnumerated(t *testing.T) {
 	}
 }
 
+func TestToolAlias_ResolvesLegacyEventToolNames(t *testing.T) {
+	cases := []struct {
+		legacy, canonical string
+	}{
+		{"get_triage_explanation", ToolEventTriageExplanation},
+		{"get_incident_assembly", ToolEventIncidentAssembly},
+	}
+	for _, c := range cases {
+		t.Run(c.legacy, func(t *testing.T) {
+			tool, ok := core.GetNBTool("fake-account", c.legacy)
+			require.True(t, ok)
+			assert.Equal(t, c.canonical, tool.Name())
+		})
+	}
+}
+
+func TestToolAlias_LegacyEventNamesAreNotEnumerated(t *testing.T) {
+	names := core.ListRegisteredSystemToolNames()
+	assert.Contains(t, names, ToolEventTriageExplanation)
+	assert.Contains(t, names, ToolEventIncidentAssembly)
+	assert.NotContains(t, names, "get_triage_explanation")
+	assert.NotContains(t, names, "get_incident_assembly")
+}
+
+func TestToolAlias_ResolveAndGetNBToolAliases(t *testing.T) {
+	assert.Equal(t, ToolEventTriageExplanation, core.ResolveNBToolAlias("get_triage_explanation"))
+	assert.Equal(t, ToolEventTriageExplanation, core.ResolveNBToolAlias("GET_TRIAGE_EXPLANATION"))
+	assert.Equal(t, ToolEventIncidentAssembly, core.ResolveNBToolAlias("get_incident_assembly"))
+	assert.Equal(t, ToolExecuteAwsCliCommand, core.ResolveNBToolAlias("aws"))
+	assert.Equal(t, ToolExecuteGcpCliCommand, core.ResolveNBToolAlias("gcp"))
+	assert.Equal(t, ToolExecuteAzureCliCommand, core.ResolveNBToolAlias("azure"))
+	assert.Equal(t, ToolExecuteKubectlCommand, core.ResolveNBToolAlias("kubectl"))
+	assert.Equal(t, "unaliased_tool", core.ResolveNBToolAlias("unaliased_tool"))
+
+	assert.Contains(t, core.GetNBToolAliases(ToolEventTriageExplanation), "get_triage_explanation")
+	assert.Contains(t, core.GetNBToolAliases(ToolEventIncidentAssembly), "get_incident_assembly")
+	assert.Contains(t, core.GetNBToolAliases(ToolExecuteAwsCliCommand), "aws")
+}
+
+func TestToolAlias_ToolStructsImplementGetNameAliases(t *testing.T) {
+	assert.Contains(t, TriageExplanationTool{}.GetNameAliases(), "get_triage_explanation")
+	assert.Contains(t, IncidentAssemblyTool{}.GetNameAliases(), "get_incident_assembly")
+	assert.Contains(t, AwsCliTool{}.GetNameAliases(), "aws")
+	assert.Contains(t, GcpCliTool{}.GetNameAliases(), "gcp")
+	assert.Contains(t, AzureCliTool{}.GetNameAliases(), "azure")
+	assert.Contains(t, KubectlExecuteTool{}.GetNameAliases(), "kubectl")
+}
+
 // Compile-time interface checks so a renamed or unexported ToolPrompt method
 // fails the build instead of silently dropping delegate-context safety rules.
 var (
@@ -67,13 +115,23 @@ var (
 // silent quality drops in delegated cloud/k8s investigations.
 func TestAwsCliTool_ToolPromptSafetyRules(t *testing.T) {
 	joined := joinLines(AwsCliTool{}.ToolPrompt())
+	assert.Contains(t, joined, "do not override an agent policy", "aws ToolPrompt must defer read routing to the active agent")
+	assert.Contains(t, joined, "pass that exact name", "aws ToolPrompt must preserve a named account across delegation")
 	assert.Contains(t, joined, "IAM", "aws ToolPrompt must warn against self-IAM-modify")
 	assert.Contains(t, joined, "--filters", "aws ToolPrompt must call out the plural --filters gotcha")
 	assert.Contains(t, joined, "Cost Explorer", "aws ToolPrompt must cover credit/refund exclusion")
 	assert.Contains(t, joined, "Evidence-based", "aws ToolPrompt must include evidence-based invariant")
 }
+
+func TestAwsCliTool_DescriptionDefersRoutingToAgent(t *testing.T) {
+	description := AwsCliTool{}.Description()
+	assert.Contains(t, description, "Follow the active agent's system prompt")
+	assert.Contains(t, description, "Both paths use the normal command classification and approval flow")
+	assert.NotContains(t, description, "Prioritize this tool")
+}
 func TestGcpCliTool_ToolPromptSafetyRules(t *testing.T) {
 	joined := joinLines(GcpCliTool{}.ToolPrompt())
+	assert.Contains(t, joined, "do not override an agent policy", "gcp ToolPrompt must defer read routing to the active agent")
 	assert.Contains(t, joined, "IAM", "gcp ToolPrompt must warn against self-IAM-modify")
 	assert.Contains(t, joined, "gcloud config set project", "gcp ToolPrompt must call out the project-preconfigured gotcha")
 	assert.Contains(t, joined, "gcloud_execute", "gcp ToolPrompt must state the canonical tool name (planner-fail guard)")
@@ -81,17 +139,46 @@ func TestGcpCliTool_ToolPromptSafetyRules(t *testing.T) {
 }
 func TestAzureCliTool_ToolPromptSafetyRules(t *testing.T) {
 	joined := joinLines(AzureCliTool{}.ToolPrompt())
+	assert.Contains(t, joined, "do not override an agent policy", "azure ToolPrompt must defer read routing to the active agent")
 	assert.Contains(t, joined, "role assignment", "azure ToolPrompt must warn against self-role-modify")
 	assert.Contains(t, joined, "az monitor metrics list", "azure ToolPrompt must cover monitoring disambiguation")
 	assert.Contains(t, joined, "run-command", "azure ToolPrompt must cover OS-detect-before-run-command")
 	assert.Contains(t, joined, "Evidence-based", "azure ToolPrompt must include evidence-based invariant")
 }
+
+func TestAzureAndGcpCliToolDescriptionsDeferReadRoutingToAgent(t *testing.T) {
+	tests := []struct {
+		name        string
+		description string
+		provider    string
+	}{
+		{"azure", AzureCliTool{}.Description(), "Azure"},
+		{"gcp", GcpCliTool{}.Description(), "GCP"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Contains(t, tc.description, "Follow the active agent's system prompt")
+			assert.Contains(t, tc.description, "assigns "+tc.provider+" reads to the workspace shell")
+			assert.Contains(t, tc.description, "approval and resume behavior is preserved")
+			assert.NotContains(t, tc.description, "Prioritize this tool")
+		})
+	}
+}
 func TestKubectlExecuteTool_ToolPromptSafetyRules(t *testing.T) {
 	joined := joinLines(KubectlExecuteTool{}.ToolPrompt())
+	assert.Contains(t, joined, "do not override an agent policy", "kubectl ToolPrompt must defer read routing to the active agent")
 	assert.Contains(t, joined, "namespace", "kubectl ToolPrompt must enforce namespace discipline")
 	assert.Contains(t, joined, "RBAC", "kubectl ToolPrompt must warn against self-RBAC-modify")
 	assert.Contains(t, joined, "--all-namespaces", "kubectl ToolPrompt must cover the -o json/-o yaml + all-namespaces context-saturation gotcha")
 	assert.Contains(t, joined, "--previous", "kubectl ToolPrompt must retain the empty-logs recovery hint")
+}
+
+func TestKubectlExecuteTool_DescriptionDefersReadRoutingToAgent(t *testing.T) {
+	description := KubectlExecuteTool{}.Description()
+	assert.Contains(t, description, "Follow the active agent's system prompt")
+	assert.Contains(t, description, "assigns Kubernetes reads to the workspace shell")
+	assert.Contains(t, description, "approval and resume behavior is preserved")
+	assert.NotContains(t, description, "Prioritize this tool")
 }
 
 // joinLines is defined in tool_prompt_test.go (added for helm/redis/rabbit).

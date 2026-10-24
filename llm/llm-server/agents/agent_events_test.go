@@ -1,10 +1,70 @@
 package agents
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"nudgebee/llm/agents/core"
+	"nudgebee/llm/events"
+	"nudgebee/llm/security"
+	"nudgebee/llm/tools"
 )
+
+func TestAgentEventsExposesStructuredEventTools(t *testing.T) {
+	agent := AgentEvents{}
+	names := map[string]bool{}
+	for _, tool := range agent.GetSupportedTools(security.NewRequestContextForSuperAdmin()) {
+		names[tool.Name()] = true
+	}
+
+	assert.True(t, names[tools.ToolGetEventById])
+	assert.True(t, names[tools.ToolListEvents])
+	assert.True(t, names[tools.ToolAggregateEvents])
+	assert.True(t, names[tools.ToolEventTriageExplanation])
+	assert.True(t, names[tools.ToolEventIncidentAssembly])
+	assert.False(t, names["get_triage_explanation"])
+	assert.False(t, names["get_incident_assembly"])
+	assert.True(t, names[tools.ToolEventExecuteSql], "raw SQL must remain available as a fallback")
+}
+
+func TestAgentEventsPromptPrefersStructuredTools(t *testing.T) {
+	prompt := AgentEvents{}.GetSystemPrompt(security.NewRequestContextForSuperAdmin(), core.NBAgentRequest{})
+	joined := strings.Join(append(append([]string{}, prompt.Instructions...), prompt.Constraints...), "\n")
+
+	assert.Contains(t, joined, "use get_event_by_id for an exact event UUID")
+	assert.Contains(t, joined, "list_events for recent or filtered event lists")
+	assert.Contains(t, joined, "aggregate_events for counts or grouping")
+	assert.Contains(t, joined, "get_event_triage_explanation")
+	assert.Contains(t, joined, "get_event_incident_assembly")
+	assert.NotContains(t, joined, "get_triage_explanation")
+	assert.NotContains(t, joined, "get_incident_assembly")
+	assert.NotContains(t, joined, "Always use the 'events_execute' tool")
+	assert.NotContains(t, joined, "You must generate the SQL query")
+}
+
+func TestAgentEventsExamplesRouteSupportedIntentsToStructuredTools(t *testing.T) {
+	prompt := AgentEvents{}.GetSystemPrompt(security.NewRequestContextForSuperAdmin(), core.NBAgentRequest{})
+	want := map[string]string{
+		"What  are latest errors?":                                                        tools.ToolListEvents,
+		"Get all events for nodes within a specific time range?":                          tools.ToolListEvents,
+		"How many events are thre for each aggregation key within a specific time range?": tools.ToolAggregateEvents,
+		"Group all HIGH priority events from the last 7 days by their aggregation key.":   tools.ToolAggregateEvents,
+		"Why is this event suppressed / why is it only P3?":                               tools.ToolGetEventById,
+	}
+
+	for _, example := range prompt.Examples {
+		toolName, ok := want[example.Question]
+		if !ok {
+			continue
+		}
+		assert.NotEmpty(t, example.AnswerSteps)
+		assert.Equal(t, toolName, example.AnswerSteps[0].Tool, example.Question)
+		delete(want, example.Question)
+	}
+	assert.Empty(t, want, "every representative intent must have a structured-tool example")
+}
 
 func TestCountEventsInResponse(t *testing.T) {
 	tests := []struct {
@@ -216,5 +276,76 @@ func TestSummarizeTraceSpan(t *testing.T) {
 		})
 		assert.NotNil(t, got)
 		assert.Equal(t, true, got["is_error"], "numeric grpc/http codes must be detected")
+	})
+}
+
+// Regression: tool_event_v2.go's capInvestigateDataEvidence can shrink an
+// oversized evidence payload down to a plain truncated string. Traces.Data
+// and AlertLabels.Data are normally map[string]any / []any respectively —
+// reduceEventData must not panic when a cap has collapsed either into a
+// string, and must still extract the real data when the shape is intact.
+func TestReduceEventData_CappedEvidenceDoesNotPanic(t *testing.T) {
+	t.Run("traces as an intact map extracts trace summaries", func(t *testing.T) {
+		event := events.Event{
+			Title: "test event",
+			Evidences: events.InvestigateData{
+				Traces: events.InvestigateDataInsight{
+					Data: map[string]any{
+						"data": []any{
+							map[string]any{"span_id": "s1", "status_code": "STATUS_CODE_ERROR"},
+						},
+					},
+				},
+			},
+		}
+		result := reduceEventData(event)
+		traces, ok := result["traces"].([]map[string]any)
+		assert.True(t, ok)
+		assert.Len(t, traces, 1)
+	})
+
+	t.Run("traces capped to a string is skipped, not panicked on", func(t *testing.T) {
+		event := events.Event{
+			Title: "test event",
+			Evidences: events.InvestigateData{
+				Traces: events.InvestigateDataInsight{Data: "... (truncated)"},
+			},
+		}
+		assert.NotPanics(t, func() {
+			result := reduceEventData(event)
+			_, hasTraces := result["traces"]
+			assert.False(t, hasTraces)
+		})
+	})
+
+	t.Run("alert labels as an intact slice extracts labels", func(t *testing.T) {
+		event := events.Event{
+			Title: "test event",
+			Evidences: events.InvestigateData{
+				AlertLabels: events.InvestigateDataInsight{
+					Data: []any{
+						map[string]any{"label": "severity", "value": "critical"},
+					},
+				},
+			},
+		}
+		result := reduceEventData(event)
+		labels, ok := result["labels"].(map[string]any)
+		assert.True(t, ok)
+		assert.Equal(t, "critical", labels["severity"])
+	})
+
+	t.Run("alert labels capped to a string is skipped, not panicked on", func(t *testing.T) {
+		event := events.Event{
+			Title: "test event",
+			Evidences: events.InvestigateData{
+				AlertLabels: events.InvestigateDataInsight{Data: "label=value;label=value;... (truncated)"},
+			},
+		}
+		assert.NotPanics(t, func() {
+			result := reduceEventData(event)
+			_, hasLabels := result["labels"]
+			assert.False(t, hasLabels)
+		})
 	})
 }

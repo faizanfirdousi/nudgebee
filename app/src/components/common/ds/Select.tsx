@@ -24,7 +24,8 @@
  * `grouped` renders options under collapsible section headers keyed by each
  * option's `group` field — same contract and behavior as ds/FilterDropdown's
  * grouped mode (`group` + `groupIcon(rawGroup)`, snakeToTitleCase'd header
- * text, groups collapsed by default, auto-expanded while searching,
+ * text, groups collapsed by default — `defaultGroupsOpen` flips that —
+ * auto-expanded while searching,
  * selection-count badge on the header, auto-collapse to a flat list when the
  * full options list spans only one group). In `multiple` mode the
  * selected-first ordering applies WITHIN each group (selected rows above a
@@ -108,6 +109,8 @@ interface SelectBaseProps {
    * to override.
    */
   searchable?: boolean;
+  /** Opt-in custom value creation. Return false to retain the search after validation fails. */
+  onCreateOption?: (value: string) => boolean | void;
   /** Placeholder for the search input. Default `'Search…'`. */
   searchPlaceholder?: string;
   /** Show a skeleton placeholder list in the popup while options load. */
@@ -123,6 +126,13 @@ interface SelectBaseProps {
   grouped?: boolean;
   /** Renders beside each group header. Receives the raw (un-normalized) `group` value. */
   groupIcon?: (group: string) => React.ReactNode;
+  /**
+   * Start every group expanded instead of collapsed. Default `false`, matching
+   * FilterDropdown. Set `true` where the rows themselves are what the reader
+   * came for and the headers only sort them — a picker whose groups all start
+   * shut asks for a click before it shows anything.
+   */
+  defaultGroupsOpen?: boolean;
   className?: string;
   id?: string;
   name?: string;
@@ -139,7 +149,10 @@ export interface SelectMultipleProps extends SelectBaseProps {
   multiple: true;
   value: string[];
   onChange: (next: string[]) => void;
-  /** Max labels shown inline before collapsing to '+N'. Default 2. */
+  /**
+   * Ceiling on the labels shown inline before collapsing to '+N'. Default 2.
+   * Fewer are shown when the labels are long — see `visibleChipCount`.
+   */
   maxChips?: number;
   /**
    * Hide the per-option (and select-all) checkboxes in the popup. Default
@@ -229,6 +242,38 @@ function ClearButton({ onClear, label }: { onClear: (e: React.SyntheticEvent) =>
   );
 }
 
+/**
+ * Characters of selected-label text the trigger shows before it collapses the
+ * rest into "+N".
+ *
+ * A fixed chip count reads badly once the labels are long: two 30-character
+ * account names arrive as "iteration-prod-cl…, nudgebee-bill…", which names
+ * neither of them, while "+4" at least names the remainder honestly. So the
+ * count follows the text — labels are taken while they fit this budget, never
+ * more than `maxChips` allows.
+ */
+const CHIP_LABEL_BUDGET = 28;
+
+/**
+ * How many selected labels to render inline before the "+N" badge.
+ *
+ * `max` (the author's `maxChips`) is a ceiling, not a target: the budget only
+ * ever takes the count down. The first label always shows even when it alone
+ * blows the budget — it ellipsizes, and a trigger reading only "+5" says
+ * nothing at all.
+ */
+export function visibleChipCount(labels: string[], max: number): number {
+  if (labels.length === 0) return 0;
+  let used = 0;
+  let count = 0;
+  for (const label of labels.slice(0, Math.max(max, 1))) {
+    if (count > 0 && used + label.length > CHIP_LABEL_BUDGET) break;
+    used += label.length;
+    count += 1;
+  }
+  return Math.max(count, 1);
+}
+
 function SelectedLabel({ label }: { label: string }) {
   const [isOverflowing, setIsOverflowing] = React.useState(false);
 
@@ -243,7 +288,7 @@ function SelectedLabel({ label }: { label: string }) {
         sx={{
           color: 'var(--ds-blue-500)',
           fontWeight: 'var(--ds-font-weight-semibold)',
-          maxWidth: ds.space.mul(0, 50),
+          minWidth: 0,
           overflow: 'hidden',
           textOverflow: 'ellipsis',
           display: 'inline-block',
@@ -272,9 +317,11 @@ export function Select(props: SelectProps) {
     minWidth,
     popoverWidth,
     searchable,
+    onCreateOption,
     searchPlaceholder = 'Search…',
     loading = false,
     grouped = false,
+    defaultGroupsOpen = false,
     groupIcon,
     className,
     id,
@@ -307,10 +354,18 @@ export function Select(props: SelectProps) {
   const [openGroups, setOpenGroups] = React.useState<Record<string, boolean>>({});
   const open = Boolean(anchorEl);
 
-  const toggleGroup = (header: string) => setOpenGroups((prev) => ({ ...prev, [header]: !prev[header] }));
+  const toggleGroup = (header: string) => setOpenGroups((prev) => ({ ...prev, [header]: !(prev[header] ?? defaultGroupsOpen) }));
 
   // Auto-show search when there are many options; `searchable` prop overrides.
-  const showSearch = searchable ?? options.length > 8;
+  const showSearch = !!onCreateOption || (searchable ?? options.length > 8);
+  const customValue = search.trim();
+  const canCreate =
+    !!onCreateOption &&
+    !!customValue &&
+    !options.some((option) => typeof option?.value === 'string' && option.value.toLowerCase() === customValue.toLowerCase());
+  const createOption = () => {
+    if (canCreate && onCreateOption?.(customValue) !== false) setSearch('');
+  };
 
   // Reset search + group expansion whenever the popup closes, so each open
   // starts from the same collapsed-groups baseline (FilterDropdown's grouped
@@ -441,10 +496,12 @@ export function Select(props: SelectProps) {
       return <>{opt?.label ?? props.value}</>;
     }
 
-    // Multi-mode: render up to maxChips labels then '+N' for the rest
+    // Multi-mode: render the labels that fit, then '+N' for the rest
     const maxChips = props.maxChips ?? 2;
     const selectedOpts = props.value.map((v) => optionsByValue.get(v)).filter((o): o is SelectOption => Boolean(o));
-    const visible = selectedOpts.slice(0, maxChips);
+    const chipLabel = (opt: SelectOption) => (typeof opt.label === 'string' ? opt.label : String(opt.value));
+    const shown = visibleChipCount(selectedOpts.map(chipLabel), maxChips);
+    const visible = selectedOpts.slice(0, shown);
     const hidden = selectedOpts.length - visible.length;
     return (
       <>
@@ -455,7 +512,7 @@ export function Select(props: SelectProps) {
                 ,
               </Box>
             )}
-            <SelectedLabel label={typeof opt.label === 'string' ? opt.label : String(opt.value)} />
+            <SelectedLabel label={chipLabel(opt)} />
           </React.Fragment>
         ))}
         {hidden > 0 && (
@@ -463,8 +520,8 @@ export function Select(props: SelectProps) {
             variant='interactive'
             title={
               <Box sx={{ display: 'flex', flexDirection: 'column', gap: ds.space[0] }}>
-                {selectedOpts.slice(maxChips).map((o) => (
-                  <span key={o.value}>{typeof o.label === 'string' ? o.label : String(o.value)}</span>
+                {selectedOpts.slice(shown).map((o) => (
+                  <span key={o.value}>{chipLabel(o)}</span>
                 ))}
               </Box>
             }
@@ -601,7 +658,7 @@ export function Select(props: SelectProps) {
           {help}
         </Box>
       )}
-      {hasError && (
+      {hasError && !(open && onCreateOption) && (
         <Box component='span' id={errorId} role='alert' sx={{ fontSize: 'var(--ds-text-caption)', color: 'var(--ds-red-600)' }}>
           {error}
         </Box>
@@ -619,9 +676,36 @@ export function Select(props: SelectProps) {
       >
         {/* Search input — pinned at the top, outside the scroll area, so it
             stays visible while the user scrolls through long option lists. */}
-        {showSearch && <OverlaySearch value={search} onChange={setSearch} placeholder={searchPlaceholder} />}
+        {showSearch && (
+          <OverlaySearch
+            value={search}
+            onChange={setSearch}
+            placeholder={searchPlaceholder}
+            onKeyDown={
+              onCreateOption
+                ? (event) => {
+                    if (event.key === 'Enter' && !event.nativeEvent.isComposing) {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      createOption();
+                    }
+                  }
+                : undefined
+            }
+          />
+        )}
 
+        {hasError && onCreateOption && (
+          <Box id={errorId} role='alert' sx={{ padding: ds.space[2], fontSize: 'var(--ds-text-caption)', color: 'var(--ds-red-600)' }}>
+            {error}
+          </Box>
+        )}
         <OverlayScrollBox>
+          {canCreate && (
+            <OverlayItem size='md' onClick={createOption}>
+              Add “{customValue}”
+            </OverlayItem>
+          )}
           {/* Select-all / Clear-all row — multi mode only, hidden while loading */}
           {!loading && showOptionCheckbox && filteredOptions.length > 0 && (
             <OverlaySelectAll
@@ -645,7 +729,7 @@ export function Select(props: SelectProps) {
                 textAlign: 'center',
               }}
             >
-              {options.length === 0 ? 'No options available' : 'No results found'}
+              {canCreate ? 'No matching suggestions' : options.length === 0 ? 'No options available' : 'No results found'}
             </Box>
           ) : effectiveGrouped && groupedFilteredOptions ? (
             // Grouped mode: collapsible section per group, collapsed by
@@ -657,7 +741,7 @@ export function Select(props: SelectProps) {
             // ordering applies within each group — never globally — so rows
             // don't leave their section.
             groupedFilteredOptions.map(([header, { rawGroup, opts }]) => {
-              const isGroupOpen = search.trim().length > 0 || !!openGroups[header];
+              const isGroupOpen = search.trim().length > 0 || (openGroups[header] ?? defaultGroupsOpen);
               const selectedInGroup = opts.filter((opt) => isSelected(opt.value));
               const unselectedInGroup = opts.filter((opt) => !isSelected(opt.value));
               const orderedOpts = props.multiple ? [...selectedInGroup, ...unselectedInGroup] : opts;

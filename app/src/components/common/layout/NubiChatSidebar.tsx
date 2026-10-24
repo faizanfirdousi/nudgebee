@@ -1,4 +1,6 @@
-import { Box, IconButton, Typography, Tooltip, useTheme } from '@mui/material';
+import { Box, IconButton, Typography, useTheme } from '@mui/material';
+import { Button } from '@ui/Button';
+import Tooltip from '@ui/Tooltip';
 import { useState, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import SafeIcon from '@shared/icons/SafeIcon';
@@ -333,31 +335,37 @@ const NubiChatSidebar: React.FC<NubiChatSidebarProps> = ({
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 'var(--ds-space-1)' }}>
               {canCollapse && (
                 <Tooltip title='Collapse' placement='bottom'>
-                  <IconButton onClick={() => setIsCollapsed(true)} size='small' sx={{ color: ds.brand[500] }} aria-label='Collapse assistant panel'>
-                    {isRight ? <ChevronRightIcon /> : <ChevronLeftIcon />}
-                  </IconButton>
+                  <Button
+                    tone='ghost'
+                    size='sm'
+                    composition='icon-only'
+                    icon={isRight ? <ChevronRightIcon /> : <ChevronLeftIcon />}
+                    onClick={() => setIsCollapsed(true)}
+                    aria-label='Collapse assistant panel'
+                  />
                 </Tooltip>
               )}
               {onClose && (
                 <Tooltip title={enableKeyboardShortcut ? 'Close (⌘K)' : 'Close'} placement='left'>
-                  <IconButton
+                  <Button
+                    tone='ghost'
+                    size='sm'
+                    composition='icon-only'
+                    icon={
+                      <Box
+                        sx={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          transform: isRight ? 'rotate(180deg)' : 'none',
+                        }}
+                      >
+                        <SafeIcon src={CollapseLeftIcon} width={20} height={20} alt='close' />
+                      </Box>
+                    }
                     onClick={onClose}
-                    size='small'
-                    sx={{
-                      color: ds.brand[500],
-                    }}
-                  >
-                    <Box
-                      sx={{
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        transform: isRight ? 'rotate(180deg)' : 'none',
-                      }}
-                    >
-                      <SafeIcon src={CollapseLeftIcon} width={20} height={20} alt='close' />
-                    </Box>
-                  </IconButton>
+                    aria-label='Close assistant panel'
+                  />
                 </Tooltip>
               )}
             </Box>
@@ -391,7 +399,6 @@ const NubiChatSidebar: React.FC<NubiChatSidebarProps> = ({
               conversationId={urlConversationId}
               source={sourceProp || (context?.type === 'workflow' ? 'workflow_builder' : 'ask_nudgbee_chat')}
               categorySource={categorySource}
-              showBorder={false}
               apiMode={apiModeProp || (context?.type === 'workflow' || context?.type === 'workflowbuilder' ? 'workflow' : 'investigate')}
               // Session comes from props; the shared pointer would load another workflow's chat.
               persistLastSession={false}

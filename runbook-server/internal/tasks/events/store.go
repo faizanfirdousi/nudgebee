@@ -6,6 +6,7 @@ import (
 	"nudgebee/runbook/internal/tasks/types"
 	"nudgebee/runbook/services/cloud"
 	"nudgebee/runbook/services/service"
+	"strings"
 )
 
 // EventsStoreTask defines a task that interacts with an LLM to generate a summary.
@@ -42,6 +43,11 @@ func (t *EventsStoreTask) Execute(taskCtx types.TaskContext, params map[string]a
 		}
 	}
 
+	if err := validateFindingId(event); err != nil {
+		logger.Error("events.store: validation failed", "tenant", taskCtx.GetTenantID(), "status", event.Status, "error", err)
+		return nil, err
+	}
+
 	if event.AccountId == "" {
 		event.AccountId = taskCtx.GetAccountID()
 	}
@@ -72,6 +78,21 @@ func (t *EventsStoreTask) Execute(taskCtx types.TaskContext, params map[string]a
 		event.Source = "automation"
 	}
 
+	if event.Source == "automation" {
+		if event.Labels == nil {
+			event.Labels = map[string]string{}
+		}
+		if _, ok := event.Labels["automation_id"]; !ok {
+			event.Labels["automation_id"] = taskCtx.GetWorkflowID()
+		}
+		if _, ok := event.Labels["automation_execution_id"]; !ok {
+			event.Labels["automation_execution_id"] = taskCtx.GetWorkflowRunID()
+		}
+		if _, ok := event.Labels["automation_name"]; !ok {
+			event.Labels["automation_name"] = taskCtx.GetWorkflowName()
+		}
+	}
+
 	if err := common.ValidateStruct(event); err != nil {
 		logger.Error("events.store: validation failed", "tenant", event.Tenant, "finding_id", event.FindingId, "error", err)
 		return nil, err
@@ -91,6 +112,21 @@ func (t *EventsStoreTask) Execute(taskCtx types.TaskContext, params map[string]a
 
 	logger.Info("events.store: event stored", "tenant", event.Tenant, "event_id", ids[0], "finding_id", event.FindingId)
 	return ids[0], nil
+}
+
+// validateFindingId requires finding_id except on a resolve that carries a
+// fingerprint: that one closes every open event of the fingerprint instead of one
+// named firing, for automations that do not track which firings are open.
+func validateFindingId(event service.Event) error {
+	if event.FindingId != "" {
+		return nil
+	}
+	status := strings.ToUpper(string(event.Status))
+	isResolve := status == string(service.EventStatusResolved) || status == string(service.EventStatusClosed)
+	if isResolve && event.Fingerprint != "" {
+		return nil
+	}
+	return errors.New("events.store: finding_id is required unless status is RESOLVED or CLOSED and fingerprint is set")
 }
 
 // InputSchema returns the schema for the task's expected parameters.
@@ -144,9 +180,10 @@ func (t *EventsStoreTask) InputSchema() *types.Schema {
 				Required:    true,
 			},
 			"finding_id": {
-				Type:        types.PropertyTypeString,
-				Description: "Unique Event ID at Source. Events with the same finding_id, tenant, and account will update the existing event instead of creating a new one.",
-				Required:    true,
+				Type:         types.PropertyTypeString,
+				Description:  "ID of one firing of the alert. A later event with the same finding_id updates that event instead of creating one, and status RESOLVED closes it. A firing after a close needs a new finding_id. Optional on RESOLVED/CLOSED when fingerprint is set.",
+				Required:     false,
+				RequiredWhen: &types.RequiredWhen{Field: "status", Value: []string{"FIRING"}},
 			},
 			"finding_type": {
 				Type:        types.PropertyTypeString,
@@ -209,12 +246,12 @@ func (t *EventsStoreTask) InputSchema() *types.Schema {
 			},
 			"fingerprint": {
 				Type:        types.PropertyTypeString,
-				Description: "Event Fingerprint for Deduplication",
+				Description: "Stable identity of the alert, the same on every firing. RESOLVED with a fingerprint and no finding_id closes every open event of this fingerprint from the same source.",
 				Required:    false,
 			},
 			"status": {
 				Type:        types.PropertyTypeString,
-				Description: "Event Status",
+				Description: "FIRING opens an event. RESOLVED closes the event named by finding_id, or every open event of the fingerprint when finding_id is omitted. It never reopens a closed event.",
 				Required:    true,
 				Options:     []string{"FIRING", "RESOLVED", "CLOSED"},
 			},

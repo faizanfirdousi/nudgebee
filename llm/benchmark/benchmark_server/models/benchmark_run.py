@@ -128,8 +128,26 @@ class BenchmarkTestResult(Base):
     )  # LLM judge feedback for answer_relevancy
     execution_trace = Column(Text, nullable=True)  # Full plan + agent/tool call trace
 
+    # Verdict: an independent LLM judge's qualitative verdict on whether the
+    # agent actually solved the task (passed / partially_correct / failed),
+    # separate from the numeric Sim/Rel/Plan scores above. NULL means not yet
+    # judged, or skipped for lack of evidence (see verdict_judge.should_skip_verdict).
+    verdict_status = Column(String(20), nullable=True)
+    verdict_result = Column(
+        JSONB, nullable=True
+    )  # full structured verdict, see verdict_judge.VerdictOutput
+    # Set only when the judge itself errored (crashed / returned unparseable
+    # output) — distinct from a real "failed" verdict, which lands in
+    # verdict_status instead.
+    verdict_error = Column(Text, nullable=True)
+
     # Performance
     duration_seconds = Column(Float, default=0.0)
+    # Time the agent sat parked on followups waiting for a human answer, already
+    # excluded from duration_seconds. Nullable with no default on purpose: a real
+    # 0.0 means "asked nobody", while NULL means "recorded before this column
+    # existed" — a DEFAULT would make every historical row claim it never waited.
+    followup_wait_seconds = Column(Float, nullable=True)
     setup_duration = Column(Float, default=0.0)  # before_test time
     llm_duration = Column(Float, default=0.0)  # LLM call + eval time
     teardown_duration = Column(Float, default=0.0)  # after_test time

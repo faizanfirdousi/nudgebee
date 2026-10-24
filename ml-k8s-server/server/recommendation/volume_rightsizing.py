@@ -10,20 +10,36 @@ logic in the ml-k8s-server.
 import asyncio
 import json
 import logging
+import math
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Dict, List, Optional, Any
 
-import requests
 from server.utils.utils import DatabaseEngine, get_trace
 from server.utils.utils import MetricsServerConfigs
-from server.metrics.prometheus_metrics import prometheus_range_query
+from server.metrics.api_server_metrics import query_utilisation_via_api_server
+from server.recommendation.storage_pricing import FALLBACK_STORAGE_RATE_PER_GB_MONTH, resolve_storage_pricing
 from sqlalchemy import text
 
 logger = logging.getLogger(__name__)
 tracer = get_trace(__name__)
+
+# Elastic Agent `volume` metricset. Only PVC-backed volumes carry the claim name, so
+# ES_PVC_FIELD doubles as the selector that excludes configMap/projected/emptyDir
+# mounts — those report the NODE's filesystem size and would dwarf a real claim.
+ES_PVC_FIELD = "kubernetes.persistentvolumeclaim.name"
+ES_NAMESPACE_FIELD = "kubernetes.namespace"
+ES_VOLUME_USED_FIELD = "kubernetes.volume.fs.used.bytes"
+ES_VOLUME_CAPACITY_FIELD = "kubernetes.volume.fs.capacity.bytes"
+
+# Mirrors the Prometheus pair: a recent window for "current", 7 days for the peak.
+ES_CURRENT_WINDOW_MINUTES = 10
+ES_PEAK_WINDOW_MINUTES = 7 * 24 * 60
+
+ES_MAX_NAMESPACES = 1000
+ES_MAX_PVCS = 1000
 
 
 @dataclass
@@ -71,6 +87,40 @@ class VolumeRightsizingResult:
     database_stored: bool = False
 
 
+def entries_from_es_volume_aggregations(data: Dict[str, Any]) -> List[dict]:
+    """An Elasticsearch volume response in the shape api-server returns.
+
+    Only used by the direct-Elasticsearch fallback, and only for the body this module
+    builds: namespace -> claim -> max(used), max(capacity).
+    """
+    entries: List[dict] = []
+    ns_buckets = ((data or {}).get("aggregations") or {}).get("ns") or {}
+    if ns_buckets.get("sum_other_doc_count"):
+        # A capped terms aggregation drops whole namespaces, which would read as
+        # "those claims have no usage" rather than as missing data.
+        logger.warning(
+            f"Elasticsearch volume aggregation truncated at {ES_MAX_NAMESPACES} namespaces; "
+            f"{ns_buckets['sum_other_doc_count']} documents excluded"
+        )
+    for ns in ns_buckets.get("buckets", []) or []:
+        if not isinstance(ns, dict) or not (namespace := ns.get("key")):
+            continue
+        for pvc in (ns.get("pvc") or {}).get("buckets") or []:
+            if not isinstance(pvc, dict) or not (pvc_name := pvc.get("key")):
+                continue
+            for name in ("used", "capacity"):
+                value = (pvc.get(name) or {}).get("value")
+                if value is not None:
+                    entries.append(
+                        {
+                            "metric": {"ns": namespace, "pvc": pvc_name, "__name__": name},
+                            "timestamps": [0],
+                            "values": [value],
+                        }
+                    )
+    return entries
+
+
 class VolumeRightsizingService:
     """Service for generating PVC rightsizing recommendations."""
 
@@ -95,21 +145,39 @@ class VolumeRightsizingService:
         datadog_api_key: Optional[str] = None,
         datadog_app_key: Optional[str] = None,
         datadog_site: Optional[str] = None,
+        elasticsearch: Optional[dict] = None,
     ):
         self.account_id = account_id
         self.tenant_id = tenant_id
         self.engine = DatabaseEngine.get_engine()
         self.prometheus_url = MetricsServerConfigs.url
+        # Accepted and no longer read: the claim keys are answered by the account's
+        # default provider. Kept on the signature so the trigger contract does not
+        # change in this PR; it goes with the Datadog/ES credential fields.
         self.metrics_provider = metrics_provider or "prometheus"
         self.datadog_api_key = datadog_api_key
         self.datadog_app_key = datadog_app_key
         self.datadog_site = datadog_site
-        self._executor = ThreadPoolExecutor(max_workers=4)
+        self.elasticsearch = elasticsearch
+        # Named so a leaked pool is identifiable in `py-spy dump` and in
+        # /proc/<pid>/task/*/comm on a live pod.
+        self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="pvc-rightsize")
 
         # Configuration from original implementation
-        self.storage_cost_per_gb = 0.10  # $0.10 per GB per month
         self.overprovisioning_threshold = 0.9  # 90% usage threshold
         self.minimum_savings_threshold = 0.1  # Minimum $1 savings to recommend
+
+    def close(self) -> None:
+        """Release this scan's thread pool.
+
+        One service is built per scan and then dropped; without this its worker threads park
+        on the work queue for the life of the gunicorn worker, holding the scan's object
+        graph with them. See RecommendationService.close for the measurements.
+
+        Note the prometheus provider path never submits to this pool, so those threads are
+        created and leaked having done no work at all.
+        """
+        self._executor.shutdown(wait=True, cancel_futures=True)
 
     async def generate_recommendations(
         self, namespace_filter: Optional[str] = None, max_recommendations: Optional[int] = None
@@ -171,25 +239,19 @@ class VolumeRightsizingService:
         ctx_logger = self._get_contextual_logger(namespace_filter)
         with tracer.start_as_current_span("get_volume_usage_data") as span:
             try:
-                if self.metrics_provider == "datadog":
-                    return await self._get_volume_usage_data_datadog(namespace_filter, ctx_logger, span)
-
-                # Prometheus path (default)
-                current_usage_query = (
-                    "max by (persistentvolumeclaim, namespace) (kubelet_volume_stats_used_bytes{ __CLUSTER__ })"
+                # One path for every provider. The claim keys are answered by whatever
+                # the account's default metrics provider is, so this no longer asks
+                # which one that is — the three branches this replaces each wrote the
+                # same three questions in a different query language.
+                #
+                # Current and capacity are the last reading over ten minutes; the peak
+                # is the max over seven days. Same key, different window and collapse,
+                # which is why there are two keys rather than four.
+                current_usage_map, capacity_map, usage_7_days_map = await asyncio.gather(
+                    self._query_claim_metric("pvc_used_by_claim", timedelta(minutes=10), namespace_filter),
+                    self._query_claim_metric("pvc_capacity_by_claim", timedelta(minutes=10), namespace_filter),
+                    self._query_claim_metric("pvc_used_by_claim", timedelta(days=7), namespace_filter, aggregate="max"),
                 )
-                usage_7_days_query = "max_over_time(kubelet_volume_stats_used_bytes{ __CLUSTER__ }[7d])"
-                capacity_query = (
-                    "max by (persistentvolumeclaim, namespace) (kubelet_volume_stats_capacity_bytes{ __CLUSTER__ })"
-                )
-
-                current_usage_data = await self._query_prometheus_range(current_usage_query, timedelta(minutes=10))
-                usage_7_days_data = await self._query_prometheus_range(usage_7_days_query, timedelta(days=7))
-                capacity_data = await self._query_prometheus_range(capacity_query, timedelta(minutes=10))
-
-                current_usage_map = self._build_usage_map(current_usage_data)
-                usage_7_days_map = self._build_usage_map(usage_7_days_data)
-                capacity_map = self._build_usage_map(capacity_data)
 
                 pvc_metadata = await self._get_pvc_metadata(namespace_filter)
 
@@ -235,240 +297,67 @@ class VolumeRightsizingService:
                 ctx_logger.error(f"Failed to get volume usage data: {e}")
                 raise
 
-    async def _query_prometheus_range(self, query: str, duration: timedelta) -> List[Dict]:
-        """Execute Prometheus range query."""
-        try:
-            total_minutes = int(duration.total_seconds() / 60)
-            response_data = prometheus_range_query(
-                endpoint=self.prometheus_url,
-                promql_query=query,
-                account_id=self.account_id,
-                duration_minutes=total_minutes,
-                step="1m",
-            )
-            return response_data if response_data and isinstance(response_data, list) else []
-        except Exception as e:
-            logger.error(f"Prometheus query failed for query: {query[:100]}..., error: {str(e)}")
-            return []
+    async def _query_claim_metric(
+        self,
+        key: str,
+        duration: timedelta,
+        namespace_filter: Optional[str] = None,
+        aggregate: str = "",
+    ) -> Dict[str, float]:
+        """One claim metric, keyed `{pvc}_{namespace}` as the caller below expects.
 
-    def _build_usage_map(self, prometheus_data: List[Dict]) -> Dict[str, float]:
-        """Build usage map from Prometheus data.
-
-        The relay returns a `series_list_result` shape: each series has
-        separate `timestamps: [...]` and `values: ["str", "str", ...]` arrays
-        (values are scalar value strings, NOT [ts, val] pairs). For instant
-        queries the agent emits `vector_result` items with `value: [ts, "str"]`
-        — both shapes are handled here.
+        Returns {} rather than raising: a scan covering every claim in a cluster must
+        not end because one window could not be fetched, and an empty map reads as
+        "no data for these claims", which is what a failed query has always meant here.
         """
-        usage_map = {}
-        for item in prometheus_data:
-            try:
-                metric = item.get("metric", {})
-                pvc_name = metric.get("persistentvolumeclaim")
-                namespace = metric.get("namespace")
-                if not (pvc_name and namespace):
-                    continue
-                key = f"{pvc_name}_{namespace}"
-                values = item.get("values")
-                if values:
-                    last = values[-1]
-                    # range query — series_list_result: scalar value strings
-                    # instant query path may also land here as [ts, "val"] pairs;
-                    # accept both rather than guess.
-                    raw = last[1] if isinstance(last, (list, tuple)) else last
-                    usage_map[key] = float(raw)
-                    continue
-                value = item.get("value")
-                if value:
-                    usage_map[key] = float(value[1])
-            except (ValueError, IndexError, KeyError, TypeError) as e:
-                logger.warning(f"Failed to parse Prometheus metric: {item}, error: {e}")
-                continue
-        logger.info(f"Built usage map with {len(usage_map)} entries")
-        return usage_map
+        # No `kind`: a claim belongs to a namespace, not to a workload, and the claim
+        # keys ignore it — verified live, the same 25 claims come back for deployment,
+        # statefulset or nothing at all. Sending one would imply a scope that is not there.
+        request: Dict[str, Any] = {"metrics": [key]}
+        if namespace_filter:
+            request["workload_namespace"] = namespace_filter
 
-    def _query_datadog(self, query: str, from_ts: int, to_ts: int) -> dict:
-        """Execute a Datadog metrics query and return raw response JSON."""
-        headers: dict[str, str] = {}
-        if self.datadog_api_key:
-            headers["DD-API-KEY"] = self.datadog_api_key
-        if self.datadog_app_key:
-            headers["DD-APPLICATION-KEY"] = self.datadog_app_key
-        resp = requests.get(
-            f"https://{self.datadog_site}/api/v1/query",
-            headers=headers,
-            params={
-                "from": str(from_ts),
-                "to": str(to_ts),
-                "query": query,
-            },
-            timeout=60,
-        )
-        resp.raise_for_status()
-        result: dict = resp.json()
-        return result
-
-    async def _async_query_datadog(self, query: str, from_ts: int, to_ts: int) -> dict:
-        """Async wrapper around _query_datadog."""
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            self._executor,
-            lambda: self._query_datadog(query, from_ts, to_ts),
-        )
-
-    def _build_datadog_usage_map(self, data: dict) -> Dict[str, float]:
-        """Build pvc_namespace usage map from Datadog series response."""
-        usage_map: Dict[str, float] = {}
-        for series in data.get("series", []):
-            scope = series.get("scope", "")
-            tag_map = {}
-            for part in scope.split(","):
-                part = part.strip()
-                if ":" in part:
-                    k, v = part.split(":", 1)
-                    tag_map[k] = v
-
-            pvc_name = tag_map.get("persistentvolumeclaim", "")
-            namespace = tag_map.get("kube_namespace", "")
-            if not pvc_name or not namespace:
-                continue
-
-            key = f"{pvc_name}_{namespace}"
-            pointlist = series.get("pointlist", [])
-            if pointlist:
-                # Take the last non-None value
-                for point in reversed(pointlist):
-                    if len(point) >= 2 and point[1] is not None:
-                        usage_map[key] = float(point[1])
-                        break
-
-        logger.info(f"Built Datadog usage map with {len(usage_map)} entries")
-        return usage_map
-
-    async def _get_volume_usage_data_datadog(
-        self, namespace_filter: Optional[str], ctx_logger, span
-    ) -> List[VolumeUsageData]:
-        """Get volume usage data from Datadog."""
-        now = datetime.utcnow()
-        from_ts = int((now - timedelta(minutes=10)).timestamp())
-        to_ts = int(now.timestamp())
-        from_ts_7d = int((now - timedelta(days=7)).timestamp())
-
-        ns_filter = f"kube_namespace:{namespace_filter}," if namespace_filter else ""
-
-        current_usage_query = (
-            f"max:kubernetes.kubelet.volume.stats.used_bytes{{{ns_filter}*}}"
-            f" by {{persistentvolumeclaim,kube_namespace}}"
-        )
-        capacity_query = (
-            f"max:kubernetes.kubelet.volume.stats.capacity_bytes{{{ns_filter}*}}"
-            f" by {{persistentvolumeclaim,kube_namespace}}"
-        )
-        usage_7_days_query = (
-            f"max:kubernetes.kubelet.volume.stats.used_bytes{{{ns_filter}*}}"
-            f".rollup(max, 604800)"
-            f" by {{persistentvolumeclaim,kube_namespace}}"
-        )
-
+        end = datetime.now(UTC)
         try:
-            current_data, capacity_data, usage_7d_data = await asyncio.gather(
-                self._async_query_datadog(current_usage_query, from_ts, to_ts),
-                self._async_query_datadog(capacity_query, from_ts, to_ts),
-                self._async_query_datadog(usage_7_days_query, from_ts_7d, to_ts),
+            answered = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: query_utilisation_via_api_server(
+                    account_id=str(self.account_id),
+                    tenant_id=self.tenant_id,
+                    request=request,
+                    start_time=end - duration,
+                    end_time=end,
+                    aggregate=aggregate,
+                ),
             )
         except Exception as e:
-            ctx_logger.error(f"Datadog volume metrics query failed: {e}")
-            return []
+            logger.error(f"volume metrics query failed for {key}: {e}")
+            return {}
 
-        current_usage_map = self._build_datadog_usage_map(current_data)
-        capacity_map = self._build_datadog_usage_map(capacity_data)
-        usage_7_days_map = self._build_datadog_usage_map(usage_7d_data)
-
-        logger.info(
-            f"Datadog volume maps - current_usage: {len(current_usage_map)} keys, "
-            f"capacity: {len(capacity_map)} keys, usage_7d: {len(usage_7_days_map)} keys"
-        )
-        if current_usage_map and not usage_7_days_map:
-            logger.warning(
-                f"Datadog 7-day usage map is empty while current usage has data. "
-                f"7d query: {usage_7_days_query}, from: {from_ts_7d}, to: {to_ts}, "
-                f"7d response series count: {len(usage_7d_data.get('series', []))}, "
-                f"7d response status: {usage_7d_data.get('status')}, "
-                f"7d response errors: {usage_7d_data.get('errors')}"
-            )
-        elif usage_7_days_map and current_usage_map:
-            current_keys_sample = list(current_usage_map.keys())[:3]
-            usage_7d_keys_sample = list(usage_7_days_map.keys())[:3]
-            logger.info(f"Datadog key samples - current: {current_keys_sample}, 7d: {usage_7d_keys_sample}")
-
-        # Get PVC metadata from relay server (same as Prometheus path)
-        pvc_metadata = await self._get_pvc_metadata(namespace_filter)
-
-        volume_data = []
-        # If we have PVC metadata from relay server, use it
-        if pvc_metadata:
-            for pvc_key, metadata in pvc_metadata.items():
+        usage_map: Dict[str, float] = {}
+        for series in answered.get(key) or []:
+            metric = series.get("metric") or {}
+            claim, namespace = metric.get("persistentvolumeclaim"), metric.get("namespace")
+            values = series.get("values") or []
+            if not (claim and namespace and values):
+                continue
+            # Backwards for the most recent READABLE reading, not simply the last one.
+            # Raised in review of #38823: giving up on the claim because the newest
+            # sample would not parse reads downstream as "this claim has no usage",
+            # which shrinks or drops a volume that is actually full.
+            for raw in reversed(values):
                 try:
-                    pvc_name = metadata["name"]
-                    namespace = metadata["namespace"]
-                    if namespace_filter and namespace != namespace_filter:
-                        continue
-                    usage_key = f"{pvc_name}_{namespace}"
-                    current_usage_gb = current_usage_map.get(usage_key, 0.0) / (1024**3)
-                    usage_7_days_gb = (
-                        (val / (1024**3)) if (val := usage_7_days_map.get(usage_key)) is not None else None
-                    )
-                    capacity_gb = capacity_map.get(usage_key, 0.0) / (1024**3)
-                    if capacity_gb > 0:
-                        volume_data.append(
-                            VolumeUsageData(
-                                pvc_name=pvc_name,
-                                namespace=namespace,
-                                capacity_gb=capacity_gb,
-                                current_usage_gb=current_usage_gb,
-                                usage_7_days_gb=usage_7_days_gb,
-                                pv_name=metadata.get("pv_name", ""),
-                                storage_class=metadata.get("storage_class", ""),
-                                metadata=metadata,
-                            )
-                        )
-                except Exception as e:
-                    ctx_logger.warning(f"Failed to process PVC {pvc_key}: {e}")
+                    reading = float(raw)
+                except (TypeError, ValueError):
                     continue
-        else:
-            # Fallback: build volume data directly from Datadog metrics (no relay server metadata)
-            all_keys = set(current_usage_map.keys()) | set(capacity_map.keys())
-            for key in all_keys:
-                try:
-                    parts = key.rsplit("_", 1)
-                    if len(parts) != 2:
-                        continue
-                    pvc_name, namespace = parts
-                    if namespace_filter and namespace != namespace_filter:
-                        continue
-                    current_usage_gb = current_usage_map.get(key, 0.0) / (1024**3)
-                    usage_7_days_gb = (val / (1024**3)) if (val := usage_7_days_map.get(key)) is not None else None
-                    capacity_gb = capacity_map.get(key, 0.0) / (1024**3)
-                    if capacity_gb > 0:
-                        volume_data.append(
-                            VolumeUsageData(
-                                pvc_name=pvc_name,
-                                namespace=namespace,
-                                capacity_gb=capacity_gb,
-                                current_usage_gb=current_usage_gb,
-                                usage_7_days_gb=usage_7_days_gb,
-                                pv_name="",
-                                storage_class="",
-                                metadata={"name": pvc_name, "namespace": namespace},
-                            )
-                        )
-                except Exception as e:
-                    ctx_logger.warning(f"Failed to process Datadog PVC {key}: {e}")
+                # float("NaN") parses happily. A NaN usage compares false against every
+                # threshold downstream, so the claim would be sized as though it were
+                # empty; keep walking back for a real reading instead.
+                if math.isnan(reading) or math.isinf(reading):
                     continue
-
-        span.set_attribute("pvc.volume_data_count", len(volume_data))
-        ctx_logger.info(f"Retrieved usage data for {len(volume_data)} volumes from Datadog")
-        return volume_data
+                usage_map[f"{claim}_{namespace}"] = reading
+                break
+        return usage_map
 
     async def _get_pvc_metadata(self, namespace_filter: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
         """Get PVC metadata from Kubernetes API via relay server."""
@@ -484,7 +373,7 @@ class VolumeRightsizingService:
                 inject(headers_with_context, current_context)
 
             # Prepare action parameters for get_resource action.
-            # The post-Robusta Go agent (nudgebee-agent#34) requires `version`
+            # The Go agent (nudgebee-agent#34) requires `version`
             # for every get_resource call — without it the agent rejects with
             # 500 `kube: version and resource_type are required`, the response
             # has no `findings`, and we silently fall through to "No PVC data
@@ -599,9 +488,20 @@ class VolumeRightsizingService:
         """Generate volume recommendations."""
         recommendations = []
         with tracer.start_as_current_span("generate_volume_recommendations") as span:
+            storage_classes = await self._get_storage_classes()
+            provider = self._get_k8s_provider()
             for volume in volume_data:
                 try:
-                    recommendation = self._analyze_single_volume(volume)
+                    pvc_object = volume.metadata.get("metadata") or {
+                        "spec": {"storage_class_name": volume.storage_class}
+                    }
+                    pricing = resolve_storage_pricing(
+                        pvc_object,
+                        storage_classes=storage_classes,
+                        provider=provider,
+                        size_gb=volume.capacity_gb,
+                    )
+                    recommendation = self._analyze_single_volume(volume, pricing)
                     if recommendation:
                         recommendations.append(recommendation)
                 except Exception as e:
@@ -610,7 +510,78 @@ class VolumeRightsizingService:
             span.set_attribute("pvc.recommendations_generated", len(recommendations))
         return recommendations
 
-    def _analyze_single_volume(self, volume: VolumeUsageData) -> Optional[VolumeRecommendation]:
+    def _get_k8s_provider(self) -> str:
+        """Canonical provider ("aws"/"gcp"/"azure") from agent telemetry, or ""."""
+        query = text("""SELECT k8s_provider
+               FROM agent
+               WHERE cloud_account_id = :account_id
+               AND k8s_provider IS NOT NULL
+               AND k8s_provider != ''""")
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(query, {"account_id": self.account_id}).fetchall()
+        except Exception as e:
+            logger.warning(f"k8s_provider lookup failed for account {self.account_id}: {e}")
+            return ""
+        if not rows:
+            return ""
+        provider = (rows[0][0] or "").lower()
+        return {"eks": "aws", "gke": "gcp", "aks": "azure"}.get(provider, provider)
+
+    async def _get_storage_classes(self) -> Dict[str, Dict[str, Any]]:
+        """StorageClass objects by name via relay, for per-class pricing.
+
+        A failure must not fail the scan — pricing degrades to provider
+        defaults, so this swallows errors and returns {}.
+        """
+        try:
+            from server.utils.utils import get_http_session_with_retry
+
+            headers = {"Content-Type": "application/json", "X-SECRET-KEY": MetricsServerConfigs.secret}
+            payload = json.dumps(
+                {
+                    "no_sinks": True,
+                    "body": {
+                        "account_id": str(self.account_id),
+                        "action_name": "get_resource",
+                        "action_params": {
+                            "group": "storage.k8s.io",
+                            "version": "v1",
+                            "resource_type": "storageclasses",
+                            "all_namespaces": False,
+                        },
+                    },
+                    "cache": False,
+                }
+            )
+            response = get_http_session_with_retry().request(
+                "POST", self.prometheus_url, headers=headers, data=payload, timeout=60
+            )
+            if response.status_code != 200:
+                logger.warning(f"storageclasses fetch failed: {response.status_code}: {response.text[:200]}")
+                return {}
+
+            sc_list: List[Dict[str, Any]] = []
+            findings = response.json().get("data", {}).get("findings", [])
+            if findings:
+                for item in json.loads(findings[0].get("evidence", [{}])[0].get("data", "[]")):
+                    if item.get("type") == "json" and "data" in item:
+                        sc_list = json.loads(item["data"])
+                        break
+            by_name = {}
+            for sc in sc_list:
+                name = sc.get("metadata", {}).get("name")
+                if name:
+                    by_name[name] = sc
+            logger.info(f"Retrieved {len(by_name)} storage classes from relay server")
+            return by_name
+        except Exception as e:
+            logger.warning(f"storageclasses fetch failed, pricing falls back to provider defaults: {e}")
+            return {}
+
+    def _analyze_single_volume(
+        self, volume: VolumeUsageData, pricing: Dict[str, Any]
+    ) -> Optional[VolumeRecommendation]:
         """Analyze single volume, assuming input is already in GB."""
         pvc_id = f"{volume.namespace}/{volume.pvc_name}"
         logger.info(f"[{pvc_id}] Starting analysis...")
@@ -631,9 +602,10 @@ class VolumeRightsizingService:
 
             recommended_size_gb, savings, reason, priority, algorithm = 0.0, 0.0, "", "Low", "N/A"
 
+            price_per_gb = pricing["price_per_gb"]
             if utilization > self.overprovisioning_threshold:
-                recommended_size_gb = capacity_gb * 1.2
-                savings = -(capacity_gb * 0.2 * self.storage_cost_per_gb)
+                recommended_size_gb = float(math.ceil(capacity_gb * 1.2))
+                savings = -((recommended_size_gb - capacity_gb) * price_per_gb)
                 reason, priority, algorithm = (
                     "Volume is over 90% full, recommend increasing size",
                     "High",
@@ -650,7 +622,9 @@ class VolumeRightsizingService:
 
                 pfss90_gb = current_free_gb + 10 * (current_free_gb - free_7_days_ago_gb)
                 mfss_gb = max(0.0, min(pfss90_gb, free_7_days_ago_gb))
-                recommended_size_gb = (capacity_gb - mfss_gb) * 1.3
+                # A claim is sized in whole GiB, and the record truncates to an
+                # int: a fractional size below one GiB used to become 0.
+                recommended_size_gb = float(max(1, math.ceil((capacity_gb - mfss_gb) * 1.3)))
                 logger.info(
                     f"[{pvc_id}] Projected Max Free Space: {mfss_gb:.2f} GB. Recommended Size: "
                     f"{recommended_size_gb:.2f} GB."
@@ -658,7 +632,10 @@ class VolumeRightsizingService:
 
                 if 0 < recommended_size_gb < capacity_gb:
                     storage_save_gb = capacity_gb - recommended_size_gb
-                    savings = self.storage_cost_per_gb * storage_save_gb
+                    # For tiered Azure SKUs this is approximate: the exact saving
+                    # is tier(current) - tier(recommended). Kept proportional so an
+                    # in-band resize still surfaces instead of costing $0.
+                    savings = price_per_gb * storage_save_gb
                     logger.info(f"[{pvc_id}] Potential downsizing identified. Savings: ${savings:.2f}.")
 
                     if savings >= self.minimum_savings_threshold:
@@ -695,6 +672,7 @@ class VolumeRightsizingService:
                     "utilization_percent": utilization * 100,
                     "algorithm": algorithm,
                     **volume.metadata,
+                    "pricing": pricing,
                 },
             )
         except Exception as e:
@@ -780,10 +758,13 @@ class VolumeRightsizingService:
                             "creationTimestamp": pvc_metadata.get("metadata", {}).get("creation_timestamp", ""),
                         },
                         "apiVersion": "v1",
+                        "pricing": rec.metadata.get("pricing", {}),
                         "recommendation": {
                             "usage": {"current": current_usage_bytes, "before_30_days": usage_7_days_bytes},
                             "capacity": current_capacity_bytes,
-                            "price_per_gb": self.storage_cost_per_gb,
+                            "price_per_gb": rec.metadata.get("pricing", {}).get(
+                                "price_per_gb", FALLBACK_STORAGE_RATE_PER_GB_MONTH
+                            ),
                             "recommend_size": int(rec.recommended_capacity_gb),
                         },
                     }
@@ -835,7 +816,7 @@ class VolumeRightsizingService:
         no-op: the upsert immediately re-opened those same rows, leaving deleted PVCs (and rows
         written by the retired collector-side producer, which keyed on PV name) Open forever.
 
-        Mirrors archive_existing_krr_recommendations in vertical_rightsizing/__init__.py, which
+        Mirrors archive_existing_rightsizing_recommendations in vertical_rightsizing/__init__.py, which
         fixed this same bug for pod_right_sizing.
 
         Scope rules ensure we only reconcile what the scan was exhaustive over:
@@ -883,7 +864,7 @@ class VolumeRightsizingService:
             UPDATE recommendation SET status = 'Archive'
             WHERE tenant_id = :tenant_id AND cloud_account_id = :account_id
             AND category = 'RightSizing' AND rule_name = 'pv_rightsize'
-            AND status NOT IN ('Closed', 'InProgress', 'Archive')
+            AND status = 'Open'
             {scope_clause}
         """)
 
@@ -942,6 +923,7 @@ async def generate_volume_rightsizing_recommendations(
     datadog_api_key: Optional[str] = None,
     datadog_app_key: Optional[str] = None,
     datadog_site: Optional[str] = None,
+    elasticsearch: Optional[dict] = None,
 ) -> VolumeRightsizingResult:
     """Main entry point for generating volume rightsizing recommendations."""
     service = VolumeRightsizingService(
@@ -951,11 +933,18 @@ async def generate_volume_rightsizing_recommendations(
         datadog_api_key=datadog_api_key,
         datadog_app_key=datadog_app_key,
         datadog_site=datadog_site,
+        elasticsearch=elasticsearch,
     )
-    result = await service.generate_recommendations(namespace_filter=namespace, max_recommendations=max_recommendations)
-    if persist_recommendation:
-        await service.store_recommendations_to_db(
-            result, namespace_filter=namespace, max_recommendations=max_recommendations
+    try:
+        result = await service.generate_recommendations(
+            namespace_filter=namespace, max_recommendations=max_recommendations
         )
-        result.database_stored = True
-    return result
+        if persist_recommendation:
+            await service.store_recommendations_to_db(
+                result, namespace_filter=namespace, max_recommendations=max_recommendations
+            )
+            result.database_stored = True
+        return result
+    finally:
+        # In a finally, not after the return: the scans that leak are the ones that raise.
+        service.close()

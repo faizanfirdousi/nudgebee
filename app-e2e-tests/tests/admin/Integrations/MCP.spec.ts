@@ -7,6 +7,7 @@ import {
   disableIntegration,
   enableIntegration,
   selectAccountFromDropdown,
+  testConnection,
 } from "./util";
 import { IntegrationLocators } from "./IntegrationLocators";
 
@@ -39,7 +40,7 @@ async function openMcpList(page: Page, locators: IntegrationLocators): Promise<v
 test.describe.serial("MCP Account Integration", () => {
   let integrationExists = false;
 
-  test("Check if MCP integration exists", async ({ page }) => {
+  test("Check if MCP integration exists", { tag: ["@dev", "@test", "@oss", "@regression", "@functional"] }, async ({ page }) => {
     test.skip(
       missingEnv.length > 0,
       `Missing required env vars: ${missingEnv.join(", ")} — add them to the E2E_TEST_ENV secret`,
@@ -53,7 +54,7 @@ test.describe.serial("MCP Account Integration", () => {
     });
   });
 
-  test("Delete MCP integration if present", async ({ page }) => {
+  test("Delete MCP integration if present", { tag: ["@dev", "@test", "@oss", "@regression", "@functional", "@crud"] }, async ({ page }) => {
     test.skip(
       missingEnv.length > 0,
       `Missing required env vars: ${missingEnv.join(", ")} — add them to the E2E_TEST_ENV secret`,
@@ -68,7 +69,7 @@ test.describe.serial("MCP Account Integration", () => {
     });
   });
 
-  test("Add MCP Account Integration", async ({ page }) => {
+  test("Add MCP Account Integration", { tag: ["@dev", "@test", "@oss", "@regression", "@functional", "@crud", "@quarantine"] }, async ({ page }) => {
     test.skip(
       missingEnv.length > 0,
       `Missing required env vars: ${missingEnv.join(", ")} — add them to the E2E_TEST_ENV secret`,
@@ -94,6 +95,20 @@ test.describe.serial("MCP Account Integration", () => {
       await locators.mcpLlmInstructionsInput.fill(process.env.MCP_LLM_INSTRUCTIONS);
     }
 
+    // MCP's schema is `testable`, so the Save button (id="create-integration-acc",
+    // shared across all integration types) stays disabled until Test Connection
+    // succeeds — see IntegrationDynamicFormModal.jsx's connectionVerified gate.
+    const connected = await testConnection(page, {
+      testConnectionBtn: locators.mcpTestConnectionBtn,
+      successToast: locators.mcpTestConnectionSuccessToast,
+      serviceName: "MCP",
+      saveBtn: locators.saveBtn,
+      operationNames: ["TestIntegrationConnectionConfig"],
+      skipOnBackendError: true,
+      checkDataErrors: true,
+    });
+    if (!connected) return;
+
     await saveAndHandleAlreadyExists(page, {
       saveBtn: locators.saveBtn,
       successToast: locators.mcpSuccessToast,
@@ -106,7 +121,7 @@ test.describe.serial("MCP Account Integration", () => {
     });
   });
 
-  test("Disable MCP integration", async ({ page }) => {
+  test("Disable MCP integration", { tag: ["@dev", "@test", "@oss", "@regression", "@functional", "@crud"] }, async ({ page }) => {
     test.skip(
       missingEnv.length > 0,
       `Missing required env vars: ${missingEnv.join(", ")} — add them to the E2E_TEST_ENV secret`,
@@ -116,7 +131,7 @@ test.describe.serial("MCP Account Integration", () => {
     await disableIntegration(page, { configName, serviceName: "MCP" });
   });
 
-  test("Enable MCP integration", async ({ page }) => {
+  test("Enable MCP integration", { tag: ["@dev", "@test", "@oss", "@regression", "@functional", "@crud"] }, async ({ page }) => {
     test.skip(
       missingEnv.length > 0,
       `Missing required env vars: ${missingEnv.join(", ")} — add them to the E2E_TEST_ENV secret`,

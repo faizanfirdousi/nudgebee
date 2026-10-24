@@ -269,7 +269,11 @@ func mergeGraph(nodes []*core.DbNode, edges []*core.DbEdge, opts mergeOpts) ([]*
 	edges = core.DeduplicateEdgesWithPriority(edges)
 
 	if opts.crossAccount && opts.svc != nil {
-		g := &core.Graph{Nodes: nodes, Edges: edges}
+		// TenantID must mirror BuildGraphs (core/service.go), which seeds the
+		// unified graph with req.TenantID. BuildCrossAccountRelationships stamps
+		// it onto every edge it creates, so leaving it empty here produced
+		// tenant-less duplicates of edges the sources had already emitted.
+		g := &core.Graph{Nodes: nodes, Edges: edges, TenantID: e2eTenantID}
 		rules := opts.svc.GetDefaultRelationships()
 		if caEdges, err := opts.svc.BuildCrossAccountRelationships(g, rules); err == nil && len(caEdges) > 0 {
 			edges = append(edges, caEdges...)
@@ -611,7 +615,9 @@ func TestE2E_TierA_AWSLBToK8s(t *testing.T) {
 	// Assert the two cross-source edge types from this enricher are present.
 	var routesToK8s, managesK8s bool
 	for _, e := range edges {
-		if e.Source == "aws_lb_k8s_enricher" {
+		// Enrichers stamp their edges with their registered name; the scoped edge
+		// sweep relies on that to recognise edges from an enricher that ran.
+		if e.Source == "aws_lb_k8s" {
 			switch e.RelationshipType {
 			case core.RelationshipRoutesTo:
 				routesToK8s = true

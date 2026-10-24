@@ -26,7 +26,7 @@ import (
 // API). List exists for ops debugging; no production read path goes
 // through it.
 
-const tenantConfigSelectColumns = `tenant_id, mode, enabled, allowlist, custom_rules, disabled_rules, pii_enabled, pii_mode, pii_ner_enabled, pii_disabled_categories, updated_at`
+const tenantConfigSelectColumns = `tenant_id, mode, enabled, entropy_enabled, allowlist, custom_rules, disabled_rules, disabled_agents, pii_enabled, pii_mode, pii_ner_enabled, pii_disabled_categories, updated_at`
 
 // GetTenantConfigByID returns the override row for one tenant, or (nil, nil)
 // when no row exists. The "no row" case is normal — most tenants run at
@@ -50,21 +50,24 @@ func GetTenantConfigByID(ctx context.Context, tenantID uuid.UUID) (*TenantConfig
 		WHERE tenant_id = $1
 	`
 	var (
-		mode            string
-		enabled         bool
-		allowlistJSON   []byte
-		customRules     []byte
-		disabledJSON    []byte
-		piiEnabled      sql.NullBool
-		piiMode         sql.NullString
-		piiNerEnabled   sql.NullBool
-		piiDisabledCats pq.StringArray
-		updatedAt       time.Time
-		tenantIDOut     uuid.UUID
+		mode               string
+		enabled            bool
+		entropyEnabled     bool
+		allowlistJSON      []byte
+		customRules        []byte
+		disabledJSON       []byte
+		disabledAgentsJSON []byte
+		piiEnabled         sql.NullBool
+		piiMode            sql.NullString
+		piiNerEnabled      sql.NullBool
+		piiDisabledCats    pq.StringArray
+		updatedAt          time.Time
+		tenantIDOut        uuid.UUID
 	)
 	row := db.Db.QueryRowContext(ctx, query, tenantID)
 	err = row.Scan(
-		&tenantIDOut, &mode, &enabled, &allowlistJSON, &customRules, &disabledJSON,
+		&tenantIDOut, &mode, &enabled, &entropyEnabled, &allowlistJSON, &customRules, &disabledJSON,
+		&disabledAgentsJSON,
 		&piiEnabled, &piiMode, &piiNerEnabled, &piiDisabledCats,
 		&updatedAt,
 	)
@@ -79,6 +82,7 @@ func GetTenantConfigByID(ctx context.Context, tenantID uuid.UUID) (*TenantConfig
 		TenantID:              tenantIDOut,
 		Mode:                  Mode(mode),
 		Enabled:               enabled,
+		EntropyEnabled:        entropyEnabled,
 		CustomRules:           customRules,
 		PIIDisabledCategories: []string(piiDisabledCats),
 		UpdatedAt:             updatedAt,
@@ -99,6 +103,9 @@ func GetTenantConfigByID(ctx context.Context, tenantID uuid.UUID) (*TenantConfig
 	}
 	if err := json.Unmarshal(disabledJSON, &cfg.DisabledRules); err != nil {
 		return nil, fmt.Errorf("egressfilter.GetTenantConfigByID: parse disabled_rules: %w", err)
+	}
+	if err := json.Unmarshal(disabledAgentsJSON, &cfg.DisabledAgents); err != nil {
+		return nil, fmt.Errorf("egressfilter.GetTenantConfigByID: parse disabled_agents: %w", err)
 	}
 	return cfg, nil
 }
@@ -132,6 +139,10 @@ func UpsertTenantConfig(ctx context.Context, cfg *TenantConfig) error {
 	disabledJSON, err := jsonOrEmpty(cfg.DisabledRules)
 	if err != nil {
 		return fmt.Errorf("egressfilter.UpsertTenantConfig: marshal disabled_rules: %w", err)
+	}
+	disabledAgentsJSON, err := jsonOrEmpty(cfg.DisabledAgents)
+	if err != nil {
+		return fmt.Errorf("egressfilter.UpsertTenantConfig: marshal disabled_agents: %w", err)
 	}
 	customRules := cfg.CustomRules
 	if len(customRules) == 0 {
@@ -169,18 +180,20 @@ func UpsertTenantConfig(ctx context.Context, cfg *TenantConfig) error {
 
 	query := `
 		INSERT INTO public.llm_egressfilter_tenant_config
-			(tenant_id, mode, enabled, allowlist, custom_rules, disabled_rules,
-			 pii_enabled, pii_mode, pii_ner_enabled, pii_disabled_categories,
-			 updated_at)
-		VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb,
-		        $7, $8, $9, $10,
+			(tenant_id, mode, enabled, entropy_enabled, allowlist, custom_rules, disabled_rules,
+			 disabled_agents, pii_enabled, pii_mode, pii_ner_enabled,
+			 pii_disabled_categories, updated_at)
+		VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7::jsonb,
+		        $8::jsonb, $9, $10, $11, $12,
 		        NOW())
 		ON CONFLICT (tenant_id) DO UPDATE SET
 			mode                     = EXCLUDED.mode,
 			enabled                  = EXCLUDED.enabled,
+			entropy_enabled          = EXCLUDED.entropy_enabled,
 			allowlist                = EXCLUDED.allowlist,
 			custom_rules             = EXCLUDED.custom_rules,
 			disabled_rules           = EXCLUDED.disabled_rules,
+			disabled_agents          = EXCLUDED.disabled_agents,
 			pii_enabled              = EXCLUDED.pii_enabled,
 			pii_mode                 = EXCLUDED.pii_mode,
 			pii_ner_enabled          = EXCLUDED.pii_ner_enabled,
@@ -196,8 +209,8 @@ func UpsertTenantConfig(ctx context.Context, cfg *TenantConfig) error {
 		cats = []string{}
 	}
 	if _, err := db.Db.ExecContext(ctx, query,
-		cfg.TenantID, string(cfg.Mode), cfg.Enabled,
-		allowlistJSON, customRules, disabledJSON,
+		cfg.TenantID, string(cfg.Mode), cfg.Enabled, cfg.EntropyEnabled,
+		allowlistJSON, customRules, disabledJSON, disabledAgentsJSON,
 		piiEnabledArg, piiModeArg, piiNerEnabledArg, pq.Array(cats),
 	); err != nil {
 		return fmt.Errorf("egressfilter.UpsertTenantConfig: exec: %w", err)
@@ -251,20 +264,23 @@ func ListTenantConfigs(ctx context.Context, limit int) ([]TenantConfig, error) {
 	var out []TenantConfig
 	for rows.Next() {
 		var (
-			tID             uuid.UUID
-			mode            string
-			enabled         bool
-			allowlistJSON   []byte
-			customRules     []byte
-			disabledJSON    []byte
-			piiEnabled      sql.NullBool
-			piiMode         sql.NullString
-			piiNerEnabled   sql.NullBool
-			piiDisabledCats pq.StringArray
-			updatedAt       time.Time
+			tID                uuid.UUID
+			mode               string
+			enabled            bool
+			entropyEnabled     bool
+			allowlistJSON      []byte
+			customRules        []byte
+			disabledJSON       []byte
+			disabledAgentsJSON []byte
+			piiEnabled         sql.NullBool
+			piiMode            sql.NullString
+			piiNerEnabled      sql.NullBool
+			piiDisabledCats    pq.StringArray
+			updatedAt          time.Time
 		)
 		if err := rows.Scan(
-			&tID, &mode, &enabled, &allowlistJSON, &customRules, &disabledJSON,
+			&tID, &mode, &enabled, &entropyEnabled, &allowlistJSON, &customRules, &disabledJSON,
+			&disabledAgentsJSON,
 			&piiEnabled, &piiMode, &piiNerEnabled, &piiDisabledCats,
 			&updatedAt,
 		); err != nil {
@@ -274,6 +290,7 @@ func ListTenantConfigs(ctx context.Context, limit int) ([]TenantConfig, error) {
 			TenantID:              tID,
 			Mode:                  Mode(mode),
 			Enabled:               enabled,
+			EntropyEnabled:        entropyEnabled,
 			CustomRules:           customRules,
 			PIIDisabledCategories: []string(piiDisabledCats),
 			UpdatedAt:             updatedAt,
@@ -295,6 +312,10 @@ func ListTenantConfigs(ctx context.Context, limit int) ([]TenantConfig, error) {
 		// hard error that hides the rest of the list.
 		if err := json.Unmarshal(allowlistJSON, &cfg.Allowlist); err != nil {
 			slog.Error("egressfilter.ListTenantConfigs: failed to unmarshal allowlist",
+				"tenant_id", tID, "error", err)
+		}
+		if err := json.Unmarshal(disabledAgentsJSON, &cfg.DisabledAgents); err != nil {
+			slog.Error("egressfilter.ListTenantConfigs: failed to unmarshal disabled_agents",
 				"tenant_id", tID, "error", err)
 		}
 		if err := json.Unmarshal(disabledJSON, &cfg.DisabledRules); err != nil {

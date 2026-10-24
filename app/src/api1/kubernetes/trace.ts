@@ -1,6 +1,40 @@
 import getMockData from '@api1/mock';
 import { gqlStringify, queryGraphQL } from '@lib/HttpService';
 
+/**
+ * A where clause the caller builds itself, merged on top of the named
+ * parameters below.
+ *
+ * Those parameters each hard-code their operator — `span_name` is always `_eq`,
+ * `resource` always `_like '%…%'`, `duration_ns` always `_gte` — which is the
+ * only question the traces listings ask. The dashboard's filter builder lets an
+ * author PICK the operator, so it passes the clause itself rather than a bare
+ * value whose operator is decided here. Merged per column, so the two can be
+ * combined; the caller's operators win on a collision.
+ */
+export type TraceWhereClause = Record<string, Record<string, unknown>>;
+
+/**
+ * A caller that authors its own filter must hear a refusal.
+ *
+ * The server names what it will not run — a regex outside the supported subset,
+ * a trace provider that cannot filter that way — and the functions below return
+ * only `data`, so that answer used to arrive as an empty result and the panel
+ * said "Nothing came back", which reads as "the filter matched nothing". The
+ * listings that pass no clause of their own keep their existing behaviour.
+ */
+function throwIfRefused(response: any, where?: TraceWhereClause) {
+  if (!where || Object.keys(where).length === 0) return;
+  const message = response?.data?.errors?.[0]?.message;
+  if (message) throw new Error(message);
+}
+
+function mergeWhere(binary: Record<string, any>, where?: TraceWhereClause) {
+  for (const [column, operators] of Object.entries(where || {})) {
+    binary[column] = { ...(binary[column] || {}), ...operators };
+  }
+}
+
 interface TraceV2Params {
   accountId: string;
   namespace: string[];
@@ -32,6 +66,9 @@ interface TraceV2Params {
   // ES-only: the trace index chosen in the Traces tab index picker. Sent as
   // request.index so the backend queries it (else it uses the per-account default).
   esIndex?: string;
+  // Operator-carrying filters, for callers that author their own (the dashboard
+  // filter builder). See TraceWhereClause.
+  where?: TraceWhereClause;
 }
 
 const apiTrace = {
@@ -61,6 +98,7 @@ const apiTrace = {
       fromWorkload = false,
       byTrace = false,
       esIndex,
+      where,
       cols = [
         'trace_id',
         'span_id',
@@ -157,6 +195,8 @@ const apiTrace = {
     } else if (typeof traceId === 'string' && traceId) {
       query['trace_id'] = { _eq: traceId };
     }
+    mergeWhere(query, where);
+
     const trace_request = {
       account_id: accountId,
       query: '',
@@ -225,6 +265,7 @@ const apiTrace = {
       opName,
       {}
     );
+    throwIfRefused(response, where);
     return response?.data?.data;
   },
   async traceDistinctWorloadAndNamespace(accountId: string, data: any) {
@@ -271,6 +312,25 @@ const apiTrace = {
       endTime: data.endDate ? new Date(data.endDate).getTime() : 0,
     });
     return response?.data?.data;
+  },
+  /**
+   * The values one span column takes in a window — any column, unlike the two
+   * fixed sets above. What a dashboard panel's viewer filter lists. `limit`
+   * bounds the GROUP BY behind it, so a trace id column cannot return the store.
+   */
+  async traceLabelValues(accountId: string, label: string, startMs: number, endMs: number, limit: number): Promise<string[]> {
+    const TraceLabelValues = `
+    query TraceLabelValues($accountId: String!, $label: String, $startTime: Float, $endTime: Float, $limit: Int) {
+      traces_label_values(request: {account_id: $accountId, label: $label, start_time: $startTime, end_time: $endTime, query_request: {limit: $limit}}) {
+        values
+      }
+    }
+    `;
+    if (accountId === 'demo') return [];
+    const response = await queryGraphQL(TraceLabelValues, 'TraceLabelValues', { accountId, label, startTime: startMs, endTime: endMs, limit });
+    const errors = response?.data?.errors;
+    if (errors?.length) throw new Error(errors[0]?.message || 'Could not list the values.');
+    return response?.data?.data?.traces_label_values?.values || [];
   },
   async traceDistinctFilters(accountId: string, data: any) {
     let TraceListingFiltersV3 = `
@@ -329,7 +389,8 @@ const apiTrace = {
     spanType: string,
     sortCol: string,
     sortOrder: string,
-    esIndex?: string
+    esIndex?: string,
+    where?: TraceWhereClause
   ) {
     if (accountId === 'demo') {
       const tracesMock = await getMockData('k8s-traces');
@@ -392,6 +453,8 @@ const apiTrace = {
     } else if (spanType == 'query') {
       binary['span_name'] = { _eq: 'query' };
     }
+    mergeWhere(binary, where);
+
     const trace_group_request = {
       account_id: accountId,
       query: '',
@@ -453,6 +516,7 @@ const apiTrace = {
       'TraceGroupingV3',
       {}
     );
+    throwIfRefused(response, where);
     return response?.data?.data || {};
   },
   async traceGroupZones({

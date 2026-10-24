@@ -258,7 +258,11 @@ interface AutoSuggestTextareaProps {
   buttonProperties: {
     show: boolean;
     enable: boolean;
-    onClick: (e: string, config?: { llm_provider?: string; llm_model_name?: string; llm_config_source?: string }, images?: OutgoingImage[]) => void;
+    onClick: (
+      e: string,
+      config?: { llm_provider?: string; llm_model_name?: string; llm_config_source?: string },
+      images?: OutgoingImage[]
+    ) => void | boolean | Promise<void | boolean>;
     onClickStop: () => void;
   };
   chatScreen?: boolean;
@@ -278,8 +282,14 @@ interface AutoSuggestTextareaProps {
   onConfigClear?: () => void;
   popupInitial?: boolean;
   imageSupport?: ImageSupport;
+  imageDraft?: { id: string; text?: string; images: OutgoingImage[] };
+  onDraftChange?: (hasDraft: boolean) => void;
+  onDraftSubmitted?: (id: string) => void;
   externalAgentsLoading?: boolean;
   submitOnModEnter?: boolean;
+  // Rendered first in the footer row, before the agent and model pickers
+  // (the Ask page puts its account chip here).
+  leadingControls?: React.ReactNode;
 }
 
 // A whole-config selection: the config decides the model, per task, using its
@@ -378,10 +388,12 @@ export const ModelPickerPopover: React.FC<ModelPickerPopoverProps> = ({
       onConfigSelect?.(null);
       onModelSelect?.(staged);
     } else if (mode === 'tier') {
+      // A pick is usable when it names a config source or a complete provider+model
+      // pair; requiring both silently dropped a config chosen without a model.
       const cleaned: TierModelMap = {};
       for (const t of PICKER_TIER_KEYS) {
         const p = stagedTier[t];
-        if (p && p.provider && p.model) cleaned[t] = p;
+        if (p && (p.configSource || (p.provider && p.model))) cleaned[t] = p;
       }
       onModelSelect?.(null);
       onConfigSelect?.(null);
@@ -484,6 +496,20 @@ export const ModelPickerPopover: React.FC<ModelPickerPopoverProps> = ({
   };
 
   const isRowSelected = (row: ModelRow): boolean => isSameModelOption(currentPick, optionForRow(row));
+
+  // A pick may name only a config, meaning "use that config's own model", so read
+  // the model off the slot the server resolves through — matching on isFallback,
+  // since a slot lists its primary alongside its fallbacks.
+  const tierPickLabel = (pick: ModelOption): string => {
+    const cfg = configEntries.find((c) => c.key === configKeyForSource(pick.configSource));
+    const name = pick.configName || cfg?.name;
+    const primaryOf = (source?: string) => (source ? cfg?.entries.find((e) => e.configSource === source && !e.isFallback)?.model : undefined);
+    const resolved = primaryOf(pick.configSource) || (cfg ? primaryOf(baseConfigSourceFor(cfg.key)) : undefined) || '';
+    // Naming a config without a model runs that config's default model, not its
+    // per-task one — so the qualifier belongs on the model.
+    const model = pick.model || (resolved && `${resolved} (config default)`);
+    return [model, name].filter(Boolean).join(' · ') || 'Config default';
+  };
 
   // Lets the left pane mark which config holds the current pick, so the user
   // doesn't have to open each one to find it. Selections restored from older
@@ -743,7 +769,7 @@ export const ModelPickerPopover: React.FC<ModelPickerPopoverProps> = ({
                         </Typography>
                         {activeConfigTiers.map(({ tier, model }) => (
                           <Box key={tier} sx={{ display: 'flex', justifyContent: 'space-between', gap: 'var(--ds-space-2)', py: ds.space[0] }}>
-                            <Typography sx={{ fontSize: 'var(--ds-text-small)', color: 'var(--ds-gray-700)', fontWeight: 500 }}>
+                            <Typography sx={{ fontSize: 'var(--ds-text-small)', color: 'var(--ds-gray-700)', fontWeight: ds.weight.medium }}>
                               {PICKER_TIER_LABELS[tier]}
                             </Typography>
                             <Typography
@@ -865,7 +891,7 @@ export const ModelPickerPopover: React.FC<ModelPickerPopoverProps> = ({
                     return (
                       <Box key={t} sx={{ display: 'flex', flexDirection: 'column', gap: ds.space[0] }}>
                         <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 'var(--ds-space-2)' }}>
-                          <Typography sx={{ fontSize: 'var(--ds-text-small)', color: 'var(--ds-gray-700)', fontWeight: 500 }}>
+                          <Typography sx={{ fontSize: 'var(--ds-text-small)', color: 'var(--ds-gray-700)', fontWeight: ds.weight.medium }}>
                             {PICKER_TIER_LABELS[t]}
                           </Typography>
                           <Box sx={{ display: 'flex', alignItems: 'center', gap: 'var(--ds-space-2)', minWidth: 0 }}>
@@ -881,7 +907,7 @@ export const ModelPickerPopover: React.FC<ModelPickerPopoverProps> = ({
                               {/* The config is named too: two configs can serve
                                   the same model name, so the model alone doesn't
                                   say which credential the tier will use. */}
-                              {cur ? `${cur.model}${cur.configName ? ` · ${cur.configName}` : ''}` : 'Inherit default'}
+                              {cur ? tierPickLabel(cur) : 'Inherit default'}
                             </Typography>
                             {cur && (
                               <MuiButtonBase
@@ -921,6 +947,15 @@ export const ModelPickerPopover: React.FC<ModelPickerPopoverProps> = ({
   );
 };
 
+// `variables` arrives as a name list, a {name}-object list, or a name-keyed object
+// depending on the function — normalise before any .map/.length assumes an array.
+const variableNamesOf = (fn?: { variables?: any }): string[] => {
+  const raw = fn?.variables;
+  if (Array.isArray(raw)) return raw.map((v) => (typeof v === 'string' ? v : v?.name)).filter(Boolean);
+  if (raw && typeof raw === 'object') return Object.keys(raw);
+  return [];
+};
+
 const AutoSuggestTextarea = React.forwardRef<HTMLTextAreaElement, AutoSuggestTextareaProps>(function AutoSuggestTextarea(
   {
     value,
@@ -949,8 +984,12 @@ const AutoSuggestTextarea = React.forwardRef<HTMLTextAreaElement, AutoSuggestTex
     onConfigClear,
     popupInitial = false,
     imageSupport,
+    imageDraft,
+    onDraftSubmitted,
+    onDraftChange,
     externalAgentsLoading = false,
     submitOnModEnter = false,
+    leadingControls,
   },
   forwardedRef
 ) {
@@ -969,6 +1008,18 @@ const AutoSuggestTextarea = React.forwardRef<HTMLTextAreaElement, AutoSuggestTex
   const agentButtonRef = useRef<HTMLDivElement | null>(null);
   const [attachedImages, setAttachedImages] = useState<AttachedImage[]>([]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const previousImageDraftRef = useRef(imageDraft);
+  useEffect(() => {
+    if (!imageDraft && previousImageDraftRef.current) {
+      const previousId = previousImageDraftRef.current.id;
+      setAttachedImages((current) => current.filter((image) => !image.id.startsWith(`${previousId}-`)));
+    }
+    previousImageDraftRef.current = imageDraft;
+    if (imageDraft) {
+      if (imageDraft.text !== undefined) setText(imageDraft.text);
+      setAttachedImages(imageDraft.images.map((image, index) => ({ ...image, id: `${imageDraft.id}-${index}`, name: `Attachment ${index + 1}` })));
+    }
+  }, [imageDraft]);
 
   const imagesEnabled = !!imageSupport?.enabled;
   const allowedMimeTypes = imageSupport?.allowedMimeTypes ?? [];
@@ -1031,24 +1082,41 @@ const AutoSuggestTextarea = React.forwardRef<HTMLTextAreaElement, AutoSuggestTex
 
   // Single send path used by every submit affordance so text + image clearing
   // and the outgoing payload stay consistent.
-  const handleSend = () => {
-    const config = selectedModel
-      ? {
-          llm_provider: selectedModel.provider,
-          llm_model_name: selectedModel.model,
-          ...(selectedModel.configSource && { llm_config_source: selectedModel.configSource }),
-        }
-      : undefined;
-    const images: OutgoingImage[] = attachedImages.map(({ data, mime_type }) => ({ data, mime_type }));
-    buttonProperties.onClick(text, config, images.length ? images : undefined);
-    setText('');
-    setAttachedImages([]);
+  const sendingRef = useRef(false);
+  const [isSending, setIsSending] = useState(false);
+  useEffect(() => {
+    onDraftChange?.(Boolean(text.trim() || attachedImages.length));
+  }, [text, attachedImages, onDraftChange]);
+
+  const handleSend = async () => {
+    if (sendingRef.current) return;
+    sendingRef.current = true;
+    setIsSending(true);
+    try {
+      const config = selectedModel
+        ? {
+            llm_provider: selectedModel.provider,
+            llm_model_name: selectedModel.model,
+            ...(selectedModel.configSource && { llm_config_source: selectedModel.configSource }),
+          }
+        : undefined;
+      const images: OutgoingImage[] = attachedImages.map(({ data, mime_type }) => ({ data, mime_type }));
+      const sent = await buttonProperties.onClick(text, config, images.length ? images : undefined);
+      if (sent === false) return;
+      if (imageDraft) onDraftSubmitted?.(imageDraft.id);
+      setText((current) => (current === text ? '' : current));
+      setAttachedImages((current) => current.filter((image) => !attachedImages.some((sentImage) => sentImage.id === image.id)));
+    } finally {
+      sendingRef.current = false;
+      setIsSending(false);
+    }
   };
 
   const buildFunctionCall = (selectedFunction: { name: string; variables?: any; variable_defaults?: any }) => {
     let functionCall = `/call ${selectedFunction.name}`;
-    if (selectedFunction.variables && selectedFunction.variables.length > 0) {
-      const paramPairs = selectedFunction.variables.map((variable: string) => {
+    const varNames = variableNamesOf(selectedFunction);
+    if (varNames.length > 0) {
+      const paramPairs = varNames.map((variable) => {
         const defaultValue = selectedFunction.variable_defaults?.[variable] || '';
         return `${variable}="${defaultValue}"`;
       });
@@ -1073,10 +1141,6 @@ const AutoSuggestTextarea = React.forwardRef<HTMLTextAreaElement, AutoSuggestTex
     const typedFunction = callMatch && callMatch[1] ? callMatch[1].trim().toLowerCase() : '';
     const matchedFunctions = functionSuggestions.filter((func) => func.name.toLowerCase().startsWith(typedFunction));
 
-    // Check if function name is complete and parameters are present
-    const hasCompleteFunction = /^\/call\s+(\w+)(?:\s+\w+="[^"]*")*/.test(value);
-    const hasParametersInText = /^\/call\s+\w+\s+\w+="/.test(value);
-
     if (value.startsWith('@') && suggestionsAt.length > 0 && matchedAgents.length > 0) {
       setSuggestionsTrigger('at');
       setFilteredSuggestions(matchedAgents);
@@ -1094,9 +1158,12 @@ const AutoSuggestTextarea = React.forwardRef<HTMLTextAreaElement, AutoSuggestTex
       setSuggestionsTrigger('call');
       setFilteredSuggestions([]);
 
-      // Only show suggestions if function name is not complete or has no parameters yet
-      if (!hasCompleteFunction || (typedFunction !== '' && !hasParametersInText)) {
-        const functionsToShow = typedFunction === '' ? functionSuggestions : matchedFunctions;
+      // Hide once the name is fully typed AND followed by a space (params/free-text
+      // follow); until then keep offering matches so a prefix like "get" still shows "get_user".
+      const isFunctionFullyTyped = /^\/call\s+\w+\s+/.test(value);
+      const functionsToShow = typedFunction === '' ? functionSuggestions : matchedFunctions;
+
+      if (!isFunctionFullyTyped && functionsToShow.length > 0) {
         setFilteredFunctions(functionsToShow);
         setShowSuggestions(true);
         setSelectedIndex(-1);
@@ -1125,21 +1192,24 @@ const AutoSuggestTextarea = React.forwardRef<HTMLTextAreaElement, AutoSuggestTex
     } else if (suggestionsTrigger === 'button') {
       setText(`@${suggest} `);
       setSelectedAgent(suggest);
-    } else if (suggestionsTrigger === 'call') {
-      // Find the selected function details
-      const selectedFunc = filteredFunctions.find((func) => func.name === suggest);
-      if (selectedFunc) {
-        const callIndex = text.indexOf('/call');
-        if (callIndex !== -1) {
-          const beforeCall = text.substring(0, callIndex);
-          const afterCallPattern = text.substring(callIndex).match(/^\/call\s*\w*/);
-          const afterCallEnd = afterCallPattern ? callIndex + afterCallPattern[0].length : callIndex + 5;
-          const afterReplacement = text.substring(afterCallEnd);
-          setText(beforeCall + buildFunctionCall(selectedFunc) + afterReplacement);
-        } else {
-          setText(buildFunctionCall(selectedFunc) + ' ');
-        }
-      }
+    }
+    setShowSuggestions(false);
+    setSelectedIndex(-1);
+    setTimeout(() => {
+      textareaRef.current?.focus();
+    }, 0);
+  };
+
+  const handleSelectFunction = (selectedFunc: { name: string; variables?: any; variable_defaults?: any }) => {
+    if (!selectedFunc) return;
+    const callIndex = text.indexOf('/call');
+    if (callIndex !== -1) {
+      const beforeCall = text.substring(0, callIndex);
+      const afterCallPattern = text.substring(callIndex).match(/^\/call\s*\w*/);
+      const afterCallEnd = afterCallPattern ? callIndex + afterCallPattern[0].length : callIndex + 5;
+      setText(beforeCall + buildFunctionCall(selectedFunc) + text.substring(afterCallEnd));
+    } else {
+      setText(buildFunctionCall(selectedFunc) + ' ');
     }
     setShowSuggestions(false);
     setSelectedIndex(-1);
@@ -1155,7 +1225,8 @@ const AutoSuggestTextarea = React.forwardRef<HTMLTextAreaElement, AutoSuggestTex
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (submitOnModEnter && e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
-      if (!(isFollowUp && allowStop) && text.trim() && buttonProperties.enable) {
+      const isStop = isFollowUp && allowStop && !text.trim();
+      if (!isStop && text.trim() && buttonProperties.enable) {
         handleSend();
       }
       return;
@@ -1175,7 +1246,7 @@ const AutoSuggestTextarea = React.forwardRef<HTMLTextAreaElement, AutoSuggestTex
           e.preventDefault();
           if (selectedIndex >= 0) {
             if (suggestionsTrigger === 'call') {
-              handleSelectSuggestion(filteredFunctions[selectedIndex].name);
+              handleSelectFunction(filteredFunctions[selectedIndex]);
             } else {
               handleSelectSuggestion(filteredSuggestions[selectedIndex].name);
             }
@@ -1334,15 +1405,15 @@ const AutoSuggestTextarea = React.forwardRef<HTMLTextAreaElement, AutoSuggestTex
                             fontSize: 'var(--ds-text-caption)',
                           },
                         }}
-                        onClick={() => handleSelectSuggestion(func.name)}
+                        onClick={() => handleSelectFunction(func)}
                       >
                         <Typography sx={{ fontWeight: 'var(--ds-font-weight-semibold)', color: ds.blue[500], fontSize: 'var(--ds-text-small)' }}>
                           {func.name}
                         </Typography>
                         <Typography sx={{ fontSize: 'var(--ds-text-caption)', color: ds.gray[600], lineHeight: 1.2 }}>{func.description}</Typography>
-                        {func.variables && func.variables.length > 0 && (
+                        {variableNamesOf(func).length > 0 && (
                           <Typography sx={{ fontSize: 'var(--ds-text-caption)', color: ds.gray[700], fontStyle: 'italic' }}>
-                            {func.variables.length} parameter{func.variables.length !== 1 ? 's' : ''}
+                            {variableNamesOf(func).length} parameter{variableNamesOf(func).length !== 1 ? 's' : ''}
                           </Typography>
                         )}
                       </Box>
@@ -1422,21 +1493,28 @@ const AutoSuggestTextarea = React.forwardRef<HTMLTextAreaElement, AutoSuggestTex
             </>
           )}
           <Box sx={{ width: '1px', height: ds.space[5], backgroundColor: 'var(--ds-brand-200)', mx: 'var(--ds-space-3)' }} />
-          <Button
-            size='md'
-            onClick={() => {
-              if (isFollowUp && allowStop) {
-                buttonProperties.onClickStop();
-              } else {
-                handleSend();
-              }
-            }}
-            icon={
-              isFollowUp && allowStop ? <StopIcon sx={{ color: 'white' }} /> : <SafeIcon src={ArrowRightWhiteIcon} alt='' width={18} height={18} />
-            }
-            aria-label={isFollowUp && allowStop ? 'Stop' : 'Send'}
-            disabled={!(isFollowUp && allowStop) && (!text || !buttonProperties.enable)}
-          />
+          {isFollowUp && allowStop && text.trim() && (
+            <Button size='md' onClick={() => buttonProperties.onClickStop?.()} icon={<StopIcon sx={{ color: 'white' }} />} aria-label='Stop' />
+          )}
+          {(() => {
+            const isStop = isFollowUp && allowStop && !text.trim();
+            return (
+              <Button
+                size='md'
+                onClick={() => {
+                  if (isStop) {
+                    buttonProperties.onClickStop?.();
+                  } else {
+                    handleSend();
+                  }
+                }}
+                icon={isStop ? <StopIcon sx={{ color: 'white' }} /> : <SafeIcon src={ArrowRightWhiteIcon} alt='' width={18} height={18} />}
+                aria-label={isStop ? 'Stop' : isSending ? 'Sending' : 'Send'}
+                loading={!isStop && isSending}
+                disabled={!isStop && (isSending || !text || !buttonProperties.enable)}
+              />
+            );
+          })()}
         </Box>
       )}
 
@@ -1499,6 +1577,7 @@ const AutoSuggestTextarea = React.forwardRef<HTMLTextAreaElement, AutoSuggestTex
             pt: 'var(--ds-space-1)',
           }}
         >
+          {leadingControls}
           {imagesEnabled && (
             <>
               <input
@@ -1631,7 +1710,27 @@ const AutoSuggestTextarea = React.forwardRef<HTMLTextAreaElement, AutoSuggestTex
               disabled={disabled}
             />
           )}
-          <Box sx={{ flex: 1 }} />
+          <Typography
+            sx={{
+              flex: 1,
+              ml: 'var(--ds-space-2)',
+              fontSize: 'var(--ds-text-caption)',
+              color: ds.gray[500],
+              whiteSpace: 'nowrap',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+            }}
+          >
+            Type{' '}
+            <Box component='span' sx={{ fontWeight: 'var(--ds-font-weight-semibold)' }}>
+              @
+            </Box>{' '}
+            to mention an agent,{' '}
+            <Box component='span' sx={{ fontWeight: 'var(--ds-font-weight-semibold)' }}>
+              /call
+            </Box>{' '}
+            to run a function.
+          </Typography>
           {text.length >= maxLength * 0.8 && (
             <Typography
               sx={{
@@ -1646,22 +1745,29 @@ const AutoSuggestTextarea = React.forwardRef<HTMLTextAreaElement, AutoSuggestTex
             </Typography>
           )}
           {/* Submit / Stop button */}
-          <Button
-            id='set-config-btn'
-            size='md'
-            onClick={() => {
-              if (isFollowUp && allowStop) {
-                buttonProperties.onClickStop();
-              } else {
-                handleSend();
-              }
-            }}
-            icon={
-              isFollowUp && allowStop ? <StopIcon sx={{ color: 'white' }} /> : <SafeIcon src={ArrowRightWhiteIcon} alt='' width={18} height={18} />
-            }
-            aria-label={isFollowUp && allowStop ? 'Stop' : 'Send'}
-            disabled={!(isFollowUp && allowStop) && (!text || !buttonProperties.enable)}
-          />
+          {isFollowUp && allowStop && text.trim() && (
+            <Button size='md' onClick={() => buttonProperties.onClickStop?.()} icon={<StopIcon sx={{ color: 'white' }} />} aria-label='Stop' />
+          )}
+          {(() => {
+            const isStop = isFollowUp && allowStop && !text.trim();
+            return (
+              <Button
+                id='set-config-btn'
+                size='md'
+                onClick={() => {
+                  if (isStop) {
+                    buttonProperties.onClickStop?.();
+                  } else {
+                    handleSend();
+                  }
+                }}
+                icon={isStop ? <StopIcon sx={{ color: 'white' }} /> : <SafeIcon src={ArrowRightWhiteIcon} alt='' width={18} height={18} />}
+                aria-label={isStop ? 'Stop' : isSending ? 'Sending' : 'Send'}
+                loading={!isStop && isSending}
+                disabled={!isStop && (isSending || !text || !buttonProperties.enable)}
+              />
+            );
+          })()}
         </Box>
       ) : null}
     </Box>

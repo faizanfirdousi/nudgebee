@@ -1,5 +1,16 @@
 import { gqlStringify, queryGraphQL } from '@lib/HttpService';
-import { getEndOfDay, getEndOfMonth, getEndOfYear, getLast7Days, getStartOfMonth, getStartOfYear } from '@lib/datetime';
+import {
+  getEndOfDay,
+  getEndOfMonth,
+  getEndOfMonthUTC,
+  getEndOfLastMonthUTC,
+  getEndOfYearUTC,
+  getLast7Days,
+  getStartOfMonth,
+  getStartOfMonthUTC,
+  getStartOfLastMonthUTC,
+  getStartOfYearUTC,
+} from '@lib/datetime';
 
 const GET_DISTINCT_REGIONS = `
 query GetDistinctRegions($where: CloudResourceGroupingsWhereRequest) {
@@ -12,8 +23,8 @@ query GetDistinctRegions($where: CloudResourceGroupingsWhereRequest) {
 `;
 
 const LIST_NOTIFICATION_TARGETS = `
-mutation CloudListNotificationTargets($account_id: String!, $region: String) {
-  cloud_list_notification_targets(account_id: $account_id, region: $region) {
+mutation CloudListNotificationTargets($account_id: String!, $region: String, $resource_id: String) {
+  cloud_list_notification_targets(account_id: $account_id, region: $region, resource_id: $resource_id) {
     targets {
       id
       name
@@ -166,6 +177,7 @@ export const LIST_CLOUD_ISSUES = `
       computed_score
       score_factors
       score_confidence
+      is_investigated
     }
   }
 }`;
@@ -206,6 +218,7 @@ export const LIST_CLOUD_ISSUES_LIGHT = `
       computed_priority
       computed_score
       score_confidence
+      is_investigated
     }
   }
 }`;
@@ -326,14 +339,7 @@ query cloudResourceCostTrend($dateUnit:String!) {
 export const CLOUD_ACC_SUMMARY = `
 query CloudAccountSummary(
   $recWhere: RecommendationGroupingWhereRequest,
-  $spendsWhere: SpendGroupingsWhereRequest,
-  $grossSpendsWhere: SpendGroupingsWhereRequest,
-  $creditsWhere: SpendGroupingsWhereRequest,
-  $lmSpendsWhere: SpendGroupingsWhereRequest,
-  $lmGrossSpendsWhere: SpendGroupingsWhereRequest,
-  $lmCreditsWhere: SpendGroupingsWhereRequest,
-  $yearlySpendsWhere: SpendGroupingsWhereRequest,
-  $yearlyGrossSpendsWhere: SpendGroupingsWhereRequest,
+  $spendSummaryWhere: SpendGroupingsWhereRequest,
   $eventsWhere: EventGroupingsWhereRequest,
   $ec2Where: CloudResourceGroupingsWhereRequest,
   $rdsWhere: CloudResourceGroupingsWhereRequest,
@@ -345,29 +351,13 @@ query CloudAccountSummary(
       sum_estimated_savings
     }
   }
-  spends_aggregate: spend_groupings_v2(where: $spendsWhere) {
-    rows { spend_amount }
-  }
-  gross_spends_aggregate: spend_groupings_v2(where: $grossSpendsWhere) {
-    rows { spend_amount }
-  }
-  credits_aggregate: spend_groupings_v2(where: $creditsWhere) {
-    rows { spend_amount }
-  }
-  lm_spends_aggregate: spend_groupings_v2(where: $lmSpendsWhere) {
-    rows { spend_amount }
-  }
-  lm_gross_spends_aggregate: spend_groupings_v2(where: $lmGrossSpendsWhere) {
-    rows { spend_amount }
-  }
-  lm_credits_aggregate: spend_groupings_v2(where: $lmCreditsWhere) {
-    rows { spend_amount }
-  }
-  yearly_spends_aggregate: spend_groupings_v2(where: $yearlySpendsWhere) {
-    rows { spend_amount }
-  }
-  yearly_gross_spends_aggregate: spend_groupings_v2(where: $yearlyGrossSpendsWhere) {
-    rows { spend_amount }
+  spend_summary: spend_summary_windows_v2(where: $spendSummaryWhere) {
+    rows {
+      currency_type
+      cm_net cm_gross cm_credits
+      lm_net lm_gross lm_credits
+      yr_net yr_gross
+    }
   }
   events_aggregate: event_groupings_v2(where: $eventsWhere) {
     rows { event_count }
@@ -392,14 +382,7 @@ query CloudAccEC2Summary(
   $nicsWhere: CloudResourceGroupingsWhereRequest,
   $recWhere: RecommendationGroupingWhereRequest,
   $eventsWhere: EventGroupingsWhereRequest,
-  $spendsWhere: SpendGroupingsWhereRequest,
-  $grossSpendsWhere: SpendGroupingsWhereRequest,
-  $creditsWhere: SpendGroupingsWhereRequest,
-  $lmSpendsWhere: SpendGroupingsWhereRequest,
-  $lmGrossSpendsWhere: SpendGroupingsWhereRequest,
-  $lmCreditsWhere: SpendGroupingsWhereRequest,
-  $yearlySpendsWhere: SpendGroupingsWhereRequest,
-  $yearlyGrossSpendsWhere: SpendGroupingsWhereRequest
+  $spendSummaryWhere: SpendGroupingsWhereRequest
 ) {
   cloud_resourses: cloud_resource_v2(where: $resourcesWhere) {
     rows { service_name meta name status }
@@ -419,29 +402,13 @@ query CloudAccEC2Summary(
   events_aggregate: event_groupings_v2(where: $eventsWhere) {
     rows { event_count }
   }
-  spends_aggregate: spend_groupings_v2(where: $spendsWhere) {
-    rows { spend_amount }
-  }
-  gross_spends_aggregate: spend_groupings_v2(where: $grossSpendsWhere) {
-    rows { spend_amount }
-  }
-  credits_aggregate: spend_groupings_v2(where: $creditsWhere) {
-    rows { spend_amount }
-  }
-  lm_spends_aggregate: spend_groupings_v2(where: $lmSpendsWhere) {
-    rows { spend_amount }
-  }
-  lm_gross_spends_aggregate: spend_groupings_v2(where: $lmGrossSpendsWhere) {
-    rows { spend_amount }
-  }
-  lm_credits_aggregate: spend_groupings_v2(where: $lmCreditsWhere) {
-    rows { spend_amount }
-  }
-  yearly_spends_aggregate: spend_groupings_v2(where: $yearlySpendsWhere) {
-    rows { spend_amount }
-  }
-  yearly_gross_spends_aggregate: spend_groupings_v2(where: $yearlyGrossSpendsWhere) {
-    rows { spend_amount }
+  spend_summary: spend_summary_windows_v2(where: $spendSummaryWhere) {
+    rows {
+      currency_type
+      cm_net cm_gross cm_credits
+      lm_net lm_gross lm_credits
+      yr_net yr_gross
+    }
   }
 }
 `;
@@ -451,14 +418,7 @@ query CloudAccRDSSummary(
   $resourcesWhere: CloudResourcesWhereRequest,
   $recWhere: RecommendationGroupingWhereRequest,
   $eventsWhere: EventGroupingsWhereRequest,
-  $spendsWhere: SpendGroupingsWhereRequest,
-  $grossSpendsWhere: SpendGroupingsWhereRequest,
-  $creditsWhere: SpendGroupingsWhereRequest,
-  $lmSpendsWhere: SpendGroupingsWhereRequest,
-  $lmGrossSpendsWhere: SpendGroupingsWhereRequest,
-  $lmCreditsWhere: SpendGroupingsWhereRequest,
-  $yearlySpendsWhere: SpendGroupingsWhereRequest,
-  $yearlyGrossSpendsWhere: SpendGroupingsWhereRequest
+  $spendSummaryWhere: SpendGroupingsWhereRequest
 ) {
   cloud_resourses: cloud_resource_v2(where: $resourcesWhere) {
     rows { service_name meta name }
@@ -469,29 +429,13 @@ query CloudAccRDSSummary(
   events_aggregate: event_groupings_v2(where: $eventsWhere) {
     rows { event_count }
   }
-  spends_aggregate: spend_groupings_v2(where: $spendsWhere) {
-    rows { spend_amount }
-  }
-  gross_spends_aggregate: spend_groupings_v2(where: $grossSpendsWhere) {
-    rows { spend_amount }
-  }
-  credits_aggregate: spend_groupings_v2(where: $creditsWhere) {
-    rows { spend_amount }
-  }
-  lm_spends_aggregate: spend_groupings_v2(where: $lmSpendsWhere) {
-    rows { spend_amount }
-  }
-  lm_gross_spends_aggregate: spend_groupings_v2(where: $lmGrossSpendsWhere) {
-    rows { spend_amount }
-  }
-  lm_credits_aggregate: spend_groupings_v2(where: $lmCreditsWhere) {
-    rows { spend_amount }
-  }
-  yearly_spends_aggregate: spend_groupings_v2(where: $yearlySpendsWhere) {
-    rows { spend_amount }
-  }
-  yearly_gross_spends_aggregate: spend_groupings_v2(where: $yearlyGrossSpendsWhere) {
-    rows { spend_amount }
+  spend_summary: spend_summary_windows_v2(where: $spendSummaryWhere) {
+    rows {
+      currency_type
+      cm_net cm_gross cm_credits
+      lm_net lm_gross lm_credits
+      yr_net yr_gross
+    }
   }
 }
 `;
@@ -500,14 +444,7 @@ export const CLOUD_ACC_S3_SUMMARY = `
 query CloudAccS3Summary(
   $s3Where: CloudResourceGroupingsWhereRequest,
   $recWhere: RecommendationGroupingWhereRequest,
-  $spendsWhere: SpendGroupingsWhereRequest,
-  $grossSpendsWhere: SpendGroupingsWhereRequest,
-  $creditsWhere: SpendGroupingsWhereRequest,
-  $lmSpendsWhere: SpendGroupingsWhereRequest,
-  $lmGrossSpendsWhere: SpendGroupingsWhereRequest,
-  $lmCreditsWhere: SpendGroupingsWhereRequest,
-  $yearlySpendsWhere: SpendGroupingsWhereRequest,
-  $yearlyGrossSpendsWhere: SpendGroupingsWhereRequest
+  $spendSummaryWhere: SpendGroupingsWhereRequest
 ) {
   s3_count: cloud_resource_groupings_v2(where: $s3Where) {
     rows { count }
@@ -515,29 +452,13 @@ query CloudAccS3Summary(
   recommendation_aggregate: recommendation_groupings_v2(where: $recWhere) {
     rows { count sum_estimated_savings }
   }
-  spends_aggregate: spend_groupings_v2(where: $spendsWhere) {
-    rows { spend_amount }
-  }
-  gross_spends_aggregate: spend_groupings_v2(where: $grossSpendsWhere) {
-    rows { spend_amount }
-  }
-  credits_aggregate: spend_groupings_v2(where: $creditsWhere) {
-    rows { spend_amount }
-  }
-  lm_spends_aggregate: spend_groupings_v2(where: $lmSpendsWhere) {
-    rows { spend_amount }
-  }
-  lm_gross_spends_aggregate: spend_groupings_v2(where: $lmGrossSpendsWhere) {
-    rows { spend_amount }
-  }
-  lm_credits_aggregate: spend_groupings_v2(where: $lmCreditsWhere) {
-    rows { spend_amount }
-  }
-  yearly_spends_aggregate: spend_groupings_v2(where: $yearlySpendsWhere) {
-    rows { spend_amount }
-  }
-  yearly_gross_spends_aggregate: spend_groupings_v2(where: $yearlyGrossSpendsWhere) {
-    rows { spend_amount }
+  spend_summary: spend_summary_windows_v2(where: $spendSummaryWhere) {
+    rows {
+      currency_type
+      cm_net cm_gross cm_credits
+      lm_net lm_gross lm_credits
+      yr_net yr_gross
+    }
   }
 }
 `;
@@ -547,14 +468,7 @@ query CloudAccECSSummary(
   $resourcesWhere: CloudResourcesWhereRequest,
   $recWhere: RecommendationGroupingWhereRequest,
   $eventsWhere: EventGroupingsWhereRequest,
-  $spendsWhere: SpendGroupingsWhereRequest,
-  $grossSpendsWhere: SpendGroupingsWhereRequest,
-  $creditsWhere: SpendGroupingsWhereRequest,
-  $lmSpendsWhere: SpendGroupingsWhereRequest,
-  $lmGrossSpendsWhere: SpendGroupingsWhereRequest,
-  $lmCreditsWhere: SpendGroupingsWhereRequest,
-  $yearlySpendsWhere: SpendGroupingsWhereRequest,
-  $yearlyGrossSpendsWhere: SpendGroupingsWhereRequest
+  $spendSummaryWhere: SpendGroupingsWhereRequest
 ) {
   cloud_resourses: cloud_resource_v2(where: $resourcesWhere) {
     rows { service_name meta name type status }
@@ -565,29 +479,13 @@ query CloudAccECSSummary(
   events_aggregate: event_groupings_v2(where: $eventsWhere) {
     rows { event_count }
   }
-  spends_aggregate: spend_groupings_v2(where: $spendsWhere) {
-    rows { spend_amount }
-  }
-  gross_spends_aggregate: spend_groupings_v2(where: $grossSpendsWhere) {
-    rows { spend_amount }
-  }
-  credits_aggregate: spend_groupings_v2(where: $creditsWhere) {
-    rows { spend_amount }
-  }
-  lm_spends_aggregate: spend_groupings_v2(where: $lmSpendsWhere) {
-    rows { spend_amount }
-  }
-  lm_gross_spends_aggregate: spend_groupings_v2(where: $lmGrossSpendsWhere) {
-    rows { spend_amount }
-  }
-  lm_credits_aggregate: spend_groupings_v2(where: $lmCreditsWhere) {
-    rows { spend_amount }
-  }
-  yearly_spends_aggregate: spend_groupings_v2(where: $yearlySpendsWhere) {
-    rows { spend_amount }
-  }
-  yearly_gross_spends_aggregate: spend_groupings_v2(where: $yearlyGrossSpendsWhere) {
-    rows { spend_amount }
+  spend_summary: spend_summary_windows_v2(where: $spendSummaryWhere) {
+    rows {
+      currency_type
+      cm_net cm_gross cm_credits
+      lm_net lm_gross lm_credits
+      yr_net yr_gross
+    }
   }
 }
 `;
@@ -608,23 +506,6 @@ function applyTypeFilter(where: any, type: string | string[] | undefined) {
   } else if (type) {
     where.type = { _eq: type };
   }
-}
-
-function buildServiceSpendWhere(
-  accountId: string,
-  serviceName: string,
-  s: string | Date,
-  e: string | Date,
-  amountFilter?: any,
-  excludeAggregate = false
-) {
-  const conditions: any[] = [{ spend_date: { _gte: s } }, { spend_date: { _lte: e } }, { exclude_aggregate: { _eq: excludeAggregate } }];
-  if (amountFilter) conditions.push(amountFilter);
-  return {
-    account_id: { _eq: accountId },
-    resource_service_name: { _eq: serviceName },
-    _and: conditions,
-  };
 }
 
 // Lookup maps for multi-cloud service name mappings (EC2/VM summary)
@@ -727,7 +608,7 @@ const apiCloudAccount = {
       }
       const where: any = {
         account: { _eq: accountId },
-        status: { _eq: 'Active' },
+        status: { _in: ['Active', 'Inactive'] },
         tags: { _is_null: false },
       };
       if (serviceName) {
@@ -767,7 +648,7 @@ const apiCloudAccount = {
       }
       const where: any = {
         account: { _eq: accountId },
-        status: { _eq: 'Active' },
+        status: { _in: ['Active', 'Inactive'] },
         tags: { _has_key: tagKey },
       };
       if (serviceName) {
@@ -794,7 +675,13 @@ const apiCloudAccount = {
       return [];
     }
   },
-  listNotificationTargets: async function (accountId: string, region?: string): Promise<{ targets: CloudNotificationTarget[]; error?: string }> {
+  // Pass the resource id when the region is unknown: the server resolves the
+  // resource's own region so regional targets (SNS topics) still list.
+  listNotificationTargets: async function (
+    accountId: string,
+    region?: string,
+    resourceId?: string
+  ): Promise<{ targets: CloudNotificationTarget[]; error?: string }> {
     if (accountId === 'demo') {
       return { targets: [] };
     }
@@ -802,6 +689,7 @@ const apiCloudAccount = {
       const response = await queryGraphQL(LIST_NOTIFICATION_TARGETS, 'CloudListNotificationTargets', {
         account_id: accountId,
         region: region || undefined,
+        resource_id: resourceId || undefined,
       });
       const errors = response?.data?.errors;
       if (errors && errors.length > 0) {
@@ -943,6 +831,7 @@ const apiCloudAccount = {
       principal?: string | string[];
       source?: string | string[];
       nbStatus?: string | string[];
+      nbPriority?: string | string[];
       messageSearch?: string;
       startDate?: Date;
       endDate?: Date;
@@ -1051,6 +940,14 @@ const apiCloudAccount = {
           filterParams['nb_status'] = { _in: query.nbStatus };
         } else {
           filterParams['nb_status'] = { _eq: query.nbStatus };
+        }
+      }
+
+      if (query?.nbPriority) {
+        if (Array.isArray(query.nbPriority)) {
+          filterParams['computed_priority'] = { _in: query.nbPriority };
+        } else {
+          filterParams['computed_priority'] = { _eq: query.nbPriority };
         }
       }
 
@@ -1258,6 +1155,10 @@ const apiCloudAccount = {
       }
 
       const sn = data.service_name.toLowerCase();
+      // GCP reports cpu/memory utilization as a 0–1 fraction while AWS/Azure already
+      // return 0–100 percent, so GCP fractions are scaled ×100. Keyed off the provider,
+      // not the value magnitude. Mirrors useLiveResourceMetrics.ts.
+      const isGcpFraction = sn.includes('compute engine');
       let metricNames: string[] = [];
       if (sn.includes('amazon') || sn.includes('ec2')) {
         metricNames = ['CPUUtilization'];
@@ -1337,6 +1238,9 @@ mutation CloudMetrics($request: CloudMetricsRequestInput!) {
           let finalValue = value;
           if (CPU_NAMES.includes(item.name)) {
             key = 'cpu';
+            if (isGcpFraction) {
+              finalValue = Math.round(value * 10000) / 100;
+            }
           } else if (MEMORY_NAMES.includes(item.name)) {
             key = 'memory';
             // Azure returns 'Available Memory Bytes' (raw bytes, not %).
@@ -1350,6 +1254,9 @@ mutation CloudMetrics($request: CloudMetricsRequestInput!) {
                 // Can't convert without total memory — skip this metric
                 continue;
               }
+            } else if (isGcpFraction) {
+              // GCP 'memory/utilization' is a 0–1 fraction; scale to percent.
+              finalValue = Math.round(value * 10000) / 100;
             }
           } else {
             continue;
@@ -1518,11 +1425,6 @@ mutation CloudMetrics($request: CloudMetricsRequestInput!) {
       return { mtd: [], prevMonth: [], ytd: [] };
     }
     const currentDate = new Date();
-    const lastMonthDate = new Date();
-    // Pin to the 1st before stepping back a month — on the 29th-31st,
-    // setMonth alone overflows (e.g. Jul 31 → "Jun 31" → Jul 1).
-    lastMonthDate.setDate(1);
-    lastMonthDate.setMonth(lastMonthDate.getMonth() - 1);
 
     const iso = (d: Date | string) => (d instanceof Date ? d.toISOString() : d);
     const buildWhere = (s: Date | string, e: Date | string) => ({
@@ -1532,10 +1434,10 @@ mutation CloudMetrics($request: CloudMetricsRequestInput!) {
 
     const query = CLOUD_ACCOUNTS_SPEND_SUMMARY.replace(
       '__WHERE_CM__',
-      gqlStringify(buildWhere(getStartOfMonth(currentDate), getEndOfMonth(currentDate)))
+      gqlStringify(buildWhere(getStartOfMonthUTC(currentDate), getEndOfMonthUTC(currentDate)))
     )
-      .replace('__WHERE_LM__', gqlStringify(buildWhere(getStartOfMonth(lastMonthDate), getEndOfMonth(lastMonthDate))))
-      .replace('__WHERE_YR__', gqlStringify(buildWhere(getStartOfYear(currentDate), getEndOfYear(currentDate))));
+      .replace('__WHERE_LM__', gqlStringify(buildWhere(getStartOfLastMonthUTC(currentDate), getEndOfLastMonthUTC(currentDate))))
+      .replace('__WHERE_YR__', gqlStringify(buildWhere(getStartOfYearUTC(currentDate), getEndOfYearUTC(currentDate))));
 
     const response = await queryGraphQL(query, 'CloudAccountsSpendSummary', {});
     const errors = response?.data?.errors;
@@ -1553,24 +1455,8 @@ mutation CloudMetrics($request: CloudMetricsRequestInput!) {
   cloudAccountSummary: async function (accountId: string, data: any = null) {
     if (accountId === 'demo') return null;
     try {
-      const currentDate = new Date();
-      const lastMonthStart = new Date();
-      lastMonthStart.setMonth(lastMonthStart.getMonth() - 1);
       const startDate = data?.start_date || getLast7Days().toISOString();
       const endDate = data?.end_date || getEndOfDay().toISOString();
-
-      const cmStart = getStartOfMonth(currentDate);
-      const cmEnd = getEndOfMonth(currentDate);
-      const lmStart = getStartOfMonth(lastMonthStart);
-      const lmEnd = getEndOfMonth(lastMonthStart);
-      const yrStart = getStartOfYear(currentDate);
-      const yrEnd = getEndOfYear(currentDate);
-
-      const buildSpendWhere = (s: string | Date, e: string | Date, amountFilter?: any, excludeAggregate = false) => {
-        const conditions: any[] = [{ spend_date: { _gte: s } }, { spend_date: { _lte: e } }, { exclude_aggregate: { _eq: excludeAggregate } }];
-        if (amountFilter) conditions.push(amountFilter);
-        return { account_id: { _eq: accountId }, _and: conditions };
-      };
 
       const eventsWhere: any = {
         account_id: { _eq: accountId },
@@ -1583,14 +1469,7 @@ mutation CloudMetrics($request: CloudMetricsRequestInput!) {
 
       const response = await queryGraphQL(CLOUD_ACC_SUMMARY, 'CloudAccountSummary', {
         recWhere: { account_id: { _eq: accountId }, status: { _in: ['Open', 'Assigned'] } },
-        spendsWhere: buildSpendWhere(cmStart, cmEnd),
-        grossSpendsWhere: buildSpendWhere(cmStart, cmEnd, { amount: { _gte: 0 } }),
-        creditsWhere: buildSpendWhere(cmStart, cmEnd, { amount: { _lt: 0 } }, true),
-        lmSpendsWhere: buildSpendWhere(lmStart, lmEnd),
-        lmGrossSpendsWhere: buildSpendWhere(lmStart, lmEnd, { amount: { _gte: 0 } }),
-        lmCreditsWhere: buildSpendWhere(lmStart, lmEnd, { amount: { _lt: 0 } }, true),
-        yearlySpendsWhere: buildSpendWhere(yrStart, yrEnd),
-        yearlyGrossSpendsWhere: buildSpendWhere(yrStart, yrEnd, { amount: { _gte: 0 } }),
+        spendSummaryWhere: { account_id: { _eq: accountId } },
         eventsWhere,
         ec2Where: {
           account_id: { _eq: accountId },
@@ -1603,7 +1482,11 @@ mutation CloudMetrics($request: CloudMetricsRequestInput!) {
       });
 
       const d = response?.data?.data;
-      const spendAgg = (key: string) => ({ aggregate: { sum: { amount: d?.[key]?.rows?.[0]?.spend_amount || 0 } } });
+      // spend_summary_windows_v2 returns one row with every window pre-summed;
+      // wrap each figure back into the { aggregate: { sum: { amount } } } shape
+      // the callers already expect.
+      const sw = d?.spend_summary?.rows?.[0] || {};
+      const spendAgg = (field: string) => ({ aggregate: { sum: { amount: sw[field] || 0 } } });
       const countAgg = (key: string) => ({ aggregate: { count: d?.[key]?.rows?.[0]?.count || 0 } });
 
       return {
@@ -1613,14 +1496,14 @@ mutation CloudMetrics($request: CloudMetricsRequestInput!) {
             sum: { estimated_savings: d?.recommendation_aggregate?.rows?.[0]?.sum_estimated_savings || 0 },
           },
         },
-        spends_aggregate: spendAgg('spends_aggregate'),
-        gross_spends_aggregate: spendAgg('gross_spends_aggregate'),
-        credits_aggregate: spendAgg('credits_aggregate'),
-        lm_spends_aggregate: spendAgg('lm_spends_aggregate'),
-        lm_gross_spends_aggregate: spendAgg('lm_gross_spends_aggregate'),
-        lm_credits_aggregate: spendAgg('lm_credits_aggregate'),
-        yearly_spends_aggregate: spendAgg('yearly_spends_aggregate'),
-        yearly_gross_spends_aggregate: spendAgg('yearly_gross_spends_aggregate'),
+        spends_aggregate: spendAgg('cm_net'),
+        gross_spends_aggregate: spendAgg('cm_gross'),
+        credits_aggregate: spendAgg('cm_credits'),
+        lm_spends_aggregate: spendAgg('lm_net'),
+        lm_gross_spends_aggregate: spendAgg('lm_gross'),
+        lm_credits_aggregate: spendAgg('lm_credits'),
+        yearly_spends_aggregate: spendAgg('yr_net'),
+        yearly_gross_spends_aggregate: spendAgg('yr_gross'),
         events_aggregate: { aggregate: { count: d?.events_aggregate?.rows?.[0]?.event_count || 0 } },
         ec2_count: countAgg('ec2_count'),
         rds_count: countAgg('rds_count'),
@@ -1636,16 +1519,6 @@ mutation CloudMetrics($request: CloudMetricsRequestInput!) {
     try {
       const startDate = data?.start_date || getLast7Days().toISOString();
       const endDate = data?.end_date || getEndOfDay().toISOString();
-      const currentDate = new Date();
-      const lastMonthStart = new Date();
-      lastMonthStart.setMonth(lastMonthStart.getMonth() - 1);
-
-      const cmStart = getStartOfMonth(currentDate);
-      const cmEnd = getEndOfMonth(currentDate);
-      const lmStart = getStartOfMonth(lastMonthStart);
-      const lmEnd = getEndOfMonth(lastMonthStart);
-      const yrStart = getStartOfYear(currentDate);
-      const yrEnd = getEndOfYear(currentDate);
 
       const svc = data.serviceName;
       const resourceType = EC2_RESOURCE_TYPE_MAP[svc] || EC2_DEFAULT_RESOURCE_TYPE;
@@ -1655,9 +1528,6 @@ mutation CloudMetrics($request: CloudMetricsRequestInput!) {
       if (svc) {
         recWhere.resource_cloud_service = { _eq: svc };
       }
-
-      const buildSpendWhere = (s: string | Date, e: string | Date, amountFilter?: any, excludeAggregate = false) =>
-        buildServiceSpendWhere(accountId, svc, s, e, amountFilter, excludeAggregate);
 
       const ebsServiceName = EC2_EBS_SERVICE_MAP[svc] || svc;
       const ebsType = svc === 'microsoft.compute/virtualmachines' ? 'disks' : 'storage';
@@ -1691,19 +1561,13 @@ mutation CloudMetrics($request: CloudMetricsRequestInput!) {
         },
         recWhere,
         eventsWhere,
-        spendsWhere: buildSpendWhere(cmStart, cmEnd),
-        grossSpendsWhere: buildSpendWhere(cmStart, cmEnd, { amount: { _gte: 0 } }),
-        creditsWhere: buildSpendWhere(cmStart, cmEnd, { amount: { _lt: 0 } }, true),
-        lmSpendsWhere: buildSpendWhere(lmStart, lmEnd),
-        lmGrossSpendsWhere: buildSpendWhere(lmStart, lmEnd, { amount: { _gte: 0 } }),
-        lmCreditsWhere: buildSpendWhere(lmStart, lmEnd, { amount: { _lt: 0 } }, true),
-        yearlySpendsWhere: buildSpendWhere(yrStart, yrEnd),
-        yearlyGrossSpendsWhere: buildSpendWhere(yrStart, yrEnd, { amount: { _gte: 0 } }),
+        spendSummaryWhere: svc ? { account_id: { _eq: accountId }, resource_service_name: { _eq: svc } } : { account_id: { _eq: accountId } },
       });
 
       const d = response?.data?.data;
       const rows = d?.cloud_resourses?.rows || [];
-      const spendAgg = (key: string) => ({ aggregate: { sum: { amount: d?.[key]?.rows?.[0]?.spend_amount || 0 } } });
+      const sw = d?.spend_summary?.rows?.[0] || {};
+      const spendAgg = (field: string) => ({ aggregate: { sum: { amount: sw[field] || 0 } } });
 
       return {
         cloud_resourses: rows.map((r: any) => ({ ...r, meta: typeof r.meta === 'string' ? JSON.parse(r.meta) : r.meta })),
@@ -1717,14 +1581,14 @@ mutation CloudMetrics($request: CloudMetricsRequestInput!) {
           },
         },
         events_aggregate: { aggregate: { count: d?.events_aggregate?.rows?.[0]?.event_count || 0 } },
-        spends_aggregate: spendAgg('spends_aggregate'),
-        gross_spends_aggregate: spendAgg('gross_spends_aggregate'),
-        credits_aggregate: spendAgg('credits_aggregate'),
-        lm_spends_aggregate: spendAgg('lm_spends_aggregate'),
-        lm_gross_spends_aggregate: spendAgg('lm_gross_spends_aggregate'),
-        lm_credits_aggregate: spendAgg('lm_credits_aggregate'),
-        yearly_spends_aggregate: spendAgg('yearly_spends_aggregate'),
-        yearly_gross_spends_aggregate: spendAgg('yearly_gross_spends_aggregate'),
+        spends_aggregate: spendAgg('cm_net'),
+        gross_spends_aggregate: spendAgg('cm_gross'),
+        credits_aggregate: spendAgg('cm_credits'),
+        lm_spends_aggregate: spendAgg('lm_net'),
+        lm_gross_spends_aggregate: spendAgg('lm_gross'),
+        lm_credits_aggregate: spendAgg('lm_credits'),
+        yearly_spends_aggregate: spendAgg('yr_net'),
+        yearly_gross_spends_aggregate: spendAgg('yr_gross'),
       };
     } catch (error) {
       console.log('failed to fetch ec2 summary-', error);
@@ -1736,16 +1600,6 @@ mutation CloudMetrics($request: CloudMetricsRequestInput!) {
     try {
       const startDate = data?.start_date || getLast7Days().toISOString();
       const endDate = data?.end_date || getEndOfDay().toISOString();
-      const currentDate = new Date();
-      const lastMonthStart = new Date();
-      lastMonthStart.setMonth(lastMonthStart.getMonth() - 1);
-
-      const cmStart = getStartOfMonth(currentDate);
-      const cmEnd = getEndOfMonth(currentDate);
-      const lmStart = getStartOfMonth(lastMonthStart);
-      const lmEnd = getEndOfMonth(lastMonthStart);
-      const yrStart = getStartOfYear(currentDate);
-      const yrEnd = getEndOfYear(currentDate);
 
       const eventsWhere: any = {
         account_id: { _eq: accountId },
@@ -1765,26 +1619,17 @@ mutation CloudMetrics($request: CloudMetricsRequestInput!) {
         recWhere.resource_cloud_service = { _eq: data.serviceName };
       }
 
-      const buildSpendWhere = (s: string | Date, e: string | Date, amountFilter?: any, excludeAggregate = false) =>
-        buildServiceSpendWhere(accountId, data.serviceName, s, e, amountFilter, excludeAggregate);
-
       const response = await queryGraphQL(CLOUD_ACC_RDS_SUMMARY, 'CloudAccRDSSummary', {
         resourcesWhere: { account: { _eq: accountId }, service_name: { _eq: data.serviceName }, status: { _eq: 'Active' } },
         recWhere,
         eventsWhere,
-        spendsWhere: buildSpendWhere(cmStart, cmEnd),
-        grossSpendsWhere: buildSpendWhere(cmStart, cmEnd, { amount: { _gte: 0 } }),
-        creditsWhere: buildSpendWhere(cmStart, cmEnd, { amount: { _lt: 0 } }, true),
-        lmSpendsWhere: buildSpendWhere(lmStart, lmEnd),
-        lmGrossSpendsWhere: buildSpendWhere(lmStart, lmEnd, { amount: { _gte: 0 } }),
-        lmCreditsWhere: buildSpendWhere(lmStart, lmEnd, { amount: { _lt: 0 } }, true),
-        yearlySpendsWhere: buildSpendWhere(yrStart, yrEnd),
-        yearlyGrossSpendsWhere: buildSpendWhere(yrStart, yrEnd, { amount: { _gte: 0 } }),
+        spendSummaryWhere: { account_id: { _eq: accountId }, resource_service_name: { _eq: data.serviceName } },
       });
 
       const d = response?.data?.data;
       const rows = d?.cloud_resourses?.rows || [];
-      const spendAgg = (key: string) => ({ aggregate: { sum: { amount: d?.[key]?.rows?.[0]?.spend_amount || 0 } } });
+      const sw = d?.spend_summary?.rows?.[0] || {};
+      const spendAgg = (field: string) => ({ aggregate: { sum: { amount: sw[field] || 0 } } });
 
       return {
         cloud_resourses: rows.map((r: any) => ({ ...r, meta: typeof r.meta === 'string' ? JSON.parse(r.meta) : r.meta })),
@@ -1795,14 +1640,14 @@ mutation CloudMetrics($request: CloudMetricsRequestInput!) {
           },
         },
         events_aggregate: { aggregate: { count: d?.events_aggregate?.rows?.[0]?.event_count || 0 } },
-        spends_aggregate: spendAgg('spends_aggregate'),
-        gross_spends_aggregate: spendAgg('gross_spends_aggregate'),
-        credits_aggregate: spendAgg('credits_aggregate'),
-        lm_spends_aggregate: spendAgg('lm_spends_aggregate'),
-        lm_gross_spends_aggregate: spendAgg('lm_gross_spends_aggregate'),
-        lm_credits_aggregate: spendAgg('lm_credits_aggregate'),
-        yearly_spends_aggregate: spendAgg('yearly_spends_aggregate'),
-        yearly_gross_spends_aggregate: spendAgg('yearly_gross_spends_aggregate'),
+        spends_aggregate: spendAgg('cm_net'),
+        gross_spends_aggregate: spendAgg('cm_gross'),
+        credits_aggregate: spendAgg('cm_credits'),
+        lm_spends_aggregate: spendAgg('lm_net'),
+        lm_gross_spends_aggregate: spendAgg('lm_gross'),
+        lm_credits_aggregate: spendAgg('lm_credits'),
+        yearly_spends_aggregate: spendAgg('yr_net'),
+        yearly_gross_spends_aggregate: spendAgg('yr_gross'),
       };
     } catch (error) {
       console.log('failed to fetch rds summary-', error);
@@ -1812,20 +1657,6 @@ mutation CloudMetrics($request: CloudMetricsRequestInput!) {
   cloudAccountS3Summary: async function (accountId: string, data: any = null) {
     if (accountId === 'demo') return null;
     try {
-      const currentDate = new Date();
-      const lastMonthStart = new Date();
-      lastMonthStart.setMonth(lastMonthStart.getMonth() - 1);
-
-      const cmStart = getStartOfMonth(currentDate);
-      const cmEnd = getEndOfMonth(currentDate);
-      const lmStart = getStartOfMonth(lastMonthStart);
-      const lmEnd = getEndOfMonth(lastMonthStart);
-      const yrStart = getStartOfYear(currentDate);
-      const yrEnd = getEndOfYear(currentDate);
-
-      const buildSpendWhere = (s: string | Date, e: string | Date, amountFilter?: any, excludeAggregate = false) =>
-        buildServiceSpendWhere(accountId, data.serviceName, s, e, amountFilter, excludeAggregate);
-
       const response = await queryGraphQL(CLOUD_ACC_S3_SUMMARY, 'CloudAccS3Summary', {
         s3Where: {
           account_id: { _eq: accountId },
@@ -1834,18 +1665,12 @@ mutation CloudMetrics($request: CloudMetricsRequestInput!) {
           type: { _eq: data.storageType },
         },
         recWhere: { account_id: { _eq: accountId }, resource_cloud_service: { _eq: data.serviceName }, status: { _in: ['Open', 'Assigned'] } },
-        spendsWhere: buildSpendWhere(cmStart, cmEnd),
-        grossSpendsWhere: buildSpendWhere(cmStart, cmEnd, { amount: { _gte: 0 } }),
-        creditsWhere: buildSpendWhere(cmStart, cmEnd, { amount: { _lt: 0 } }, true),
-        lmSpendsWhere: buildSpendWhere(lmStart, lmEnd),
-        lmGrossSpendsWhere: buildSpendWhere(lmStart, lmEnd, { amount: { _gte: 0 } }),
-        lmCreditsWhere: buildSpendWhere(lmStart, lmEnd, { amount: { _lt: 0 } }, true),
-        yearlySpendsWhere: buildSpendWhere(yrStart, yrEnd),
-        yearlyGrossSpendsWhere: buildSpendWhere(yrStart, yrEnd, { amount: { _gte: 0 } }),
+        spendSummaryWhere: { account_id: { _eq: accountId }, resource_service_name: { _eq: data.serviceName } },
       });
 
       const d = response?.data?.data;
-      const spendAgg = (key: string) => ({ aggregate: { sum: { amount: d?.[key]?.rows?.[0]?.spend_amount || 0 } } });
+      const sw = d?.spend_summary?.rows?.[0] || {};
+      const spendAgg = (field: string) => ({ aggregate: { sum: { amount: sw[field] || 0 } } });
 
       return {
         s3_count: { aggregate: { count: d?.s3_count?.rows?.[0]?.count || 0 } },
@@ -1855,14 +1680,14 @@ mutation CloudMetrics($request: CloudMetricsRequestInput!) {
             sum: { estimated_savings: d?.recommendation_aggregate?.rows?.[0]?.sum_estimated_savings },
           },
         },
-        spends_aggregate: spendAgg('spends_aggregate'),
-        gross_spends_aggregate: spendAgg('gross_spends_aggregate'),
-        credits_aggregate: spendAgg('credits_aggregate'),
-        lm_spends_aggregate: spendAgg('lm_spends_aggregate'),
-        lm_gross_spends_aggregate: spendAgg('lm_gross_spends_aggregate'),
-        lm_credits_aggregate: spendAgg('lm_credits_aggregate'),
-        yearly_spends_aggregate: spendAgg('yearly_spends_aggregate'),
-        yearly_gross_spends_aggregate: spendAgg('yearly_gross_spends_aggregate'),
+        spends_aggregate: spendAgg('cm_net'),
+        gross_spends_aggregate: spendAgg('cm_gross'),
+        credits_aggregate: spendAgg('cm_credits'),
+        lm_spends_aggregate: spendAgg('lm_net'),
+        lm_gross_spends_aggregate: spendAgg('lm_gross'),
+        lm_credits_aggregate: spendAgg('lm_credits'),
+        yearly_spends_aggregate: spendAgg('yr_net'),
+        yearly_gross_spends_aggregate: spendAgg('yr_gross'),
       };
     } catch (error) {
       console.log('failed to fetch s3 summary-', error);
@@ -1877,16 +1702,6 @@ mutation CloudMetrics($request: CloudMetricsRequestInput!) {
 
       const startDate = data?.start_date || getLast7Days().toISOString();
       const endDate = data?.end_date || getEndOfDay().toISOString();
-      const currentDate = new Date();
-      const lastMonthStart = new Date();
-      lastMonthStart.setMonth(lastMonthStart.getMonth() - 1);
-
-      const cmStart = getStartOfMonth(currentDate);
-      const cmEnd = getEndOfMonth(currentDate);
-      const lmStart = getStartOfMonth(lastMonthStart);
-      const lmEnd = getEndOfMonth(lastMonthStart);
-      const yrStart = getStartOfYear(currentDate);
-      const yrEnd = getEndOfYear(currentDate);
 
       const eventsWhere: any = {
         account_id: { _eq: accountId },
@@ -1904,9 +1719,6 @@ mutation CloudMetrics($request: CloudMetricsRequestInput!) {
         recWhere.account_object_id = { _ilike: 'arn:aws:' + data.accountObjectId + '%' };
       }
 
-      const buildSpendWhere = (s: string | Date, e: string | Date, amountFilter?: any, excludeAggregate = false) =>
-        buildServiceSpendWhere(accountId, 'AmazonECS', s, e, amountFilter, excludeAggregate);
-
       const response = await queryGraphQL(CLOUD_ACC_ECS_SUMMARY, 'CloudAccECSSummary', {
         resourcesWhere: {
           account: { _eq: accountId },
@@ -1916,19 +1728,13 @@ mutation CloudMetrics($request: CloudMetricsRequestInput!) {
         },
         recWhere,
         eventsWhere,
-        spendsWhere: buildSpendWhere(cmStart, cmEnd),
-        grossSpendsWhere: buildSpendWhere(cmStart, cmEnd, { amount: { _gte: 0 } }),
-        creditsWhere: buildSpendWhere(cmStart, cmEnd, { amount: { _lt: 0 } }, true),
-        lmSpendsWhere: buildSpendWhere(lmStart, lmEnd),
-        lmGrossSpendsWhere: buildSpendWhere(lmStart, lmEnd, { amount: { _gte: 0 } }),
-        lmCreditsWhere: buildSpendWhere(lmStart, lmEnd, { amount: { _lt: 0 } }, true),
-        yearlySpendsWhere: buildSpendWhere(yrStart, yrEnd),
-        yearlyGrossSpendsWhere: buildSpendWhere(yrStart, yrEnd, { amount: { _gte: 0 } }),
+        spendSummaryWhere: { account_id: { _eq: accountId }, resource_service_name: { _eq: data.serviceName } },
       });
 
       const d = response?.data?.data;
       const rows = d?.cloud_resourses?.rows || [];
-      const spendAgg = (key: string) => ({ aggregate: { sum: { amount: d?.[key]?.rows?.[0]?.spend_amount || 0 } } });
+      const sw = d?.spend_summary?.rows?.[0] || {};
+      const spendAgg = (field: string) => ({ aggregate: { sum: { amount: sw[field] || 0 } } });
 
       return {
         cloud_resourses: rows.map((r: any) => ({ ...r, meta: typeof r.meta === 'string' ? JSON.parse(r.meta) : r.meta })),
@@ -1939,14 +1745,14 @@ mutation CloudMetrics($request: CloudMetricsRequestInput!) {
           },
         },
         events_aggregate: { aggregate: { count: d?.events_aggregate?.rows?.[0]?.event_count || 0 } },
-        spends_aggregate: spendAgg('spends_aggregate'),
-        gross_spends_aggregate: spendAgg('gross_spends_aggregate'),
-        credits_aggregate: spendAgg('credits_aggregate'),
-        lm_spends_aggregate: spendAgg('lm_spends_aggregate'),
-        lm_gross_spends_aggregate: spendAgg('lm_gross_spends_aggregate'),
-        lm_credits_aggregate: spendAgg('lm_credits_aggregate'),
-        yearly_spends_aggregate: spendAgg('yearly_spends_aggregate'),
-        yearly_gross_spends_aggregate: spendAgg('yearly_gross_spends_aggregate'),
+        spends_aggregate: spendAgg('cm_net'),
+        gross_spends_aggregate: spendAgg('cm_gross'),
+        credits_aggregate: spendAgg('cm_credits'),
+        lm_spends_aggregate: spendAgg('lm_net'),
+        lm_gross_spends_aggregate: spendAgg('lm_gross'),
+        lm_credits_aggregate: spendAgg('lm_credits'),
+        yearly_spends_aggregate: spendAgg('yr_net'),
+        yearly_gross_spends_aggregate: spendAgg('yr_gross'),
       };
     } catch (error) {
       console.log('failed to fetch ecs summary-', error);

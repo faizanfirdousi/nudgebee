@@ -5,7 +5,7 @@ import apiKubernetes1 from '@api1/kubernetes1';
 import Loader from '@shared/Loader';
 import { toast as snackbar } from '@ui/Toast';
 import { ds } from 'src/utils/colors';
-import WidgetCard from '@ui/WidgetCard';
+import { Card } from '@ui/Card';
 import CopyButton from '@shared/buttons/CopyButton';
 import { ExternalLinkIcon } from '@assets';
 import SafeIcon from '@shared/icons/SafeIcon';
@@ -112,23 +112,37 @@ const DevOpsTimelineMUI = ({ eventId }: { eventId: string }) => {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    let cancelled = false;
+
     const fetchTimelineData = async () => {
       setIsLoading(true);
       setError(null);
       try {
         const response: any = await apiKubernetes1.getTimelineData(eventId);
+        if (cancelled) {
+          return;
+        }
         setTimelineData(response?.data?.data?.event_get_timeline || {});
       } catch (err) {
+        if (cancelled) {
+          return;
+        }
         console.error(err);
         setError('Failed to load timeline data.');
       } finally {
-        setIsLoading(false);
+        if (!cancelled) {
+          setIsLoading(false);
+        }
       }
     };
 
     if (eventId) {
       fetchTimelineData();
     }
+
+    return () => {
+      cancelled = true;
+    };
   }, [eventId]);
 
   // Memoize sorted timeline to prevent re-sorting on every render
@@ -153,9 +167,9 @@ const DevOpsTimelineMUI = ({ eventId }: { eventId: string }) => {
 
   if (!timelineData?.timeline || timelineData.timeline.length === 0) {
     return (
-      <WidgetCard sx={{ width: '100%' }}>
+      <Card sx={{ mt: 'var(--ds-space-5)', padding: 'var(--ds-space-4) var(--ds-space-5)', width: '100%' }}>
         <Typography>No timeline events found.</Typography>
-      </WidgetCard>
+      </Card>
     );
   }
 
@@ -206,7 +220,7 @@ const DevOpsTimelineMUI = ({ eventId }: { eventId: string }) => {
                 minWidth={ds.space.mul(0, 70)}
                 pt={ds.space[1]}
               >
-                <Typography variant='caption' sx={{ fontFamily: 'monospace', fontSize: 'var(--ds-text-small)' }}>
+                <Typography variant='caption' sx={{ fontFamily: ds.font.mono, fontSize: 'var(--ds-text-small)' }}>
                   {formatDate(item.timestamp)}
                 </Typography>
               </Box>
@@ -267,7 +281,7 @@ const DevOpsTimelineMUI = ({ eventId }: { eventId: string }) => {
                       sx={{
                         height: ds.space.mul(0, 10),
                         fontSize: 'var(--ds-text-caption)',
-                        fontFamily: 'poppins',
+                        fontFamily: ds.font.display,
                         fontWeight: 'var(--ds-font-weight-semibold)',
                         color: styles.color === 'grey' ? 'text.primary' : `${styles.color}.dark`,
                         bgcolor: ds.background[100],

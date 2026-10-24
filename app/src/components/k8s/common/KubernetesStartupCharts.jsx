@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import k8sApi from '@api1/kubernetes';
-import { Box, Typography, Grid, Alert } from '@mui/material';
+import { Box, Typography, Grid } from '@mui/material';
+import { Banner } from '@ui/Banner';
 import Chart from '@ui/Chart';
 import { ds, resolveColor, resolveColors } from 'src/utils/colors';
 import MetricQueryInfo, { K8S_METRIC_QUERY_LABELS } from '@shared/MetricQueryInfo';
@@ -19,7 +20,7 @@ function fetchPodMetrics(pod, query, groupBy, datasource) {
     .getK8sPodGroupings2(10, query, groupBy, datasource || 'prometheus')
     .then((res) => ({ pod, data: res?.data?.k8s_pod_groupings || [], promQueries: res?.data?.promQueries || {}, createdMs }))
     .catch((err) => {
-      console.error(`Failed to fetch startup metrics for pod ${pod.name}:`, err);
+      console.error('Failed to fetch startup metrics for pod', { pod: pod.name, err });
       return { pod, data: [], promQueries: {}, createdMs };
     });
 }
@@ -51,6 +52,8 @@ const KubernetesStartupCharts = ({ accountId, workloadName, namespaceName, conta
       return;
     }
 
+    let cancelled = false;
+
     const fetchStartupMetrics = async () => {
       setIsLoading(true);
       setInfoMessage(null);
@@ -58,6 +61,7 @@ const KubernetesStartupCharts = ({ accountId, workloadName, namespaceName, conta
       try {
         // Step 1: Fetch recent active pods for this workload
         const podsRes = await k8sApi.getK8sPods(MAX_PODS, 0, { accountId, namespaceName, workloadName, isActive: true }, false);
+        if (cancelled) return;
         const pods = podsRes?.data?.k8s_pods || [];
 
         if (pods.length === 0) {
@@ -95,6 +99,7 @@ const KubernetesStartupCharts = ({ accountId, workloadName, namespaceName, conta
         });
 
         const results = await Promise.all(metricsPromises);
+        if (cancelled) return;
 
         // Filter to pods that returned data
         const podsWithData = results.filter((r) => r.data.length > 0);
@@ -280,14 +285,20 @@ const KubernetesStartupCharts = ({ accountId, workloadName, namespaceName, conta
         setCpuDatasets(cpuDs);
         setMemDatasets(memDs);
       } catch (err) {
+        if (cancelled) return;
         console.error('Failed to fetch startup metrics:', err);
         setInfoMessage('Failed to load startup metrics.');
       } finally {
-        setIsLoading(false);
+        if (!cancelled) {
+          setIsLoading(false);
+        }
       }
     };
 
     fetchStartupMetrics();
+    return () => {
+      cancelled = true;
+    };
   }, [accountId, workloadName, namespaceName, containerName, datasource, recc?.cpuRecc, recc?.memoryRecc, recc?.cpuRequest, recc?.cpuLimit]);
 
   const scaleOptions = {
@@ -309,10 +320,10 @@ const KubernetesStartupCharts = ({ accountId, workloadName, namespaceName, conta
   if (infoMessage) {
     return (
       <Box sx={{ mt: ds.space[5] }}>
-        <Typography fontSize={ds.text.bodyLg} fontWeight={600} color={ds.brand[500]} sx={{ mb: ds.space[2] }}>
+        <Typography fontSize={ds.text.bodyLg} fontWeight={ds.weight.semibold} color={ds.brand[500]} sx={{ mb: ds.space[2] }}>
           Startup Metrics (first {STARTUP_WINDOW_MINUTES} min after pod creation)
         </Typography>
-        <Alert severity='info'>{infoMessage}</Alert>
+        <Banner tone='info' message={infoMessage} surface='section' />
       </Box>
     );
   }
@@ -323,7 +334,7 @@ const KubernetesStartupCharts = ({ accountId, workloadName, namespaceName, conta
 
   return (
     <Box sx={{ mt: ds.space[5] }}>
-      <Typography fontSize={ds.text.bodyLg} fontWeight={600} color={ds.brand[500]} sx={{ mb: ds.space[1] }}>
+      <Typography fontSize={ds.text.bodyLg} fontWeight={ds.weight.semibold} color={ds.brand[500]} sx={{ mb: ds.space[1] }}>
         Startup Metrics — {podCount} pod{podCount !== 1 ? 's' : ''} (first {STARTUP_WINDOW_MINUTES} min after creation)
       </Typography>
       {podDetailsSummary && (
@@ -345,7 +356,7 @@ const KubernetesStartupCharts = ({ accountId, workloadName, namespaceName, conta
             }}
           >
             <Box sx={{ display: 'flex', alignItems: 'center', gap: ds.space[2] }}>
-              <Typography fontSize={ds.text.bodyLg} fontWeight={600} color={ds.brand[500]}>
+              <Typography fontSize={ds.text.bodyLg} fontWeight={ds.weight.semibold} color={ds.brand[500]}>
                 Startup CPU (Core)
               </Typography>
               <MetricQueryInfo queries={cpuQueries} labelMap={K8S_METRIC_QUERY_LABELS} />
@@ -366,7 +377,7 @@ const KubernetesStartupCharts = ({ accountId, workloadName, namespaceName, conta
             }}
           >
             <Box sx={{ display: 'flex', alignItems: 'center', gap: ds.space[2] }}>
-              <Typography fontSize={ds.text.bodyLg} fontWeight={600} color={ds.brand[500]}>
+              <Typography fontSize={ds.text.bodyLg} fontWeight={ds.weight.semibold} color={ds.brand[500]}>
                 Startup Memory (MB)
               </Typography>
               <MetricQueryInfo queries={memoryQueries} labelMap={K8S_METRIC_QUERY_LABELS} />

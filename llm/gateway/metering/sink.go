@@ -1,7 +1,9 @@
 package metering
 
 import (
+	"context"
 	"log/slog"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -92,12 +94,31 @@ func (s *dbSink) Close() error {
 // Close is called before a connection succeeds. Runs off the request path, so the
 // DB being slow/down never affects serving — events buffer until it is ready.
 func (s *dbSink) connect() *common.DatabaseManager {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	logger := slog.Default()
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("metering: panic in connect cancel monitor", "recover", r, "stack", string(debug.Stack()))
+			}
+		}()
+		select {
+		case <-s.done:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
 	backoff := connectRetryInitial
 	for {
-		db, err := common.GetDatabaseManager(common.MeteringSink)
+		db, err := common.GetDatabaseManagerWithContext(ctx, common.MeteringSink)
 		if err == nil {
 			slog.Info("metering: sink DB connected")
 			return db
+		}
+		if ctx.Err() != nil {
+			return nil
 		}
 		slog.Warn("metering: sink DB not ready, retrying in background", "error", err, "retry_in", backoff.String())
 		timer := time.NewTimer(backoff)
@@ -169,7 +190,7 @@ func (s *dbSink) run() {
 
 // usageColumns is the fixed column order for inserts (matches UsageEvent db tags).
 var usageColumns = []string{
-	"id", "created_at", "tenant_id", "account_id", "user_id", "token_id",
+	"id", "created_at", "tenant_id", "account_id", "user_id", "token_id", "api_key_id",
 	"session_id", "attributes",
 	"provider", "model", "requested_provider", "requested_model", "responded_model",
 	"routing_reason", "routing_rule",
@@ -204,7 +225,7 @@ func (s *dbSink) insert(evs []UsageEvent) error {
 		}
 		sb.WriteByte(')')
 		args = append(args,
-			ev.ID, ev.CreatedAt, ev.TenantID, ev.AccountID, ev.UserID, ev.TokenID,
+			ev.ID, ev.CreatedAt, ev.TenantID, ev.AccountID, ev.UserID, ev.TokenID, ev.APIKeyID,
 			ev.SessionID, ev.Attributes,
 			ev.Provider, ev.Model, ev.RequestedProvider, ev.RequestedModel, ev.RespondedModel,
 			ev.RoutingReason, ev.RoutingRule,

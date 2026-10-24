@@ -9,6 +9,7 @@ import { FiArrowRight } from 'react-icons/fi';
 import ListingLayout from '@ui/ListingLayout';
 import { Button as DsButton } from '@ui/Button';
 import { Switch as DsSwitch } from '@ui/Switch';
+import ToggleGroup from '@ui/ToggleGroup';
 import SeverityIcon from '@ui/SeverityIcon';
 import NBStatusBadge from '@shared/widgets/NBStatusBadge';
 import FilterDropdown from '@ui/FilterDropdown';
@@ -17,9 +18,9 @@ import SearchInput from '@ui/SearchInput';
 // DS V2 compositions / format / widgets
 import Datetime from '@shared/format/Datetime';
 import Text from '@shared/format/Text';
-import { Label } from '@ui/Label';
 import TicketLink from '@shared/links/TicketLink';
 import ThreeDotsMenu from '@ui/ThreeDotsMenu';
+import AlertStatusBadge from '@shared/widgets/AlertStatusBadge';
 import { toast as snackbar } from '@ui/Toast';
 import ScoreDisplay from '@shared/widgets/ScoreDisplay';
 import PriorityPinControl from '@shared/widgets/PriorityPinControl';
@@ -49,7 +50,7 @@ import k8sApi from '@api1/kubernetes';
 import ticketsApi from '@api1/tickets';
 import apiUser from '@api1/user';
 import { getDateString, getLast24Hrs } from '@lib/datetime';
-import { hasWriteAccess, hasPermission, getCurrentTenant } from '@lib/auth';
+import { hasWriteAccess, hasPermission, getCurrentTenant, getUserSession } from '@lib/auth';
 import { safeJSONParse, titleCaseForAggregationKey, syncFilterFromQuery, toSeverityLevel, EXCLUDED_TRIAGE_AGGREGATION_KEYS } from 'src/utils/common';
 import { applyFiltersOnRouter } from '@lib/router';
 import { action } from 'src/utils/actionStyles';
@@ -60,7 +61,7 @@ import { useEventCloudFilter } from '@hooks/useCloudFilters';
 // Assets
 import TicketsIcon from '@assets/sidebar-icon/tickets-icon.svg';
 import { dashboardIcon1 as ClassifyIcon, infoIcon } from '@assets';
-import { getTriageStatusTooltip } from '@api1/triage';
+import { TRIAGE_SCORE_INFO, getTriageStatusTooltip } from '@api1/triage';
 import useKubernetesEventFilters from '@hooks/useKubernetesEventFilters';
 import { readPersistedFilters, writePersistedFilters } from '@hooks/usePersistedFilters';
 import WorkflowIcon from '@assets/WorkflowIcon';
@@ -84,6 +85,16 @@ const KNOWN_SHORTCUT_DURATIONS_MS = new Set([
   24 * 60 * 60 * 1000,
   7 * 24 * 60 * 60 * 1000,
 ]);
+
+const resolveEffectiveRange = (range) => {
+  const shortcut = range?.shortcutClickTime;
+  if (typeof shortcut === 'number' && KNOWN_SHORTCUT_DURATIONS_MS.has(shortcut)) {
+    const now = Date.now();
+    return { startDate: now - shortcut, endDate: now };
+  }
+  return { startDate: range?.startDate, endDate: range?.endDate };
+};
+
 // Distinct line colors for the multi-account trend chart, cycled by account index.
 const TREND_SERIES_COLORS = ['#2f7af0', '#f5b400', '#e5484d', '#16a34a', '#9333ea', '#0891b2', '#db2777', '#65a30d'];
 
@@ -124,9 +135,13 @@ const DEFAULT_TABLE_COLUMNS = [
   {
     name: 'Triage Score',
     width: '10%',
+    // The cell packs a score, a bar, an info icon and the priority-pin control — ~173px
+    // of content. Without a floor the resize hook happily allots it 10% (~74px) and the
+    // whole group spills over the columns on both sides.
+    minWidth: 175,
     align: 'left',
     defaultVisible: true,
-    info: "Triage Score is NudgeBee's context-aware triage score/level, computed using multiple signals beyond raw thresholds such as service criticality, customer/user impact, recurrence frequency, dependency (upstream/downstream) blast radius, and the nature of the service/workload.",
+    info: TRIAGE_SCORE_INFO,
   },
   {
     name: 'Alert Status',
@@ -218,6 +233,104 @@ const ensureSelectedInOptions = (options = [], selectedValue) => {
 };
 
 const renderAccountGroupIcon = (provider) => <CloudProviderIcon cloud_provider={provider} width='14px' height='14px' />;
+
+// Troubleshoot Events tab view modes. 'all' = every event row; 'grouped' folds
+// same-subject incident children under their leader (#34655); 'unique' collapses
+// to one row per fingerprint (same table, fed from a fingerprint-level grouping
+// query so its count matches the briefing's "Issues you could see").
+const VIEW_MODE_OPTIONS = [
+  {
+    value: 'all',
+    label: 'All',
+    tooltip: 'One row per event. The same alert firing repeatedly shows a row each time.',
+  },
+  {
+    value: 'grouped',
+    label: 'Grouped',
+    tooltip:
+      'Related alerts on one subject at the same time folded under a single leading event (e.g. OOMKilled + CrashLoopBackOff on the same pod → one row).',
+  },
+  {
+    value: 'unique',
+    label: 'Unique',
+    tooltip: 'One row per distinct issue — repeat firings collapsed by fingerprint. Matches the “Issues you could see” count above.',
+  },
+];
+
+// 'unique' view: group by fingerprint only (tenant_id/account_id never split a
+// fingerprint), so COUNT(DISTINCT ...) equals the briefing's DISTINCT-fingerprint
+// count. Do NOT add source/aggregation_key to the key — they vary within a
+// fingerprint and would inflate the count; read aggregation_key from
+// distinct_aggregation_key instead. The grouping engine only returns columns
+// that are in the group key or an aggregate (latest_/distinct_/count_/max_).
+const UNIQUE_GROUP_BY = ['tenant_id', 'account_id', 'fingerprint'];
+const UNIQUE_COLS = [
+  'tenant_id',
+  'account_id',
+  'fingerprint',
+  'distinct_aggregation_key',
+  'latest_event_id',
+  'latest_title',
+  'latest_computed_priority',
+  'latest_computed_score',
+  'latest_score_factors',
+  'latest_score_confidence',
+  'latest_nb_status',
+  'latest_snoozed_until',
+  'distinct_status',
+  'distinct_priority',
+  'distinct_subject_name',
+  'distinct_subject_namespace',
+  'count_subject_name',
+  'max_created_at',
+  'fingerprint_first_seen_at',
+  'is_new_issue',
+];
+const UNIQUE_SORT_MAP = { computed_score: 'latest_computed_score', created_at: 'max_created_at', starts_at: 'max_created_at' };
+const SEVERITY_RANK = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'DEBUG', 'INFO'];
+
+const asJsonArray = (value) => {
+  if (Array.isArray(value)) {
+    return value;
+  }
+  const parsed = safeJSONParse(value);
+  return Array.isArray(parsed) ? parsed : [];
+};
+const firstOfJson = (value) => asJsonArray(value)[0];
+const highestSeverity = (value) => {
+  const arr = asJsonArray(value);
+  return SEVERITY_RANK.find((s) => arr.includes(s)) ?? arr[0];
+};
+
+// One fingerprint-grouped row -> the flat event shape buildRowData expects.
+// Fields that vary within a fingerprint show the latest occurrence, or a
+// "N workloads" summary when the fingerprint spans several subjects.
+const mapUniqueRowToEvent = (g) => {
+  const multiSubject = (g.count_subject_name || 0) > 1;
+  const statusArr = asJsonArray(g.distinct_status);
+  return {
+    id: g.latest_event_id,
+    account_id: g.account_id,
+    fingerprint: g.fingerprint,
+    title: g.latest_title,
+    aggregation_key: firstOfJson(g.distinct_aggregation_key),
+    priority: highestSeverity(g.distinct_priority),
+    computed_priority: g.latest_computed_priority,
+    computed_score: g.latest_computed_score,
+    score_factors: g.latest_score_factors,
+    score_confidence: g.latest_score_confidence,
+    nb_status: g.latest_nb_status,
+    snoozed_until: g.latest_snoozed_until,
+    status: statusArr.includes('FIRING') ? 'FIRING' : statusArr.includes('CLOSED') ? 'CLOSED' : statusArr[0],
+    created_at: g.max_created_at,
+    starts_at: g.max_created_at,
+    subject_name: multiSubject ? `${g.count_subject_name} workloads` : firstOfJson(g.distinct_subject_name),
+    subject_namespace: multiSubject ? undefined : firstOfJson(g.distinct_subject_namespace),
+    is_new_issue: g.is_new_issue,
+    fingerprint_first_seen_at: g.fingerprint_first_seen_at,
+    incident_member_count: 0,
+  };
+};
 const NB_STATUS_FILTER = [
   { value: 'OPEN', label: 'Open' },
   { value: 'ACTION_REQUIRED', label: 'Action Required' },
@@ -243,6 +356,9 @@ const KubernetesEventsTable = ({
   hideScopeFilters = false,
   isTroubleshootPage = false,
   showEventTypeColumn = false,
+  // Members view (#34655): only events linked under this leader — used by the
+  // Triage Inbox 'Grouped Alerts' drill-down.
+  incidentLeaderId = '',
 }) => {
   const router = useRouter();
 
@@ -291,10 +407,12 @@ const KubernetesEventsTable = ({
     const endTime = getValidParam(router.query.end_time);
 
     if (startTime && endTime) {
-      return {
-        startDate: parseInt(startTime),
-        endDate: parseInt(endTime),
-      };
+      const urlShortcut = Number(getValidParam(router.query.time_shortcut));
+      if (!isTroubleshootPage && Number.isFinite(urlShortcut) && KNOWN_SHORTCUT_DURATIONS_MS.has(urlShortcut)) {
+        const now = Date.now();
+        return { startDate: now - urlShortcut, endDate: now, shortcutClickTime: urlShortcut };
+      }
+      return { startDate: parseInt(startTime), endDate: parseInt(endTime) };
     } else if (defaultQuery?.startTime && defaultQuery?.endTime) {
       return { startDate: defaultQuery.startTime, endDate: defaultQuery.endTime };
     }
@@ -314,7 +432,7 @@ const KubernetesEventsTable = ({
     ) {
       return { startDate: persisted.startDate, endDate: persisted.endDate };
     }
-    return { startDate: getLast24Hrs().getTime(), endDate: new Date().getTime() };
+    return { startDate: getLast24Hrs().getTime(), endDate: new Date().getTime(), shortcutClickTime: 24 * 60 * 60 * 1000 };
   };
 
   const getInitialAggregationKey = () => {
@@ -364,8 +482,9 @@ const KubernetesEventsTable = ({
       {
         name: 'Triage Score',
         width: '10%',
+        minWidth: 175,
         align: 'left',
-        info: "Triage Score is NudgeBee's context-aware triage score/level, computed using multiple signals beyond raw thresholds such as service criticality, customer/user impact, recurrence frequency, dependency (upstream/downstream) blast radius, and the nature of the service/workload.",
+        info: TRIAGE_SCORE_INFO,
       },
       {
         name: 'Alert Status',
@@ -472,6 +591,12 @@ const KubernetesEventsTable = ({
   const [selectedNbStatus, setSelectedNbStatus] = useState([]);
   const [selectedSortBy, setSelectedSortBy] = useState(() => getValidParam(router.query.sortBy) || persisted?.sortBy || 'created_at');
   const [selectedIssueType, setSelectedIssueType] = useState(() => getValidParam(router.query.issueType) || persisted?.issueType || 'all');
+  // Events view mode: 'all' | 'grouped' | 'unique'. Default 'all'. Seeded from
+  // ?eventsView so the briefing "Issues you could see" tile can deep-link
+  // straight to 'unique' without leaving the Events tab. 'grouped' folds
+  // same-subject incident children (#34655); 'unique' keeps this same table but
+  // feeds it one row per fingerprint (see the fetch branch in listEvents).
+  const [viewMode, setViewMode] = useState(() => (['grouped', 'unique'].includes(router.query.eventsView) ? router.query.eventsView : 'all'));
 
   // UI Toggles & Popups
   const [isTicketCreateFormOpen, setIsTicketCreateFormOpen] = useState(false);
@@ -481,6 +606,7 @@ const KubernetesEventsTable = ({
   const [isTrendChartLoading, setIsTrendChartLoading] = useState(false);
   const [selectedEvent, setSelectedEvent] = useState({});
   const [isClassifyModalOpen, setIsClassifyModalOpen] = useState(false);
+  const [dateDisplayNonce, setDateDisplayNonce] = useState(0);
 
   // --- Hooks ---
 
@@ -636,6 +762,14 @@ const KubernetesEventsTable = ({
           info: item?.info,
           infoPlacement: item?.infoPlacement,
           component: item?.component,
+          // `truncate` and `align` have to survive this remap: they're what makes the
+          // table clamp a cell to its own column. Dropping them let a long alert title
+          // render at full width and paint over the Triage Score column beside it.
+          ...(item?.truncate && { truncate: item.truncate }),
+          ...(item?.align && { align: item.align }),
+          ...(item?.size && { size: item.size }),
+          ...(item?.minWidth !== undefined && { minWidth: item.minWidth }),
+          ...(item?.maxWidth !== undefined && { maxWidth: item.maxWidth }),
           ...(item?.mandatory && { mandatory: item.mandatory }),
           ...(item?.defaultVisible !== undefined && { defaultVisible: item.defaultVisible }),
         };
@@ -646,6 +780,9 @@ const KubernetesEventsTable = ({
 
   const rawEventsRef = useRef([]);
   const ticketReferenceMapRef = useRef(new Map());
+  // event id -> the display name of whoever manually closed it, prefetched in
+  // listEvents' non-blocking second pass for the current page's Closed rows.
+  const closedByMapRef = useRef(new Map());
   const buildRowDataRef = useRef(null);
   // Sequence guards so a slow, superseded request can't overwrite state set by a
   // later, faster one (e.g. rapid filter changes firing overlapping API calls).
@@ -824,6 +961,9 @@ const KubernetesEventsTable = ({
 
   const getMenuItems = (item, disableTicket) => {
     const canCreateTicket = canCreateTicketFor(item);
+    // Close/Open lives on the Alert Status badge's own dropdown (AlertStatusBadge),
+    // not here — matching how Triage Status exposes its transitions on the badge
+    // rather than in this overflow menu.
     let MENU_ITEMS;
     if (hasWriteAccess(item.account_id)) {
       MENU_ITEMS = [
@@ -888,6 +1028,32 @@ const KubernetesEventsTable = ({
     }
   };
 
+  const handleToggleEventStatus = async (eventId, newStatus, details) => {
+    try {
+      await k8sApi.updateEventStatus(eventId, newStatus, details);
+      rawEventsRef.current = rawEventsRef.current.map((e) => (e.id === eventId ? { ...e, status: newStatus } : e));
+      if (newStatus === 'CLOSED') {
+        const closerName = getUserSession()?.user?.name || getUserSession()?.user?.email;
+        if (closerName) {
+          closedByMapRef.current.set(eventId, {
+            name: closerName,
+            reasonCode: details?.reasonCode,
+            reasonText: details?.reasonText,
+            evidenceUrl: details?.evidenceUrl,
+          });
+        }
+      } else {
+        closedByMapRef.current.delete(eventId);
+      }
+      if (buildRowDataRef.current) {
+        setData(buildRowDataRef.current(rawEventsRef.current, ticketReferenceMapRef.current));
+      }
+      snackbar.success(newStatus === 'CLOSED' ? 'Event closed' : 'Event opened');
+    } catch (_error) {
+      snackbar.error(newStatus === 'CLOSED' ? 'Failed to close event' : 'Failed to open event');
+    }
+  };
+
   const handleTicketSuccess = ({ ticketId, url } = {}) => {
     const fingerprint = ticketData?.fingerprint;
     if (!fingerprint || !buildRowDataRef.current) return;
@@ -931,7 +1097,15 @@ const KubernetesEventsTable = ({
       shortcutClickTime: passedSelectedDateTime.shortcutClickTime ?? 0,
     };
     setSelectedDateRange(next);
-    applyFiltersOnRouter(router, { start_time: passedSelectedDateTime.startTime, end_time: passedSelectedDateTime.endTime });
+    // A filter-less table is embedded (row drill-down): its picker scopes only
+    // its own list. start_time/end_time in the URL are the page's scope — the
+    // Troubleshoot sub-tab remount key and the briefing both follow them.
+    if (!enableFilters) return;
+    applyFiltersOnRouter(router, {
+      start_time: passedSelectedDateTime.startTime,
+      end_time: passedSelectedDateTime.endTime,
+      time_shortcut: isTroubleshootPage ? undefined : next.shortcutClickTime || undefined,
+    });
     // Persist the shortcut duration when known so we can rehydrate as a relative
     // range. For a custom range (shortcutClickTime = 0) persist the absolute
     // bounds; getInitialTime() ignores them once they're > 30 days old.
@@ -954,6 +1128,7 @@ const KubernetesEventsTable = ({
     if (!selectedAccountId.length && !isTroubleshootPage) {
       return;
     }
+    const uniqueView = viewMode === 'unique' && isTroubleshootPage;
     const requestId = ++eventsRequestIdRef.current;
     setData([]);
     setTotalCount(0);
@@ -969,9 +1144,19 @@ const KubernetesEventsTable = ({
       query = { ...query, ...defaultQuery };
     }
     if (isK8sFilterVisible) {
+      // Clearing a filter must drop the key from the query (#34105) — but only for keys
+      // that the filter state actually owns. defaultQuery is mirrored into that state
+      // under camelCase aliases only (namespace / workloadName / subjectName /
+      // aggregation_key), so a caller passing the raw snake_case subject_name /
+      // subject_namespace scope (Pod Details, drill-down tables) left the selections
+      // empty and had its scope deleted here — showing every account event instead.
+      const scopedByCaller = (key) => {
+        const scope = defaultQuery?.[key];
+        return Array.isArray(scope) ? scope.length > 0 : Boolean(scope);
+      };
       if (selectedNamespace) {
         query.subject_namespace = selectedNamespace;
-      } else {
+      } else if (!scopedByCaller('subject_namespace')) {
         delete query.subject_namespace;
       }
       if (selectedAggregationKey?.length > 0) {
@@ -981,7 +1166,7 @@ const KubernetesEventsTable = ({
       }
       if (selectedWorkload) {
         query.subject_name = selectedWorkload;
-      } else {
+      } else if (!scopedByCaller('subject_name')) {
         delete query.subject_name;
       }
     }
@@ -1006,15 +1191,16 @@ const KubernetesEventsTable = ({
     if (selectedSource && selectedSource.length > 0) {
       query.source = selectedSource?.map((e) => e.value);
     }
+    const effectiveRange = resolveEffectiveRange(selectedDateRange);
     if (defaultQuery.startDate) {
       query.startDate = new Date(defaultQuery.startDate);
-    } else if (selectedDateRange?.startDate) {
-      query.startDate = new Date(selectedDateRange.startDate);
+    } else if (effectiveRange.startDate) {
+      query.startDate = new Date(effectiveRange.startDate);
     }
     if (defaultQuery.endDate) {
       query.endDate = new Date(defaultQuery.endDate);
-    } else if (selectedDateRange?.endDate) {
-      query.endDate = new Date(selectedDateRange.endDate);
+    } else if (effectiveRange.endDate) {
+      query.endDate = new Date(effectiveRange.endDate);
     }
     if (resource_ids.length) {
       query.resource_ids = resource_ids;
@@ -1051,6 +1237,29 @@ const KubernetesEventsTable = ({
     // Dashboard-only: hide low-signal config-change records from the Events list.
     if (isTroubleshootPage) {
       query.aggregation_key_nin = EXCLUDED_TRIAGE_AGGREGATION_KEYS;
+    }
+    // Same-subject incident grouping (#34655): members drill-down (children of
+    // one leader) or the default list (children folded unless toggled visible).
+    // Folding applies only to the TOP-LEVEL lists — embedded usages (row
+    // drill-downs scoped by fingerprint, filter-less nested tables) must show
+    // every event or a drill-down whose events are group children renders
+    // empty.
+    const embedded = !enableFilters || Boolean(defaultQuery?.fingerprint);
+    if (incidentLeaderId) {
+      // Group membership is absolute: drop every inherited filter (the page
+      // URL leaks eventAggregationKey/priority/etc. into this component's
+      // state, which would silently hide members that don't match the page's
+      // current filter — leaving the "+7" chip disagreeing with a 3-row list).
+      query = {
+        incident_leader_id: incidentLeaderId,
+        account_id: query.account_id,
+        startDate: query.startDate,
+        endDate: query.endDate,
+        sort_by: 'starts_at',
+        sort_order: 'asc',
+      };
+    } else if (!embedded && viewMode === 'grouped') {
+      query.hide_incident_children = true;
     }
     setLoading(true);
 
@@ -1127,13 +1336,13 @@ const KubernetesEventsTable = ({
                     >
                       <span>
                         <Chip variant='tag' tone='warning' size='xs' data-testid='incident-leader-chip'>
-                          +{item.incident_member_count} SAME INCIDENT
+                          +{item.incident_member_count} GROUPED
                         </Chip>
                       </span>
                     </Tooltip>
                   )}
                   {item.incident_leader_id && (
-                    <Tooltip title='Part of an incident on this subject — click to open the leading event'>
+                    <Tooltip title='Part of an alert group on this subject — click to open the leading event'>
                       <span
                         style={{ cursor: 'pointer' }}
                         onClick={(e) => {
@@ -1162,7 +1371,9 @@ const KubernetesEventsTable = ({
             component: ClusterNameWithRegion({
               name: item.title,
               hideIcon: true,
-              smallScreenWidth: ds.space.mul(0, 60),
+              // No `smallScreenWidth`: the Message column is already percentage-sized by the
+              // table, so pinning it to a fixed 120px under 1100px only squeezed the copy into
+              // a sliver while the cell around it stayed wide.
               maxWidth: '100%',
               showAutoEllipsis: true,
               lineClamp: 3,
@@ -1228,10 +1439,15 @@ const KubernetesEventsTable = ({
                   alignItems: 'center',
                 }}
               >
-                <Label
-                  margin='0'
-                  text={item.status === 'FIRING' ? 'Open' : item.status === 'CLOSED' ? 'Closed' : item.status}
-                  variant={item.status === 'FIRING' ? 'red' : item.status === 'CLOSED' ? 'grey' : ''}
+                <AlertStatusBadge
+                  eventId={item.id}
+                  status={item.status}
+                  canToggle={hasWriteAccess(item.account_id)}
+                  closedByName={closedByMapRef.current.get(item.id)?.name}
+                  closedReasonCode={closedByMapRef.current.get(item.id)?.reasonCode}
+                  closedReasonText={closedByMapRef.current.get(item.id)?.reasonText}
+                  closedEvidenceUrl={closedByMapRef.current.get(item.id)?.evidenceUrl}
+                  onToggle={handleToggleEventStatus}
                 />
               </Box>
             ),
@@ -1280,6 +1496,12 @@ const KubernetesEventsTable = ({
             });
           }
         }
+        if (headersSet.has('Source')) {
+          row.push({
+            text: <Text showAutoEllipsis value={titleCaseForAggregationKey(item.source || '')} />,
+            data: item.source,
+          });
+        }
         if (headersSet.has('Triage Status')) {
           row.push({
             component: (
@@ -1319,9 +1541,9 @@ const KubernetesEventsTable = ({
                 size='xs'
                 trailingAccent={<FiArrowRight />}
                 href={`/investigate?id=${item.id}&accountId=${item.account_id}`}
-                data-testid='investigate-btn'
+                data-testid={item.is_investigated ? 'view-analysis-btn' : 'investigate-btn'}
               >
-                Investigate
+                {item.is_investigated ? 'View Analysis' : 'Investigate'}
               </DsButton>
               <ThreeDotsMenu
                 sx={{ ...action.primary }}
@@ -1339,20 +1561,88 @@ const KubernetesEventsTable = ({
 
     buildRowDataRef.current = buildRowData;
 
-    // Fire data query (onlyData skips count) and count query in parallel
-    const dataQuery = { ...query, onlyData: true };
-    const dataPromise = k8sApi.getK8sEvents(rowsPerPage, currentPage * rowsPerPage, dataQuery);
-    const countPromise = k8sApi.getK8sEventsCount(query);
+    // Fire data query (onlyData skips count) and count query in parallel. In
+    // 'unique' view both come from one fingerprint-level grouping request: rows
+    // grouped by fingerprint, count = COUNT(DISTINCT fingerprint).
+    let dataPromise;
+    let countPromise;
+    if (uniqueView) {
+      const uniqueQuery = {
+        account_id: query.account_id,
+        start_date: query.startDate,
+        end_date: query.endDate,
+        aggregation_key: query.aggregation_key,
+        aggregation_key_nin: query.aggregation_key_nin,
+        subject_namespace: query.subject_namespace,
+        subject_name: query.subject_name,
+        subject_type: query.subject_type,
+        status: query.status,
+        priority: query.priority,
+        // getK8sEventGroupings maps nb_priority -> computed_priority (the Nubi rank),
+        // so briefing rank tiles (Ranked P1/P2/...) filter correctly in this view.
+        nb_priority: query.computed_priority,
+        source: query.source,
+        nb_status: query.nb_status,
+        is_new_issue: query.is_new_issue,
+      };
+      const groupingsPromise = k8sApi.getK8sEventGroupings(rowsPerPage, currentPage * rowsPerPage, uniqueQuery, UNIQUE_GROUP_BY, UNIQUE_COLS, {
+        name: UNIQUE_SORT_MAP[selectedSortBy] || 'max_created_at',
+        order: 'desc',
+      });
+      dataPromise = groupingsPromise.then((res) => ({
+        data: { events: (res?.data?.event_groupings || []).map(mapUniqueRowToEvent) },
+      }));
+      countPromise = groupingsPromise.then((res) => ({ count: res?.data?.event_groupings_aggregate?.aggregate?.count ?? 0 }));
+    } else {
+      const dataQuery = { ...query, onlyData: true };
+      dataPromise = k8sApi.getK8sEvents(rowsPerPage, currentPage * rowsPerPage, dataQuery);
+      countPromise = k8sApi.getK8sEventsCount(query);
+    }
 
-    // Data + tickets chain: once data arrives, fetch ticket summaries, then render
+    // Render rows as soon as events arrive; ticket badges are a non-blocking second pass.
     const dataAndTicketsPromise = dataPromise.then((res) => {
       if (requestId !== eventsRequestIdRef.current) return;
       const events = res.data?.events || [];
+      rawEventsRef.current = events;
+      ticketReferenceMapRef.current = new Map();
+      closedByMapRef.current = new Map();
+      setData(buildRowData(events, ticketReferenceMapRef.current));
+      setLoading(false);
+
       const uniqueReferenceIds = new Set();
       events.forEach((item) => {
-        uniqueReferenceIds.add(item.fingerprint);
+        if (item.fingerprint) uniqueReferenceIds.add(item.fingerprint);
       });
       const references = Array.from(uniqueReferenceIds);
+
+      // "Closed by" tooltip / reopen-dropdown data for the current page's Closed
+      // rows — batched in one call and independent of the tickets pass below, so
+      // neither hovering nor opening the badge ever waits on a request (see
+      // AlertStatusBadge).
+      const closedEventIds = events.filter((item) => item.status === 'CLOSED').map((item) => item.id);
+      if (closedEventIds.length) {
+        k8sApi
+          .getEventStatusChanges(closedEventIds)
+          .then((changes) => {
+            if (requestId !== eventsRequestIdRef.current) return;
+            const closedByMap = new Map();
+            (changes || []).forEach((change) => {
+              if (change.event_id && change.changed_by_name) {
+                closedByMap.set(change.event_id, {
+                  name: change.changed_by_name,
+                  reasonCode: change.reason_code,
+                  reasonText: change.reason_text,
+                  evidenceUrl: change.evidence_url,
+                });
+              }
+            });
+            closedByMapRef.current = closedByMap;
+            setData(buildRowData(events, ticketReferenceMapRef.current));
+          })
+          .catch(() => {
+            // Non-critical: the tooltip just falls back to plain "Closed".
+          });
+      }
 
       return ticketsApi.listTicketsSummary({ reference_id: references }).then((ticketRes) => {
         if (requestId !== eventsRequestIdRef.current) return;
@@ -1360,11 +1650,8 @@ const KubernetesEventsTable = ({
         ticketRes?.data?.tickets?.forEach((element) => {
           ticketReferenceMap.set(element.reference_id, element);
         });
-        rawEventsRef.current = events;
         ticketReferenceMapRef.current = ticketReferenceMap;
-        const data = buildRowData(events, ticketReferenceMap);
-        setData(data);
-        setLoading(false);
+        setData(buildRowData(events, ticketReferenceMap));
       });
     });
 
@@ -1405,6 +1692,8 @@ const KubernetesEventsTable = ({
     selectedNbStatus,
     selectedSortBy,
     selectedIssueType,
+    viewMode,
+    incidentLeaderId,
     appliedSearchByLabel,
     appliedSearchByMessage,
   ]);
@@ -1581,6 +1870,7 @@ const KubernetesEventsTable = ({
             <Box sx={{ display: 'flex', alignItems: 'center', gap: ds.space[2] }}>
               {showTimeFilter && !hideScopeFilters && (
                 <CustomDateTimeRangePicker
+                  key={dateDisplayNonce}
                   passedSelectedDateTime={{
                     startTime: selectedDateRange.startDate,
                     endTime: selectedDateRange.endDate,
@@ -1588,6 +1878,26 @@ const KubernetesEventsTable = ({
                   }}
                   minDate={new Date(new Date().getFullYear(), new Date().getMonth() - 6, 1)}
                   onChange={({ selection }) => handleDateRangeChange(selection)}
+                />
+              )}
+              {enableFilters && isTroubleshootPage && (
+                <ToggleGroup
+                  id='events-view-mode'
+                  selection='single'
+                  size='sm'
+                  ariaLabel='Events view'
+                  value={viewMode}
+                  onChange={setViewMode}
+                  options={VIEW_MODE_OPTIONS}
+                />
+              )}
+              {enableFilters && !isTroubleshootPage && (
+                <DsSwitch
+                  id='showGroupedChildren'
+                  label='Grouped'
+                  size='sm'
+                  checked={viewMode === 'grouped'}
+                  onChange={(_e, checked) => setViewMode(checked ? 'grouped' : 'all')}
                 />
               )}
               <DsSwitch id='showTrend' label='Show Trend' size='sm' checked={showTrendChart} onChange={(_e, checked) => setShowTrendChart(checked)} />
@@ -1610,7 +1920,10 @@ const KubernetesEventsTable = ({
                 aria-label='Refresh'
                 tooltip='Refresh'
                 id='all-events-refresh'
-                onClick={() => listEvents()}
+                onClick={() => {
+                  setSelectedDateRange((prev) => ({ ...prev, ...resolveEffectiveRange(prev) }));
+                  setDateDisplayNonce((n) => n + 1);
+                }}
                 loading={loading}
               />
             </Box>
@@ -1778,7 +2091,7 @@ const KubernetesEventsTable = ({
               {isTroubleshootPage && !disabledFilters.includes('nubiRank') && (
                 <FilterDropdown
                   id='filter-nubi-rank'
-                  label='Nubi Rank'
+                  label='Triage Priority'
                   options={nubiRankFilter}
                   value={selectedNubiRank}
                   onSelect={onNubiRankFilterChange}
@@ -1867,6 +2180,7 @@ const KubernetesEventsTable = ({
 
 KubernetesEventsTable.propTypes = {
   accountId: PropTypes.string,
+  incidentLeaderId: PropTypes.string,
   recordsPerPage: PropTypes.number,
   defaultQuery: PropTypes.object,
   enableFilters: PropTypes.bool,

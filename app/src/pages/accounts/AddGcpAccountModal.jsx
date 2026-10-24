@@ -1,22 +1,12 @@
-import {
-  Grid,
-  Typography,
-  Stepper,
-  Step,
-  StepLabel,
-  StepConnector,
-  stepConnectorClasses,
-  styled,
-  Box,
-  Collapse,
-  Alert,
-  Tab,
-  Tabs,
-} from '@mui/material';
+import { Grid, Typography, Box } from '@mui/material';
+import Tabs from '@shared/navigation/Tabs';
+import { CollapsableCard } from '@ui/CollapsableCard';
 import { Chip } from '@ui/Chip';
+import { Stepper } from '@ui/Stepper';
 import { Checkbox } from '@ui/Checkbox';
 import { Input } from '@ui/Input';
-import { ContentCopy, CheckCircleOutline, Check, HelpOutline, ExpandMore, ExpandLess, InfoOutlined, Search, ErrorOutline } from '@mui/icons-material';
+import { getBrandTitle } from '@hooks/useTenantBranding';
+import { ContentCopy, CheckCircleOutline, HelpOutline, Search } from '@mui/icons-material';
 import { useState, useMemo, useEffect, useRef } from 'react';
 import apiAccount from '@api1/account';
 import apiIntegrations from '@api1/integrations';
@@ -32,53 +22,7 @@ import MarkDowns from '@shared/viewers/MarkDowns';
 import ValidationResultBanner from '@components/accounts/ValidationResultBanner';
 import AccountEnvToggle, { DEFAULT_ACCOUNT_ENV } from '@shared/forms/AccountEnvToggle';
 import { ds } from 'src/utils/colors';
-
-const StepConnectorStyled = styled(StepConnector)(() => ({
-  [`&.${stepConnectorClasses.alternativeLabel}`]: {
-    top: ds.space.mul(1, 5),
-    left: `calc(-50% + ${ds.space[4]})`,
-    right: `calc(50% + ${ds.space[4]})`,
-  },
-  [`&.${stepConnectorClasses.active}, &.${stepConnectorClasses.completed}`]: {
-    [`& .${stepConnectorClasses.line}`]: {
-      borderColor: ds.green[500],
-      borderTopWidth: 2,
-    },
-  },
-  [`& .${stepConnectorClasses.line}`]: {
-    borderColor: ds.brand[200],
-    borderTopWidth: 1,
-    borderRadius: ds.radius.sm,
-  },
-}));
-
-const StepIconCustom = ({ active, completed, icon }) => {
-  const styles = completed
-    ? { backgroundColor: ds.green[400], border: 'none', color: ds.background[100] }
-    : {
-        backgroundColor: ds.background[100],
-        border: active ? `1px solid ${ds.green[500]}` : `1px solid ${ds.gray[300]}`,
-        color: active ? ds.green[500] : ds.gray[600],
-      };
-
-  return (
-    <Box
-      sx={{
-        width: ds.space[5],
-        height: ds.space[5],
-        borderRadius: ds.radius.pill,
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        fontSize: ds.text.bodyLg,
-        fontWeight: 'bold',
-        ...styles,
-      }}
-    >
-      {completed ? <Check sx={{ fontSize: ds.text.title }} /> : icon}
-    </Box>
-  );
-};
+import { getIntegrationDescription } from '@lib/integrationDescriptions';
 
 const SETUP_GUIDE_CONTENT = `### Prerequisites
 
@@ -101,14 +45,21 @@ Grant the service account the **Viewer** role (or a custom role with read permis
 [Open GCP Service Accounts Console](https://console.cloud.google.com/iam-admin/serviceaccounts)
 `;
 
-const WEBHOOK_MANUAL_INSTRUCTIONS = `### Manual Webhook Setup
+const webhookManualInstructions = () => `### Manual Webhook Setup
 1. Copy the **Webhook URL** below
 2. Go to **GCP Console** → **Monitoring** → **Notification channels**
 3. Click **Add new** → **Webhook** → paste the URL
 4. Attach the notification channel to your alert policies
-5. Alerts will be delivered to Nudgebee in real-time`;
+5. Alerts will be delivered to ${getBrandTitle()} in real-time`;
 
 const STEPS = ['Service Account', 'Projects', 'Billing'];
+
+const PROJECT_TAB_OPTIONS = {
+  tabOptions: [
+    { value: 0, text: 'Auto-Discover' },
+    { value: 1, text: 'Manual Entry' },
+  ],
+};
 
 const AddGcpAccountModal = ({ open, onClose }) => {
   // Step 1: Service Account
@@ -119,7 +70,6 @@ const AddGcpAccountModal = ({ open, onClose }) => {
   const [validationError, setValidationError] = useState({});
   const [isValidating, setIsValidating] = useState(false);
   const [validationResult, setValidationResult] = useState(null);
-  const [guideExpanded, setGuideExpanded] = useState(false);
 
   // Step 2: Projects
   const [projectTab, setProjectTab] = useState(0);
@@ -159,7 +109,6 @@ const AddGcpAccountModal = ({ open, onClose }) => {
     setValidationError({});
     setIsValidating(false);
     setValidationResult(null);
-    setGuideExpanded(false);
     setProjectTab(0);
     setDiscoveredProjects([]);
     setSelectedProjectIds(new Set());
@@ -457,26 +406,6 @@ const AddGcpAccountModal = ({ open, onClose }) => {
         }
       }
 
-      // TODO: Re-enable Pub/Sub onboarding after testing
-      // Fetch Pub/Sub deployment URL for parent account
-      // if (result?.parent_id) {
-      //   setIsFetchingDeployUrl(true);
-      //   try {
-      //     const deployRes = await apiKubernetes1.getGcpDeploymentManagerURL(result.parent_id);
-      //     const deployData = deployRes?.data?.data?.gcp_get_onboard_pubsub_url;
-      //     if (deployData?.deployment_manager_url) {
-      //       setDeploymentManagerUrl(deployData.deployment_manager_url);
-      //       setExternalId(deployData.external_id);
-      //       setPubsubProjectId(deployData.pubsub_project_id || '');
-      //       setSubscriptionName(deployData.subscription_name || '');
-      //     }
-      //   } catch (error) {
-      //     console.error('Failed to fetch GCP Deployment Manager URL:', error);
-      //   } finally {
-      //     setIsFetchingDeployUrl(false);
-      //   }
-      // }
-
       handleCloseModal(true);
     } catch (error) {
       snackbar.error('Failed to onboard GCP projects.');
@@ -496,26 +425,17 @@ const AddGcpAccountModal = ({ open, onClose }) => {
   // ──── Render ────
 
   return (
-    <Modal width='md' open={open} handleClose={isLoading ? () => {} : () => handleCloseModal(step === 3)} title='Add GCP Account' loader={isLoading}>
-      <Stepper activeStep={step} alternativeLabel connector={<StepConnectorStyled />} sx={{ mb: ds.space[5], mt: ds.space[4] }}>
-        {STEPS.map((label, idx) => (
-          <Step key={label} completed={step > idx}>
-            <StepLabel
-              StepIconComponent={StepIconCustom}
-              sx={{
-                '& .MuiStepLabel-label.MuiStepLabel-alternativeLabel': {
-                  fontSize: ds.text.body,
-                  marginTop: ds.space[2],
-                  color: step === idx ? ds.gray[700] : 'inherit',
-                  fontWeight: step === idx ? 500 : 'normal',
-                },
-              }}
-            >
-              {label}
-            </StepLabel>
-          </Step>
-        ))}
-      </Stepper>
+    <Modal
+      width='md'
+      open={open}
+      handleClose={isLoading ? () => {} : () => handleCloseModal(step === 3)}
+      title='Add GCP Account'
+      subtitle={getIntegrationDescription('GCP')}
+      loader={isLoading}
+    >
+      <Box sx={{ mb: ds.space[5], mt: ds.space[4] }}>
+        <Stepper steps={STEPS.map((label) => ({ id: label, label }))} current={step} orientation='horizontal' />
+      </Box>
 
       {isTourDemo && step > 0 && (
         <Banner
@@ -528,36 +448,21 @@ const AddGcpAccountModal = ({ open, onClose }) => {
       {/* ──── Step 1: Service Account ──── */}
       {step === 0 && (
         <>
-          <Box sx={{ mb: ds.space[2] }}>
-            <Box
-              role='button'
-              tabIndex={0}
-              sx={{ display: 'flex', alignItems: 'center', cursor: 'pointer', gap: ds.space[1], py: ds.space[2] }}
-              onClick={() => setGuideExpanded(!guideExpanded)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' || e.key === ' ') {
-                  e.preventDefault();
-                  setGuideExpanded(!guideExpanded);
-                }
-              }}
-            >
-              <HelpOutline sx={{ fontSize: 18, color: ds.gray[600] }} />
-              <Typography sx={{ fontSize: ds.text.body, color: ds.gray[600], fontWeight: ds.weight.medium }}>
-                Setup Guide — How to create a GCP service account
-              </Typography>
-              {guideExpanded ? <ExpandLess sx={{ fontSize: 18, color: ds.gray[600] }} /> : <ExpandMore sx={{ fontSize: 18, color: ds.gray[600] }} />}
-            </Box>
-            <Collapse in={guideExpanded}>
-              <Box
-                sx={{ mt: ds.space[2], p: ds.space[4], bgcolor: ds.background[200], borderRadius: ds.radius.lg, border: `1px solid ${ds.gray[300]}` }}
-              >
-                <MarkDowns
-                  data={SETUP_GUIDE_CONTENT}
-                  sx={{ maxHeight: ds.space.mul(1, 75), overflowY: 'auto', padding: '0px', borderRadius: '0px' }}
-                />
+          <CollapsableCard
+            defaultOpen={false}
+            elevation='flat'
+            sx={{ mb: ds.space[2] }}
+            header={
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: ds.space[1] }}>
+                <HelpOutline sx={{ fontSize: 18, color: ds.gray[600] }} />
+                <Typography sx={{ fontSize: ds.text.body, color: ds.gray[600], fontWeight: ds.weight.medium }}>
+                  Setup Guide — How to create a GCP service account
+                </Typography>
               </Box>
-            </Collapse>
-          </Box>
+            }
+          >
+            <MarkDowns data={SETUP_GUIDE_CONTENT} sx={{ maxHeight: ds.space.mul(1, 75), overflowY: 'auto', padding: '0px', borderRadius: '0px' }} />
+          </CollapsableCard>
 
           <Grid container>
             <Box sx={{ mt: ds.space[4], width: '100%' }}>
@@ -631,12 +536,12 @@ const AddGcpAccountModal = ({ open, onClose }) => {
 
           <Tabs
             value={projectTab}
-            onChange={(_, v) => setProjectTab(v)}
-            sx={{ mb: ds.space[4], minHeight: ds.space.mul(1, 9), '& .MuiTab-root': { minHeight: ds.space.mul(1, 9), py: ds.space[1] } }}
-          >
-            <Tab label='Auto-Discover' />
-            <Tab label='Manual Entry' />
-          </Tabs>
+            onChange={setProjectTab}
+            behavior='filter'
+            variant='secondary'
+            ariaLabel='Project selection method'
+            options={PROJECT_TAB_OPTIONS}
+          />
 
           {projectTab === 0 && (
             <>
@@ -657,9 +562,9 @@ const AddGcpAccountModal = ({ open, onClose }) => {
               </Box>
 
               {discoveryError && (
-                <Alert severity='warning' sx={{ mb: ds.space[4], '& .MuiAlert-message': { fontSize: ds.text.body } }}>
-                  {discoveryError}
-                </Alert>
+                <Box sx={{ mb: ds.space[4] }}>
+                  <Banner tone='warning' message={discoveryError} />
+                </Box>
               )}
 
               {discoveredProjects.length > 0 && (
@@ -776,14 +681,17 @@ const AddGcpAccountModal = ({ open, onClose }) => {
       {/* ──── Step 3: Billing ──── */}
       {step === 2 && (
         <>
-          <Alert
-            severity='info'
-            icon={<InfoOutlined sx={{ fontSize: 18 }} />}
-            sx={{ mb: ds.space[4], '& .MuiAlert-message': { fontSize: ds.text.body } }}
-          >
-            Billing data is typically exported to a central BigQuery table. This may be in a different project than your resource projects. Configure
-            this in GCP Console under Billing &rarr; Billing export.
-          </Alert>
+          <Box sx={{ mb: ds.space[4] }}>
+            <Banner
+              tone='info'
+              message={
+                <>
+                  Billing data is typically exported to a central BigQuery table. This may be in a different project than your resource projects.
+                  Configure this in GCP Console under Billing &rarr; Billing export.
+                </>
+              }
+            />
+          </Box>
 
           <Grid container>
             <Box sx={{ mt: ds.space[4], width: '100%' }}>
@@ -831,15 +739,16 @@ const AddGcpAccountModal = ({ open, onClose }) => {
           </Grid>
 
           {billingValidationResult && (
-            <Alert
-              severity={billingValidationResult.hasAccess ? 'success' : 'error'}
-              icon={billingValidationResult.hasAccess ? <CheckCircleOutline sx={{ fontSize: 18 }} /> : <ErrorOutline sx={{ fontSize: 18 }} />}
-              sx={{ mt: ds.space[2], mb: ds.space[2], '& .MuiAlert-message': { fontSize: ds.text.body } }}
-            >
-              {billingValidationResult.hasAccess
-                ? 'BigQuery billing table accessible.'
-                : billingValidationResult.errorDetail || 'Unable to access BigQuery billing data.'}
-            </Alert>
+            <Box sx={{ mt: ds.space[2], mb: ds.space[2] }}>
+              <Banner
+                tone={billingValidationResult.hasAccess ? 'success' : 'critical'}
+                message={
+                  billingValidationResult.hasAccess
+                    ? 'BigQuery billing table accessible.'
+                    : billingValidationResult.errorDetail || 'Unable to access BigQuery billing data.'
+                }
+              />
+            </Box>
           )}
 
           <Box
@@ -902,36 +811,51 @@ const AddGcpAccountModal = ({ open, onClose }) => {
           </Box>
 
           {onboardResults?.accounts?.some((a) => a.status === 'error') && (
-            <Alert severity='warning' sx={{ mt: ds.space[2], mb: ds.space[2], '& .MuiAlert-message': { fontSize: ds.text.body } }}>
-              <Typography variant='body2' sx={{ fontWeight: ds.weight.medium, mb: ds.space[1] }}>
-                Some projects failed:
-              </Typography>
-              {onboardResults.accounts
-                .filter((a) => a.status === 'error')
-                .map((a) => (
-                  <Typography key={a.project_id} variant='caption' display='block'>
-                    {a.project_id}: {a.error}
-                  </Typography>
-                ))}
-            </Alert>
+            <Box sx={{ mt: ds.space[2], mb: ds.space[2] }}>
+              <Banner
+                tone='warning'
+                message={
+                  <>
+                    <Typography variant='body2' sx={{ fontWeight: ds.weight.medium, mb: ds.space[1] }}>
+                      Some projects failed:
+                    </Typography>
+                    {onboardResults.accounts
+                      .filter((a) => a.status === 'error')
+                      .map((a) => (
+                        <Typography key={a.project_id} variant='caption' display='block'>
+                          {a.project_id}: {a.error}
+                        </Typography>
+                      ))}
+                  </>
+                }
+              />
+            </Box>
           )}
 
           {webhookSetupResult?.succeeded?.length > 0 && webhookSetupResult?.failed?.length === 0 && (
-            <Alert
-              severity='success'
-              icon={<CheckCircleOutline sx={{ fontSize: 18 }} />}
-              sx={{ mt: ds.space[2], mb: ds.space[4], '& .MuiAlert-message': { fontSize: ds.text.body } }}
-            >
-              Real-time alerts enabled for {webhookSetupResult.succeeded.length} project(s). Webhook notification channels have been created.
-            </Alert>
+            <Box sx={{ mt: ds.space[2], mb: ds.space[4] }}>
+              <Banner
+                tone='success'
+                message={
+                  <>Real-time alerts enabled for {webhookSetupResult.succeeded.length} project(s). Webhook notification channels have been created.</>
+                }
+              />
+            </Box>
           )}
 
           {webhookSetupResult?.failed?.length > 0 && (
-            <Alert severity='warning' sx={{ mt: ds.space[2], mb: ds.space[4], '& .MuiAlert-message': { fontSize: ds.text.body } }}>
-              {webhookSetupResult?.succeeded?.length > 0 ? `Alerts enabled for ${webhookSetupResult.succeeded.length} project(s). ` : ''}
-              Failed for {webhookSetupResult.failed.length}: {webhookSetupResult.failed.join(', ')}. You can set them up manually below or enable
-              later from the account menu.
-            </Alert>
+            <Box sx={{ mt: ds.space[2], mb: ds.space[4] }}>
+              <Banner
+                tone='warning'
+                message={
+                  <>
+                    {webhookSetupResult?.succeeded?.length > 0 ? `Alerts enabled for ${webhookSetupResult.succeeded.length} project(s). ` : ''}
+                    Failed for {webhookSetupResult.failed.length}: {webhookSetupResult.failed.join(', ')}. You can set them up manually below or
+                    enable later from the account menu.
+                  </>
+                }
+              />
+            </Box>
           )}
 
           {!webhookSetupResult && (
@@ -963,7 +887,7 @@ const AddGcpAccountModal = ({ open, onClose }) => {
                           succeeded.push(account.project_id);
                         } catch (err) {
                           failed.push(account.project_id);
-                          console.error(`Webhook setup failed for ${account.project_id}:`, err);
+                          console.error('Webhook setup failed', { projectId: account.project_id, err });
                         }
                       }
                       setWebhookSetupResult({ succeeded, failed });
@@ -983,14 +907,17 @@ const AddGcpAccountModal = ({ open, onClose }) => {
               )}
 
               {!webhookUrl && (
-                <Alert
-                  severity='info'
-                  icon={<InfoOutlined sx={{ fontSize: 18 }} />}
-                  sx={{ mt: ds.space[2], mb: ds.space[4], '& .MuiAlert-message': { fontSize: ds.text.body } }}
-                >
-                  Real-time alerts are not configured. Your account will use polling mode to detect alert changes. You can enable real-time alerts
-                  later from the account settings.
-                </Alert>
+                <Box sx={{ mt: ds.space[2], mb: ds.space[4] }}>
+                  <Banner
+                    tone='info'
+                    message={
+                      <>
+                        Real-time alerts are not configured. Your account will use polling mode to detect alert changes. You can enable real-time
+                        alerts later from the account settings.
+                      </>
+                    }
+                  />
+                </Box>
               )}
             </>
           )}
@@ -1015,7 +942,7 @@ const AddGcpAccountModal = ({ open, onClose }) => {
                   Manual Setup
                 </Typography>
               )}
-              <MarkDowns data={WEBHOOK_MANUAL_INSTRUCTIONS} sx={{ width: 'auto' }} />
+              <MarkDowns data={webhookManualInstructions()} sx={{ width: 'auto' }} />
 
               <Grid container mt={ds.space[2]} mb={ds.space[4]} spacing={ds.space[4]}>
                 <Grid item xs={12}>

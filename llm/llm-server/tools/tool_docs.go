@@ -82,6 +82,10 @@ func searchDocumentation(nbRequestContext core.NbToolContext, query string) (str
 		return "", nil, fmt.Errorf("query cannot be empty")
 	}
 
+	if nbRequestContext.KnowledgePolicy == "disabled" || nbRequestContext.KnowledgePolicy == "llm_only" {
+		return "No documentation found for your query. Please try a different search term.", nil, nil
+	}
+
 	var matchingDocs []schema.Document
 
 	// Try fetching from RAG. All indexed doc sources (user KBs, Confluence,
@@ -89,7 +93,10 @@ func searchDocumentation(nbRequestContext core.NbToolContext, query string) (str
 	// in rag-server, so this one call covers every searchable source. Falls
 	// back to live Confluence below when the index has zero hits.
 	var refs []string
-	document := core.QueryRAG(nbRequestContext.UserId, nbRequestContext.AccountId, query, "knowledge_base", 3, nbRequestContext.ConversationId, nbRequestContext.MessageId, nbRequestContext.ParentAgentId, true)
+	searchCtx, traceID := core.WithRetrievalTraceID(nbRequestContext.Ctx.GetContext())
+	document := core.QueryRAGCollection(searchCtx, nbRequestContext.UserId, nbRequestContext.AccountId, "", query, "knowledge_base", "", 3, nbRequestContext.ConversationId, nbRequestContext.MessageId, nbRequestContext.ParentAgentId, true)
+	document = core.JudgeKBResults(nbRequestContext.Ctx, nbRequestContext.AccountId, nbRequestContext.UserId,
+		nbRequestContext.ConversationId, nbRequestContext.MessageId, query, document, traceID)
 	if len(document) > 0 {
 		for _, doc := range document {
 			matchingDocs = append(matchingDocs, schema.Document{
@@ -176,8 +183,9 @@ func searchConfluence(query string, accountId string) (ConfluenceSearchResponse,
 	mode := confluenceAuthType(configs["auth_type"])
 	siteBase := confluenceSiteBase(host, mode)
 
-	escapedQuery := strings.ReplaceAll(url.QueryEscape(strings.ReplaceAll(query, `"`, `\"`)), "+", "%20")
-	searchUrl := fmt.Sprintf("%s/content/search?cql=text~%%22%s%%22&expand=body.view", confluenceAPIBase(host, mode), escapedQuery)
+	cql := fmt.Sprintf(`text~"%s"`, strings.ReplaceAll(query, `"`, `\"`)) + confluenceScopeCQL(configs["namespace"], configs["page_trees"])
+	escapedCQL := strings.ReplaceAll(url.QueryEscape(cql), "+", "%20")
+	searchUrl := fmt.Sprintf("%s/content/search?cql=%s&expand=body.view", confluenceAPIBase(host, mode), escapedCQL)
 
 	req, err := http.NewRequest("GET", searchUrl, nil)
 	if err != nil {

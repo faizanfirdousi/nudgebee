@@ -1,4 +1,5 @@
-import { Tooltip, Box, Typography, Grid } from '@mui/material';
+import { Box, Typography, Grid } from '@mui/material';
+import Tooltip from '@ui/Tooltip';
 import { Divider } from '@ui/Divider';
 import React, { useEffect, useState } from 'react';
 import OnDemandIcon from '@assets/on-demand-icon.svg';
@@ -29,7 +30,14 @@ const NodeList = ({ nodeData, showNodes }) => {
         open={nodesModal}
         handleClose={closeNodesModal}
         title={
-          <Box display={'flex'} alignItems={'center'} gap={ds.space.mul(0, 5)} fontSize={ds.text.title} fontWeight={600} color={ds.gray[700]}>
+          <Box
+            display={'flex'}
+            alignItems={'center'}
+            gap={ds.space.mul(0, 5)}
+            fontSize={ds.text.title}
+            fontWeight={ds.weight.semibold}
+            color={ds.gray[700]}
+          >
             Instances
           </Box>
         }
@@ -257,19 +265,19 @@ const ClusterNode = ({
             fontWeight: 'var(--ds-font-weight-semibold)',
           }}
         >
-          <Tooltip title='on-demand'>
+          <Tooltip title='on-demand' placement='bottom'>
             <Box>
               <SafeIcon src={OnDemandIcon} alt={'On Demand icon'} />
               {demand}
             </Box>
           </Tooltip>
-          <Tooltip title='fallback'>
+          <Tooltip title='fallback' placement='bottom'>
             <Box>
               <SafeIcon src={FallbackIcon} alt={'Fall Back icon'} />
               {fallback}
             </Box>
           </Tooltip>
-          <Tooltip title='spot'>
+          <Tooltip title='spot' placement='bottom'>
             <Box>
               <SafeIcon src={SpotIcon} alt={'Spot icon'} />
               {spot}

@@ -87,6 +87,7 @@ var SearchAliases = map[string][]string{
 
 	// Kubernetes
 	"k8s.cli":                    {"kubectl", "kubernetes", "k8s", "cluster"},
+	"k8s.profile":                {"profile", "profiler", "pprof", "flamegraph", "cpu profile", "heap profile", "memory profile"},
 	"k8s.vertical_rightsize":     {"vertical rightsize", "vpa", "cpu limits", "memory limits", "resize pod", "request limits"},
 	"k8s.horizontal_rightsize":   {"horizontal rightsize", "hpa", "replicas", "scale out", "scale in"},
 	"k8s.pv_rightsize":           {"pv rightsize", "persistent volume", "pvc", "storage resize", "disk"},
@@ -138,7 +139,8 @@ var SearchAliases = map[string][]string{
 	"scripting.run_script": {"script", "bash", "shell", "python", "run script", "command", "ssm", "run command"},
 
 	// Events
-	"events.store": {"store event", "audit", "record event", "save event", "log event"},
+	"events.store":        {"store event", "audit", "record event", "save event", "log event"},
+	"events.add_evidence": {"add evidence", "attach evidence", "evidence", "enrich event", "update event", "append evidence"},
 }
 
 // AliasesFor returns the search synonyms registered for a task, or nil when

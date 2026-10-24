@@ -121,6 +121,10 @@ type TicketFilter struct {
 type UpdateFields struct {
 	Status   string `json:"status,omitempty"`
 	Severity string `json:"severity,omitempty"`
+	// Impact and Urgency are ServiceNow's own inputs (severity is derived from them
+	// there), as 1/2/3 codes or High/Medium/Low.
+	Impact  string `json:"impact,omitempty"`
+	Urgency string `json:"urgency,omitempty"`
 	// Assignee is the legacy single-assignee field, still used by tickets.update.
 	Assignee string `json:"assignee,omitempty"`
 	// Assignees is the multi-assignee set used by tickets.assign. When set it
@@ -189,12 +193,16 @@ type ListParams struct {
 	SortOrder     string `json:"sort_order,omitempty"`     // "asc" or "desc" (default: "desc")
 }
 
-// ListResult is the normalized response from listing tickets.
+// ListResult is the normalized response from listing tickets. HasMore is the
+// authoritative "another page exists" signal; Total is 0 when the platform
+// cannot count the full result set cheaply (cursor-paged APIs), and only an
+// approximation on Jira Cloud until the last page is reached.
 type ListResult struct {
 	Tickets []Ticket `json:"tickets"`
 	Total   int      `json:"total"`
 	Limit   int      `json:"limit"`
 	Offset  int      `json:"offset"`
+	HasMore bool     `json:"has_more"`
 }
 
 // ListTicketsRequest is the request payload for the list tickets endpoint.

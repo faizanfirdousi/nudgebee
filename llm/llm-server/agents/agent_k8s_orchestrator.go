@@ -67,8 +67,8 @@ func newK8sOrchestratorAgent(accountId string) core.NBAgent {
 // search_skills) plus a short principle-level prompt (agent_k8s_lean). Every
 // specialist (databases, helm, cloud CLIs, …) is dropped from context and
 // reached on-demand via search_tools + delegate_agent. Everything else —
-// including the answer critique — runs through the same ReAct3 planner under
-// the standard gates.
+// including the answer critique — runs through the runtime-selected ReAct
+// planner under the standard gates.
 type K8sLeanAgent struct {
 	accountId string
 	// name is the handle this instance runs under. Currently always
@@ -84,11 +84,11 @@ func newK8sLeanAgentNamed(accountId, name string) *K8sLeanAgent {
 func (l *K8sLeanAgent) GetName() string { return l.name }
 
 func (l *K8sLeanAgent) GetNameAliases() []string {
-	return []string{"Debugger", "k8s_debug"}
+	return []string{"Kubernetes Troubleshooter", "Debugger", "k8s_debug"}
 }
 
 func (l *K8sLeanAgent) GetDescription() string {
-	return `Lean-loop SRE/DevOps troubleshooting orchestrator: minimal principle-level prompt, direct kubectl/helm, specialists reached on-demand via search_tools + delegate_agent.`
+	return `Lean-loop SRE/DevOps troubleshooting orchestrator: workspace-based Kubernetes reads and local analysis, approval-aware direct kubectl mutations, and specialists such as Helm reached on-demand via search_tools + delegate_agent.`
 }
 
 func (l *K8sLeanAgent) GetPlannerType() core.AgentPlannerType {
@@ -104,7 +104,7 @@ func (l *K8sLeanAgent) IsWatchCapable() bool { return true }
 
 // NB: no CritiqueEnabled() method on purpose — the orchestrator does not
 // implement NBAgentReActPlannerCritiqueSupport, so critique is governed by the
-// standard gate (LlmServerReActCritiqueEnabled && top-level && investigation).
+// standard gate (top-level && investigation).
 
 func (l *K8sLeanAgent) GetSupportedTools(ctx *security.RequestContext) []toolcore.NBTool {
 	// Reduced k8s core (kubectl_execute + logs/events/metrics/traces + SDG +
@@ -126,6 +126,9 @@ func (l *K8sLeanAgent) GetSystemPrompt(ctx *security.RequestContext, query core.
 	}
 	if nudge := memoryNudgeIfEnabled(); nudge != "" {
 		promptText += "\n\n" + nudge
+	}
+	if grounding := k8sGroundingIfEnabled(query); grounding != "" {
+		promptText += "\n\n" + grounding
 	}
 	return core.ParsePromptToNBAgentPrompt(promptText)
 }
@@ -248,12 +251,35 @@ func appendMemoryToolName(names []string) []string {
 // early. A tool description alone doesn't reliably drive call ordering (the model
 // reads it as "what the tool does", not "when to call it"), so the ordering hint
 // lives in the system prompt instead.
-const memoryToolNudge = "**Check memory first:** When investigating a named service, pod, or workload, call the `memory` tool with keywords (service/pod name + symptom) as an early step — before running live tools — to recall this user's known recurring patterns, past root causes, and preferences for that resource. Use relevant hits to focus the investigation; if nothing relevant returns, proceed normally. Call it at most once."
+const memoryToolNudge = "**Check memory early:** When investigating a named service, pod, or workload, call the `memory` tool at most once with keywords (service/pod name + symptom) to recall this user's known recurring patterns, past root causes, and preferences for that resource. When the memory input and grounding inputs are already known, issue memory alongside independent, non-conflicting live checks in the same batch. Wait for memory first only when its result is needed to construct the live checks. Use relevant hits to focus the investigation; if nothing relevant returns, proceed normally."
 
 // memoryNudgeIfEnabled returns the memory-first nudge when path B is on, else "".
 func memoryNudgeIfEnabled() string {
 	if config.Config.MemoryToolEnabled {
 		return memoryToolNudge
+	}
+	return ""
+}
+
+// k8sGroundingNudge is the "ground before you fan out" discipline. k8s_lean is the
+// only lean orchestrator missing the "start where the symptom shows" paragraph its
+// aws/gcp/azure siblings carry, and in practice the planner opens live-symptom
+// investigations by delegating a heavy metrics/logs sub-agent and blocking on it —
+// before running the cheap authoritative kubectl tools it already holds. This adds
+// two disciplines: (1) probe cheap-and-local first, then delegate scoped; (2) for a
+// hostname/URL symptom, resolve WHAT SERVES the host before assuming a workload, and
+// say so honestly when nothing in-cluster serves it (rather than diagnosing a
+// similarly-named workload — the observed "external marketing host → similarly-named
+// in-cluster dev host" subject swap). It scopes the investigation, never replaces it. Appended (not baked into k8s_lean.yaml)
+// so it stays behind OrchestratorGroundingEnabled for a clean A/B and cannot regress the shared
+// prompt when the flag is off.
+const k8sGroundingNudge = "**Ground before scoped investigation when the target is unknown.** For a live symptom — a CPU/memory surge, restarts, pending pods, a workload erroring right now — use the cheap authoritative tools you already hold: `kubectl top`/`get`/`describe` on the named workload and its recent `events`, issued together in one parallel batch. If the workload, namespace, symptom, and time window are already known, issue independent historical evidence calls (`metrics`, `logs`, or `traces`) alongside that live batch instead of waiting. If their inputs depend on what the live snapshot reveals, observe it first and then delegate with the resolved scope. When the symptom is a hostname or URL (e.g. an uptime/downtime alert), first resolve WHAT SERVES IT — `kubectl get ingress -A` (or the Service) for that host — before assuming a workload; if no in-cluster ingress serves that host, say so plainly (\"not served by this cluster\") rather than diagnosing a similarly-named workload. Grounding SCOPES the investigation; it never replaces it — a healthy live snapshot doesn't close a \"why did it happen\" question, so carry it through to the mechanism."
+
+// k8sGroundingIfEnabled returns the grounding discipline when the flag is on, else "".
+func k8sGroundingIfEnabled(query core.NBAgentRequest) string {
+	isTopLevel := query.ParentAgentId == "" || query.ParentAgentId == query.AgentId
+	if config.Config.OrchestratorGroundingEnabled && isTopLevel {
+		return k8sGroundingNudge
 	}
 	return ""
 }

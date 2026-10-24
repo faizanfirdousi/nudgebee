@@ -1,16 +1,30 @@
 /**
- * `redis`, `rabbitmq` and `postgresql` are command datasources: they run a
- * read-only command through the relay and tabulate its output. They return a
- * snapshot rather than a series, so those panels are always tables and ignore
+ * `redis`, `rabbitmq`, `postgresql` and `kubectl` are command datasources: they
+ * run a read-only command through the relay and tabulate its output. They return
+ * a snapshot rather than a series, so those panels are always tables and ignore
  * the time range.
  *
- * Each value is also the integration type looked up for the account, which is
- * why it is `postgresql` rather than `postgres`.
+ * The first three are also the integration type looked up for the account, which
+ * is why it is `postgresql` rather than `postgres`. `kubectl` has no integration
+ * — it runs against the account's own agent, so it is offered on Kubernetes
+ * accounts only.
  */
-export type PanelDatasource = 'metrics' | 'logs' | 'traces' | 'nudgebee' | 'redis' | 'rabbitmq' | 'postgresql';
-export type PanelType = 'timeseries' | 'stat' | 'table' | 'bar' | 'text';
+export type PanelDatasource = 'metrics' | 'logs' | 'traces' | 'nudgebee' | 'redis' | 'rabbitmq' | 'postgresql' | 'kubectl';
+export type PanelType = 'timeseries' | 'stat' | 'gauge' | 'table' | 'bar' | 'text';
 
-export const COMMAND_DATASOURCES: PanelDatasource[] = ['redis', 'rabbitmq', 'postgresql'];
+export const COMMAND_DATASOURCES: PanelDatasource[] = ['redis', 'rabbitmq', 'postgresql', 'kubectl'];
+
+/**
+ * What a kubectl panel's accounts must be: `AccountOption.kind`, which says what
+ * an account MANAGES — not `cloud_provider`, which says who runs it. A `vm`
+ * fleet also reaches an agent, and that agent has no kubectl.
+ */
+export const KUBERNETES_ACCOUNT_KIND = 'kubernetes';
+
+/** Panels on this datasource may only be scoped to Kubernetes accounts. */
+export function isKubernetesOnlyDatasource(datasource: PanelDatasource): boolean {
+  return datasource === 'kubectl';
+}
 
 export function isCommandDatasource(datasource: PanelDatasource): boolean {
   return COMMAND_DATASOURCES.includes(datasource);
@@ -40,8 +54,9 @@ export interface PanelTarget {
    */
   time_column?: string;
   /**
-   * Series naming, e.g. `{{route}}`. Not hand-editable — set by dashboard
-   * import, which is where a legend format realistically comes from.
+   * Series naming, e.g. `{{route}}`. Set by dashboard import, and editable in
+   * the panel editor once a metrics panel has more than one query — the point
+   * at which its lines need telling apart.
    */
   legend_format?: string;
   hide?: boolean;
@@ -111,6 +126,92 @@ export interface PanelTableOptions {
   hidden_columns?: string[];
 }
 
+/**
+ * The colours a threshold step may take.
+ *
+ * A NAME, not a value: a stored panel is rendered by every viewer in whatever
+ * theme they are on, so it carries the intent and the renderer resolves the
+ * design-system token — see panelThresholds.ts.
+ */
+export type PanelThresholdColor = 'red' | 'amber' | 'green' | 'blue';
+
+/** How a threshold compares: the value is above, at or above, below, or at or below it. */
+export type PanelThresholdOp = 'gt' | 'gte' | 'lt' | 'lte';
+
+/**
+ * Which number a threshold step is about, on a panel scoped to several accounts.
+ *
+ * - `shown` — the number the panel shows: the accounts' total, or one account's
+ *   figure when the view is narrowed to it. What every step meant before this
+ *   field existed, so an absent value reads as this.
+ * - `every` — each account's own figure, checked on its own; covers accounts a
+ *   type-scoped panel picks up later.
+ * - `account` — one account's figure, named by `account_id`.
+ */
+export type PanelThresholdAppliesTo = 'shown' | 'every' | 'account';
+
+/**
+ * One step of a panel's threshold scale: a colour for a value on one side of a
+ * line.
+ *
+ * Absolute only. A percentage step is read against a field's min and max, which
+ * a panel holding one aggregated number does not have — and a gauge's scale IS
+ * 0 to 100, so an absolute step already reads as a percentage there.
+ *
+ * There is no base step either: a value no step matches draws exactly as it
+ * always did, so a colour for that range would be stored config nothing ever
+ * renders.
+ */
+export interface PanelThresholdStep {
+  value: number;
+  color: PanelThresholdColor;
+  /** Absent means `gte` — Grafana's model, and every step written before this field. */
+  op?: PanelThresholdOp;
+  /** Absent means `shown`. */
+  applies_to?: PanelThresholdAppliesTo;
+  /** The account an `account` step is about. Ignored for the other two. */
+  account_id?: string;
+}
+
+/**
+ * `options` on a panel that evaluates thresholds — `stat` and `gauge`, the two
+ * that show ONE number and so have something unambiguous to compare.
+ */
+export interface PanelThresholdOptions {
+  /** Stored in whatever order they were authored; the renderer sorts. */
+  thresholds?: PanelThresholdStep[];
+}
+
+/**
+ * How a stat or gauge folds several accounts' figures into the one it shows.
+ *
+ * `sum` adds them — right for the `sum(...)` / `count(...)` a stat is usually
+ * written as. `avg` takes their mean — right for a ratio or a percentage, which
+ * is what a gauge's 0–100 dial reads, and which four clusters' figures added up
+ * would overshoot by roughly four times. Absent means the panel type's default:
+ * `avg` on a gauge, `sum` on a stat. A weighted average, when it comes, is a
+ * third value here rather than a new field.
+ */
+export type PanelCombine = 'sum' | 'avg';
+
+/** `options` on a `stat` or `gauge` panel: how its accounts are combined. */
+export interface PanelCombineOptions {
+  combine?: PanelCombine;
+}
+
+/**
+ * `options` on a traces or `nudgebee` table panel: which columns its "Filter by
+ * column" menu offers a viewer.
+ */
+export interface PanelFilterOptions {
+  /**
+   * Column names, in the order the menu lists them. Absent means every column
+   * the panel's table can be filtered by — what every panel offered before the
+   * author could choose. A name the table does not have is ignored.
+   */
+  filter_columns?: string[];
+}
+
 export interface Panel {
   id: number;
   title: string;
@@ -128,12 +229,35 @@ export interface Panel {
    */
   account_type?: string;
   account_ids?: string[];
+  /**
+   * Which observability backend this panel's expression is written for, on a
+   * metrics/logs/traces panel — `prometheus`, `ES`, `datadog`, …
+   *
+   * A panel holds ONE expression in ONE query language, but each account
+   * resolves its own provider server-side, so a panel spanning a Prometheus
+   * account and an Elasticsearch one can only ever be valid for one of them.
+   * Naming it here sends the provider on the query instead of letting each
+   * account fall back to its own default.
+   *
+   * Empty means "each account's own default" — what every panel written before
+   * this field did, and still does.
+   */
+  provider?: string;
+  /**
+   * The Elasticsearch index (or wildcard pattern) this panel queries, when its
+   * `provider` is ES.
+   *
+   * Empty means each account's own configured index — the per-account mapping,
+   * else the integration's top-level one — which is what every panel resolved
+   * before this field. Only meaningful alongside `provider`.
+   */
+  provider_index?: string;
   grid_pos: GridPos;
   targets?: PanelTarget[];
   unit?: string;
   /** Backs the `text` panel type. */
   content?: string;
-  options?: PanelTableOptions & Record<string, unknown>;
+  options?: PanelTableOptions & PanelThresholdOptions & PanelCombineOptions & PanelFilterOptions & Record<string, unknown>;
 }
 
 export interface DashboardDefinition {
@@ -246,6 +370,18 @@ export interface AccountOption {
   label: string;
   value: string;
   cloud_provider: string;
+  /**
+   * `cloud_accounts.status`, straight off `accounts_list`. Anything other than
+   * `active` is a disabled account.
+   *
+   * Carried because nothing downstream filters on it: `get_cloud_accounts_v2`
+   * returns disabled accounts alongside live ones, and the observability read
+   * path never checks the column — a disabled account whose agent row still
+   * exists resolves a provider and looks perfectly healthy. Optional because it
+   * is additive: a caller that has not been updated treats every account as
+   * live, which is exactly what happened before this field.
+   */
+  status?: string;
   /**
    * What the account manages — `kubernetes`, `cloud` or `vm` — straight off
    * `accounts_list`'s `account_type`.

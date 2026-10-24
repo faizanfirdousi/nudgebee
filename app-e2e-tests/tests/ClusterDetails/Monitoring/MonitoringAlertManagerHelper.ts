@@ -78,12 +78,19 @@ export async function applyFilterAndSearch(
   alertName: string,
   testInfo: { title: string }
 ): Promise<void> {
-  await clickFilterDropdown(page, filterId, filterLabel);
-  await selectDropdownOption(page, filterValue);
   await waitForGraphQLAndValidate(
     page,
-    async () => { await searchAlert(page, alertName); },
-    { testName: testInfo.title, operationNames: [] }
+    async () => {
+      // Filter select is inside the window: re-searching an unchanged name issues no refetch.
+      await clickFilterDropdown(page, filterId, filterLabel);
+      await selectDropdownOption(page, filterValue);
+      await searchAlert(page, alertName);
+    },
+    // Named, not auto-capture. Auto mode only ever waits 10s regardless of the timeout
+    // asked for, so on a slow runner the refetch lands after the window closes and the
+    // watcher reports "No operations captured" for a search that did fire. GetEventRules
+    // is the query the listing re-issues on search.
+    { testName: testInfo.title, operationNames: ["GetEventRules"] }
   );
 }
 

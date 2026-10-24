@@ -9,6 +9,9 @@ export interface ModelConfig {
   // or 'db:<integration-uuid>'. Supplied by ai_list_models as llm_config_source;
   // clients should echo the value back rather than composing it.
   llm_config_source?: string;
+  // Scopes the turn to an event, so an automation the model triggers gets
+  // tagged back to it and shows up in that event's automation history.
+  event_id?: string;
 }
 
 export interface ConversationAttachment {
@@ -51,6 +54,10 @@ export interface ConversationV3Message {
   parent_agent_id: string | null;
   message_config: string | null;
   ack_message: string | null;
+  // Raw JSON string from the per-message `metadata` jsonb slot — namespace-keyed
+  // by subsystem (`egressfilter`, `confidence`, …). Consumers parse it and
+  // dispatch on the top-level keys they understand; null when the row has none.
+  metadata: string | null;
   attachments: ConversationAttachment[];
 }
 
@@ -81,6 +88,7 @@ export interface ConversationV3ToolCall {
   references: string | null;
   tool_id: string | null;
   status: string;
+  metadata: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -94,9 +102,16 @@ export interface GenerateQueryRequest {
   // user's "Log Provider:" dropdown selection, when it differs from the
   // account's default. Ignored by the other AI query-generation actions.
   log_provider?: string;
+  // Optional Elasticsearch index for ai_generate_log_query and
+  // ai_generate_metrics_query — the user's "Select an Index" dropdown
+  // selection on the logs and metrics tabs. ES field sets are per-index, so this
+  // both scopes the fields the generator is shown and pins the index the
+  // generated query resolves against. Ignored by backends with no index concept.
+  index?: string;
 }
 
 export interface InvestigateRequest {
+  queue_only?: boolean;
   account_id: string;
   query: string;
   session_id?: string;
@@ -110,16 +125,24 @@ export interface InvestigateRequest {
 
 export interface FollowupRequest {
   account_id: string;
-  query: string;
+  // Required when answering; omitted (or ignored) when resolving via `resolution` instead.
+  query?: string;
   conversation_id: string;
   agent_id: string;
   message_id: string;
+  // Resolves the pending follow-up without answering it. Only 'dismiss' is supported —
+  // soft-skips the question and ends the conversation with a structured marker. A hard
+  // terminate already exists as a separate action (see useLLMInvestigationControl's stop).
+  resolution?: 'dismiss';
+  // Optional user-supplied note recorded with a 'dismiss' resolution. Ignored otherwise.
+  reason?: string;
 }
 
 export type ConversationActiveFilter = 'All' | 'Mine' | 'Saved' | 'Waiting';
 
 export interface ConversationHistoryRequest {
-  account_id: string;
+  // One account (`_eq`) or several (`_in`), e.g. the Ask page's all-accounts chat list.
+  account_id: string | string[];
   skipTotalCount?: boolean;
   latestLastRecordedAt?: string;
   source?: string | string[];
@@ -283,4 +306,23 @@ export interface UpdateFunctionData {
 export interface StopInvestigateRequest {
   accountId: string;
   conversationId: string;
+}
+
+export interface DeleteQueuedMessageRequest {
+  accountId: string;
+  conversationId: string;
+  messageId: string;
+}
+
+export interface UpdateQueuedMessageRequest {
+  accountId: string;
+  conversationId: string;
+  messageId: string;
+  message: string;
+}
+
+export interface ForceExecuteQueuedMessageRequest {
+  accountId: string;
+  conversationId: string;
+  messageId: string;
 }

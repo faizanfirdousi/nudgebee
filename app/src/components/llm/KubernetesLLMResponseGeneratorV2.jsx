@@ -1,3 +1,4 @@
+import { useOptimisticQueue } from '@hooks/useOptimisticQueue';
 import { ArrowRightYellowIcon, ChatRoundedIcon, ListIcon, SaveIconOutlinelight, SaveIconOutlineselect, ShareIconBlue, UsersIcon } from '@assets';
 import { useTenantBranding, getNubiIconUrl } from '@hooks/useTenantBranding';
 import { useBrowserNotification } from '@hooks/useBrowserNotification';
@@ -9,7 +10,6 @@ import Tooltip from '@ui/Tooltip';
 import AskNudgebeeLayout from '@shared/layout/AskNudgebeeLayoutV2';
 import { Button } from '@ui/Button';
 import { toast as snackbar } from '@ui/Toast';
-import SettingsModal from '@components/llm/SettingsModal';
 import { useData } from '@context/DataContext';
 import { useOptionalNubiGlobalChat } from '@context/NubiGlobalChatContext';
 import { useAgentConfiguration } from '@hooks/useAgentConfiguration';
@@ -18,17 +18,22 @@ import { useConversationManager } from '@hooks/useConversationManager';
 import { useConversationSuggestions } from '@hooks/useConversationSuggestions';
 import { useLLMInvestigationControl } from '@hooks/useLLMInvestigationControl';
 import { useTokenUsage } from '@hooks/useTokenUsage';
+import { useFollowLatest } from '@hooks/useFollowLatest';
 import { getUserSession, hasReadAccess, hasPermission } from '@lib/auth';
 import { applyFiltersOnRouter } from '@lib/router';
-import { Avatar, Box, CircularProgress, Divider, Typography } from '@mui/material';
+import { Avatar, Box, CircularProgress, Typography } from '@mui/material';
+import { Divider } from '@ui/Divider';
 import { useRouter } from 'next/router';
 import PropTypes from 'prop-types';
-import { useEffect, useRef, useReducer, useMemo, useCallback } from 'react';
+import { useEffect, useRef, useReducer, useMemo, useCallback, useState } from 'react';
 import { ds } from '@utils/colors';
 import AutoSuggestTextarea from '@components/k8s/common/TextAreaV2';
 import { SummaryBlock } from '@components/k8s/KubernetesClusterSummary';
 import { isFailedCachedConversation } from '@api1/ask-nudgebee';
 import { isCompleteWorkflowDefinition } from './utils/isCompleteWorkflowDefinition';
+import { isConversationActivelyExecuting } from './utils/conversationStatus';
+import { readNubiConversationPointer, writeNubiConversationPointer, clearNubiConversationPointer } from './utils/nubiConversationPointer';
+import { isPendingCrossAccountOpen } from './utils/crossAccountOpen';
 import ConversationShimmer from './common/ConversationShimmer';
 import { ConversationTokenUsage } from './common/TokenUsageDisplay';
 import ConversationList from './ConversationListV2';
@@ -41,6 +46,8 @@ import FollowupSheet from './common/FollowupSheet';
 import MessageStream from './MessageStream';
 import TroubleshootList from './TroubleshootList';
 import SafeIcon from '@shared/icons/SafeIcon';
+import { useQueuedMessages } from '@hooks/useQueuedMessages';
+import QueuedMessagesBanner from './common/QueuedMessagesBanner';
 
 // --- Component-level state reducer ---
 
@@ -91,6 +98,25 @@ function componentReducer(state, action) {
 // per window) while still picking up rows written after the run settled.
 const TOKEN_USAGE_TTL_MS = 30_000;
 
+// The event-investigation pipeline (llm-server `api/event_analyzer.go`) runs its
+// phases — summary, root cause, log analysis, synthesis — as SEPARATE turns on a
+// single `event-<fingerprint>` conversation. Between phases the conversation row
+// legitimately reads COMPLETED for a stretch before the next phase flips it back
+// to IN_PROGRESS, so the normal poll (which stops on the first terminal status)
+// leaves a follow-up drawer opened mid-investigation frozen on phase 1 until it
+// is closed and reopened. The final synthesis turn is worse still: it writes a
+// message straight to COMPLETED and never flips the conversation status at all,
+// so there is no status transition to observe — only new message content.
+//
+// While such a drawer stays open on an investigation session we have seen
+// running, keep re-polling across a terminal status. The window is re-armed both
+// on a status flip back to non-terminal AND on any new message arriving, so it
+// tracks real pipeline activity rather than a fixed span from one phase edge; it
+// finally lapses this long after the last new content. Generous because a phase
+// can be re-dispatched via MQ rather than chained in-process.
+const INVESTIGATION_PHASE_GAP_GRACE_MS = 120_000;
+const INVESTIGATION_TERMINAL_STATUSES = ['COMPLETED', 'FAILED', 'KILLED', 'TERMINATED'];
+
 const getInitials = (name) => {
   if (!name?.trim()) {
     return '?';
@@ -113,7 +139,9 @@ const KubernetesLLMResponseGenerator = ({
   categorySource = '',
   sessionId = '',
   conversationId = '',
-  showBorder = false,
+  // Scopes a new investigation turn to an event, so a triggered automation
+  // gets tagged back to it (see useLLMInvestigationControl).
+  eventId = '',
   apiMode = 'investigate', // 'investigate' | 'workflow'
   workflowId = '',
   workflowDefinition = null,
@@ -125,6 +153,9 @@ const KubernetesLLMResponseGenerator = ({
   drawerIsOpen = true,
   // Owns the shared localStorage "last opened conversation" pointer — global drawer only.
   persistLastSession = true,
+  // callback(sessionId) whenever the conversation on screen changes — lets the
+  // global drawer point "Open full page" at the current chat without reading cache.
+  onActiveSessionChange = undefined,
 }) => {
   const router = useRouter();
   const { assistantName, baseTitle } = useTenantBranding();
@@ -132,6 +163,9 @@ const KubernetesLLMResponseGenerator = ({
   const reportWipActivity = nubiGlobalChat?.reportWipActivity ?? NOOP;
 
   const previousAccountIdRef = useRef(accountId);
+  // Set when the chat list opens a conversation from another account; consumed by the
+  // account-switch effect so that navigation keeps its session instead of resetting.
+  const pendingCrossAccountOpenRef = useRef(null);
   // Separate refs for separate IDs
   const previousSessionIdRef = useRef(router.query.session_id);
   const previousConversationIdRef = useRef(router.query.conversation_id);
@@ -140,6 +174,7 @@ const KubernetesLLMResponseGenerator = ({
   const textareaRef = useRef(null);
   const bottomRef = useRef(null);
   const scrollContainerRef = useRef(null);
+  const followingLatestRef = useFollowLatest(scrollContainerRef);
   const processedSessionIds = useRef(new Set());
   const prevSessionConvIdRef = useRef({ sessionId, conversationId });
   const isAlertOpen = useRef(false);
@@ -165,8 +200,8 @@ const KubernetesLLMResponseGenerator = ({
 
   const [uiState, uiDispatch] = useReducer(componentReducer, null, () => {
     let restoredSessionId = router.query.session_id || sessionId || '';
-    if (popup && persistLastSession && typeof window !== 'undefined' && !restoredSessionId) {
-      const stored = localStorage.getItem('nubi_selected_conversation_id');
+    if (popup && persistLastSession && !restoredSessionId) {
+      const stored = readNubiConversationPointer(accountId);
       if (stored) {
         restoredSessionId = stored;
       }
@@ -176,7 +211,6 @@ const KubernetesLLMResponseGenerator = ({
       generateQuestionText: queryPrefix || '',
       isConversationListVisible: false,
       collapsedObj: {},
-      openSettingsModal: false,
       // Per-question "Show more / Show less" expand state, keyed by message index —
       // mirrors collapsedObj so each question bubble owns its own toggle (issue #35751).
       showFullText: {},
@@ -202,7 +236,6 @@ const KubernetesLLMResponseGenerator = ({
     generateQuestionText,
     isConversationListVisible,
     collapsedObj,
-    openSettingsModal,
     showFullText,
     selectedSessionId,
     selectedConversationId,
@@ -214,7 +247,6 @@ const KubernetesLLMResponseGenerator = ({
   const setGenerateQuestionText = useCallback((payload) => uiDispatch({ type: 'SET_FIELD', field: 'generateQuestionText', payload }), []);
   const setIsConversationListVisible = useCallback((payload) => uiDispatch({ type: 'SET_FIELD', field: 'isConversationListVisible', payload }), []);
   const setCollapsedObj = useCallback((payload) => uiDispatch({ type: 'SET_FIELD', field: 'collapsedObj', payload }), []);
-  const setOpenSettingsModal = useCallback((payload) => uiDispatch({ type: 'SET_FIELD', field: 'openSettingsModal', payload }), []);
   const setShowFullText = useCallback((payload) => uiDispatch({ type: 'SET_FIELD', field: 'showFullText', payload }), []);
   const setSelectedSessionId = useCallback((payload) => uiDispatch({ type: 'SET_FIELD', field: 'selectedSessionId', payload }), []);
   const setSelectedConversationId = useCallback((payload) => uiDispatch({ type: 'SET_FIELD', field: 'selectedConversationId', payload }), []);
@@ -228,13 +260,21 @@ const KubernetesLLMResponseGenerator = ({
       return;
     }
 
-    if (!selectedSessionId && typeof window !== 'undefined') {
-      const stored = localStorage.getItem('nubi_selected_conversation_id');
+    if (!selectedSessionId) {
+      const stored = readNubiConversationPointer(accountId);
       if (stored) {
         setSelectedSessionId(stored);
       }
     }
-  }, [popup, persistLastSession, drawerIsOpen, selectedSessionId, setSelectedSessionId]);
+  }, [popup, persistLastSession, drawerIsOpen, selectedSessionId, setSelectedSessionId, accountId]);
+
+  // Report the conversation on screen upward. Deliberately NOT persisted here:
+  // merely opening the drawer onto a conversation (investigate "Ask a follow up")
+  // must not overwrite the cached "last opened" pointer — only genuine engagement
+  // (send / history-pick, below) does. "Open full page" uses this live value.
+  useEffect(() => {
+    onActiveSessionChange?.(selectedSessionId);
+  }, [selectedSessionId, onActiveSessionChange]);
 
   const isNewChat = useMemo(() => !selectedSessionId && !selectedConversationId, [selectedSessionId, selectedConversationId]);
   const { troubleShootData, optimizationData } = useClusterInsights(accountId);
@@ -265,6 +305,10 @@ const KubernetesLLMResponseGenerator = ({
     isLoading: isConversationLoading,
     messages,
     setMessages,
+    queuedMessages: serverQueuedMessages,
+    queueInvestigationMessage,
+    queueSupport = { enabled: false, maxMessages: 5 },
+    needsConversationRefresh,
     conversationStatus,
     setConversationStatus,
     conversationTitle,
@@ -282,7 +326,7 @@ const KubernetesLLMResponseGenerator = ({
     setSelectedConfig,
     clearModelConfig,
     imageSupport,
-  } = useLLMInvestigationControl(accountId);
+  } = useLLMInvestigationControl(accountId, eventId);
 
   const isConversationInProgress = useMemo(
     () => conversationStatus === 'IN_PROGRESS' || !!currentlyProcessingQuestion,
@@ -303,6 +347,13 @@ const KubernetesLLMResponseGenerator = ({
     [messages]
   );
 
+  // Conversation-wide total for the header's hover metrics — sums each
+  // response's already-loaded followup_wait_seconds, no extra fetch needed.
+  const followupWaitSeconds = useMemo(
+    () => messages.filter((m) => (m.tool ?? m.type) === 'response').reduce((sum, m) => sum + (m.followup_wait_seconds || 0), 0),
+    [messages]
+  );
+
   // Backend holds the parent conversationMessage in WAITING between a followup answer
   // POST and the next agent tick — `isConversationInProgress` (IN_PROGRESS-only) goes
   // false in that window, so anything that means "is the system working right now?"
@@ -315,6 +366,85 @@ const KubernetesLLMResponseGenerator = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [conversationStatus, currentlyProcessingQuestion]
   );
+
+  const [optimisticFollowupAnswer, setOptimisticFollowupAnswer] = useState(null);
+
+  // ── Investigation follow-up drawer: bridge the gaps between pipeline phases ──
+  // See INVESTIGATION_PHASE_GAP_GRACE_MS. Only a `event-<fingerprint>` session
+  // opened in the drawer needs this; every other chat is a single conversation
+  // that ends when it ends.
+  const isInvestigationFollowupSession = useMemo(
+    () => popup && !selectedConversationId && selectedSessionId.startsWith('event-'),
+    [popup, selectedConversationId, selectedSessionId]
+  );
+
+  // Latch: has this investigation been observed running while the drawer was
+  // open? Guards against re-polling an investigation that already finished and
+  // that the user merely reopened to read. Reset whenever the session changes so
+  // a stale latch from a previous event's drawer doesn't carry over.
+  const sawInvestigationActiveRef = useRef(false);
+  const investigationLatchSessionRef = useRef('');
+  const investigationPhaseWatchDeadlineRef = useRef(0);
+  const lastInvestigationMsgCountRef = useRef(0);
+  useEffect(() => {
+    if (!isInvestigationFollowupSession) {
+      sawInvestigationActiveRef.current = false;
+      investigationLatchSessionRef.current = '';
+      investigationPhaseWatchDeadlineRef.current = 0;
+      lastInvestigationMsgCountRef.current = 0;
+      return;
+    }
+    if (investigationLatchSessionRef.current !== selectedSessionId) {
+      investigationLatchSessionRef.current = selectedSessionId;
+      sawInvestigationActiveRef.current = false;
+      investigationPhaseWatchDeadlineRef.current = 0;
+      lastInvestigationMsgCountRef.current = messages.length;
+    }
+    if (isConversationActivelyExecuting(conversationStatus) || conversationStatus === 'WAITING' || currentlyProcessingQuestion) {
+      sawInvestigationActiveRef.current = true;
+    }
+    // A later phase's turn — the synthesis turn especially, which writes straight
+    // to COMPLETED and never flips the conversation status — surfaces only as new
+    // message content. Treat that as fresh activity so the bridge keeps polling
+    // past it, and only lets the window lapse once the pipeline goes quiet.
+    if (messages.length > lastInvestigationMsgCountRef.current) {
+      lastInvestigationMsgCountRef.current = messages.length;
+      if (sawInvestigationActiveRef.current) {
+        investigationPhaseWatchDeadlineRef.current = Date.now() + INVESTIGATION_PHASE_GAP_GRACE_MS;
+      }
+    }
+  }, [isInvestigationFollowupSession, selectedSessionId, conversationStatus, currentlyProcessingQuestion, messages.length]);
+
+  // Keep re-polling the session across a phase's terminal status until the next
+  // phase turn appears (status flips off-terminal and the main poll effect
+  // re-arms itself, or a new message lands) or the grace window elapses with no
+  // new turn.
+  useEffect(() => {
+    if (!isInvestigationFollowupSession || !drawerIsOpen || !sawInvestigationActiveRef.current) {
+      return;
+    }
+    if (!INVESTIGATION_TERMINAL_STATUSES.includes(conversationStatus)) {
+      // Mid-phase: the main poll owns the loop — just keep the window fresh for
+      // the next between-phase gap.
+      investigationPhaseWatchDeadlineRef.current = Date.now() + INVESTIGATION_PHASE_GAP_GRACE_MS;
+      return;
+    }
+    if (investigationPhaseWatchDeadlineRef.current === 0 || Date.now() >= investigationPhaseWatchDeadlineRef.current) {
+      // No window armed (0 = sentinel), or it elapsed with no new turn — the
+      // investigation is done; nothing to bridge.
+      return;
+    }
+    const id = setInterval(() => {
+      if (Date.now() >= investigationPhaseWatchDeadlineRef.current) {
+        clearInterval(id);
+        return;
+      }
+      fetchConversation(selectedSessionId, '', 'poll', false);
+    }, 5000);
+    return () => clearInterval(id);
+    // messages.length: re-evaluate when content lands so a re-armed window can
+    // restart a loop that had already stopped at the previous deadline.
+  }, [isInvestigationFollowupSession, drawerIsOpen, conversationStatus, selectedSessionId, fetchConversation, messages.length]);
 
   // Derive the latest follow-up that's waiting for the user — this is what the bottom-anchored
   // FollowupSheet renders. The followup message itself is saved as IN_PROGRESS while it sits
@@ -360,11 +490,55 @@ const KubernetesLLMResponseGenerator = ({
     ? `${activeWaitingFollowup.response?.message_id || ''}:${activeWaitingFollowup.response?.agent_id || ''}`
     : null;
 
+  // True once the user has optimistically answered the currently-active followup — hides the
+  // sheet the instant they submit, before the poll confirms it.
+  const isActiveFollowupOptimisticallyAnswered = Boolean(activeFollowupKey) && optimisticFollowupAnswer?.key === activeFollowupKey;
+
   // Only surface the followup prompt while the conversation itself is still open. The
   // per-message terminal check above can lag the conversation (a stale followup message can
   // still read IN_PROGRESS after the run finished), so gate on conversationStatus too —
-  // a COMPLETED conversation must never render an answerable followup sheet.
-  const showFollowupSheet = Boolean(activeWaitingFollowup) && conversationStatus !== 'COMPLETED';
+  // a COMPLETED conversation must never render an answerable followup sheet. Also drop it the
+  // moment the user optimistically answers, so the sheet collapses into its inline pill
+  // instead of sitting with a loader until the next poll.
+  const showFollowupSheet = Boolean(activeWaitingFollowup) && conversationStatus !== 'COMPLETED' && !isActiveFollowupOptimisticallyAnswered;
+
+  const displayMessages = useMemo(() => {
+    if (!optimisticFollowupAnswer) {
+      return messages;
+    }
+    return messages.map((m) => {
+      const type = m?.tool ?? m?.type;
+      if (type !== 'followup-question') {
+        return m;
+      }
+      const key = `${m.response?.message_id || ''}:${m.response?.agent_id || ''}`;
+      if (key !== optimisticFollowupAnswer.key || TERMINAL_FOLLOWUP_STATUSES.includes(m.response?.status)) {
+        return m;
+      }
+      return { ...m, response: { ...m.response, status: 'COMPLETED', text: optimisticFollowupAnswer.answer } };
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [messages, optimisticFollowupAnswer]);
+
+  // Drop the overlay once the server confirms the answer — the polled `messages` now carry the
+  // real terminal status + text, so we stop shadowing them with the optimistic copy.
+  useEffect(() => {
+    if (!optimisticFollowupAnswer) {
+      return;
+    }
+    const confirmed = messages.some((m) => {
+      const type = m?.tool ?? m?.type;
+      if (type !== 'followup-question') {
+        return false;
+      }
+      const key = `${m.response?.message_id || ''}:${m.response?.agent_id || ''}`;
+      return key === optimisticFollowupAnswer.key && TERMINAL_FOLLOWUP_STATUSES.includes(m.response?.status);
+    });
+    if (confirmed) {
+      setOptimisticFollowupAnswer(null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [messages, optimisticFollowupAnswer]);
 
   const currentSessionId = router.query.session_id || sessionId;
   const notifyNavigateTo = currentSessionId ? `/ask-nudgebee?accountId=${accountId}&session_id=${currentSessionId}` : '';
@@ -380,16 +554,20 @@ const KubernetesLLMResponseGenerator = ({
     navigateTo: notifyNavigateTo,
   });
 
-  const handleGenerateInvestigation = useCallback(
-    async (text, images) => {
-      if (conversationStatus === 'IN_PROGRESS' || !text) {
-        return;
+  const handleStopInvestigation = useCallback(() => {
+    stopInvestigation(conversationIdAtDb, conversationStatus, clearSuggestions);
+  }, [conversationIdAtDb, conversationStatus, stopInvestigation, clearSuggestions]);
+
+  const executeInvestigation = useCallback(
+    async (text, images, preserveDraftOnFailure = false, pendingSubmission = false) => {
+      if (!text) {
+        return false;
       }
 
       // Verify user has access to the account before starting investigation
       if (accountId && !hasReadAccess(accountId)) {
         snackbar.error('You do not have permission to perform this action');
-        return;
+        return false;
       }
 
       let processedText = text;
@@ -403,14 +581,10 @@ const KubernetesLLMResponseGenerator = ({
       }
 
       // Add optimistic question message immediately so user sees their question right away.
-      // Skip for workflow mode: handleWorkflowGeneration appends the question itself via
-      // buildWorkflowConversationMessages, so an optimistic add here would produce a
-      // duplicate question (one with user 'You', one with the real userName) once the
-      // workflow API returns. querySuffix alone is not a reliable workflow indicator
-      // because follow-up calls in workflow mode don't carry a suffix.
-      if (apiMode !== 'workflow') {
+      const optimisticMessageId = `optimistic-${Date.now()}`;
+      if (apiMode !== 'workflow' && !pendingSubmission) {
         const optimisticQuestionMessage = {
-          id: `optimistic-${Date.now()}`,
+          id: optimisticMessageId,
           text: processedText,
           type: 'question',
           created_at: new Date().toISOString(),
@@ -424,8 +598,9 @@ const KubernetesLLMResponseGenerator = ({
       }
 
       // Call Hook with both IDs (one or both might be empty)
-      await startInvestigation({
+      return await startInvestigation({
         text: processedText,
+        optimisticMessageId,
         queryPrefix,
         querySuffix,
         selectedSessionId,
@@ -441,20 +616,24 @@ const KubernetesLLMResponseGenerator = ({
         popup,
         router,
         onSuccess: (llmSessionId) => {
+          // Conversation-id-only routes retain that identity, including pending follow-ups.
+          if (!llmSessionId) return;
           if (!popup) {
             // Standardize on session_id for new chats, clear conversation_id to avoid ambiguity
             applyFiltersOnRouter(router, { session_id: llmSessionId, conversation_id: null }, { shallow: true });
           } else if (persistLastSession) {
-            localStorage.setItem('nubi_selected_conversation_id', llmSessionId);
+            writeNubiConversationPointer(accountId, llmSessionId);
           }
           setSelectedSessionId(llmSessionId);
           setSelectedConversationId(''); // Reset conversationId as we have a fresh session
-          setGenerateQuestionText('');
+          // A late response must not overwrite the next draft.
           setConversationStatus('IN_PROGRESS');
         },
         onFailure: () => {
           setConversationStatus('FAILED');
-          if (!popup) {
+          setMessages((previous) => previous.filter((message) => message.id !== optimisticMessageId));
+          if (preserveDraftOnFailure && !pendingSubmission) setGenerateQuestionText(text);
+          if (!popup && !preserveDraftOnFailure) {
             applyFiltersOnRouter(router, { session_id: '', conversation_id: '' });
           }
         },
@@ -462,7 +641,6 @@ const KubernetesLLMResponseGenerator = ({
     },
     [
       accountId,
-      conversationStatus,
       queryPrefix,
       querySuffix,
       selectedSessionId,
@@ -482,21 +660,153 @@ const KubernetesLLMResponseGenerator = ({
     ]
   );
 
+  const {
+    queuedMessages,
+    isExpanded: isQueueExpanded,
+    toggleExpanded: toggleQueueExpanded,
+    remove: removeQueuedMessage,
+    edit: editQueuedMessage,
+    sendNow: sendNowQueuedMessage,
+    clear: clearQueuedMessages,
+    maxQueuedMessages,
+    isMaxQueueReached: isServerMaxQueueReached,
+    error: queueActionError,
+  } = useQueuedMessages({
+    isConversationInProgress,
+    conversationStatus,
+    conversationId: conversationIdAtDb,
+    accountId,
+    maxQueuedMessages: queueSupport.maxMessages,
+    serverQueuedMessages,
+    onDispatch: async (msg) => {
+      await executeInvestigation(msg.text, msg.images);
+    },
+    onStop: handleStopInvestigation,
+    onRefresh: async () => {
+      if (queueScopeRef.current !== `${accountId}:${conversationIdAtDb}:${selectedSessionId}`) return;
+      await fetchConversation(selectedSessionId, conversationIdAtDb, 'poll', false, true);
+    },
+  });
+
+  const composerHasDraftRef = useRef(false);
+  const trackComposerDraft = useCallback((hasDraft) => {
+    composerHasDraftRef.current = hasDraft;
+  }, []);
+  const [queueImageDraft, setQueueImageDraft] = useState(undefined);
+  const [pendingQueueEdit, setPendingQueueEdit] = useState(null);
+  const [queueSubmitError, setQueueSubmitError] = useState(null);
+
+  const queueScope = `${accountId}:${conversationIdAtDb}:${selectedSessionId}`;
+  const queueScopeRef = useRef(queueScope);
+  queueScopeRef.current = queueScope;
+  useEffect(() => {
+    setQueueImageDraft(undefined);
+    setPendingQueueEdit(null);
+    setQueueSubmitError(null);
+  }, [queueScope]);
+
+  const handleEditQueuedMessage = useCallback(
+    async (id) => {
+      const scope = queueScopeRef.current;
+      setPendingQueueEdit({ scope, id });
+      try {
+        const msg = await editQueuedMessage(id);
+        if (msg && scope === queueScopeRef.current) {
+          setGenerateQuestionText(msg.text);
+          setQueueImageDraft({ id: msg.id, text: msg.text, images: (msg.images || []).filter((image) => image.data && image.mime_type) });
+          setTimeout(() => {
+            textareaRef.current?.focus();
+          }, 0);
+        }
+      } finally {
+        if (scope === queueScopeRef.current) setPendingQueueEdit(null);
+      }
+    },
+    [editQueuedMessage]
+  );
+
+  const canQueueMessages = apiMode === 'investigate' && queueSupport.enabled && Boolean(conversationIdAtDb);
+
+  const optimisticQueue = useOptimisticQueue(queueScope, maxQueuedMessages, queuedMessages.length);
+  const displayedQueue = [...queuedMessages, ...optimisticQueue.entries];
+
+  const isMaxQueueReached =
+    isServerMaxQueueReached ||
+    queuedMessages.length + optimisticQueue.entries.filter((entry) => entry.saving && !entry.isForeground).length >= maxQueuedMessages;
+
+  const handleGenerateInvestigation = useCallback(
+    async (text, images) => {
+      if (!text || !text.trim()) {
+        return;
+      }
+
+      // If an investigation is actively running, queue the message
+      if (isConversationInProgress) {
+        if (!canQueueMessages || isMaxQueueReached) {
+          return false;
+        }
+        const scope = queueScopeRef.current;
+        const accepted = optimisticQueue.submit(text, images, async () => {
+          await queueInvestigationMessage({ text, images });
+          if (scope === queueScopeRef.current) setQueueSubmitError(null);
+        });
+        if (accepted) setGenerateQuestionText('');
+        return accepted;
+      }
+
+      // Existing conversations can accept follow-ups while this HTTP response is
+      // outstanding. Keep the submitted draft in the pending list, not the composer.
+      // A new conversation still needs its server identity before it can queue.
+      if (canQueueMessages) {
+        if (accountId && !hasReadAccess(accountId)) {
+          snackbar.error('You do not have permission to perform this action');
+          return false;
+        }
+        return optimisticQueue.submit(text, images, () => executeInvestigation(text, images, true, true), true);
+      }
+      return await executeInvestigation(text, images, true);
+    },
+    [
+      optimisticQueue.submit,
+      accountId,
+      isConversationInProgress,
+      isMaxQueueReached,
+      canQueueMessages,
+      queueInvestigationMessage,
+      executeInvestigation,
+      fetchConversation,
+      selectedSessionId,
+      conversationIdAtDb,
+    ]
+  );
+
   useEffect(() => {
     if (previousAccountIdRef.current !== accountId) {
       previousAccountIdRef.current = accountId; // Handle Account Switching
+      // Consumed on every switch, so a pending open that never landed can't
+      // suppress a later manual switch.
+      const pendingOpen = pendingCrossAccountOpenRef.current;
+      pendingCrossAccountOpenRef.current = null;
 
-      // Full Reset
-      uiDispatch({ type: 'NEW_CHAT' });
-      resetTokenMetrics();
-      clearSuggestions();
-      resetInvestigationState();
-      previousConversationStatusRef.current = '';
+      if (isPendingCrossAccountOpen(pendingOpen, accountId, selectedSessionId)) {
+        // The list opened this chat on its own account: handleSelectConversation already
+        // cleared the previous chat's state, so only the per-account state is left to
+        // reset before falling through to load the conversation.
+        resetInvestigationState();
+      } else {
+        // Full Reset
+        uiDispatch({ type: 'NEW_CHAT' });
+        resetTokenMetrics();
+        clearSuggestions();
+        clearQueuedMessages();
+        resetInvestigationState();
+        previousConversationStatusRef.current = '';
 
-      if (!popup) {
-        applyFiltersOnRouter(router, { session_id: '', conversation_id: '' });
+        if (!popup) {
+          applyFiltersOnRouter(router, { session_id: '', conversation_id: '' });
+        }
+        return;
       }
-      return;
     }
 
     // Update Ref for Polling safety (Prefer session ID if available, else conversation ID)
@@ -521,7 +831,7 @@ const KubernetesLLMResponseGenerator = ({
             }
             return;
           }
-          setGenerateQuestionText('');
+          // Refreshing history must not erase an unsent or restored edit draft.
           // Pass both IDs to fetchConversation
           fetchConversation(selectedSessionId, selectedConversationId, 'selected', false);
         }
@@ -685,7 +995,7 @@ const KubernetesLLMResponseGenerator = ({
   useEffect(() => {
     if (messages.length > 0) {
       const timeoutId = setTimeout(() => {
-        if (messages[messages.length - 1]?.type === 'response') {
+        if (messages[messages.length - 1]?.type === 'response' && followingLatestRef.current) {
           bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
         }
       }, 1000);
@@ -720,7 +1030,7 @@ const KubernetesLLMResponseGenerator = ({
 
     runAutoCheck();
 
-    const shouldStopPolling = ['COMPLETED', 'FAILED', 'KILLED', 'TERMINATED'].includes(conversationStatus);
+    const shouldStopPolling = ['COMPLETED', 'FAILED', 'KILLED', 'TERMINATED'].includes(conversationStatus) && !serverQueuedMessages?.length;
     if (shouldStopPolling) {
       setAllowStop(false);
 
@@ -745,15 +1055,6 @@ const KubernetesLLMResponseGenerator = ({
     } else {
       setAllowStop(true);
     }
-
-    if ((selectedSessionId !== '' || selectedConversationId !== '') && conversationStatus && !isNewChat) {
-      const id = setInterval(async () => {
-        // Pass both to poll
-        await fetchConversation(selectedSessionId, selectedConversationId, 'poll', false);
-      }, 5000);
-
-      return () => clearInterval(id);
-    }
   }, [
     popup,
     query,
@@ -775,7 +1076,32 @@ const KubernetesLLMResponseGenerator = ({
     handleGenerateInvestigation,
     setConversationStatus,
     checkConversationExists,
+    serverQueuedMessages?.length,
   ]);
+
+  // Keep the polling clock independent of message renders and draft edits.
+  // Serialize requests so a slow poll cannot overlap and invalidate its predecessor.
+  const shouldPollConversation =
+    !!conversationStatus &&
+    !isNewChat &&
+    (needsConversationRefresh || !INVESTIGATION_TERMINAL_STATUSES.includes(conversationStatus) || !!serverQueuedMessages?.length);
+  useEffect(() => {
+    if (!shouldPollConversation || (!selectedSessionId && !selectedConversationId)) return;
+    let cancelled = false;
+    let timer;
+    const poll = async () => {
+      try {
+        await fetchConversation(selectedSessionId, selectedConversationId, 'poll', false);
+      } finally {
+        if (!cancelled) timer = setTimeout(poll, 1000);
+      }
+    };
+    timer = setTimeout(poll, needsConversationRefresh ? 0 : 1000);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [shouldPollConversation, needsConversationRefresh, selectedSessionId, selectedConversationId, fetchConversation]);
 
   useEffect(() => {
     if (conversationStatus === 'IN_PROGRESS') {
@@ -938,12 +1264,13 @@ const KubernetesLLMResponseGenerator = ({
     setConversationStatus('');
     setCurrentlyProcessingQuestion(null);
     clearSuggestions();
+    clearQueuedMessages();
     resetInvestigationState();
     previousConversationStatusRef.current = '';
     if (!popup) {
       applyFiltersOnRouter(router, { session_id: '', conversation_id: '' });
     } else if (persistLastSession) {
-      localStorage.removeItem('nubi_selected_conversation_id');
+      clearNubiConversationPointer();
     }
     setTimeout(() => {
       textareaRef.current?.focus();
@@ -956,6 +1283,7 @@ const KubernetesLLMResponseGenerator = ({
     setConversationStatus,
     setCurrentlyProcessingQuestion,
     clearSuggestions,
+    clearQueuedMessages,
     resetInvestigationState,
   ]);
 
@@ -1003,23 +1331,35 @@ const KubernetesLLMResponseGenerator = ({
   );
 
   const handleSelectConversation = useCallback(
-    (index) => {
+    (index, _userName, conversationAccountId) => {
       if (index !== selectedSessionId) {
         uiDispatch({ type: 'SELECT_CONVERSATION', sessionId: index });
         setConversationStatus('');
         setCurrentlyProcessingQuestion(null);
         if (!popup) {
-          applyFiltersOnRouter(router, { session_id: index, conversation_id: null });
+          // The list spans accounts: a chat from another account opens on that account,
+          // so its agents, tools and follow-up questions run where it started.
+          const opensOtherAccount = Boolean(conversationAccountId) && conversationAccountId !== accountId;
+          if (opensOtherAccount) {
+            pendingCrossAccountOpenRef.current = { accountId: conversationAccountId, sessionId: index };
+          }
+          applyFiltersOnRouter(router, {
+            session_id: index,
+            conversation_id: null,
+            ...(opensOtherAccount && { accountId: conversationAccountId }),
+          });
         } else if (persistLastSession) {
-          localStorage.setItem('nubi_selected_conversation_id', index);
+          writeNubiConversationPointer(accountId, index);
         }
         setMessages([]);
         clearSuggestions();
+        clearQueuedMessages();
         resetTokenMetrics();
         previousConversationStatusRef.current = '';
       }
     },
     [
+      accountId,
       selectedSessionId,
       popup,
       persistLastSession,
@@ -1028,16 +1368,10 @@ const KubernetesLLMResponseGenerator = ({
       setConversationStatus,
       setCurrentlyProcessingQuestion,
       clearSuggestions,
+      clearQueuedMessages,
       resetTokenMetrics,
     ]
   );
-
-  const handleStopInvestigation = useCallback(() => {
-    stopInvestigation(conversationIdAtDb, conversationStatus, () => {
-      setConversationStatus('TERMINATING');
-      clearSuggestions();
-    });
-  }, [conversationIdAtDb, conversationStatus, stopInvestigation, setConversationStatus, clearSuggestions]);
 
   const handleTokenUsageHover = useCallback(async () => {
     // Usage metrics resolve by either key — session_id (normal chats) or conversation_id
@@ -1088,23 +1422,47 @@ const KubernetesLLMResponseGenerator = ({
       noLabel
       onClusterDataLoaded={handleClusterData}
       clusterData={selectedCluster}
-      minWidth={ds.space.mul(0, 112)}
+      minWidth={ds.space.mul(0, 90)}
       groupByCloudProvider
       showPadding={true}
       showSmallTopPadding={false}
+      openDirection='up'
+      // A chat stays on the account it started on; switching happens from a new chat.
+      isDisabled={isChatScreen}
     />
+  );
+
+  // The account a chat runs on is chosen where the question is typed, next to the model.
+  const composerAccountChip = popup ? undefined : (
+    <Tooltip
+      title={isChatScreen ? 'This chat stays on its account. Start a new chat to ask about another account.' : 'Account this chat runs on'}
+      placement='top'
+    >
+      <Box
+        data-testid='nubi-composer-account'
+        sx={{
+          display: 'flex',
+          alignItems: 'center',
+          flexShrink: 0,
+          border: `0.5px solid ${ds.gray[300]}`,
+          borderRadius: ds.radius.sm,
+          backgroundColor: isChatScreen ? ds.background[300] : ds.background[100],
+          '&:hover': { borderColor: isChatScreen ? ds.gray[300] : ds.blue[500] },
+          '.MuiAutocomplete-root': { minHeight: 'auto !important' },
+          '& .MuiFormControl-root': { margin: '0 !important' },
+          '& .MuiOutlinedInput-notchedOutline': { border: 'none !important' },
+          '& .MuiOutlinedInput-root': { padding: `0 ${ds.space.mul(1, 7)} 0 0 !important` },
+          '& .MuiAutocomplete-input': { padding: `${ds.space[1]} 0 !important`, fontSize: 'var(--ds-text-caption) !important' },
+          '& li': { paddingLeft: '0 !important' },
+        }}
+      >
+        {clusterDropdownContent}
+      </Box>
+    </Tooltip>
   );
 
   const content = (
     <>
-      <SettingsModal
-        open={openSettingsModal}
-        onClose={() => setOpenSettingsModal(false)}
-        accountId={accountId}
-        allAgents={allAgents}
-        refreshAgentListing={refreshAgents}
-        loadingAgents={loadingAgents}
-      />
       <Box
         sx={{
           position: popup ? 'relative' : 'static',
@@ -1131,7 +1489,6 @@ const KubernetesLLMResponseGenerator = ({
           />
         ) : (
           <ConversationList
-            accountId={accountId}
             onSelectConversation={handleSelectConversation}
             selectedId={selectedSessionId || selectedConversationId}
             isConversationListVisible={isConversationListVisible}
@@ -1188,36 +1545,6 @@ const KubernetesLLMResponseGenerator = ({
                     {assistantName}
                   </Typography>
                 </Box>
-              </Box>
-              <Box
-                sx={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  border: `1px solid var(--ds-gray-300)`,
-                  borderRadius: ds.radius.sm,
-                  position: 'relative',
-                  '&:hover': {
-                    borderColor: 'var(--ds-blue-500)',
-                  },
-                  '.MuiAutocomplete-root': {
-                    minHeight: `${ds.space[6]} !important`,
-                  },
-                  '& .MuiFormControl-root': {
-                    margin: '0 !important',
-                    fontSize: 'var(--ds-text-title) !important',
-                  },
-                  '& .MuiOutlinedInput-notchedOutline': {
-                    border: showBorder ? 'inherit' : 'none !important',
-                  },
-                  '& .MuiInputBase-sizeSmall': {
-                    padding: `${ds.space[1]} ${ds.space.mul(1, 10)} ${ds.space.mul(0, 3)} 0 !important`,
-                  },
-                  '& li': {
-                    paddingLeft: '0 !important',
-                  },
-                }}
-              >
-                {clusterDropdownContent}
               </Box>
             </Box>
           )}
@@ -1388,10 +1715,14 @@ const KubernetesLLMResponseGenerator = ({
                     </Tooltip>
                   )}
                   <Box onMouseEnter={handleTokenUsageHover}>
-                    <ConversationTokenUsage tokenUsageData={tokenUsageData} isLoading={isFetchingTokenData} />
+                    <ConversationTokenUsage
+                      tokenUsageData={tokenUsageData}
+                      isLoading={isFetchingTokenData}
+                      followupWaitSeconds={followupWaitSeconds}
+                    />
                   </Box>
                 </Box>
-                <Divider orientation='vertical' variant='middle' flexItem sx={{ height: ds.space.mul(1, 7), mx: ds.space.mul(0, 5) }} />
+                <Divider orientation='vertical' sx={{ height: ds.space.mul(1, 7), mx: ds.space.mul(0, 5), my: ds.space[2] }} />
                 <Box sx={{ display: 'flex', alignItems: 'center', gap: ds.space[2] }}>
                   {selectedConversation?.id && (
                     <Button
@@ -1426,40 +1757,6 @@ const KubernetesLLMResponseGenerator = ({
                     icon={<SafeIcon src={ShareIconBlue} height={18} width={18} alt={'Share'} />}
                     onClick={handleShare}
                   />
-                </Box>
-                <Divider orientation='vertical' variant='middle' flexItem sx={{ height: ds.space.mul(1, 7), mx: ds.space.mul(0, 5) }} />
-                <Box
-                  sx={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    border: `1px solid var(--ds-gray-300)`,
-                    borderRadius: ds.radius.sm,
-                    position: 'relative',
-                    '&:hover': {
-                      borderColor: 'var(--ds-blue-500)',
-                    },
-                    '.MuiAutocomplete-root': {
-                      minHeight: `${ds.space[6]} !important`,
-                    },
-                    '& .MuiAutocomplete-input': {
-                      paddingTop: '0 !important',
-                    },
-                    '& .MuiFormControl-root': {
-                      margin: '0 !important',
-                      fontSize: 'var(--ds-text-title) !important',
-                    },
-                    '& .MuiOutlinedInput-notchedOutline': {
-                      border: showBorder ? 'inherit' : 'none !important',
-                    },
-                    '& .MuiOutlinedInput-root': {
-                      padding: `${ds.space[1]} ${ds.space.mul(1, 10)} ${ds.space[1]} 0 !important`,
-                    },
-                    '& li': {
-                      paddingLeft: '0 !important',
-                    },
-                  }}
-                >
-                  {clusterDropdownContent}
                 </Box>
               </Box>
             </Box>
@@ -1629,16 +1926,25 @@ const KubernetesLLMResponseGenerator = ({
                         <AutoSuggestTextarea
                           functionSuggestions={allFunctions}
                           ref={textareaRef}
+                          onDraftChange={trackComposerDraft}
                           value={generateQuestionText}
                           fontSize='var(--ds-text-body-lg)'
                           fontWeight='var(--ds-font-weight-regular)'
-                          placeholder={popup ? 'Ask a question...' : 'Ask me about troubleshooting, error logs, resource usage, or optimizations.'}
+                          placeholder={
+                            isConversationInProgress && canQueueMessages
+                              ? isMaxQueueReached
+                                ? `Queue limit reached (max ${maxQueuedMessages}). Wait for tasks to complete or remove a queued message.`
+                                : 'Queue a follow-up message...'
+                              : popup
+                              ? 'Ask a question...'
+                              : 'Ask me about troubleshooting, error logs, resource usage, or optimizations.'
+                          }
                           maxRows={popup ? 4 : 3}
                           minRows={popup ? 1 : 3}
                           maxLength={500000}
                           suggestionsAt={enabledAgents}
                           showBorderleft={false}
-                          disabled={isConversationLoading || isConversationInProgress}
+                          disabled={isConversationLoading || (isConversationInProgress && (!canQueueMessages || isMaxQueueReached))}
                           credentials={availableCredentials}
                           models={availableModels}
                           defaultModel={defaultModel}
@@ -1650,13 +1956,16 @@ const KubernetesLLMResponseGenerator = ({
                           onConfigSelect={setSelectedConfig}
                           onConfigClear={clearModelConfig}
                           imageSupport={imageSupport}
+                          imageDraft={queueImageDraft}
+                          onDraftSubmitted={(id) => setQueueImageDraft((current) => (current?.id === id ? undefined : current))}
                           isFollowUp={popup}
                           submitOnModEnter
+                          leadingControls={composerAccountChip}
                           buttonProperties={{
                             show: true,
-                            enable: !isConversationLoading,
+                            enable: !isConversationLoading && (!isConversationInProgress || (canQueueMessages && !isMaxQueueReached)),
                             onClick: (text, _config, images) => {
-                              handleGenerateInvestigation(text, images);
+                              return handleGenerateInvestigation(text, images);
                             },
                           }}
                         />
@@ -1762,8 +2071,9 @@ const KubernetesLLMResponseGenerator = ({
             )}
 
             <MessageStream
-              messages={messages}
+              messages={displayMessages}
               isProcessing={isConversationInProgress}
+              isBusy={isSystemBusy}
               collapsedObj={collapsedObj}
               setCollapsedObj={setCollapsedObj}
               showFullText={showFullText}
@@ -1787,17 +2097,23 @@ const KubernetesLLMResponseGenerator = ({
                 // when the sheet is rendered so we don't have two interactive entry points for
                 // the same question.
                 followupReadOnlyKey: showFollowupSheet ? activeFollowupKey : null,
-                // When a background watch transitions to a terminal state, the
-                // responder appends a markdown "Watch update" block to the parent
-                // message's `response` column on the server. The chip poller in
-                // MessageStream detects that transition and invokes this callback
-                // so we pull the fresh message bodies — without it, the block
-                // is in the DB but the UI keeps showing the pre-terminal copy
-                // until a hard refresh. fetchConversation is the same call used
-                // for initial chat load; it's idempotent.
+                // When a background watch reaches a terminal state, the responder
+                // appends a markdown "Watch update" block to the parent message's
+                // `response` column on the server. The watch poller in MessageStream
+                // calls this until that block actually shows up, so we pull the fresh
+                // message bodies — without it the block is in the DB but the UI keeps
+                // showing the pre-terminal copy until a hard refresh.
+                //
+                // 'poll' rather than 'selected' deliberately. Both go through the same
+                // ai_get_conversation_v3 delta fetcher, but 'selected' additionally
+                // flips isLoading, clears the model picker and aborts in-flight
+                // requests — a visible flash on an otherwise settled chat, and
+                // self-cancelling once this runs more than once. 'poll' is inert here:
+                // its one side effect, SET_ALLOW_STOP, is gated behind
+                // conversationStatus === 'IN_PROGRESS' at the Stop button.
                 onWatchTerminal: () => {
                   if (selectedSessionId || selectedConversationId) {
-                    fetchConversation(selectedSessionId, selectedConversationId, 'selected', false);
+                    fetchConversation(selectedSessionId, selectedConversationId, 'poll', false);
                   }
                 },
               }}
@@ -1902,7 +2218,9 @@ const KubernetesLLMResponseGenerator = ({
                   left: ds.space.mul(1, 25),
                   right: 0,
                   zIndex: 10,
-                  backgroundColor: 'transparent',
+                  backgroundColor: 'var(--ds-background-100)',
+                  borderRadius: 'var(--ds-radius-lg) var(--ds-radius-lg) 0 0',
+                  pt: ds.space[2],
                   px: 0,
                   transform: isConversationListVisible ? 'translateX(125px)' : 'translateX(0)',
                   transition: 'transform 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
@@ -1933,9 +2251,41 @@ const KubernetesLLMResponseGenerator = ({
                     selectedTierModels={selectedTierModels}
                     popup={popup}
                     onStop={handleStopInvestigation}
+                    onOptimisticSubmit={(answer) => setOptimisticFollowupAnswer({ key: activeFollowupKey, answer })}
+                    onSubmitError={() => {
+                      setOptimisticFollowupAnswer(null);
+                      snackbar.error('Couldn’t submit your response. Please try again.');
+                    }}
                   />
                 </Box>
               )}
+              {(queueSubmitError || queueActionError) && (
+                <Typography role='alert' color='error'>
+                  {queueSubmitError || queueActionError}
+                </Typography>
+              )}
+              <QueuedMessagesBanner
+                queuedMessages={displayedQueue}
+                onRefresh={() => fetchConversation(selectedSessionId, conversationIdAtDb, 'poll', false)}
+                onRestore={(id) => {
+                  if (composerHasDraftRef.current || textareaRef.current?.value?.trim()) {
+                    setQueueSubmitError('Send or clear your current draft before moving this message to the composer.');
+                    return;
+                  }
+                  const msg = optimisticQueue.takeDraft(id);
+                  if (msg) {
+                    setGenerateQuestionText(msg.text);
+                    setQueueImageDraft({ id: msg.id, text: msg.text, images: msg.images || [] });
+                  }
+                }}
+                editingMessageId={pendingQueueEdit?.scope === queueScope ? pendingQueueEdit.id : undefined}
+                isExpanded={isQueueExpanded}
+                maxQueuedMessages={maxQueuedMessages}
+                onToggleExpanded={toggleQueueExpanded}
+                onSendNow={sendNowQueuedMessage}
+                onEdit={handleEditQueuedMessage}
+                onDelete={removeQueuedMessage}
+              />
               {!showFollowupSheet && (
                 <SummaryBlock
                   hideTitle
@@ -1981,14 +2331,21 @@ const KubernetesLLMResponseGenerator = ({
                   <AutoSuggestTextarea
                     functionSuggestions={allFunctions}
                     ref={textareaRef}
+                    onDraftChange={trackComposerDraft}
                     fontSize='var(--ds-text-body)'
                     fontWeight='var(--ds-font-weight-regular)'
                     value={generateQuestionText}
-                    placeholder='Ask a question...'
+                    placeholder={
+                      isConversationInProgress && canQueueMessages
+                        ? isMaxQueueReached
+                          ? `Queue limit reached (max ${maxQueuedMessages}). Wait for tasks to complete or remove a queued message.`
+                          : 'Queue a follow-up message...'
+                        : 'Ask a question...'
+                    }
                     maxRows={popup ? 20 : 8}
                     minRows={popup ? 1 : undefined}
                     maxLength={500000}
-                    disabled={isConversationLoading || isConversationInProgress}
+                    disabled={isConversationLoading || (isConversationInProgress && (!canQueueMessages || isMaxQueueReached))}
                     suggestionsAt={enabledAgents}
                     credentials={availableCredentials}
                     models={availableModels}
@@ -2001,12 +2358,14 @@ const KubernetesLLMResponseGenerator = ({
                     onConfigSelect={setSelectedConfig}
                     onConfigClear={clearModelConfig}
                     imageSupport={imageSupport}
+                    imageDraft={queueImageDraft}
+                    onDraftSubmitted={(id) => setQueueImageDraft((current) => (current?.id === id ? undefined : current))}
                     externalAgentsLoading={loadingAgents}
                     buttonProperties={{
                       show: true,
-                      enable: !isConversationLoading && !isConversationInProgress,
+                      enable: !isConversationLoading && (!isConversationInProgress || (canQueueMessages && !isMaxQueueReached)),
                       onClick: (text, _config, images) => {
-                        handleGenerateInvestigation(text, images);
+                        return handleGenerateInvestigation(text, images);
                       },
                       onClickStop: () => {
                         handleStopInvestigation();
@@ -2016,6 +2375,7 @@ const KubernetesLLMResponseGenerator = ({
                     popupInitial={popup && !!queryPrefix && messages.length === 0}
                     submitOnModEnter
                     isFollowUp={true}
+                    leadingControls={composerAccountChip}
                     // Show Stop only when there's something genuinely actionable to stop:
                     // either the user has an in-flight question they initiated this session
                     // (currentlyProcessingQuestion), or the server-side conversation is
@@ -2083,13 +2443,13 @@ KubernetesLLMResponseGenerator.propTypes = {
   accountId: PropTypes.string,
   sessionId: PropTypes.string,
   conversationId: PropTypes.string,
+  eventId: PropTypes.string,
   source: PropTypes.string,
   categorySource: PropTypes.string,
   query: PropTypes.string,
   queryPrefix: PropTypes.string,
   querySuffix: PropTypes.string,
   popup: PropTypes.bool,
-  showBorder: PropTypes.bool,
   apiMode: PropTypes.oneOf(['investigate', 'workflow']),
   workflowId: PropTypes.string,
   workflowDefinition: PropTypes.object,
@@ -2098,6 +2458,7 @@ KubernetesLLMResponseGenerator.propTypes = {
   historyButtonRef: PropTypes.object,
   drawerIsOpen: PropTypes.bool,
   persistLastSession: PropTypes.bool,
+  onActiveSessionChange: PropTypes.func,
 };
 
 export default KubernetesLLMResponseGenerator;

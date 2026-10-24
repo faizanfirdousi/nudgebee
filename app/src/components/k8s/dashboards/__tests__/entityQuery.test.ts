@@ -5,10 +5,14 @@ import {
   draftFromQuery,
   findTable,
   operatorTakesList,
+  operatorTakesRegex,
   operatorTakesValue,
   operatorsFor,
+  renderEntityQuery,
+  selectableColumns,
   tablesFor,
 } from '../entityQuery';
+import { renderTemplate } from '../templating';
 
 describe('defaultDraft', () => {
   it('opens on a query that already runs', () => {
@@ -112,6 +116,21 @@ describe('tablesFor', () => {
   });
 });
 
+describe('selectableColumns', () => {
+  it('hides filter-only columns from the column and sort pickers', () => {
+    // A trace grouping can be NARROWED by a column its fixed response never
+    // returns; selecting or sorting by one would render a blank column.
+    const groupings = findTable('traces_groupings_v2');
+    const selectable = selectableColumns(groupings).map((c) => c.name);
+    expect(selectable).toContain('span_name');
+    expect(selectable).not.toContain('trace_source');
+    // Filter-only only makes sense on a column you can filter on.
+    for (const column of groupings.columns.filter((c) => c.filterOnly)) {
+      expect([column.name, column.filterable]).toEqual([column.name, true]);
+    }
+  });
+});
+
 describe('operatorsFor', () => {
   const events = findTable('events_v2');
 
@@ -124,7 +143,7 @@ describe('operatorsFor', () => {
   });
 
   it('offers only operators the SQL generator implements', () => {
-    // `_icontains` / `_regex` are declared in the engine's operator constants
+    // `_icontains` and friends are declared in the engine's operator constants
     // but only the log providers implement them — the entity path answers
     // "binary clause type not supported", i.e. a panel that breaks at render.
     const implemented = new Set([
@@ -135,6 +154,8 @@ describe('operatorsFor', () => {
       '_like',
       '_nlike',
       '_ilike',
+      '_regex',
+      '_nregex',
       '_lt',
       '_lte',
       '_gt',
@@ -151,6 +172,41 @@ describe('operatorsFor', () => {
         }
       }
     }
+  });
+
+  it('offers a regex match on text columns of both datasources, and nowhere else', () => {
+    // The only way to say "A or B" on one column when the values are not known
+    // exactly — rows are AND-ed, and a pattern (%…%) has no alternation.
+    for (const [table, column] of [
+      [events, 'title'],
+      [findTable('traces_v2'), 'resource'],
+      [findTable('traces_groupings_v2'), 'resource'],
+    ] as const) {
+      const values = operatorsFor(table, column).map((o) => o.value);
+      expect([table.value, values.includes('_regex'), values.includes('_nregex')]).toEqual([table.value, true, true]);
+    }
+    expect(operatorsFor(events, 'computed_score').map((o) => o.value)).not.toContain('_regex');
+    expect(operatorsFor(events, 'starts_at').map((o) => o.value)).not.toContain('_regex');
+
+    expect(operatorTakesRegex('_regex')).toBe(true);
+    expect(operatorTakesRegex('_nregex')).toBe(true);
+    expect(operatorTakesRegex('_ilike')).toBe(false);
+    // One pattern, not a comma-separated list: `a,b|c` must reach the engine whole.
+    expect(operatorTakesList('_regex')).toBe(false);
+    expect(operatorTakesValue('_regex')).toBe(true);
+  });
+
+  it('does not offer "is empty" on traces', () => {
+    // It compiles to IS NULL, and a span store's columns are not nullable — the
+    // filter would silently empty the panel rather than find the blank rows.
+    for (const table of ENTITY_TABLES.filter((t) => t.datasource === 'traces')) {
+      for (const column of table.columns) {
+        const values = operatorsFor(table, column.name).map((o) => o.value);
+        expect([table.value, column.name, values.includes('_is_null')]).toEqual([table.value, column.name, false]);
+      }
+    }
+    // Still offered on the query-engine tables, where the columns ARE nullable.
+    expect(operatorsFor(events, 'ends_at').map((o) => o.value)).toContain('_is_null');
   });
 
   it('knows which operators take a list or no value', () => {
@@ -251,5 +307,193 @@ describe('draftFromQuery', () => {
     const restored = draftFromQuery(buildEntityQuery(defaultDraft('event_groupings_v2')));
     expect(restored.table).toBe('event_groupings_v2');
     expect(restored.columns).toContain('event_count');
+  });
+});
+
+describe('aggregate filters', () => {
+  it('routes a filter on a computed column into HAVING, not WHERE', () => {
+    // The engine refuses an aggregate in a where clause outright — "column
+    // event_count defined in where clause is aggregated and cannot be used in
+    // where clause" — so a panel filtering on Event count used to fail to render.
+    const query = buildEntityQuery({
+      ...defaultDraft('event_groupings_v2'),
+      filters: [
+        { column: 'cluster', operator: '_eq', value: 'prod' },
+        { column: 'event_count', operator: '_gt', value: '100' },
+      ],
+    });
+    expect((query.where as any)._and).toEqual([{ _binary: { cluster: { _eq: 'prod' } } }]);
+    expect((query.having as any)._and).toEqual([{ _binary: { event_count: { _gt: 100 } } }]);
+  });
+
+  it('stores a regex filter as one pattern, exactly as typed', () => {
+    const query = buildEntityQuery({
+      ...defaultDraft('events_v2'),
+      filters: [{ column: 'title', operator: '_regex', value: ' registry-(central|edge), again ' }],
+    });
+    // Trimmed like every value, but never split on the comma the way a list is.
+    expect((query.where as any)._and).toEqual([{ _binary: { title: { _regex: 'registry-(central|edge), again' } } }]);
+    // …and it comes back into the builder as the same row.
+    expect(draftFromQuery(query).filters).toEqual([{ column: 'title', operator: '_regex', value: 'registry-(central|edge), again' }]);
+  });
+
+  it('leaves HAVING off a query with no aggregate filter', () => {
+    const query = buildEntityQuery({ ...defaultDraft('events_v2'), filters: [{ column: 'title', operator: '_ilike', value: '%oom%' }] });
+    expect(query.having).toBeUndefined();
+  });
+
+  it('reads an aggregate filter back into the builder', () => {
+    const original = {
+      ...defaultDraft('recommendation_groupings_v2'),
+      filters: [{ column: 'count', operator: '_gte', value: '5' }],
+    };
+    const restored = draftFromQuery(buildEntityQuery(original));
+    expect(restored.filters).toEqual([{ column: 'count', operator: '_gte', value: '5' }]);
+  });
+
+  it('never offers a traces aggregate as a filter', () => {
+    // Traces have no HAVING surface: their filters go to the traces service, so
+    // an aggregate there can only rebuild the bug this replaced.
+    for (const table of ENTITY_TABLES.filter((t) => t.datasource === 'traces')) {
+      for (const column of table.columns.filter((c) => c.aggregate)) {
+        expect([table.value, column.name, column.filterable]).toEqual([table.value, column.name, undefined]);
+      }
+    }
+    expect(findTable('traces_groupings_v2').columns.filter((c) => c.aggregate).length).toBe(5);
+  });
+
+  it('marks every column the engine computes from the GROUP BY', () => {
+    // Mirrors IsAggregated in api-server/services/query/metadata.go. A column
+    // that gains an aggregate Def there and is not marked here becomes a filter
+    // that builds a query the engine rejects.
+    const expected: Record<string, string[]> = {
+      event_groupings_v2: [
+        'event_count',
+        'count_priority_p0',
+        'count_priority_p1',
+        'count_priority_p2',
+        'count_priority_p3',
+        'count_new_issues',
+        'count_pod_issues',
+        'count_node_issues',
+        'count_application_issues',
+        'max_created_at',
+        'min_created_at',
+      ],
+      recommendation_groupings_v2: ['count', 'sum_estimated_savings'],
+      spend_groupings_v2: ['spend_amount', 'spend_count', 'resource_count', 'account_count'],
+      ticket_groupings_v2: ['count'],
+      anomaly_grouping_v2: ['count'],
+      recommendation_security_cis_groupings_v2: ['count', 'updated_at'],
+      auto_pilot_task_groupings_v2: ['count'],
+      llm_conversation_groupings_v2: ['count'],
+    };
+    for (const [table, columns] of Object.entries(expected)) {
+      const marked = findTable(table)
+        .columns.filter((c) => c.aggregate)
+        .map((c) => c.name);
+      expect([table, marked.sort()]).toEqual([table, [...columns].sort()]);
+    }
+  });
+});
+
+describe('renderEntityQuery', () => {
+  const query = buildEntityQuery({
+    ...defaultDraft('events_v2'),
+    filters: [
+      { column: 'subject_namespace', operator: '_eq', value: '$namespace' },
+      { column: 'priority', operator: '_in', value: '$priority, P0' },
+      { column: 'ends_at', operator: '_is_null', value: '' },
+    ],
+  });
+
+  it('substitutes a variable into a filter value', () => {
+    // An entity panel's query is an object, so it never passed through
+    // renderTemplate — `$namespace` travelled to the engine verbatim and matched
+    // nothing, while the builder's placeholder advertised it.
+    const rendered = renderEntityQuery(query, (v) => v.replace('$namespace', 'prod').replace('$priority', 'P1'));
+    const clauses = (rendered.where as any)._and;
+    expect(clauses[0]._binary.subject_namespace._eq).toBe('prod');
+    // A list value is substituted element by element.
+    expect(clauses[1]._binary.priority._in).toEqual(['P1', 'P0']);
+    // `_is_null` carries a boolean, which no template touches.
+    expect(clauses[2]._binary.ends_at._is_null).toBe(true);
+  });
+
+  it('keeps a regex anchor, and still fills a variable inside the pattern', () => {
+    // `$` ends a regex and starts a variable. Only a known variable name is
+    // substituted, so the trailing anchor must reach the engine untouched.
+    const regexQuery = buildEntityQuery({
+      ...defaultDraft('events_v2'),
+      filters: [{ column: 'title', operator: '_regex', value: '^($namespace|edge)-api$' }],
+    });
+    const rendered = renderEntityQuery(regexQuery, (v) => renderTemplate(v, { namespace: 'prod' }));
+    expect((rendered.where as any)._and[0]._binary.title._regex).toBe('^(prod|edge)-api$');
+  });
+
+  it('leaves column names and operators alone', () => {
+    // Only values are authored by hand; a substitutable column name would let a
+    // variable rewrite which column is filtered.
+    const rendered = renderEntityQuery(query, () => 'REPLACED');
+    const clauses = (rendered.where as any)._and;
+    expect(Object.keys(clauses[0]._binary)).toEqual(['subject_namespace']);
+    expect(Object.keys(clauses[0]._binary.subject_namespace)).toEqual(['_eq']);
+  });
+
+  it('survives a column whose operators are not an object', () => {
+    // Stored dashboard JSON is hand-editable and predates the current shape, so
+    // a null here is reachable. Object.entries(null) threw and took the whole
+    // dashboard render with it.
+    const malformed = { _and: [{ _binary: { subject_namespace: null } }, { _binary: { priority: 'not-an-object' } }] };
+    const rendered = renderEntityQuery({ where: malformed }, (v) => v);
+    const clauses = (rendered.where as any)._and;
+    expect(clauses[0]._binary.subject_namespace).toEqual({});
+    expect(clauses[1]._binary.priority).toEqual({});
+  });
+
+  it('substitutes into HAVING as well as WHERE', () => {
+    const grouped = buildEntityQuery({
+      ...defaultDraft('event_groupings_v2'),
+      filters: [
+        { column: 'cluster', operator: '_eq', value: '$cluster' },
+        { column: 'event_count', operator: '_gt', value: '10' },
+      ],
+    });
+    const rendered = renderEntityQuery(grouped, (v) => v.replace('$cluster', 'eu-1'));
+    expect((rendered.where as any)._and[0]._binary.cluster._eq).toBe('eu-1');
+    expect((rendered.having as any)._and[0]._binary.event_count._gt).toBe(10);
+  });
+
+  it('passes a query with no filters through untouched', () => {
+    const bare = buildEntityQuery(defaultDraft('events_v2'));
+    expect(renderEntityQuery(bare, () => 'REPLACED')).toEqual(bare);
+  });
+});
+
+// The tables hold `{brand}` rather than a literal product name so a white-label
+// tenant is not stuck with the house brand (see fillBrandTokens). Substitution
+// happens in the accessors, which means every user-facing field has to be listed
+// there: a field that is added to the copy but not to brandTable() ships the raw
+// placeholder to the user, which is worse than the name it replaced. `detail` was
+// exactly that miss.
+describe('brand placeholders', () => {
+  const BRAND_TOKEN = /\{brand\}|\{assistant\}/i;
+
+  it('leaves no placeholder in any field the accessors return', () => {
+    for (const source of ENTITY_TABLES) {
+      const table = findTable(source.value);
+      expect(table.label).not.toMatch(BRAND_TOKEN);
+      expect(table.description).not.toMatch(BRAND_TOKEN);
+      expect(table.detail).not.toMatch(BRAND_TOKEN);
+      for (const column of table.columns) {
+        expect(column.label).not.toMatch(BRAND_TOKEN);
+      }
+    }
+  });
+
+  it('substitutes through tablesFor as well as findTable', () => {
+    for (const table of tablesFor('nudgebee')) {
+      expect(`${table.description} ${table.detail}`).not.toMatch(BRAND_TOKEN);
+    }
   });
 });

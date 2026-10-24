@@ -501,6 +501,53 @@ def _run_test_core(
     elapsed = round(time.time() - llm_start, 2)
     docs = extractor(llm_result.data, session.account_id, tool_names, db_tool_name)
 
+    # A benchmark must never approve a mutation, and a write confirmation must
+    # never stall an unattended run: answer tool-confirmation followups with an
+    # explicit denial so the agent finishes with the denial handled and the
+    # final text stays scoreable. Fixtures that exercise a real apply flow opt
+    # out with ``auto_deny_write_confirmations: false``.
+    auto_deny = test_case.get(
+        "auto_deny_write_confirmations",
+        config.get("auto_deny_write_confirmations", True),
+    )
+    deny_rounds = 0
+    while (
+        auto_deny
+        and llm_result.status == "WAITING"
+        and deny_rounds < 3
+        and llm_result.followups
+        and all(
+            str(f.get("followup_type") or "") == "tool_confirmation"
+            for f in llm_result.followups
+        )
+    ):
+        deny_rounds += 1
+        fu = llm_result.followups[0]
+        deny_cid = extract_conversation_id(llm_result.data) if llm_result.data else None
+        logger.info(
+            "[%s] auto-denying write confirmation (round %d): %s",
+            test_id,
+            deny_rounds,
+            str(fu.get("question") or "")[:120],
+        )
+        llm_result = call_llm(
+            "no",
+            session.account_id,
+            session.tenant_id,
+            session.user_id,
+            config=llm_config,
+            conversation_id=deny_cid or "",
+            agent_id=str(fu.get("agent_id") or ""),
+            message_id=str(fu.get("message_id") or ""),
+            k8s_orchestrator_mode=config.get("k8s_orchestrator_mode"),
+            llm_config_source=config.get("llm_config_source"),
+            llm_provider=config.get("llm_provider"),
+            llm_model_name=config.get("llm_model_name"),
+            llm_tier_models=config.get("llm_tier_models"),
+        )
+        elapsed = round(time.time() - llm_start, 2)
+        docs = extractor(llm_result.data, session.account_id, tool_names, db_tool_name)
+
     # Handle WAITING status
     if llm_result.status == "WAITING":
         convo_id = extract_conversation_id(llm_result.data) if llm_result.data else None
@@ -644,6 +691,15 @@ def _run_test_core(
     score_reason = ""
     trace = ""
 
+    # Fetch the execution trace whenever a conversation exists — including
+    # for a failed test. A crash mid-task still has real evidence (the
+    # verdict judge below needs it); a setup failure that never started a
+    # conversation has none (convo_id is empty, so this is a no-op for it).
+    if convo_id:
+        trace = get_execution_trace(convo_id, session.account_id) or ""
+        if not trace:
+            trace = get_planner_response(convo_id, session.account_id) or ""
+
     if not test_failed and session.llm:
         try:
             from llm.agents.common.ragas_evaluation import evaluate_single
@@ -655,20 +711,15 @@ def _run_test_core(
             rel_score = eval_result.quality
             score_reason = eval_result.reason
 
-            # Planner evaluation
-            trace = (
-                get_execution_trace(convo_id, session.account_id) if convo_id else ""
-            )
-            if not trace:
-                trace = get_planner_response(convo_id, session.account_id) or ""
             if trace:
                 from llm.agents.common.benchmark import _evaluate_planner
+                from llm.agents.common.eval_markers import PLANNER_LABEL
 
                 planner_score, planner_reason = _evaluate_planner(
                     trace, user_prompt, session.llm
                 )
                 if planner_reason:
-                    score_reason += f"\n[Planner] {planner_reason}"
+                    score_reason += f"\n{PLANNER_LABEL} {planner_reason}"
                     score_reason = score_reason.strip()
         except Exception as e:
             logger.error("[%s] RAGAS evaluation failed: %s", test_id, e)
@@ -704,6 +755,42 @@ def _run_test_core(
     else:
         final_status = "fail"
 
+    # --- Verdict: independent qualitative judge (runs in the background) ---
+    # Only for a terminal outcome: a "running" row (poll budget elapsed,
+    # conversation still in flight) is finalized later by the reconciler,
+    # which queues its own judge call. Unlike RAGAS above, a failed test is
+    # judged too when there's a trace to judge from. The row is stored as
+    # "pending" and the call is queued after the store, so the next test
+    # starts without waiting for the verdict.
+    verdict_context = None
+    if session.llm and convo_id and final_status in ("pass", "fail"):
+        from llm.agents.common.verdict_judge import should_skip_verdict
+
+        if not should_skip_verdict(final_status, trace):
+            verdict_context = {
+                "test_id": test_id,
+                "query": user_prompt,
+                "setup": test_case.get("before_test", ""),
+                "expected_answer": ground_truth_str,
+                "actual_answer": answer,
+                "execution_trace": trace,
+                "tool_names": (
+                    tool_names_data.get("tool_names", []) if tool_names_data else []
+                ),
+                "tool_calls_total": (
+                    token_metrics.get("total_tool_calls", 0) if token_metrics else 0
+                ),
+                "tool_calls_successful": (
+                    token_metrics.get("successful_tool_calls", 0)
+                    if token_metrics
+                    else 0
+                ),
+                "error_message": error_message,
+                "error_category": error_category,
+                "status": final_status,
+                "tags": test_case.get("tags", []),
+            }
+
     # Store to DB
     if run_id:
         store_test_result(
@@ -722,6 +809,9 @@ def _run_test_core(
                 "planner_relevancy": planner_score,
                 "score_reason": score_reason,
                 "execution_trace": trace if not test_failed else "",
+                "verdict_status": "pending" if verdict_context else None,
+                "verdict_result": None,
+                "verdict_error": None,
                 "duration_seconds": round(duration, 2),
                 "setup_duration": setup_duration,
                 "llm_duration": elapsed,
@@ -760,6 +850,10 @@ def _run_test_core(
                 "error_category": error_category or "",
             },
         )
+        if verdict_context:
+            from llm.agents.common.verdict_judge import submit_verdict
+
+            submit_verdict(run_id, global_index, convo_id, verdict_context, session.llm)
 
     status = final_status
     logger.info(
@@ -800,7 +894,15 @@ def _store_error(
             ),
             "duration_seconds": round(duration, 2),
             "setup_duration": setup_duration,
-            "error_message": error_msg[:500],
+            # 500 chars cut this off before the diagnostics tail
+            # (_get_pod_diagnostics' pod status + recent events) ever showed
+            # up — every stored setup_failed message was boilerplate (the
+            # truncated script + empty stdout/stderr) with the actually
+            # useful part (e.g. "0/17 nodes available: Insufficient
+            # memory...") silently dropped. error_message is a Text column,
+            # no DB-side limit; 4000 comfortably fits pod status + last 20
+            # events per namespace while still bounding pathological output.
+            "error_message": error_msg[:4000],
             "error_category": error_cat,
             "tags": test_case.get("tags", []),
         },

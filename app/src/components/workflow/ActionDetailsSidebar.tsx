@@ -1,5 +1,9 @@
 import React, { Fragment, useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { Box, Typography, Switch, Dialog, Chip, Tabs, Tab, Autocomplete, TextField, Alert } from '@mui/material';
+import { Box, Typography, Dialog, Tabs, Tab, Autocomplete, TextField } from '@mui/material';
+import { Callout } from '@ui/Callout';
+import { Chip } from '@ui/Chip';
+import { Label } from '@ui/Label';
+import { Switch } from '@ui/Switch';
 import { Button } from '@ui/Button';
 import { Modal } from '@ui/Modal';
 import { PlayArrow, Timer, Storage, GridView, ErrorOutline, Close, AltRoute, Check } from '@mui/icons-material';
@@ -25,19 +29,25 @@ import FilterDropdown from '@ui/FilterDropdown';
 import { getPreviousTasksForNode, getSwitchChildNodeIds, getSwitchDryRunEligibility } from './utils/templateUtils';
 import {
   DBMS_OPTIONS,
-  FIELD_PLACEHOLDERS,
   formatFieldLabel,
   getCodeLanguage,
   getDropdownOptionsForField,
-  isTemplateString,
+  getExamplePlaceholder,
+  parseJsonExample,
   resolveFieldType,
+  normalizeStoredObjectValue,
+  resolveObjectFieldValue,
   type SchemaProperty,
 } from './utils/fieldTypeUtils';
 import { getUpstreamSuggestedValues } from './utils/getUpstreamSuggestedValues';
 import { parseDurationToSeconds, sanitizeTaskId } from './utils/taskUtils';
+import { EVENT_ACCOUNT_TEMPLATE, listensToSeveralAccounts } from './utils/listenAccounts';
+import { triggerInputFields } from './utils/triggerPayloadMock';
 import apiWorkflow from '@api1/workflow';
 import apiAccount from '@api1/account';
 import { isTenantAdmin } from '@lib/auth';
+import { useBrandingConfig } from '@hooks/useTenantBranding';
+import { isUrlFieldName, urlFieldStatus } from 'src/utils/url';
 import { DurationField, TemplateExpressionField, FailurePolicyField, HooksField, KeyValueField, MatrixField } from './components/advanced-config';
 import CollapsableCard from '@ui/CollapsableCard';
 import {
@@ -52,6 +62,7 @@ import {
   NestedSchemaEditor,
 } from './components/WorkflowFieldComponents';
 import { StableTextField, StableTextarea, StableNumberField } from './components/StableFormFields';
+import FieldGuidance from './components/FieldGuidance';
 
 // Built-in dynamic variables exposed to subject/body of the workflow email action.
 // Mirrors the keys added to the Gonja context in runbook-server templating.go so the
@@ -193,6 +204,8 @@ interface ActionDetailsSidebarProps {
   // parent container (used by the standalone Task Runner page). Inline mode drops
   // the Previous Actions column — there is no surrounding workflow graph.
   variant?: 'dialog' | 'inline';
+  // Error the last server validation reported for this step, if any.
+  serverError?: string | null;
 }
 
 const DEFAULT_FORM_FIELD_PROPS = {
@@ -207,6 +220,21 @@ const DEFAULT_FORM_FIELD_PROPS = {
 };
 
 // Status color mapping for dry-run results
+/** The same status axis as getStatusColor, expressed as a ds/Label tone. */
+const getStatusTone = (status: string): 'success' | 'critical' | 'info' | 'neutral' => {
+  switch (status?.toUpperCase()) {
+    case 'COMPLETED':
+      return 'success';
+    case 'FAILED':
+      return 'critical';
+    case 'RUNNING':
+    case 'IN_PROGRESS':
+      return 'info';
+    default:
+      return 'neutral';
+  }
+};
+
 const getStatusColor = (status: string) => {
   switch (status?.toUpperCase()) {
     case 'COMPLETED':
@@ -232,15 +260,15 @@ const renderDescriptiveOption = (
   const found = options.find((o) => o.value === option);
   return (
     <li {...props} key={option}>
-      <Box sx={{ py: 0.25 }}>
+      <Box sx={{ py: ds.space[0] }}>
         <Typography
           component='span'
-          sx={{ fontWeight: 'var(--ds-font-weight-semibold)', fontSize: 'var(--ds-text-body)', color: ds.blue[500], fontFamily: 'monospace' }}
+          sx={{ fontWeight: 'var(--ds-font-weight-semibold)', fontSize: 'var(--ds-text-body)', color: ds.blue[500], fontFamily: ds.font.mono }}
         >
           {option}
         </Typography>
         {found?.description && (
-          <Typography component='p' sx={{ fontSize: 'var(--ds-text-small)', color: ds.gray[700], mt: 0.25, lineHeight: 1.3 }}>
+          <Typography component='p' sx={{ fontSize: 'var(--ds-text-small)', color: ds.gray[700], mt: ds.space[0], lineHeight: 1.3 }}>
             {found.description}
           </Typography>
         )}
@@ -274,6 +302,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
   pendingData,
   onPendingDataConsumed,
   variant = 'dialog',
+  serverError,
 }) => {
   const [localData, setLocalData] = useState(taskData || {});
 
@@ -309,6 +338,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
   // Workflow configs state
   const [workflowConfigs, setWorkflowConfigs] = useState<Array<{ key: string; value: string; type: string }>>([]);
   const [showAllConfigs, setShowAllConfigs] = useState(false);
+  const [showAllTriggerFields, setShowAllTriggerFields] = useState(false);
 
   // Default provider (logs / metrics / traces) for the currently selected
   // account, shown as a read-only chip below the account dropdown for any
@@ -387,6 +417,11 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
 
   // Find the current task definition
   const currentTaskDefinition = taskDefinitions.find((def) => def.name === selectedActionType);
+  // The server names the field when a multi-account automation leaves a step's account empty.
+  const serverErrorNamesAccount = !!serverError && serverError.includes('account_id');
+  // Task descriptions come from runbook-server, which has no tenant branding
+  const { title: brandTitle } = useBrandingConfig();
+  const currentTaskDescription = currentTaskDefinition?.description?.replace(/\bNudgebee\b/g, () => brandTitle);
 
   // Use centralized hook for node config access
   const { selectedNode: hookSelectedNode, taskConfig } = useSelectedNodeConfig(nodes);
@@ -608,7 +643,9 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
     applyAutoDefault(updated);
   }, [selectedActionType, timeMode, taskDefinitions, applyAutoDefault]);
 
-  // Normalize object-type fields that may have empty string values (e.g., headers: "" → {}).
+  // Normalize object-type fields stored as a string (e.g., headers: "" → {}).
+  // Unparseable text is left alone — it is a JsonEditor edit in progress, and
+  // rewriting it mid-keystroke wiped what the user had typed.
   // Template strings like "{{workflow.secrets.mcp_headers}}" are preserved so the backend
   // can resolve them to a map at runtime via ProcessValue (runbook-server templating.go).
   useEffect(() => {
@@ -623,8 +660,13 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
     for (const [key, fieldSchema] of Object.entries(schema.input_schema)) {
       const fs = fieldSchema as SchemaProperty;
       const isObjectType = fs.type === 'object' || fs.type === 'map[string]string' || fs.type === 'map[string]any';
-      if (isObjectType && key in normalized && typeof normalized[key] === 'string' && !isTemplateString(normalized[key])) {
-        normalized[key] = {};
+      if (!isObjectType || !(key in normalized)) {
+        continue;
+      }
+      // No opts needed: an object-typed field never resolves to resource_dropdown.
+      const normalizedValue = normalizeStoredObjectValue(normalized[key], resolveFieldType(key, fs) === 'json');
+      if (normalizedValue.changed) {
+        normalized[key] = normalizedValue.value;
         needsNormalize = true;
       }
     }
@@ -1351,7 +1393,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
     const hasOutput = taskOutput?.output;
 
     return (
-      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5, ml: 1 }}>
+      <Box sx={{ display: 'flex', flexDirection: 'column', gap: ds.space[1], ml: ds.space[2] }}>
         {Object.entries(outputSchema).map(([fieldName, fieldSchema]: [string, any]) => (
           <DraggableOutputField
             key={`${task.id}-${fieldName}`}
@@ -1385,7 +1427,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
     }
 
     return (
-      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5 }}>
+      <Box sx={{ display: 'flex', flexDirection: 'column', gap: ds.space[1] }}>
         {workflowInputs.map((input) => (
           <DraggableOutputField
             key={input.id}
@@ -1416,7 +1458,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
     const remainingCount = workflowConfigs.length - INITIAL_CONFIGS_COUNT;
 
     return (
-      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5 }}>
+      <Box sx={{ display: 'flex', flexDirection: 'column', gap: ds.space[1] }}>
         {displayedConfigs.map((config) => (
           <DraggableOutputField
             key={config.key}
@@ -1433,6 +1475,36 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
         {hasMoreConfigs && (
           <Button id='action-sidebar-toggle-configs-btn' tone='ghost' size='xs' onClick={() => setShowAllConfigs(!showAllConfigs)}>
             {showAllConfigs ? 'Show less' : `Show ${remainingCount} more`}
+          </Button>
+        )}
+      </Box>
+    );
+  };
+
+  // What the trigger delivers, as `Inputs.event.*` — every step can read it, not just the first.
+  const triggerInputs = useMemo(() => triggerInputFields(nodes), [nodes]);
+
+  const renderTriggerInputFields = () => {
+    if (!triggerInputs) return null;
+    const INITIAL_TRIGGER_FIELDS_COUNT = 8;
+    const displayed = showAllTriggerFields ? triggerInputs.fields : triggerInputs.fields.slice(0, INITIAL_TRIGGER_FIELDS_COUNT);
+    const remainingCount = triggerInputs.fields.length - INITIAL_TRIGGER_FIELDS_COUNT;
+
+    return (
+      <Box sx={{ display: 'flex', flexDirection: 'column', gap: ds.space[1] }}>
+        {displayed.map((field) => (
+          <DraggableOutputField
+            key={field.path}
+            taskId=''
+            taskName='Trigger'
+            fieldName={`event.${field.path}`}
+            fieldType={field.type}
+            template={`{{ Inputs.event.${field.path} }}`}
+          />
+        ))}
+        {remainingCount > 0 && (
+          <Button id='action-sidebar-toggle-trigger-fields-btn' tone='ghost' size='xs' onClick={() => setShowAllTriggerFields(!showAllTriggerFields)}>
+            {showAllTriggerFields ? 'Show less' : `Show ${remainingCount} more`}
           </Button>
         )}
       </Box>
@@ -1459,20 +1531,20 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
         {/* Header */}
         <Box
           sx={{
-            px: 2,
-            py: 1.5,
+            px: ds.space[4],
+            py: ds.space[3],
             borderBottom: '1px solid var(--ds-brand-150)',
             bgcolor: 'var(--ds-background-100)',
           }}
         >
-          <Typography sx={{ fontSize: 'var(--ds-text-body)', fontWeight: 'var(--ds-font-weight-semibold)', color: ds.gray[700], mb: 0.5 }}>
+          <Typography sx={{ fontSize: 'var(--ds-text-body)', fontWeight: 'var(--ds-font-weight-semibold)', color: ds.gray[700], mb: ds.space[1] }}>
             Available Data
           </Typography>
           <Typography sx={{ fontSize: 'var(--ds-text-caption)', color: ds.gray[400] }}>Drag fields to use in configuration</Typography>
         </Box>
 
         {/* Dry Run Button */}
-        <Box sx={{ px: 2, py: 1.5, borderBottom: '1px solid var(--ds-brand-150)', bgcolor: 'var(--ds-background-100)' }}>
+        <Box sx={{ px: ds.space[4], py: ds.space[3], borderBottom: '1px solid var(--ds-brand-150)', bgcolor: 'var(--ds-background-100)' }}>
           <Button
             id='action-sidebar-test-prev-actions-btn'
             tone='secondary'
@@ -1486,7 +1558,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
             {previousDryRunLoading ? 'Running...' : 'Test Previous Actions'}
           </Button>
           {previousDryRunError && (
-            <Typography sx={{ fontSize: 'var(--ds-text-caption)', color: ds.red[500], mt: 0.5 }}>{previousDryRunError}</Typography>
+            <Typography sx={{ fontSize: 'var(--ds-text-caption)', color: ds.red[500], mt: ds.space[1] }}>{previousDryRunError}</Typography>
           )}
         </Box>
 
@@ -1495,23 +1567,48 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
           sx={{
             flex: 1,
             overflow: 'auto',
-            p: 2,
+            p: ds.space[4],
             display: 'flex',
             flexDirection: 'column',
-            gap: 2,
+            gap: ds.space[4],
           }}
         >
+          {/* Trigger Section - the event or recommendation that started the run */}
+          {triggerInputs && (
+            <Box
+              data-testid='action-sidebar-trigger-inputs'
+              sx={{
+                p: ds.space[3],
+                bgcolor: 'var(--ds-background-100)',
+                border: '1px solid var(--ds-amber-300)',
+                borderRadius: ds.radius.sm,
+              }}
+            >
+              <Typography
+                sx={{ fontSize: 'var(--ds-text-small)', fontWeight: 'var(--ds-font-weight-semibold)', color: ds.gray[700], mb: ds.space[1] }}
+              >
+                {triggerInputs.triggerType === 'optimization' ? 'Trigger recommendation' : 'Trigger event'}
+              </Typography>
+              <Typography sx={{ fontSize: 'var(--ds-text-caption)', color: ds.gray[400], mb: ds.space[2] }}>
+                Filled in from the trigger that starts each run.
+              </Typography>
+              {renderTriggerInputFields()}
+            </Box>
+          )}
+
           {/* Workflow Inputs Section - Always show if inputs exist */}
           {workflowInputs && workflowInputs.length > 0 && (
             <Box
               sx={{
-                p: 1.5,
+                p: ds.space[3],
                 bgcolor: 'var(--ds-background-100)',
                 border: '1px solid var(--ds-blue-200)',
                 borderRadius: ds.radius.sm,
               }}
             >
-              <Typography sx={{ fontSize: 'var(--ds-text-small)', fontWeight: 'var(--ds-font-weight-semibold)', color: ds.gray[700], mb: 1 }}>
+              <Typography
+                sx={{ fontSize: 'var(--ds-text-small)', fontWeight: 'var(--ds-font-weight-semibold)', color: ds.gray[700], mb: ds.space[2] }}
+              >
                 Automation Inputs
               </Typography>
               {renderWorkflowInputFields()}
@@ -1522,13 +1619,15 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
           {workflowConfigs && workflowConfigs.length > 0 && (
             <Box
               sx={{
-                p: 1.5,
+                p: ds.space[3],
                 bgcolor: 'var(--ds-background-100)',
                 border: '1px solid var(--ds-yellow-300)',
                 borderRadius: ds.radius.sm,
               }}
             >
-              <Typography sx={{ fontSize: 'var(--ds-text-small)', fontWeight: 'var(--ds-font-weight-semibold)', color: ds.gray[700], mb: 1 }}>
+              <Typography
+                sx={{ fontSize: 'var(--ds-text-small)', fontWeight: 'var(--ds-font-weight-semibold)', color: ds.gray[700], mb: ds.space[2] }}
+              >
                 Automation Configs
               </Typography>
               {renderWorkflowConfigFields()}
@@ -1537,7 +1636,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
 
           {/* Previous Tasks Section */}
           {hasPreviousTasks && (
-            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, flex: 1 }}>
+            <Box sx={{ display: 'flex', flexDirection: 'column', gap: ds.space[4], flex: 1 }}>
               {previousTasks.map((task) => {
                 const taskOutput = previousDryRunResults?.[task.id];
                 const statusColors = taskOutput ? getStatusColor(taskOutput.status) : null;
@@ -1546,7 +1645,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                   <Box
                     key={task.id}
                     sx={{
-                      p: 1.5,
+                      p: ds.space[3],
                       bgcolor: 'var(--ds-background-100)',
                       border: '1px solid var(--ds-brand-150)',
                       borderRadius: ds.radius.sm,
@@ -1563,22 +1662,9 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                       <Typography sx={{ fontSize: 'var(--ds-text-small)', fontWeight: 'var(--ds-font-weight-semibold)', color: ds.gray[700] }}>
                         {task.name || task.id}
                       </Typography>
-                      {statusColors && (
-                        <Chip
-                          label={taskOutput.status}
-                          size='small'
-                          sx={{
-                            height: 18,
-                            fontSize: 'var(--ds-text-caption)',
-                            fontWeight: 'var(--ds-font-weight-semibold)',
-                            bgcolor: statusColors.bg,
-                            color: statusColors.text,
-                            border: `1px solid ${statusColors.border}`,
-                          }}
-                        />
-                      )}
+                      {statusColors && <Label tone={getStatusTone(taskOutput.status)}>{taskOutput.status}</Label>}
                     </Box>
-                    <Typography sx={{ fontSize: 'var(--ds-text-caption)', color: ds.gray[400], mb: 1 }}>{task.type}</Typography>
+                    <Typography sx={{ fontSize: 'var(--ds-text-caption)', color: ds.gray[400], mb: ds.space[2] }}>{task.type}</Typography>
                     {renderTaskOutputFields(task, taskOutput)}
 
                     {/* Show actual output after dry-run */}
@@ -1586,8 +1672,8 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                       <Box
                         sx={{
                           position: 'relative',
-                          mt: 1.5,
-                          p: 1.5,
+                          mt: ds.space[3],
+                          p: ds.space[3],
                           bgcolor: 'var(--ds-green-100)',
                           border: '1px solid var(--ds-green-200)',
                           borderRadius: ds.radius.sm,
@@ -1600,7 +1686,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                           sx={{
                             fontSize: 'var(--ds-text-caption)',
                             color: 'var(--ds-green-700)',
-                            mb: 0.5,
+                            mb: ds.space[1],
                             fontWeight: 'var(--ds-font-weight-semibold)',
                           }}
                         >
@@ -1621,8 +1707,8 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                     {taskOutput?.error && (
                       <Box
                         sx={{
-                          mt: 1.5,
-                          p: 1.5,
+                          mt: ds.space[3],
+                          p: ds.space[3],
                           bgcolor: 'var(--ds-red-100)',
                           border: '1px solid var(--ds-red-200)',
                           borderRadius: ds.radius.sm,
@@ -1638,11 +1724,14 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
           )}
 
           {/* Empty state - only show if no inputs, no configs and no previous tasks */}
-          {(!workflowInputs || workflowInputs.length === 0) && (!workflowConfigs || workflowConfigs.length === 0) && !hasPreviousTasks && (
-            <Typography sx={{ fontSize: 'var(--ds-text-small)', color: ds.gray[400], fontStyle: 'italic' }}>
-              No workflow inputs, configs or previous actions available
-            </Typography>
-          )}
+          {!triggerInputs &&
+            (!workflowInputs || workflowInputs.length === 0) &&
+            (!workflowConfigs || workflowConfigs.length === 0) &&
+            !hasPreviousTasks && (
+              <Typography sx={{ fontSize: 'var(--ds-text-small)', color: ds.gray[400], fontStyle: 'italic' }}>
+                No workflow inputs, configs or previous actions available
+              </Typography>
+            )}
         </Box>
       </Box>
     );
@@ -1678,26 +1767,13 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
       }
 
       return (
-        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: ds.space[3] }}>
           {/* Section Title & Status */}
-          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: ds.space[2] }}>
             <Typography sx={{ fontSize: 'var(--ds-text-caption)', fontWeight: 'var(--ds-font-weight-semibold)', color: ds.gray[700] }}>
               {title}:
             </Typography>
-            {statusColors && (
-              <Chip
-                label={result.status}
-                size='small'
-                sx={{
-                  height: 18,
-                  fontSize: 'var(--ds-text-caption)',
-                  fontWeight: 'var(--ds-font-weight-semibold)',
-                  bgcolor: statusColors.bg,
-                  color: statusColors.text,
-                  border: `1px solid ${statusColors.border}`,
-                }}
-              />
-            )}
+            {statusColors && <Label tone={getStatusTone(result.status)}>{result.status}</Label>}
           </Box>
 
           {/* Output */}
@@ -1705,7 +1781,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
             <Box
               sx={{
                 position: 'relative',
-                p: 1.5,
+                p: ds.space[3],
                 bgcolor: 'var(--ds-green-100)',
                 border: '1px solid var(--ds-green-200)',
                 borderRadius: ds.radius.sm,
@@ -1714,7 +1790,12 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
               }}
             >
               <Typography
-                sx={{ fontSize: 'var(--ds-text-caption)', color: 'var(--ds-green-700)', mb: 0.5, fontWeight: 'var(--ds-font-weight-semibold)' }}
+                sx={{
+                  fontSize: 'var(--ds-text-caption)',
+                  color: 'var(--ds-green-700)',
+                  mb: ds.space[1],
+                  fontWeight: 'var(--ds-font-weight-semibold)',
+                }}
               >
                 Output:
               </Typography>
@@ -1734,7 +1815,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
           {result.error && (
             <Box
               sx={{
-                p: 1.5,
+                p: ds.space[3],
                 bgcolor: 'var(--ds-red-100)',
                 border: '1px solid var(--ds-red-200)',
                 borderRadius: ds.radius.sm,
@@ -1743,7 +1824,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
               }}
             >
               <Typography
-                sx={{ fontSize: 'var(--ds-text-caption)', color: 'var(--ds-red-700)', fontWeight: 'var(--ds-font-weight-semibold)', mb: 0.25 }}
+                sx={{ fontSize: 'var(--ds-text-caption)', color: 'var(--ds-red-700)', fontWeight: 'var(--ds-font-weight-semibold)', mb: ds.space[0] }}
               >
                 Error:
               </Typography>
@@ -1751,7 +1832,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                 component='pre'
                 sx={{
                   fontSize: 'var(--ds-text-caption)',
-                  fontFamily: 'monospace',
+                  fontFamily: ds.font.mono,
                   whiteSpace: 'pre-wrap',
                   wordBreak: 'break-word',
                   color: 'var(--ds-red-700)',
@@ -1781,13 +1862,13 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
         {/* Header */}
         <Box
           sx={{
-            px: 2,
-            py: 1.5,
+            px: ds.space[4],
+            py: ds.space[3],
             borderBottom: '1px solid var(--ds-brand-150)',
             bgcolor: 'var(--ds-background-100)',
           }}
         >
-          <Typography sx={{ fontSize: 'var(--ds-text-body)', fontWeight: 'var(--ds-font-weight-semibold)', color: ds.gray[700], mb: 0.5 }}>
+          <Typography sx={{ fontSize: 'var(--ds-text-body)', fontWeight: 'var(--ds-font-weight-semibold)', color: ds.gray[700], mb: ds.space[1] }}>
             Test Action
           </Typography>
           <Typography sx={{ fontSize: 'var(--ds-text-caption)', color: ds.gray[400] }}>Test this action with dry run or live execution</Typography>
@@ -1796,13 +1877,13 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
         {/* Buttons Section */}
         <Box
           sx={{
-            px: 2,
-            py: 1.5,
+            px: ds.space[4],
+            py: ds.space[3],
             borderBottom: '1px solid var(--ds-brand-150)',
             bgcolor: 'var(--ds-background-100)',
             display: 'flex',
             flexDirection: 'column',
-            gap: 1,
+            gap: ds.space[2],
           }}
         >
           {/* Dry Run Button — dialog only; dry run simulates the surrounding
@@ -1824,7 +1905,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                 sx={{
                   fontSize: 'var(--ds-text-caption)',
                   color: !supportsDryRun ? ds.red[500] : ds.gray[400],
-                  mt: 0.5,
+                  mt: ds.space[1],
                   textAlign: 'center',
                 }}
               >
@@ -1850,7 +1931,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
               sx={{
                 fontSize: 'var(--ds-text-caption)',
                 color: !supportsIndividualRun ? ds.red[500] : ds.gray[400],
-                mt: 0.5,
+                mt: ds.space[1],
                 textAlign: 'center',
               }}
             >
@@ -1864,10 +1945,10 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
           sx={{
             flex: 1,
             overflow: 'auto',
-            p: 2,
+            p: ds.space[4],
             display: 'flex',
             flexDirection: 'column',
-            gap: 2,
+            gap: ds.space[4],
           }}
         >
           {/* Dry Run Result */}
@@ -1972,23 +2053,12 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
       const isObjectType = fieldSchema.type === 'object' || fieldSchema.type === 'map[string]string' || fieldSchema.type === 'map[string]any';
       const defaultFallback = isObjectType ? {} : '';
       const rawValue = localData[fieldName] ?? fieldSchema.default ?? defaultFallback;
-      // Coerce string values to empty objects for object-type fields (e.g., headers: "" → {}).
-      // Template strings are passed through as-is so the KeyValueHybridField below can detect
-      // expression mode and render a TemplateTextField instead of an empty KeyValueEditor.
-      let fieldValue = rawValue;
-      if (isObjectType && typeof rawValue === 'string') {
-        if (isTemplateString(rawValue)) {
-          fieldValue = rawValue;
-        } else if (rawValue.trim()) {
-          try {
-            fieldValue = JSON.parse(rawValue);
-          } catch {
-            fieldValue = {};
-          }
-        } else {
-          fieldValue = {};
-        }
-      }
+      // Determine field type based on schema (shared with the foreach sub-task form).
+      // Resolved here because the object-value coercion below depends on it.
+      const fieldType = resolveFieldType(fieldName, fieldSchema, { hasResourceNameField });
+      // Coerce string values to empty objects for object-type fields (e.g., headers: "" → {}),
+      // except where the editor holds raw JSON text. See resolveObjectFieldValue.
+      const fieldValue = isObjectType ? resolveObjectFieldValue(rawValue, fieldType === 'json') : rawValue;
       const isDropTarget = isDraggingOver === fieldName;
 
       // Generic visible_when: hide fields when the condition is not met.
@@ -2023,7 +2093,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
           },
         ];
         return (
-          <Box key={fieldName} sx={{ mb: 2 }}>
+          <Box key={fieldName} sx={{ mb: ds.space[4] }}>
             {/* Keyed by node id: the sidebar stays mounted across node switches, so
                 without a remount the editor's uid refs / expansion state would leak
                 between different foreach nodes. */}
@@ -2040,6 +2110,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
               blockedTypes={SUBTASK_BLOCKED_TYPES}
               extraSuggestions={loopItemSuggestions}
               testIdPrefix='foreach'
+              accountId={accountId}
               copy={{
                 helperText: (
                   <>Sub-tasks run sequentially for each item. Use {`{{ LoopItem.${itemVarName} }}`} in parameters to reference the current item.</>
@@ -2055,7 +2126,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
       // tasks once as a single step (no iteration / loop variable).
       if (selectedActionType === 'core.group' && fieldName === 'tasks') {
         return (
-          <Box key={fieldName} sx={{ mb: 2 }}>
+          <Box key={fieldName} sx={{ mb: ds.space[4] }}>
             {/* Keyed by node id — same remount rationale as foreach above. */}
             <SubTasksEditor
               key={selectedNode?.id ?? 'group-tasks'}
@@ -2069,6 +2140,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
               workflowConfigs={workflowConfigs}
               blockedTypes={SUBTASK_BLOCKED_TYPES}
               testIdPrefix='group'
+              accountId={accountId}
               copy={{
                 helperText: 'Tasks run together as a single step, in order.',
                 emptyStateText: 'No tasks yet. Add the tasks that should run together as one step.',
@@ -2093,7 +2165,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
         };
 
         return (
-          <Box key={fieldName} sx={{ mb: 2, display: 'flex', alignItems: 'flex-start', gap: 2, flexWrap: 'wrap' }}>
+          <Box key={fieldName} sx={{ mb: ds.space[4], display: 'flex', alignItems: 'flex-start', gap: ds.space[4], flexWrap: 'wrap' }}>
             <Typography
               sx={{
                 fontSize: 'var(--ds-text-body)',
@@ -2101,7 +2173,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                 color: ds.gray[700],
                 minWidth: '120px',
                 maxWidth: '120px',
-                pt: 1,
+                pt: ds.space[2],
               }}
             >
               {fieldSchema.title || formatFieldLabel(fieldName)}
@@ -2127,7 +2199,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                 isDropTarget={isDraggingOver === fieldName}
               />
               {fieldSchema.description && (
-                <Typography variant='caption' color='text.secondary' sx={{ mt: 0.5, display: 'block' }}>
+                <Typography variant='caption' color='text.secondary' sx={{ mt: ds.space[1], display: 'block' }}>
                   {fieldSchema.description}
                 </Typography>
               )}
@@ -2152,7 +2224,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
           };
 
           return (
-            <Box key={fieldName} sx={{ mb: 2, display: 'flex', alignItems: 'flex-start', gap: 2, flexWrap: 'wrap' }}>
+            <Box key={fieldName} sx={{ mb: ds.space[4], display: 'flex', alignItems: 'flex-start', gap: ds.space[4], flexWrap: 'wrap' }}>
               <Typography
                 sx={{
                   fontSize: 'var(--ds-text-body)',
@@ -2160,7 +2232,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                   color: ds.gray[700],
                   minWidth: '120px',
                   maxWidth: '120px',
-                  pt: 1,
+                  pt: ds.space[2],
                 }}
               >
                 {fieldSchema.title || formatFieldLabel(fieldName)}
@@ -2186,7 +2258,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                   isDropTarget={isDraggingOver === fieldName}
                 />
                 {fieldSchema.description && (
-                  <Typography variant='caption' color='text.secondary' sx={{ mt: 0.5, display: 'block' }}>
+                  <Typography variant='caption' color='text.secondary' sx={{ mt: ds.space[1], display: 'block' }}>
                     {fieldSchema.description}
                   </Typography>
                 )}
@@ -2209,7 +2281,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
           };
 
           return (
-            <Box key={fieldName} sx={{ mb: 2, display: 'flex', alignItems: 'flex-start', gap: 2, flexWrap: 'wrap' }}>
+            <Box key={fieldName} sx={{ mb: ds.space[4], display: 'flex', alignItems: 'flex-start', gap: ds.space[4], flexWrap: 'wrap' }}>
               <Typography
                 sx={{
                   fontSize: 'var(--ds-text-body)',
@@ -2217,7 +2289,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                   color: ds.gray[700],
                   minWidth: '120px',
                   maxWidth: '120px',
-                  pt: 1,
+                  pt: ds.space[2],
                 }}
               >
                 Team<span style={{ color: ds.red[500] }}> *</span>
@@ -2246,7 +2318,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                   onDragLeave={viewOnlyMode ? undefined : handleDragLeave}
                   isDropTarget={isDraggingOver === fieldName}
                 />
-                <Typography variant='caption' color='text.secondary' sx={{ mt: 0.5, display: 'block' }}>
+                <Typography variant='caption' color='text.secondary' sx={{ mt: ds.space[1], display: 'block' }}>
                   MS Teams Team
                 </Typography>
               </Box>
@@ -2268,7 +2340,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
           });
 
           return (
-            <Box key={fieldName} sx={{ mb: 2, display: 'flex', alignItems: 'flex-start', gap: 2, flexWrap: 'wrap' }}>
+            <Box key={fieldName} sx={{ mb: ds.space[4], display: 'flex', alignItems: 'flex-start', gap: ds.space[4], flexWrap: 'wrap' }}>
               <Typography
                 sx={{
                   fontSize: 'var(--ds-text-body)',
@@ -2276,7 +2348,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                   color: ds.gray[700],
                   minWidth: '120px',
                   maxWidth: '120px',
-                  pt: 1,
+                  pt: ds.space[2],
                 }}
               >
                 {fieldSchema.title || formatFieldLabel(fieldName)}
@@ -2323,7 +2395,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
           };
 
           return (
-            <Box key={fieldName} sx={{ mb: 2, display: 'flex', alignItems: 'flex-start', gap: 2, flexWrap: 'wrap' }}>
+            <Box key={fieldName} sx={{ mb: ds.space[4], display: 'flex', alignItems: 'flex-start', gap: ds.space[4], flexWrap: 'wrap' }}>
               <Typography
                 sx={{
                   fontSize: 'var(--ds-text-body)',
@@ -2331,7 +2403,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                   color: ds.gray[700],
                   minWidth: '120px',
                   maxWidth: '120px',
-                  pt: 1,
+                  pt: ds.space[2],
                 }}
               >
                 {fieldSchema.title || formatFieldLabel(fieldName)}
@@ -2357,7 +2429,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                   isDropTarget={isDraggingOver === fieldName}
                 />
                 {fieldSchema.description && (
-                  <Typography variant='caption' color='text.secondary' sx={{ mt: 0.5, display: 'block' }}>
+                  <Typography variant='caption' color='text.secondary' sx={{ mt: ds.space[1], display: 'block' }}>
                     {fieldSchema.description}
                   </Typography>
                 )}
@@ -2388,7 +2460,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
           });
 
           return (
-            <Box key={fieldName} sx={{ mb: 2, display: 'flex', alignItems: 'flex-start', gap: 2, flexWrap: 'wrap' }}>
+            <Box key={fieldName} sx={{ mb: ds.space[4], display: 'flex', alignItems: 'flex-start', gap: ds.space[4], flexWrap: 'wrap' }}>
               <Typography
                 sx={{
                   fontSize: 'var(--ds-text-body)',
@@ -2396,7 +2468,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                   color: ds.gray[700],
                   minWidth: '120px',
                   maxWidth: '120px',
-                  pt: 1,
+                  pt: ds.space[2],
                 }}
               >
                 {fieldSchema.title || formatFieldLabel(fieldName)}
@@ -2449,7 +2521,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
           };
 
           return (
-            <Box key={fieldName} sx={{ mb: 2, display: 'flex', alignItems: 'flex-start', gap: 2, flexWrap: 'wrap' }}>
+            <Box key={fieldName} sx={{ mb: ds.space[4], display: 'flex', alignItems: 'flex-start', gap: ds.space[4], flexWrap: 'wrap' }}>
               <Typography
                 sx={{
                   fontSize: 'var(--ds-text-body)',
@@ -2457,7 +2529,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                   color: ds.gray[700],
                   minWidth: '120px',
                   maxWidth: '120px',
-                  pt: 1,
+                  pt: ds.space[2],
                 }}
               >
                 {fieldSchema.title || formatFieldLabel(fieldName)}
@@ -2483,7 +2555,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                   isDropTarget={isDraggingOver === fieldName}
                 />
                 {fieldSchema.description && (
-                  <Typography variant='caption' color='text.secondary' sx={{ mt: 0.5, display: 'block' }}>
+                  <Typography variant='caption' color='text.secondary' sx={{ mt: ds.space[1], display: 'block' }}>
                     {fieldSchema.description}
                   </Typography>
                 )}
@@ -2514,7 +2586,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
           });
 
           return (
-            <Box key={fieldName} sx={{ mb: 2, display: 'flex', alignItems: 'flex-start', gap: 2, flexWrap: 'wrap' }}>
+            <Box key={fieldName} sx={{ mb: ds.space[4], display: 'flex', alignItems: 'flex-start', gap: ds.space[4], flexWrap: 'wrap' }}>
               <Typography
                 sx={{
                   fontSize: 'var(--ds-text-body)',
@@ -2522,7 +2594,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                   color: ds.gray[700],
                   minWidth: '120px',
                   maxWidth: '120px',
-                  pt: 1,
+                  pt: ds.space[2],
                 }}
               >
                 {fieldSchema.title || formatFieldLabel(fieldName)}
@@ -2571,7 +2643,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
           });
 
           return (
-            <Box key={fieldName} sx={{ mb: 2, display: 'flex', alignItems: 'flex-start', gap: 2, flexWrap: 'wrap' }}>
+            <Box key={fieldName} sx={{ mb: ds.space[4], display: 'flex', alignItems: 'flex-start', gap: ds.space[4], flexWrap: 'wrap' }}>
               <Typography
                 sx={{
                   fontSize: 'var(--ds-text-body)',
@@ -2579,7 +2651,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                   color: ds.gray[700],
                   minWidth: '120px',
                   maxWidth: '120px',
-                  pt: 1,
+                  pt: ds.space[2],
                 }}
               >
                 {fieldSchema.title || formatFieldLabel(fieldName)}
@@ -2624,7 +2696,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
         if (fieldName === 'project_key') {
           const dependenciesMet = !!localData?.integration_id;
           return (
-            <Box key={fieldName} sx={{ mb: 2, display: 'flex', alignItems: 'flex-start', gap: 2, flexWrap: 'wrap' }}>
+            <Box key={fieldName} sx={{ mb: ds.space[4], display: 'flex', alignItems: 'flex-start', gap: ds.space[4], flexWrap: 'wrap' }}>
               <Typography
                 sx={{
                   fontSize: 'var(--ds-text-body)',
@@ -2632,7 +2704,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                   color: ds.gray[700],
                   minWidth: '120px',
                   maxWidth: '120px',
-                  pt: 1,
+                  pt: ds.space[2],
                 }}
               >
                 {ticketProjectNoun}
@@ -2677,7 +2749,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
         if (fieldName === 'ticket_type') {
           const dependenciesMet = !!localData?.integration_id && !!localData?.project_key;
           return (
-            <Box key={fieldName} sx={{ mb: 2, display: 'flex', alignItems: 'flex-start', gap: 2, flexWrap: 'wrap' }}>
+            <Box key={fieldName} sx={{ mb: ds.space[4], display: 'flex', alignItems: 'flex-start', gap: ds.space[4], flexWrap: 'wrap' }}>
               <Typography
                 sx={{
                   fontSize: 'var(--ds-text-body)',
@@ -2685,7 +2757,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                   color: ds.gray[700],
                   minWidth: '120px',
                   maxWidth: '120px',
-                  pt: 1,
+                  pt: ds.space[2],
                 }}
               >
                 {fieldSchema.title || formatFieldLabel(fieldName)}
@@ -2740,7 +2812,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
           // PagerDuty/ZenDuty/ServiceNow "Urgency") when known.
           const severityLabel = ticketSeverityField?.name || fieldSchema.title || formatFieldLabel(fieldName);
           return (
-            <Box key={fieldName} sx={{ mb: 2, display: 'flex', alignItems: 'flex-start', gap: 2, flexWrap: 'wrap' }}>
+            <Box key={fieldName} sx={{ mb: ds.space[4], display: 'flex', alignItems: 'flex-start', gap: ds.space[4], flexWrap: 'wrap' }}>
               <Typography
                 sx={{
                   fontSize: 'var(--ds-text-body)',
@@ -2748,7 +2820,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                   color: ds.gray[700],
                   minWidth: '120px',
                   maxWidth: '120px',
-                  pt: 1,
+                  pt: ds.space[2],
                 }}
               >
                 {severityLabel}
@@ -2792,7 +2864,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
         const projectsSource = optionsSourceData[fieldName];
         const dependenciesMet = !!localData?.integration_id;
         return (
-          <Box key={fieldName} sx={{ mb: 2, display: 'flex', alignItems: 'flex-start', gap: 2, flexWrap: 'wrap' }}>
+          <Box key={fieldName} sx={{ mb: ds.space[4], display: 'flex', alignItems: 'flex-start', gap: ds.space[4], flexWrap: 'wrap' }}>
             <Typography
               sx={{
                 fontSize: 'var(--ds-text-body)',
@@ -2800,7 +2872,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                 color: ds.gray[700],
                 minWidth: '120px',
                 maxWidth: '120px',
-                pt: 1,
+                pt: ds.space[2],
               }}
             >
               {ticketProjectNoun}
@@ -2853,7 +2925,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
 
         if (isArray) {
           return (
-            <Box key={fieldName} sx={{ mb: 2, display: 'flex', alignItems: 'flex-start', gap: 2, flexWrap: 'wrap' }}>
+            <Box key={fieldName} sx={{ mb: ds.space[4], display: 'flex', alignItems: 'flex-start', gap: ds.space[4], flexWrap: 'wrap' }}>
               <Typography
                 sx={{
                   fontSize: 'var(--ds-text-body)',
@@ -2861,7 +2933,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                   color: ds.gray[700],
                   minWidth: '120px',
                   maxWidth: '120px',
-                  pt: 1,
+                  pt: ds.space[2],
                 }}
               >
                 {fieldSchema.title || formatFieldLabel(fieldName)}
@@ -2910,12 +2982,12 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                   }}
                 />
                 {validationErrors[fieldName] && (
-                  <Typography variant='caption' sx={{ color: ds.red[500], mt: 0.5, display: 'block' }}>
+                  <Typography variant='caption' sx={{ color: ds.red[500], mt: ds.space[1], display: 'block' }}>
                     {validationErrors[fieldName]}
                   </Typography>
                 )}
                 {fieldSchema.description && (
-                  <Typography variant='caption' color='text.secondary' sx={{ mt: 0.5, display: 'block' }}>
+                  <Typography variant='caption' color='text.secondary' sx={{ mt: ds.space[1], display: 'block' }}>
                     {fieldSchema.description}
                   </Typography>
                 )}
@@ -2931,7 +3003,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
         // through the dropdown's exact value (`provider/model`) only.
         if (fieldSchema.options_source?.type === 'llm_models') {
           return (
-            <Box key={fieldName} sx={{ mb: 2, display: 'flex', alignItems: 'flex-start', gap: 2, flexWrap: 'wrap' }}>
+            <Box key={fieldName} sx={{ mb: ds.space[4], display: 'flex', alignItems: 'flex-start', gap: ds.space[4], flexWrap: 'wrap' }}>
               <Typography
                 sx={{
                   fontSize: 'var(--ds-text-body)',
@@ -2939,7 +3011,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                   color: ds.gray[700],
                   minWidth: '120px',
                   maxWidth: '120px',
-                  pt: 1,
+                  pt: ds.space[2],
                 }}
               >
                 {fieldSchema.title || formatFieldLabel(fieldName)}
@@ -2968,12 +3040,12 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                   }}
                 />
                 {validationErrors[fieldName] && (
-                  <Typography variant='caption' sx={{ color: ds.red[500], mt: 0.5, display: 'block' }}>
+                  <Typography variant='caption' sx={{ color: ds.red[500], mt: ds.space[1], display: 'block' }}>
                     {validationErrors[fieldName]}
                   </Typography>
                 )}
                 {fieldSchema.description && (
-                  <Typography variant='caption' color='text.secondary' sx={{ mt: 0.5, display: 'block' }}>
+                  <Typography variant='caption' color='text.secondary' sx={{ mt: ds.space[1], display: 'block' }}>
                     {fieldSchema.description}
                   </Typography>
                 )}
@@ -2984,7 +3056,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
 
         // Single-select with freeSolo
         return (
-          <Box key={fieldName} sx={{ mb: 2, display: 'flex', alignItems: 'flex-start', gap: 2, flexWrap: 'wrap' }}>
+          <Box key={fieldName} sx={{ mb: ds.space[4], display: 'flex', alignItems: 'flex-start', gap: ds.space[4], flexWrap: 'wrap' }}>
             <Typography
               sx={{
                 fontSize: 'var(--ds-text-body)',
@@ -2992,7 +3064,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                 color: ds.gray[700],
                 minWidth: '120px',
                 maxWidth: '120px',
-                pt: 1,
+                pt: ds.space[2],
               }}
             >
               {fieldSchema.title || formatFieldLabel(fieldName)}
@@ -3015,15 +3087,15 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                     id={`action-sidebar-options-source-${fieldName}-input`}
                     size='small'
                     placeholder={placeholder}
-                    error={!!validationErrors[fieldName]}
-                    helperText={validationErrors[fieldName] || ''}
+                    error={!!validationErrors[fieldName] || !!sourceData?.error}
+                    helperText={validationErrors[fieldName] || sourceData?.error || ''}
                   />
                 )}
                 size='small'
                 data-testid={`options-source-${fieldName}`}
               />
               {fieldSchema.description && (
-                <Typography variant='caption' color='text.secondary' sx={{ mt: 0.5, display: 'block' }}>
+                <Typography variant='caption' color='text.secondary' sx={{ mt: ds.space[1], display: 'block' }}>
                   {fieldSchema.description}
                 </Typography>
               )}
@@ -3031,9 +3103,6 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
           </Box>
         );
       }
-
-      // Determine field type based on schema (shared with the foreach sub-task form)
-      const fieldType = resolveFieldType(fieldName, fieldSchema, { hasResourceNameField });
 
       // Resource name dropdown with cascading filters and Select/Expression toggle
       if (fieldType === 'resource_dropdown') {
@@ -3047,9 +3116,15 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
         if (accountLabel) contextChips.push({ label: 'Account', value: accountLabel });
         if (namespaceValue) contextChips.push({ label: 'Namespace', value: namespaceValue });
         if (kindValue) contextChips.push({ label: 'Kind', value: kindValue });
+        // PVC options carry their allocated storage, so the user can size the
+        // resize against what the volume has today (#34688). Absent for
+        // workload/node options and for expression-mode values, which match no
+        // option — the chip just doesn't render then.
+        const selectedResourceStorage = resourceNames.find((o) => o?.value === fieldValue)?.storage;
+        if (selectedResourceStorage) contextChips.push({ label: 'Current Size', value: selectedResourceStorage });
 
         return (
-          <Box key={fieldName} sx={{ mb: 2, display: 'flex', alignItems: 'flex-start', gap: 2, flexWrap: 'wrap' }}>
+          <Box key={fieldName} sx={{ mb: ds.space[4], display: 'flex', alignItems: 'flex-start', gap: ds.space[4], flexWrap: 'wrap' }}>
             <Typography
               sx={{
                 fontSize: 'var(--ds-text-body)',
@@ -3057,7 +3132,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                 color: ds.gray[700],
                 minWidth: '120px',
                 maxWidth: '120px',
-                pt: 1,
+                pt: ds.space[2],
               }}
             >
               {fieldSchema.title || formatFieldLabel(fieldName)}
@@ -3091,7 +3166,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
       // Handle different field types
       if (fieldType === 'switch') {
         return (
-          <Box key={fieldName} sx={{ mb: 2, display: 'flex', alignItems: 'flex-start', gap: 2, flexWrap: 'wrap' }}>
+          <Box key={fieldName} sx={{ mb: ds.space[4], display: 'flex', alignItems: 'flex-start', gap: ds.space[4], flexWrap: 'wrap' }}>
             <Typography
               sx={{
                 fontSize: 'var(--ds-text-body)',
@@ -3099,27 +3174,28 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                 color: ds.gray[700],
                 minWidth: '120px',
                 maxWidth: '120px',
-                pt: 0.5,
+                pt: ds.space[1],
               }}
             >
               {fieldSchema.title || formatFieldLabel(fieldName)}
               {isRequired && <span style={{ color: ds.red[500] }}> *</span>}
             </Typography>
             <Box sx={{ flex: '1 1 300px', minWidth: '200px', display: 'flex', flexDirection: 'column' }}>
-              <Switch
-                id={`action-sidebar-bool-${fieldName}-switch`}
-                checked={fieldValue || false}
-                onChange={(e) => handleDataChange(fieldName, e.target.checked)}
-                disabled={isReadOnly || viewOnlyMode}
-                sx={{ alignSelf: 'flex-start', ml: -1 }}
-              />
+              <Box sx={{ alignSelf: 'flex-start' }}>
+                <Switch
+                  id={`action-sidebar-bool-${fieldName}-switch`}
+                  checked={fieldValue || false}
+                  onChange={(e) => handleDataChange(fieldName, e.target.checked)}
+                  disabled={isReadOnly || viewOnlyMode}
+                />
+              </Box>
               {fieldSchema.description && (
                 <Typography
                   sx={{
                     fontSize: 'var(--ds-text-caption)',
                     color: ds.gray[400],
                     fontWeight: 'var(--ds-font-weight-regular)',
-                    mt: 0.5,
+                    mt: ds.space[1],
                   }}
                 >
                   {fieldSchema.description}
@@ -3133,7 +3209,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
       // Password field for encrypted/sensitive values
       if (fieldType === 'password') {
         return (
-          <Box key={fieldName} sx={{ mb: 2, display: 'flex', alignItems: 'flex-start', gap: 2, flexWrap: 'wrap' }}>
+          <Box key={fieldName} sx={{ mb: ds.space[4], display: 'flex', alignItems: 'flex-start', gap: ds.space[4], flexWrap: 'wrap' }}>
             <Typography
               sx={{
                 fontSize: 'var(--ds-text-body)',
@@ -3141,7 +3217,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                 color: ds.gray[700],
                 minWidth: '120px',
                 maxWidth: '120px',
-                pt: 1,
+                pt: ds.space[2],
               }}
             >
               {fieldSchema.title || formatFieldLabel(fieldName)}
@@ -3156,7 +3232,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                 placeholder={fieldSchema.description || `Enter ${fieldName.replace(/_/g, ' ')}`}
               />
               {fieldSchema.description && (
-                <Typography variant='caption' color='text.secondary' sx={{ mt: 0.5, display: 'block' }}>
+                <Typography variant='caption' color='text.secondary' sx={{ mt: ds.space[1], display: 'block' }}>
                   {fieldSchema.description}
                 </Typography>
               )}
@@ -3168,7 +3244,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
       // Duration field for timeout/duration values
       if (fieldType === 'duration') {
         return (
-          <Box key={fieldName} sx={{ mb: 2, display: 'flex', alignItems: 'flex-start', gap: 2, flexWrap: 'wrap' }}>
+          <Box key={fieldName} sx={{ mb: ds.space[4], display: 'flex', alignItems: 'flex-start', gap: ds.space[4], flexWrap: 'wrap' }}>
             <Typography
               sx={{
                 fontSize: 'var(--ds-text-body)',
@@ -3176,7 +3252,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                 color: ds.gray[700],
                 minWidth: '120px',
                 maxWidth: '120px',
-                pt: 1,
+                pt: ds.space[2],
               }}
             >
               {fieldSchema.title || formatFieldLabel(fieldName)}
@@ -3190,7 +3266,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                 disabled={isReadOnly || viewOnlyMode}
               />
               {fieldSchema.description && (
-                <Typography variant='caption' color='text.secondary' sx={{ mt: 0.5, display: 'block' }}>
+                <Typography variant='caption' color='text.secondary' sx={{ mt: ds.space[1], display: 'block' }}>
                   {fieldSchema.description}
                 </Typography>
               )}
@@ -3202,7 +3278,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
       // Key-value editor for headers, env, etc.
       if (fieldType === 'keyvalue') {
         return (
-          <Box key={fieldName} sx={{ mb: 2, display: 'flex', alignItems: 'flex-start', gap: 2, flexWrap: 'wrap' }}>
+          <Box key={fieldName} sx={{ mb: ds.space[4], display: 'flex', alignItems: 'flex-start', gap: ds.space[4], flexWrap: 'wrap' }}>
             <Typography
               sx={{
                 fontSize: 'var(--ds-text-body)',
@@ -3210,7 +3286,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                 color: ds.gray[700],
                 minWidth: '120px',
                 maxWidth: '120px',
-                pt: 1,
+                pt: ds.space[2],
               }}
             >
               {fieldSchema.title || formatFieldLabel(fieldName)}
@@ -3218,7 +3294,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
             </Typography>
             <Box sx={{ flex: '1 1 400px', minWidth: '300px' }}>
               {fieldSchema.description && (
-                <Typography variant='caption' color='text.secondary' sx={{ mb: 1, display: 'block' }}>
+                <Typography variant='caption' color='text.secondary' sx={{ mb: ds.space[2], display: 'block' }}>
                   {fieldSchema.description}
                 </Typography>
               )}
@@ -3240,7 +3316,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
       if (fieldType === 'multiselect') {
         const options = fieldSchema.options || fieldSchema.enum || [];
         return (
-          <Box key={fieldName} sx={{ mb: 2, display: 'flex', alignItems: 'flex-start', gap: 2, flexWrap: 'wrap' }}>
+          <Box key={fieldName} sx={{ mb: ds.space[4], display: 'flex', alignItems: 'flex-start', gap: ds.space[4], flexWrap: 'wrap' }}>
             <Typography
               sx={{
                 fontSize: 'var(--ds-text-body)',
@@ -3248,7 +3324,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                 color: ds.gray[700],
                 minWidth: '120px',
                 maxWidth: '120px',
-                pt: 1,
+                pt: ds.space[2],
               }}
             >
               {fieldSchema.title || formatFieldLabel(fieldName)}
@@ -3256,7 +3332,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
             </Typography>
             <Box sx={{ flex: '1 1 400px', minWidth: '300px' }}>
               {fieldSchema.description && (
-                <Typography variant='caption' color='text.secondary' sx={{ mb: 1, display: 'block' }}>
+                <Typography variant='caption' color='text.secondary' sx={{ mb: ds.space[2], display: 'block' }}>
                   {fieldSchema.description}
                 </Typography>
               )}
@@ -3277,7 +3353,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
         // Schema can have properties directly or wrapped in 'properties' key
         const schemaProperties = (fieldSchema.schema.properties || fieldSchema.schema) as Record<string, any>;
         return (
-          <Box key={fieldName} sx={{ mb: 2, display: 'flex', alignItems: 'flex-start', gap: 2, flexWrap: 'wrap' }}>
+          <Box key={fieldName} sx={{ mb: ds.space[4], display: 'flex', alignItems: 'flex-start', gap: ds.space[4], flexWrap: 'wrap' }}>
             <Typography
               sx={{
                 fontSize: 'var(--ds-text-body)',
@@ -3285,7 +3361,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                 color: ds.gray[700],
                 minWidth: '120px',
                 maxWidth: '120px',
-                pt: 1,
+                pt: ds.space[2],
               }}
             >
               {fieldSchema.title || formatFieldLabel(fieldName)}
@@ -3293,7 +3369,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
             </Typography>
             <Box sx={{ flex: '1 1 400px', minWidth: '300px' }}>
               {fieldSchema.description && (
-                <Typography variant='caption' color='text.secondary' sx={{ mb: 1, display: 'block' }}>
+                <Typography variant='caption' color='text.secondary' sx={{ mb: ds.space[2], display: 'block' }}>
                   {fieldSchema.description}
                 </Typography>
               )}
@@ -3335,7 +3411,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
           const showMcpGuidance = fieldName === 'integration_id' && selectedActionType === 'llm.mcp_call';
           return (
             <React.Fragment key={fieldName}>
-              <Box sx={{ mb: 2, display: 'flex', alignItems: 'flex-start', gap: 2, flexWrap: 'wrap' }}>
+              <Box sx={{ mb: ds.space[4], display: 'flex', alignItems: 'flex-start', gap: ds.space[4], flexWrap: 'wrap' }}>
                 <Typography
                   sx={{
                     fontSize: 'var(--ds-text-body)',
@@ -3343,7 +3419,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                     color: ds.gray[700],
                     minWidth: '120px',
                     maxWidth: '120px',
-                    pt: 1,
+                    pt: ds.space[2],
                   }}
                 >
                   {fieldSchema.title || formatFieldLabel(fieldName)}
@@ -3371,30 +3447,20 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                 </Box>
               </Box>
               {showMcpGuidance && (
-                <Box sx={{ display: 'flex', gap: 2, mb: 2 }}>
+                <Box sx={{ display: 'flex', gap: ds.space[4], mb: ds.space[4] }}>
                   <Box sx={{ minWidth: '120px', flexShrink: 0 }} />
-                  <Alert
-                    severity='info'
-                    sx={{
-                      flex: 1,
-                      py: 0.5,
-                      fontSize: 'var(--ds-text-caption)',
-                      '& .MuiAlert-icon': { py: 0.5 },
-                      '& .MuiAlert-message': { fontSize: 'var(--ds-text-caption)', py: 0.25 },
-                    }}
-                    data-testid='mcp-integration-alert'
-                  >
-                    To add an MCP integration, go to Admin &gt; Integrations &gt; MCP.
-                    <br />
-                    <Button
-                      id='action-sidebar-mcp-manage-integrations-btn'
-                      tone='link'
-                      size='xs'
-                      onClick={() => window.open('/accounts/account-form?cloudProvider=mcp', '_blank', 'noopener,noreferrer')}
-                    >
-                      Manage MCP Integrations &rarr;
-                    </Button>
-                  </Alert>
+                  <Box sx={{ flex: 1 }}>
+                    <Callout
+                      tone='info'
+                      data-testid='mcp-integration-alert'
+                      message='To add an MCP integration, go to Admin > Integrations > MCP.'
+                      action={{
+                        id: 'action-sidebar-mcp-manage-integrations-btn',
+                        label: <>Manage MCP Integrations &rarr;</>,
+                        onClick: () => window.open('/accounts/account-form?cloudProvider=mcp', '_blank', 'noopener,noreferrer'),
+                      }}
+                    />
+                  </Box>
                 </Box>
               )}
             </React.Fragment>
@@ -3420,7 +3486,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
 
         return (
           <React.Fragment key={fieldName}>
-            <Box sx={{ mb: 2, display: 'flex', alignItems: 'flex-start', gap: 2, flexWrap: 'wrap' }}>
+            <Box sx={{ mb: ds.space[4], display: 'flex', alignItems: 'flex-start', gap: ds.space[4], flexWrap: 'wrap' }}>
               <Typography
                 sx={{
                   fontSize: 'var(--ds-text-body)',
@@ -3428,7 +3494,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                   color: ds.gray[700],
                   minWidth: '120px',
                   maxWidth: '120px',
-                  pt: 1,
+                  pt: ds.space[2],
                 }}
               >
                 {fieldSchema.title || formatFieldLabel(fieldName)}
@@ -3486,74 +3552,59 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                   />
                 )}
                 {!isAccountField && (options as any[]).some((o) => o?.icon) && validationErrors[fieldName] && (
-                  <Typography sx={{ mt: 0.5, fontSize: 'var(--ds-text-small)', color: ds.red[500] }}>{validationErrors[fieldName]}</Typography>
+                  <Typography sx={{ mt: ds.space[1], fontSize: 'var(--ds-text-small)', color: ds.red[500] }}>
+                    {validationErrors[fieldName]}
+                  </Typography>
                 )}
                 {showDefaultProviderChip && (
                   <Box sx={{ mt: 0.75 }}>
-                    <Chip
-                      size='small'
-                      label={`${defaultProviderChipLabel}: ${defaultProvider}`}
-                      sx={{ fontSize: 'var(--ds-text-caption)', height: '20px', bgcolor: ds.green[200], color: ds.gray[700] }}
-                    />
+                    <Chip tone='success'>{`${defaultProviderChipLabel}: ${defaultProvider}`}</Chip>
                   </Box>
                 )}
               </Box>
             </Box>
-            {/* MCP integration guidance — shown directly below the integration_id dropdown */}
-            {fieldName === 'integration_id' && selectedActionType === 'llm.mcp_call' && (
-              <Box sx={{ display: 'flex', gap: 2, mb: 2 }}>
+            {/* A trigger listening to several accounts leaves no default target for the step */}
+            {fieldName === 'account_id' && isAccountField && (listensToSeveralAccounts(nodes) || serverErrorNamesAccount) && (
+              <Box sx={{ display: 'flex', gap: ds.space[4], mb: ds.space[4] }}>
                 <Box sx={{ minWidth: '120px', flexShrink: 0 }} />
-                <Alert
-                  severity='info'
-                  sx={{
-                    flex: 1,
-                    py: 0.5,
-                    fontSize: 'var(--ds-text-caption)',
-                    '& .MuiAlert-icon': { py: 0.5 },
-                    '& .MuiAlert-message': { fontSize: 'var(--ds-text-caption)', py: 0.25 },
-                  }}
-                  data-testid='mcp-integration-alert'
-                >
-                  To add an MCP integration, go to Admin &gt; Integrations &gt; MCP.
-                  <br />
-                  <Button
-                    id='action-sidebar-mcp-manage-integrations-id-btn'
-                    tone='link'
-                    size='xs'
-                    onClick={() => window.open('/accounts/account-form?cloudProvider=mcp', '_blank', 'noopener,noreferrer')}
-                  >
-                    Manage MCP Integrations &rarr;
-                  </Button>
-                </Alert>
+                <Box sx={{ flex: 1 }}>
+                  <Callout
+                    tone={serverErrorNamesAccount ? 'critical' : 'info'}
+                    data-testid='action-sidebar-event-account-hint'
+                    message={
+                      serverErrorNamesAccount
+                        ? serverError
+                        : "This automation listens to several accounts, so this step must name the account it acts on. Use the event's account to act wherever the event came from."
+                    }
+                    action={
+                      fieldValue === EVENT_ACCOUNT_TEMPLATE || isReadOnly || viewOnlyMode
+                        ? undefined
+                        : {
+                            id: 'action-sidebar-use-event-account-btn',
+                            label: "Use the event's account",
+                            onClick: () => handleDataChange(fieldName, EVENT_ACCOUNT_TEMPLATE),
+                          }
+                    }
+                  />
+                </Box>
               </Box>
             )}
             {/* SSM permission guidance — shown directly below the executor_type dropdown */}
             {fieldName === 'executor_type' && selectedActionType === 'scripting.run_script' && localData?.executor_type === 'aws_ssm' && (
-              <Box sx={{ display: 'flex', gap: 2, mb: 2 }}>
+              <Box sx={{ display: 'flex', gap: ds.space[4], mb: ds.space[4] }}>
                 <Box sx={{ minWidth: '120px', flexShrink: 0 }} />
-                <Alert
-                  severity='info'
-                  sx={{
-                    flex: 1,
-                    py: 0.5,
-                    fontSize: 'var(--ds-text-caption)',
-                    '& .MuiAlert-icon': { py: 0.5 },
-                    '& .MuiAlert-message': { fontSize: 'var(--ds-text-caption)', py: 0.25 },
-                  }}
-                  data-testid='ssm-permission-alert'
-                >
-                  Ensure SSM access is enabled for the selected AWS account. If you encounter permission errors, update the account permissions to
-                  enable SSM access via CloudFormation. Ignore if already done.
-                  <br />
-                  <Button
-                    id='action-sidebar-ssm-manage-permissions-btn'
-                    tone='link'
-                    size='xs'
-                    onClick={() => window.open('/accounts/account-form?cloudProvider=AWS', '_blank', 'noopener,noreferrer')}
-                  >
-                    Manage AWS Integrations &rarr;
-                  </Button>
-                </Alert>
+                <Box sx={{ flex: 1 }}>
+                  <Callout
+                    tone='info'
+                    data-testid='ssm-permission-alert'
+                    message='Ensure SSM access is enabled for the selected AWS account. If you encounter permission errors, update the account permissions to enable SSM access via CloudFormation. Ignore if already done.'
+                    action={{
+                      id: 'action-sidebar-ssm-manage-permissions-btn',
+                      label: <>Manage AWS Integrations &rarr;</>,
+                      onClick: () => window.open('/accounts/account-form?cloudProvider=AWS', '_blank', 'noopener,noreferrer'),
+                    }}
+                  />
+                </Box>
               </Box>
             )}
           </React.Fragment>
@@ -3573,7 +3624,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
             label={fieldSchema.title || formatFieldLabel(fieldName)}
             isRequired={isRequired}
             description={fieldSchema.description || ''}
-            placeholder={FIELD_PLACEHOLDERS[fieldName] || fieldSchema.description || `Enter ${fieldName.replace(/_/g, ' ')}`}
+            placeholder={getExamplePlaceholder(fieldName, fieldSchema) || fieldSchema.description || `Enter ${fieldName.replace(/_/g, ' ')}`}
             disabled={isReadOnly || viewOnlyMode}
             error={validationErrors[fieldName] || ''}
             rows={8}
@@ -3605,7 +3656,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
 
       if (fieldType === 'timestamp') {
         return (
-          <Box key={fieldName} sx={{ mb: 2, display: 'flex', alignItems: 'flex-start', gap: 2, flexWrap: 'wrap' }}>
+          <Box key={fieldName} sx={{ mb: ds.space[4], display: 'flex', alignItems: 'flex-start', gap: ds.space[4], flexWrap: 'wrap' }}>
             <Typography
               sx={{
                 fontSize: 'var(--ds-text-body)',
@@ -3613,7 +3664,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                 color: ds.gray[700],
                 minWidth: '120px',
                 maxWidth: '120px',
-                pt: 1,
+                pt: ds.space[2],
               }}
             >
               {fieldSchema.title || formatFieldLabel(fieldName)}
@@ -3629,7 +3680,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                 label={fieldSchema.title || formatFieldLabel(fieldName)}
               />
               {fieldSchema.description && (
-                <Typography variant='caption' color='text.secondary' sx={{ mt: 0.5, display: 'block' }}>
+                <Typography variant='caption' color='text.secondary' sx={{ mt: ds.space[1], display: 'block' }}>
                   {fieldSchema.description}
                 </Typography>
               )}
@@ -3640,7 +3691,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
 
       if (fieldType === 'array') {
         return (
-          <Box key={fieldName} sx={{ mb: 2, display: 'flex', alignItems: 'flex-start', gap: 2, flexWrap: 'wrap' }}>
+          <Box key={fieldName} sx={{ mb: ds.space[4], display: 'flex', alignItems: 'flex-start', gap: ds.space[4], flexWrap: 'wrap' }}>
             <Typography
               sx={{
                 fontSize: 'var(--ds-text-body)',
@@ -3648,7 +3699,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                 color: ds.gray[700],
                 minWidth: '120px',
                 maxWidth: '120px',
-                pt: 1,
+                pt: ds.space[2],
               }}
             >
               {fieldSchema.title || formatFieldLabel(fieldName)}
@@ -3656,7 +3707,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
             </Typography>
             <Box sx={{ flex: '1 1 400px', minWidth: '300px' }}>
               {fieldSchema.description && (
-                <Typography variant='caption' color='text.secondary' sx={{ mb: 1, display: 'block' }}>
+                <Typography variant='caption' color='text.secondary' sx={{ mb: ds.space[2], display: 'block' }}>
                   {fieldSchema.description}
                 </Typography>
               )}
@@ -3689,7 +3740,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
 
       if (fieldType === 'json') {
         return (
-          <Box key={fieldName} sx={{ mb: 2, display: 'flex', alignItems: 'flex-start', gap: 2, flexWrap: 'wrap' }}>
+          <Box key={fieldName} sx={{ mb: ds.space[4], display: 'flex', alignItems: 'flex-start', gap: ds.space[4], flexWrap: 'wrap' }}>
             <Typography
               sx={{
                 fontSize: 'var(--ds-text-body)',
@@ -3697,7 +3748,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                 color: ds.gray[700],
                 minWidth: '120px',
                 maxWidth: '120px',
-                pt: 1,
+                pt: ds.space[2],
               }}
             >
               {fieldSchema.title || formatFieldLabel(fieldName)}
@@ -3705,11 +3756,23 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
             </Typography>
             <Box sx={{ flex: '1 1 400px', minWidth: '300px' }}>
               {fieldSchema.description && (
-                <Typography variant='caption' color='text.secondary' sx={{ mb: 1, display: 'block' }}>
+                <Typography variant='caption' color='text.secondary' sx={{ mb: ds.space[2], display: 'block' }}>
                   {fieldSchema.description}
                 </Typography>
               )}
-              <JsonEditor value={fieldValue || {}} onChange={(value) => handleDataChange(fieldName, value)} error={validationErrors[fieldName]} />
+              <JsonEditor
+                value={fieldValue}
+                onChange={(value) => handleDataChange(fieldName, value)}
+                error={validationErrors[fieldName]}
+                placeholder={getExamplePlaceholder(fieldName, fieldSchema)}
+              />
+              <FieldGuidance
+                fieldName={fieldName}
+                help={fieldSchema.help}
+                examples={fieldSchema.examples}
+                disabled={isReadOnly || viewOnlyMode}
+                onApply={(value) => handleDataChange(fieldName, parseJsonExample(value))}
+              />
             </Box>
           </Box>
         );
@@ -3717,7 +3780,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
 
       if (fieldType === 'script') {
         const getScriptPlaceholder = () => {
-          return FIELD_PLACEHOLDERS[fieldName] || fieldSchema.description || `Enter ${fieldName.replace(/_/g, ' ')}`;
+          return getExamplePlaceholder(fieldName, fieldSchema) || fieldSchema.description || `Enter ${fieldName.replace(/_/g, ' ')}`;
         };
 
         const isScriptField = fieldName === 'script';
@@ -3725,7 +3788,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
         const language = getCodeLanguage(fieldName, fieldSchema.sub_type);
 
         return (
-          <Box key={fieldName} sx={{ mb: 2, display: 'flex', alignItems: 'flex-start', gap: 2, flexWrap: 'wrap' }}>
+          <Box key={fieldName} sx={{ mb: ds.space[4], display: 'flex', alignItems: 'flex-start', gap: ds.space[4], flexWrap: 'wrap' }}>
             <Typography
               sx={{
                 fontSize: 'var(--ds-text-body)',
@@ -3733,7 +3796,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                 color: ds.gray[700],
                 minWidth: '120px',
                 maxWidth: '120px',
-                pt: 1,
+                pt: ds.space[2],
               }}
             >
               {fieldSchema.title || formatFieldLabel(fieldName)}
@@ -3741,7 +3804,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
             </Typography>
             <Box sx={{ flex: '1 1 400px', minWidth: '300px' }}>
               {fieldSchema.description && (
-                <Typography variant='caption' color='text.secondary' sx={{ mb: 1, display: 'block' }}>
+                <Typography variant='caption' color='text.secondary' sx={{ mb: ds.space[2], display: 'block' }}>
                   {fieldSchema.description}
                 </Typography>
               )}
@@ -3753,6 +3816,13 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                 disabled={isReadOnly || viewOnlyMode}
                 placeholder={getScriptPlaceholder()}
                 height={scriptHeight}
+              />
+              <FieldGuidance
+                fieldName={fieldName}
+                help={fieldSchema.help}
+                examples={fieldSchema.examples}
+                disabled={isReadOnly || viewOnlyMode}
+                onApply={(value) => handleDataChange(fieldName, value)}
               />
             </Box>
           </Box>
@@ -3838,7 +3908,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
               }),
             }}
           >
-            <Box sx={{ mb: 2, display: 'flex', alignItems: 'flex-start', gap: 2, flexWrap: 'wrap' }}>
+            <Box sx={{ mb: ds.space[4], display: 'flex', alignItems: 'flex-start', gap: ds.space[4], flexWrap: 'wrap' }}>
               <Typography
                 sx={{
                   fontSize: 'var(--ds-text-body)',
@@ -3846,7 +3916,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                   color: ds.gray[700],
                   minWidth: '120px',
                   maxWidth: '120px',
-                  pt: 1,
+                  pt: ds.space[2],
                 }}
               >
                 {fieldSchema.title || formatFieldLabel(fieldName)}
@@ -3867,7 +3937,15 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                   multiline={isMultilineField}
                   rows={isMultilineField ? 6 : undefined}
                   maxRows={isMultilineField ? 10 : undefined}
+                  validationStatus={isUrlFieldName(fieldName) ? urlFieldStatus(fieldValue) : undefined}
                   fullWidth={true}
+                />
+                <FieldGuidance
+                  fieldName={fieldName}
+                  help={fieldSchema.help}
+                  examples={fieldSchema.examples}
+                  disabled={isReadOnly || viewOnlyMode}
+                  onApply={(value) => handleDataChange(fieldName, value)}
                 />
               </Box>
             </Box>
@@ -3892,6 +3970,15 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
           onDrop={viewOnlyMode ? undefined : (e) => handleDrop(e, fieldName, fieldValue)}
           onDragOver={viewOnlyMode ? undefined : (e) => handleDragOver(e, fieldName)}
           onDragLeave={viewOnlyMode ? undefined : handleDragLeave}
+          guidance={
+            <FieldGuidance
+              fieldName={fieldName}
+              help={fieldSchema.help}
+              examples={fieldSchema.examples}
+              disabled={isReadOnly || viewOnlyMode}
+              onApply={(value) => handleDataChange(fieldName, value)}
+            />
+          }
         />
       );
     };
@@ -3916,7 +4003,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                   sx={{
                     display: 'flex',
                     alignItems: 'center',
-                    gap: 1,
+                    gap: ds.space[2],
                     p: 'var(--ds-space-2)',
                     border: '1px solid',
                     borderColor: ds.green[200],
@@ -3945,7 +4032,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                       sx={{
                         display: 'flex',
                         alignItems: 'center',
-                        gap: 0.25,
+                        gap: ds.space[0],
                         fontWeight: 'var(--ds-font-weight-semibold)',
                         color: ds.gray[700],
                         fontSize: '0.8rem',
@@ -3990,7 +4077,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                         sx={{
                           fontSize: '0.625rem',
                           mt: 0.125,
-                          fontFamily: 'monospace',
+                          fontFamily: ds.font.mono,
                           bgcolor: ds.brand[500],
                           color: 'white',
                           px: 0.375,
@@ -4101,16 +4188,16 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
       };
 
       return (
-        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: ds.space[4] }}>
           {/* Form Description */}
-          <Typography sx={{ fontSize: 'var(--ds-text-small)', color: ds.gray[400], mb: 1 }}>{description}</Typography>
+          <Typography sx={{ fontSize: 'var(--ds-text-small)', color: ds.gray[400], mb: ds.space[2] }}>{description}</Typography>
 
           {/* Advisory date-format lint warnings (non-blocking) */}
           {Object.keys(validationWarnings).length > 0 && (
             <Box
               sx={{
-                mb: 1,
-                p: 1,
+                mb: ds.space[2],
+                p: ds.space[2],
                 borderRadius: 'var(--ds-radius-md)',
                 backgroundColor: ds.amber[100],
                 border: `1px solid ${ds.amber[200]}`,
@@ -4139,7 +4226,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                 { label: 'Absolute Range', value: 'absolute' },
               ];
               return (
-                <Box key='time-range-group' sx={{ mb: 2, display: 'flex', alignItems: 'flex-start', gap: 2 }}>
+                <Box key='time-range-group' sx={{ mb: ds.space[4], display: 'flex', alignItems: 'flex-start', gap: ds.space[4] }}>
                   <Typography
                     sx={{
                       fontSize: 'var(--ds-text-body)',
@@ -4147,12 +4234,12 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                       color: ds.gray[700],
                       minWidth: '120px',
                       maxWidth: '120px',
-                      pt: 1,
+                      pt: ds.space[2],
                     }}
                   >
                     Time Range
                   </Typography>
-                  <Box sx={{ flex: '1 1 300px', minWidth: '200px', display: 'flex', flexDirection: 'column', gap: 2 }}>
+                  <Box sx={{ flex: '1 1 300px', minWidth: '200px', display: 'flex', flexDirection: 'column', gap: ds.space[4] }}>
                     <FormField
                       {...DEFAULT_FORM_FIELD_PROPS}
                       fieldType='select'
@@ -4220,7 +4307,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
               ];
               const activePlaceholder = isNumericChange ? "e.g. '2'" : changeMode === 'by' ? "e.g. '10%'" : "e.g. '20Gi'";
               return (
-                <Box key='change-group' sx={{ mb: 2, display: 'flex', alignItems: 'flex-start', gap: 2 }}>
+                <Box key='change-group' sx={{ mb: ds.space[4], display: 'flex', alignItems: 'flex-start', gap: ds.space[4] }}>
                   <Typography
                     sx={{
                       fontSize: 'var(--ds-text-body)',
@@ -4228,12 +4315,12 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                       color: ds.gray[700],
                       minWidth: '120px',
                       maxWidth: '120px',
-                      pt: 1,
+                      pt: ds.space[2],
                     }}
                   >
-                    Resize
+                    Resize<span style={{ color: ds.red[500] }}> *</span>
                   </Typography>
-                  <Box sx={{ flex: '1 1 300px', minWidth: '200px', display: 'flex', flexDirection: 'column', gap: 2 }}>
+                  <Box sx={{ flex: '1 1 300px', minWidth: '200px', display: 'flex', flexDirection: 'column', gap: ds.space[4] }}>
                     <FormField
                       {...DEFAULT_FORM_FIELD_PROPS}
                       fieldType='select'
@@ -4273,6 +4360,8 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                       }}
                       placeholder={activePlaceholder}
                       description={activeSchema?.description || ''}
+                      error={validationErrors[activeFieldName] || ''}
+                      required={true}
                       disabled={viewOnlyMode}
                       minWidth='100%'
                     />
@@ -4286,7 +4375,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
               const startSchema = inputSchema['start_time'] as SchemaProperty;
               const endSchema = inputSchema['end_time'] as SchemaProperty;
               return (
-                <Box key='time-range-group' sx={{ mb: 2, display: 'flex', alignItems: 'flex-start', gap: 2 }}>
+                <Box key='time-range-group' sx={{ mb: ds.space[4], display: 'flex', alignItems: 'flex-start', gap: ds.space[4] }}>
                   <Typography
                     sx={{
                       fontSize: 'var(--ds-text-body)',
@@ -4294,12 +4383,12 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                       color: ds.gray[700],
                       minWidth: '120px',
                       maxWidth: '120px',
-                      pt: 1,
+                      pt: ds.space[2],
                     }}
                   >
                     Time Range
                   </Typography>
-                  <Box sx={{ flex: '1 1 300px', minWidth: '200px', display: 'flex', flexDirection: 'column', gap: 2 }}>
+                  <Box sx={{ flex: '1 1 300px', minWidth: '200px', display: 'flex', flexDirection: 'column', gap: ds.space[4] }}>
                     <TimestampPicker
                       value={localData?.['start_time'] ?? ''}
                       onChange={(value: string) => handleDataChange('start_time', value)}
@@ -4333,8 +4422,10 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
               const platformFields = Object.entries(ticketDynamicFields).filter(([, fieldMeta]) => !fieldMeta?.group);
               if (platformFields.length === 0) return null;
               return (
-                <Box sx={{ mt: 1 }}>
-                  <Typography sx={{ fontSize: 'var(--ds-text-body)', fontWeight: 'var(--ds-font-weight-semibold)', color: ds.gray[700], mb: 1 }}>
+                <Box sx={{ mt: ds.space[2] }}>
+                  <Typography
+                    sx={{ fontSize: 'var(--ds-text-body)', fontWeight: 'var(--ds-font-weight-semibold)', color: ds.gray[700], mb: ds.space[2] }}
+                  >
                     Platform Fields
                   </Typography>
                   {platformFields.map(([fieldKey, fieldMeta]) => (
@@ -4365,8 +4456,8 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
       const hasCondition = !!taskConfig.if;
 
       return (
-        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}>
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: ds.space[4] }}>
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: ds.space[2], mb: ds.space[1] }}>
             <AltRoute sx={{ fontSize: 18, color: ds.gray[700] }} />
             <Typography sx={{ fontSize: 'var(--ds-text-body)', fontWeight: 'var(--ds-font-weight-semibold)', color: ds.gray[700] }}>
               {'Conditional Execution'}
@@ -4382,7 +4473,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
               />
             )}
           </Box>
-          <Typography sx={{ fontSize: 'var(--ds-text-small)', color: ds.gray[700], mb: 1 }}>
+          <Typography sx={{ fontSize: 'var(--ds-text-small)', color: ds.gray[700], mb: ds.space[2] }}>
             {'Define a condition to control whether this task executes. The task runs only when the condition evaluates to true.'}
           </Typography>
           <TemplateExpressionField
@@ -4404,15 +4495,15 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
       const hasErrorHandling = !!(taskConfig.hooks || taskConfig.failure_policy);
 
       return (
-        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: ds.space[2] }}>
           {/* Disable Task — disconnects the node from the DAG so it's skipped at runtime */}
           <Box
             sx={{
               display: 'flex',
               alignItems: 'flex-start',
               justifyContent: 'space-between',
-              gap: 1.5,
-              px: 1.5,
+              gap: ds.space[3],
+              px: ds.space[3],
               py: 1.25,
               border: `1px solid ${ds.green[200]}`,
               borderRadius: ds.radius.sm,
@@ -4423,7 +4514,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
               <Typography sx={{ fontSize: 'var(--ds-text-body)', fontWeight: 'var(--ds-font-weight-semibold)', color: ds.blue[500] }}>
                 Disable task
               </Typography>
-              <Typography sx={{ fontSize: 'var(--ds-text-caption)', color: ds.gray[700], mt: 0.25 }}>
+              <Typography sx={{ fontSize: 'var(--ds-text-caption)', color: ds.gray[700], mt: ds.space[0] }}>
                 {taskConfig.disabled
                   ? 'Task is muted. The workflow has been rerouted around it. Toggle off to restore its original connections.'
                   : 'Skip this task without deleting it. The workflow will be rerouted: predecessors connect directly to successors. Re-enable to restore the original chain.'}
@@ -4431,21 +4522,22 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
             </Box>
             <Switch
               data-testid='task-disable-switch'
+              aria-label='Disable task'
               checked={!!taskConfig.disabled}
               onChange={(e) => handleDisableToggle(e.target.checked)}
               disabled={viewOnlyMode || !onToggleDisable}
-              size='small'
+              size='sm'
             />
           </Box>
 
           {/* Execution Control Group */}
-          <Box id='execution-control' sx={{ mb: 2, scrollMarginTop: ds.space[4] }}>
+          <Box id='execution-control' sx={{ mb: ds.space[4], scrollMarginTop: ds.space[4] }}>
             <CollapsableCard
               composition='header+meta+body'
               elevation='flat'
               defaultOpen={hasExecutionControl}
               header={
-                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: ds.space[2] }}>
                   <Timer sx={{ fontSize: ds.text.title, color: ds.gray[700] }} />
                   <Typography
                     sx={{
@@ -4462,7 +4554,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
               }
               meta={hasExecutionControl ? <Box sx={{ width: 6, height: 6, borderRadius: '50%', bgcolor: 'primary.main' }} /> : undefined}
             >
-              <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+              <Box sx={{ display: 'flex', flexDirection: 'column', gap: ds.space[4] }}>
                 <DurationField
                   label='Task Timeout'
                   value={taskConfig.timeout}
@@ -4483,13 +4575,13 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
           </Box>
 
           {/* Data Management Group */}
-          <Box id='data-management' sx={{ mb: 2, scrollMarginTop: ds.space[4] }}>
+          <Box id='data-management' sx={{ mb: ds.space[4], scrollMarginTop: ds.space[4] }}>
             <CollapsableCard
               composition='header+meta+body'
               elevation='flat'
               defaultOpen={hasDataManagement}
               header={
-                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: ds.space[2] }}>
                   <Storage sx={{ fontSize: ds.text.title, color: ds.gray[700] }} />
                   <Typography
                     sx={{
@@ -4506,7 +4598,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
               }
               meta={hasDataManagement ? <Box sx={{ width: 6, height: 6, borderRadius: '50%', bgcolor: 'primary.main' }} /> : undefined}
             >
-              <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+              <Box sx={{ display: 'flex', flexDirection: 'column', gap: ds.space[4] }}>
                 <KeyValueField
                   label='Set State (Persistent)'
                   field='set_state'
@@ -4528,13 +4620,13 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
           </Box>
 
           {/* Parallel Execution Group */}
-          <Box id='parallel-execution' sx={{ mb: 2, scrollMarginTop: ds.space[4] }}>
+          <Box id='parallel-execution' sx={{ mb: ds.space[4], scrollMarginTop: ds.space[4] }}>
             <CollapsableCard
               composition='header+meta+body'
               elevation='flat'
               defaultOpen={hasParallelExecution}
               header={
-                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: ds.space[2] }}>
                   <GridView sx={{ fontSize: ds.text.title, color: ds.gray[700] }} />
                   <Typography
                     sx={{
@@ -4551,20 +4643,20 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
               }
               meta={hasParallelExecution ? <Box sx={{ width: 6, height: 6, borderRadius: '50%', bgcolor: 'primary.main' }} /> : undefined}
             >
-              <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+              <Box sx={{ display: 'flex', flexDirection: 'column', gap: ds.space[4] }}>
                 <MatrixField value={taskConfig.matrix} onChange={(value) => onTaskConfigChange?.('matrix', value)} disabled={viewOnlyMode} />
               </Box>
             </CollapsableCard>
           </Box>
 
           {/* Error Handling Group */}
-          <Box id='error-handling' sx={{ mb: 2, scrollMarginTop: ds.space[4] }}>
+          <Box id='error-handling' sx={{ mb: ds.space[4], scrollMarginTop: ds.space[4] }}>
             <CollapsableCard
               composition='header+meta+body'
               elevation='flat'
               defaultOpen={hasErrorHandling}
               header={
-                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: ds.space[2] }}>
                   <ErrorOutline sx={{ fontSize: ds.text.title, color: ds.gray[700] }} />
                   <Typography
                     sx={{
@@ -4581,7 +4673,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
               }
               meta={hasErrorHandling ? <Box sx={{ width: 6, height: 6, borderRadius: '50%', bgcolor: 'primary.main' }} /> : undefined}
             >
-              <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+              <Box sx={{ display: 'flex', flexDirection: 'column', gap: ds.space[4] }}>
                 <FailurePolicyField
                   value={taskConfig.failure_policy}
                   onChange={(value) => onTaskConfigChange?.('failure_policy', value)}
@@ -4593,10 +4685,10 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
           </Box>
 
           {/* Schema Information */}
-          <Box sx={{ mt: 2, pt: 2, borderTop: `1px solid ${ds.green[200]}` }}>
+          <Box sx={{ mt: ds.space[4], pt: ds.space[4], borderTop: `1px solid ${ds.green[200]}` }}>
             <Typography
               variant='subtitle2'
-              sx={{ mb: 1, fontSize: 'var(--ds-text-body-lg)', fontWeight: 'var(--ds-font-weight-semibold)', color: ds.gray[700] }}
+              sx={{ mb: ds.space[2], fontSize: 'var(--ds-text-body-lg)', fontWeight: 'var(--ds-font-weight-semibold)', color: ds.gray[700] }}
             >
               Schema Information
             </Typography>
@@ -4621,7 +4713,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
       // only apply to a task inside a workflow — show Parameters directly.
       return (
         <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-          <Box sx={{ flex: 1, overflow: 'auto', p: 2 }}>{renderParametersTab()}</Box>
+          <Box sx={{ flex: 1, overflow: 'auto', p: ds.space[4] }}>{renderParametersTab()}</Box>
         </Box>
       );
     }
@@ -4629,7 +4721,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
     return (
       <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
         {/* Tabs Header */}
-        <Box sx={{ borderBottom: '1px solid var(--ds-brand-150)', px: 1, bgcolor: 'var(--ds-background-200)' }}>
+        <Box sx={{ borderBottom: '1px solid var(--ds-brand-150)', px: ds.space[2], bgcolor: 'var(--ds-background-200)' }}>
           <Tabs
             id='action-sidebar-tabs'
             value={activeTab}
@@ -4652,8 +4744,8 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                 fontWeight: activeTab === 'parameters' ? 600 : 400,
                 color: activeTab === 'parameters' ? ds.blue[500] : ds.gray[700],
                 minHeight: 40,
-                py: 1,
-                px: 2,
+                py: ds.space[2],
+                px: ds.space[4],
                 '&.Mui-selected': {
                   color: ds.blue[500],
                 },
@@ -4663,7 +4755,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
               id='action-sidebar-condition-tab'
               value='condition'
               label={
-                <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: ds.space[1] }}>
                   {'Condition'}
                   {taskConfig.if && (
                     <Box
@@ -4684,8 +4776,8 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                 fontWeight: activeTab === 'condition' ? 600 : 400,
                 color: activeTab === 'condition' ? ds.blue[500] : ds.gray[700],
                 minHeight: 40,
-                py: 1,
-                px: 2,
+                py: ds.space[2],
+                px: ds.space[4],
                 '&.Mui-selected': {
                   color: ds.blue[500],
                 },
@@ -4701,8 +4793,8 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
                 fontWeight: activeTab === 'settings' ? 600 : 400,
                 color: activeTab === 'settings' ? ds.blue[500] : ds.gray[700],
                 minHeight: 40,
-                py: 1,
-                px: 2,
+                py: ds.space[2],
+                px: ds.space[4],
                 '&.Mui-selected': {
                   color: ds.blue[500],
                 },
@@ -4712,7 +4804,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
         </Box>
 
         {/* Tab Content */}
-        <Box sx={{ flex: 1, overflow: 'auto', p: 2 }}>
+        <Box sx={{ flex: 1, overflow: 'auto', p: ds.space[4] }}>
           {activeTab === 'parameters' && renderParametersTab()}
           {activeTab === 'condition' && renderConditionTab()}
           {activeTab === 'settings' && renderSettingsTab()}
@@ -4723,7 +4815,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
 
   const renderWorkflowActionContent = () => {
     // Use currentTaskDefinition if available, otherwise create a minimal title/description from selectedActionType
-    const description = currentTaskDefinition?.description || `Configure ${selectedActionType} task parameters`;
+    const description = currentTaskDescription || `Configure ${selectedActionType} task parameters`;
 
     return renderDynamicForm(currentTaskDefinition, '', description);
   };
@@ -4740,8 +4832,8 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
           display: 'flex',
           justifyContent: 'space-between',
           alignItems: 'center',
-          px: 3,
-          py: 1.5,
+          px: ds.space[5],
+          py: ds.space[3],
           borderBottom: '1px solid var(--ds-brand-150)',
           background: 'var(--ds-background-100)',
           flexShrink: 0,
@@ -4749,18 +4841,16 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
       >
         <Box>
           <Typography sx={{ fontSize: 'var(--ds-text-title)', fontWeight: 'var(--ds-font-weight-semibold)', color: 'var(--ds-foreground)' }}>
-            {`Action Details - ${
-              selectedNode?.data?.label || currentTaskDefinition?.display_name || currentTaskDefinition?.description || selectedActionType
-            }`}
+            {`Action Details - ${selectedNode?.data?.label || currentTaskDefinition?.display_name || currentTaskDescription || selectedActionType}`}
           </Typography>
-          <Typography sx={{ fontSize: 'var(--ds-text-small)', color: 'var(--ds-gray-600)', mt: 0.25 }}>
+          <Typography sx={{ fontSize: 'var(--ds-text-small)', color: 'var(--ds-gray-600)', mt: ds.space[0] }}>
             {'Configure and test this automation action'}
           </Typography>
         </Box>
         {/* Save/Close are dialog-only: inline mode has nothing to save into
             (no workflow node) and is dismissed by selecting another task */}
         {variant === 'dialog' && (
-          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: ds.space[2] }}>
             {!viewOnlyMode && isDirty && (
               <Button id='action-sidebar-save-btn' tone='primary' size='sm' icon={<Check sx={{ fontSize: ds.text.title }} />} onClick={handleSave}>
                 Save
@@ -4810,7 +4900,7 @@ const ActionDetailsSidebar: React.FC<ActionDetailsSidebarProps> = ({
         width='xs'
         title='Disable this task?'
         actionButtons={
-          <Box sx={{ display: 'flex', justifyContent: 'flex-end', gap: 1, p: 2 }}>
+          <Box sx={{ display: 'flex', justifyContent: 'flex-end', gap: ds.space[2], p: ds.space[4] }}>
             <Button id='action-sidebar-disable-cancel-btn' tone='secondary' size='sm' onClick={() => setDisableConfirmOpen(false)}>
               Cancel
             </Button>

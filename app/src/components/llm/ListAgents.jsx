@@ -1,7 +1,8 @@
 import React from 'react';
 import PropTypes from 'prop-types';
 import apiAskNudgebee from '@api1/ask-nudgebee';
-import apiKnowledgeBase from '@api1/knowledge-base';
+import OwnerTypeBadge from './common/OwnerTypeBadge';
+import apiKnowledgeBase, { KB_AGENT_WILDCARD } from '@api1/knowledge-base';
 import ListingLayout from '@ui/ListingLayout';
 import FilterDropdown from '@ui/FilterDropdown';
 import SearchInput from '@ui/SearchInput';
@@ -20,11 +21,176 @@ import { hasWriteAccess } from '@lib/auth';
 import { useTenantBranding } from '@hooks/useTenantBranding';
 import { Avatar, Box, Typography } from '@mui/material';
 import { Checkbox } from '@ui/Checkbox';
-import { PlusIcon, EditIcon, DeleteIconRed as deleteIcon, DataBaseDark, PlusIconSecondary } from '@assets';
+import { PlusIcon, EditIcon, DeleteIconRed as deleteIcon, DataBaseDark, PlusIconSecondary, infoIcon } from '@assets';
 import { getIcon } from '@components/llm/common/AgentIcon';
 import Loader from '@shared/Loader';
 import SafeIcon from '@shared/icons/SafeIcon';
 import { HybridScopeChips } from '@components/llm/ScopeChip';
+import Tooltip from '@ui/Tooltip';
+import { getAgentUsageGuidance } from '@components/llm/common/agentUsageGuidance';
+
+// "Usage" column cell — hover surface for the static when-to-use guidance in
+// agentUsageGuidance.ts. Agents with no catalog entry (and every user-created
+// agent) render an em dash instead of the icon, so the column never claims
+// guidance it does not have.
+const USAGE_COLUMN_INFO = 'Hover the info icon on a row to see when to use that agent, an example question, why it helps, and its advantages';
+
+const AgentUsageCell = ({ agentName }) => {
+  const guidance = getAgentUsageGuidance(agentName);
+
+  if (!guidance) {
+    return <Typography sx={{ fontSize: ds.text.small, color: ds.gray[500] }}>—</Typography>;
+  }
+
+  const section = (heading, body) => (
+    <Box sx={{ mb: ds.space[2] }}>
+      <Typography
+        sx={{
+          fontSize: ds.text.caption,
+          fontWeight: ds.weight.semibold,
+          color: ds.gray[500],
+          textTransform: 'uppercase',
+          letterSpacing: '0.5px',
+        }}
+      >
+        {heading}
+      </Typography>
+      <Box sx={{ fontSize: ds.text.small, color: ds.gray[700], lineHeight: 1.5 }}>{body}</Box>
+    </Box>
+  );
+
+  return (
+    <Tooltip
+      placement='left'
+      tooltipStyle={{ maxWidth: '420px' }}
+      title={
+        <Box sx={{ textAlign: 'left' }}>
+          {guidance.brief && (
+            <Typography sx={{ fontSize: ds.text.small, color: ds.gray[700], fontWeight: ds.weight.medium, mb: ds.space[2], lineHeight: 1.5 }}>
+              {guidance.brief}
+            </Typography>
+          )}
+          {guidance.whenToUse && section('When to use', guidance.whenToUse)}
+          {guidance.why && section('Why', guidance.why)}
+          {guidance.notFor && section('Not for', guidance.notFor)}
+          {guidance.example && section('Example', <Box sx={{ fontStyle: 'italic' }}>{guidance.example}</Box>)}
+          {guidance.advantages && (
+            <Box>
+              <Typography
+                sx={{
+                  fontSize: ds.text.caption,
+                  fontWeight: ds.weight.semibold,
+                  color: ds.gray[500],
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.5px',
+                }}
+              >
+                Advantages
+              </Typography>
+              <Box component='ul' sx={{ m: 0, pl: ds.space[4], fontSize: ds.text.small, color: ds.gray[700], lineHeight: 1.5 }}>
+                {guidance.advantages.map((advantage) => (
+                  <li key={advantage}>{advantage}</li>
+                ))}
+              </Box>
+            </Box>
+          )}
+        </Box>
+      }
+    >
+      <Box component='span' sx={{ display: 'inline-flex', opacity: '60%' }}>
+        <SafeIcon src={infoIcon} alt={`When to use ${agentName}`} width={14} height={16} />
+      </Box>
+    </Tooltip>
+  );
+};
+
+AgentUsageCell.propTypes = {
+  agentName: PropTypes.string,
+};
+
+// Description cell — clamps to two lines and reveals the rest behind a
+// "Show more" / "Show less" toggle. The toggle only renders when the text
+// actually overflows two lines, so short descriptions have no dangling
+// control. Each row owns its own expand state.
+const AgentDescriptionCell = ({ text }) => {
+  const [expanded, setExpanded] = React.useState(false);
+  const [needsToggle, setNeedsToggle] = React.useState(false);
+  const textRef = React.useRef(null);
+
+  React.useEffect(() => {
+    const el = textRef.current;
+    if (!el || expanded) {
+      return;
+    }
+    // While clamped, scrollHeight exceeds clientHeight only when the text
+    // spills past the two visible lines. Re-check on resize too, since a
+    // column-width change can start/stop the overflow with no text change.
+    const checkOverflow = () => setNeedsToggle(el.scrollHeight - el.clientHeight > 1);
+    checkOverflow();
+    if (typeof ResizeObserver === 'undefined') {
+      return;
+    }
+    const observer = new ResizeObserver(checkOverflow);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [text, expanded]);
+
+  if (!text) {
+    return <Text value='-' />;
+  }
+
+  return (
+    <Box sx={{ minWidth: 0 }}>
+      <Box
+        ref={textRef}
+        sx={{
+          fontSize: ds.text.small,
+          color: ds.gray[700],
+          lineHeight: 1.5,
+          overflow: 'hidden',
+          ...(expanded
+            ? {}
+            : {
+                display: '-webkit-box',
+                WebkitLineClamp: 2,
+                WebkitBoxOrient: 'vertical',
+              }),
+        }}
+      >
+        {text}
+      </Box>
+      {(needsToggle || expanded) && (
+        <Box
+          component='button'
+          type='button'
+          data-testid='agent-description-toggle'
+          onClick={(e) => {
+            e.stopPropagation();
+            setExpanded((prev) => !prev);
+          }}
+          sx={{
+            mt: ds.space[1],
+            p: 0,
+            border: 'none',
+            background: 'none',
+            cursor: 'pointer',
+            fontFamily: 'inherit',
+            fontSize: ds.text.caption,
+            fontWeight: ds.weight.semibold,
+            color: ds.blue[600],
+            '&:hover': { textDecoration: 'underline' },
+          }}
+        >
+          {expanded ? 'Show less' : 'Show more'}
+        </Box>
+      )}
+    </Box>
+  );
+};
+
+AgentDescriptionCell.propTypes = {
+  text: PropTypes.string,
+};
 
 const ListAgents = ({ accountId, refreshAgentListing, allAgents, loadingAgents, stickyTable = false }) => {
   const { baseTitle } = useTenantBranding();
@@ -32,11 +198,13 @@ const ListAgents = ({ accountId, refreshAgentListing, allAgents, loadingAgents, 
   // global sidebar (no current account in scope), the backend's
   // agentListAgent routes empty account_id to ListAgentsForTenant — the
   // system catalog + every custom agent the caller can read across the
-  // tenant. The UI hides per-account affordances (Create / Edit / Delete /
-  // KB-mapping / tool config / agent extensions) because writes all require
-  // account context, and renders an Account column so cross-account custom
-  // agents are distinguishable.
+  // tenant. Writes all require account context, so the UI hides Create,
+  // the KB-count column and every system-agent action (override / extend),
+  // and renders an Account column so cross-account custom agents are
+  // distinguishable. Custom agents keep their Action menu: each row carries
+  // the account it belongs to (account_id), which the actions run against.
   const isTenantWide = !accountId;
+  const agentAccountId = (agent) => (isTenantWide ? agent?.account_id || '' : accountId);
   const [data, setData] = React.useState([]);
   const [originalData, setOriginalData] = React.useState([]);
   const [createAgentModal, setCreateAgentModal] = React.useState(false);
@@ -64,8 +232,16 @@ const ListAgents = ({ accountId, refreshAgentListing, allAgents, loadingAgents, 
   const [isSavingKb, setIsSavingKb] = React.useState(false);
   const [kbSearchTerm, setKbSearchTerm] = React.useState('');
   const [alreadyMappedKbIds, setAlreadyMappedKbIds] = React.useState([]);
+  // KBs mapped to every agent via the wildcard row. They reach this agent too,
+  // so they are shown ticked but locked: "all agents" is a KB-level setting and
+  // unticking it here would strip the KB from every other agent.
+  const [allAgentsKbIds, setAllAgentsKbIds] = React.useState([]);
+  const [wildcardKbCount, setWildcardKbCount] = React.useState(0);
 
   const [triggerSubmit, setTriggerSubmit] = React.useState(false);
+  // Drives the loading state on the modal's Create/Update button while the
+  // child form (CreateAgentNew / CreateAgentExtension) runs its async submit.
+  const [isSubmitting, setIsSubmitting] = React.useState(false);
 
   const fetchKBCounts = async () => {
     try {
@@ -75,21 +251,24 @@ const ListAgents = ({ accountId, refreshAgentListing, allAgents, loadingAgents, 
         return;
       }
 
-      const counts = (response.data || []).reduce((acc, item) => {
+      const rows = response.data || [];
+      const counts = rows.reduce((acc, item) => {
+        if (item.agent_id === KB_AGENT_WILDCARD) return acc;
         acc[item.agent_id] = item.kb_count || 0;
         return acc;
       }, {});
 
       setKbCountsMap(counts);
+      setWildcardKbCount(rows.find((item) => item.agent_id === KB_AGENT_WILDCARD)?.kb_count || 0);
     } catch (error) {
       console.error('Failed to fetch KB counts:', error);
     }
   };
 
-  const fetchAvailableKbs = async () => {
+  const fetchAvailableKbs = async (agent) => {
     setIsLoadingKbs(true);
     try {
-      const response = await apiKnowledgeBase.getKnowledgeBases(accountId);
+      const response = await apiKnowledgeBase.getKnowledgeBases(agentAccountId(agent));
       if (response?.errors?.length > 0) {
         snackbar.error('Failed to fetch knowledge bases');
         setAvailableKbs([]);
@@ -107,7 +286,13 @@ const ListAgents = ({ accountId, refreshAgentListing, allAgents, loadingAgents, 
 
   const fetchAlreadyMappedKbs = async (agent) => {
     try {
-      const response = await apiKnowledgeBase.getAgentKnowledgeBases(accountId, agent.name);
+      // The wildcard list is fetched alongside the agent's own mappings: those KBs
+      // reach this agent as well, and rendering them unticked would read as "not
+      // mapped" right after someone chose "All agents" in the KB form.
+      const [response, wildcardResponse] = await Promise.all([
+        apiKnowledgeBase.getAgentKnowledgeBases(agentAccountId(agent), agent.name),
+        apiKnowledgeBase.getAgentKnowledgeBases(agentAccountId(agent), KB_AGENT_WILDCARD),
+      ]);
       if (!response?.errors?.length) {
         const mappedIds = (response.data || []).map((kb) => kb.id);
         setAlreadyMappedKbIds(mappedIds);
@@ -115,6 +300,7 @@ const ListAgents = ({ accountId, refreshAgentListing, allAgents, loadingAgents, 
       } else {
         snackbar.error('Failed to fetch mapped knowledge bases for agent');
       }
+      setAllAgentsKbIds(wildcardResponse?.errors?.length ? [] : (wildcardResponse.data || []).map((kb) => kb.id));
     } catch (error) {
       console.error('Error fetching already mapped KBs:', error);
       snackbar.error('Failed to fetch mapped knowledge bases for agent');
@@ -126,8 +312,9 @@ const ListAgents = ({ accountId, refreshAgentListing, allAgents, loadingAgents, 
     setSelectedKbIds([]);
     setKbSearchTerm('');
     setAlreadyMappedKbIds([]);
+    setAllAgentsKbIds([]);
     setIsKbSelectionModalOpen(true);
-    fetchAvailableKbs();
+    fetchAvailableKbs(agent);
     fetchAlreadyMappedKbs(agent);
   };
 
@@ -138,9 +325,14 @@ const ListAgents = ({ accountId, refreshAgentListing, allAgents, loadingAgents, 
     setKbSearchTerm('');
     setAvailableKbs([]);
     setAlreadyMappedKbIds([]);
+    setAllAgentsKbIds([]);
   };
 
   const handleToggleKbSelection = (kbId) => {
+    // All-agents KBs are locked here — they are managed from the KB form.
+    if (allAgentsKbIds.includes(kbId)) {
+      return;
+    }
     setSelectedKbIds((prev) => {
       if (prev.includes(kbId)) {
         return prev.filter((id) => id !== kbId);
@@ -170,7 +362,7 @@ const ListAgents = ({ accountId, refreshAgentListing, allAgents, loadingAgents, 
 
       for (const kbId of toMap) {
         try {
-          const response = await apiKnowledgeBase.mapKnowledgeBaseToAgent(accountId, kbId, selectedAgent.name);
+          const response = await apiKnowledgeBase.mapKnowledgeBaseToAgent(agentAccountId(selectedAgent), kbId, selectedAgent.name);
           if (response?.errors?.length > 0) {
             mapError++;
           } else {
@@ -184,7 +376,7 @@ const ListAgents = ({ accountId, refreshAgentListing, allAgents, loadingAgents, 
 
       for (const kbId of toUnmap) {
         try {
-          const response = await apiKnowledgeBase.unmapKnowledgeBaseFromAgent(accountId, kbId, selectedAgent.name);
+          const response = await apiKnowledgeBase.unmapKnowledgeBaseFromAgent(agentAccountId(selectedAgent), kbId, selectedAgent.name);
           if (response?.errors?.length > 0) {
             unmapError++;
           } else {
@@ -213,7 +405,10 @@ const ListAgents = ({ accountId, refreshAgentListing, allAgents, loadingAgents, 
       }
 
       handleCloseKbSelectionModal();
-      fetchKBCounts();
+      // KB counts are per-account and not shown in tenant-wide mode.
+      if (!isTenantWide) {
+        fetchKBCounts();
+      }
     } catch (error) {
       console.error('Error saving KB changes:', error);
       snackbar.error('Failed to save knowledge base changes');
@@ -338,7 +533,7 @@ const ListAgents = ({ accountId, refreshAgentListing, allAgents, loadingAgents, 
 
     setIsDeleting(true);
     try {
-      const response = await apiAskNudgebee.deleteAgent(accountId, agentToDelete.name);
+      const response = await apiAskNudgebee.deleteAgent(agentAccountId(agentToDelete), agentToDelete.name);
       if (!(response?.data?.data?.ai_delete_agent?.data?.status === 'ok')) {
         snackbar.error('Failed to delete agent');
         return;
@@ -430,54 +625,85 @@ const ListAgents = ({ accountId, refreshAgentListing, allAgents, loadingAgents, 
       const agents = listAgentResponse.map((agent) => {
         const icon = getIcon(agent?.name?.toLowerCase());
         const currentAgentName = agent.name;
-        const kbCount = kbCountsMap[currentAgentName] || 0;
+        const kbCount = (kbCountsMap[currentAgentName] || 0) + wildcardKbCount;
         const hasExtensions = extensionsMap[currentAgentName]?.length > 0;
+        const rowAccountId = agentAccountId(agent);
+        const canManage = (!isTenantWide || agent.type === 'custom') && Boolean(rowAccountId) && hasWriteAccess(rowAccountId);
+        const actionCell = {
+          component: canManage ? (
+            // Portal the menu to <body> so it escapes the nested
+            // overflow:auto + sticky-column stack this table lives in
+            // (scrollable TableContainer inside the fixed-height Settings
+            // modal). Rendered inline, Safari mis-lays-out the popover
+            // surface into a tall empty panel; a body portal avoids that.
+            <ThreeDotsMenu
+              menuItems={getMenuItems(agent)}
+              onMenuClick={handleMenuAction}
+              data={agent}
+              disablePortal={false}
+              sx={{ padding: ds.space[1] }}
+            />
+          ) : (
+            <></>
+          ),
+        };
+        // Letter fallback shown when no icon resolves to something drawable.
+        const avatarFallback = (
+          <Avatar
+            style={{
+              width: '16px',
+              height: '16px',
+              flexShrink: 0,
+              border: `1px solid ${ds.blue[400]}`,
+              color: ds.blue[400],
+              backgroundColor: ds.background[100],
+              fontSize: ds.text.small,
+              fontWeight: ds.weight.medium,
+              borderRadius: ds.radius.sm,
+              padding: '1px 0px 0px',
+            }}
+          >
+            {agent.name ? agent.name[0].toUpperCase() : '?'}
+          </Avatar>
+        );
+        // Icons come in two shapes: `require('*.svg')` modules expose the URL
+        // at `.default`, while `*.icon.svg` assets are compiled to React
+        // components by @svgr/webpack (no `.default`). Render each accordingly
+        // and fall back to the letter avatar when neither is drawable —
+        // otherwise a truthy-but-URL-less icon renders blank with no fallback.
+        let agentIconEl = avatarFallback;
+        if (icon) {
+          // SVGR (*.icon.svg) icons can be a plain function component OR a
+          // forwardRef/memo object (typeof 'object' with a $$typeof marker) —
+          // both render as a component. require('*.svg') modules expose the URL
+          // at .default and getNubiIconUrl() returns a string — those go via SafeIcon.
+          const isComponent = typeof icon === 'function' || (typeof icon === 'object' && icon !== null && '$$typeof' in icon);
+          if (isComponent) {
+            const AgentSvg = icon;
+            agentIconEl = <Box component={AgentSvg} aria-label='agent icon' sx={{ width: 18, height: 18, flexShrink: 0 }} />;
+          } else {
+            const iconSrc = icon.default ?? (typeof icon === 'string' ? icon : null);
+            agentIconEl = iconSrc ? (
+              <Box sx={{ display: 'inline-flex', flexShrink: 0, mt: '1px' }}>
+                <SafeIcon src={iconSrc} alt='agent icon' width={18} height={18} />
+              </Box>
+            ) : (
+              avatarFallback
+            );
+          }
+        }
         return [
           {
             component: (
               <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: ds.space[2], minWidth: 0, maxWidth: '100%' }}>
-                <Box sx={{ display: 'flex', alignItems: 'center', gap: ds.space[2], flexWrap: 'wrap' }}>
-                  {icon ? (
-                    <SafeIcon src={icon?.default} alt='agent icon' width={18} height={18} />
-                  ) : (
-                    <Avatar
-                      style={{
-                        width: '16px',
-                        height: '16px',
-                        border: `1px solid ${ds.blue[400]}`,
-                        color: ds.blue[400],
-                        backgroundColor: ds.background[100],
-                        fontSize: ds.text.small,
-                        fontWeight: ds.weight.medium,
-                        borderRadius: ds.radius.sm,
-                        padding: '1px 0px 0px',
-                      }}
-                    >
-                      {/* Ensure agent.name exists before trying to access agent.name[0] */}
-                      {agent.name ? agent.name[0].toUpperCase() : '?'}
-                    </Avatar>
-                  )}
-                  <Box sx={{ fontWeight: ds.weight.medium }}>{agent.aliases?.[0] ?? agent.name}</Box>
+                <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: ds.space[2], width: '100%' }}>
+                  {agentIconEl}
+                  <Box sx={{ fontWeight: ds.weight.medium, minWidth: 0, wordBreak: 'break-word', lineHeight: 1.4 }}>
+                    {agent.aliases?.[0] ?? agent.name}
+                  </Box>
                 </Box>
                 <Box sx={{ display: 'flex', alignItems: 'center', gap: ds.space[2], flexWrap: 'wrap' }}>
-                  <Box
-                    sx={{
-                      display: 'inline-flex',
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                      backgroundColor: agent.type === 'system' ? ds.blue[100] : ds.gray[100],
-                      color: agent.type === 'system' ? ds.blue[700] : ds.gray[600],
-                      fontSize: ds.text.caption,
-                      fontWeight: ds.weight.semibold,
-                      padding: '2px 6px',
-                      borderRadius: ds.radius.pill,
-                      border: `1px solid ${agent.type === 'system' ? ds.blue[200] : ds.gray[200]}`,
-                      textTransform: 'uppercase',
-                      letterSpacing: '0.5px',
-                    }}
-                  >
-                    {agent.type === 'system' ? `${baseTitle} System Agent` : 'User Created Agent'}
-                  </Box>
+                  <OwnerTypeBadge type={agent.type} systemSuffix='System Agent' userLabel='User Created Agent' />
                   {agent.overridden && agent.type === 'custom' && (
                     <Box
                       sx={{
@@ -526,7 +752,7 @@ const ListAgents = ({ accountId, refreshAgentListing, allAgents, loadingAgents, 
             },
           },
           {
-            component: <Text value={agent.description} />,
+            component: <AgentDescriptionCell text={agent.description} />,
           },
           {
             component: <Label text={agent.status} />,
@@ -534,14 +760,18 @@ const ListAgents = ({ accountId, refreshAgentListing, allAgents, loadingAgents, 
           {
             component: <Text value={agent.tools?.join(', ') || '-'} showAutoEllipsis requiredToolTip lineClamp={2} />,
           },
+          {
+            component: <AgentUsageCell agentName={agent.name} />,
+          },
           // Tools column is already present above; in tenant-wide mode we
-          // skip the KB-count and Actions columns and replace them with an
-          // Account column so the user can tell custom rows apart.
+          // skip the KB-count column and replace it with an Account column
+          // so the user can tell custom rows apart.
           ...(isTenantWide
             ? [
                 {
                   component: <Text value={agent.account_name || (agent.type === 'system' ? '—' : agent.account_id || '—')} />,
                 },
+                actionCell,
               ]
             : [
                 {
@@ -565,13 +795,7 @@ const ListAgents = ({ accountId, refreshAgentListing, allAgents, loadingAgents, 
                     </Box>
                   ),
                 },
-                {
-                  component: hasWriteAccess(accountId) ? (
-                    <ThreeDotsMenu menuItems={getMenuItems(agent)} onMenuClick={handleMenuAction} data={agent} sx={{ padding: ds.space[1] }} />
-                  ) : (
-                    <></>
-                  ),
-                },
+                actionCell,
               ]),
         ];
       });
@@ -652,7 +876,8 @@ const ListAgents = ({ accountId, refreshAgentListing, allAgents, loadingAgents, 
                     ]}
                     tableData={getFilteredKbs().map((kb) => {
                       const isAlreadyMapped = alreadyMappedKbIds.includes(kb.id);
-                      const isSelected = selectedKbIds.includes(kb.id);
+                      const isMappedToAllAgents = allAgentsKbIds.includes(kb.id);
+                      const isSelected = isMappedToAllAgents || selectedKbIds.includes(kb.id);
                       return [
                         {
                           component: (
@@ -660,6 +885,7 @@ const ListAgents = ({ accountId, refreshAgentListing, allAgents, loadingAgents, 
                               <Checkbox
                                 size='sm'
                                 checked={isSelected}
+                                disabled={isMappedToAllAgents}
                                 onChange={() => handleToggleKbSelection(kb.id)}
                                 aria-label={`Select ${kb.name || 'knowledge base'}`}
                               />
@@ -670,7 +896,8 @@ const ListAgents = ({ accountId, refreshAgentListing, allAgents, loadingAgents, 
                           component: (
                             <Box sx={{ display: 'flex', alignItems: 'center', gap: ds.space[2] }}>
                               <Text value={kb.name} sx={{ fontWeight: ds.weight.medium }} />
-                              {isAlreadyMapped && <Label text='Mapped' tone='success' />}
+                              {isMappedToAllAgents && <Label text='All agents' tone='info' />}
+                              {isAlreadyMapped && !isMappedToAllAgents && <Label text='Mapped' tone='success' />}
                             </Box>
                           ),
                         },
@@ -688,7 +915,10 @@ const ListAgents = ({ accountId, refreshAgentListing, allAgents, loadingAgents, 
                           ),
                         },
                         {
-                          component: <Label text={kb.status || 'active'} />,
+                          // A disabled KB can still be mapped — the mapping is just
+                          // dormant until it is switched back on. Say so here, or the
+                          // row reads as "active" and the agent silently ignores it.
+                          component: kb.enabled === false ? <Label text='disabled' tone='warning' /> : <Label text={kb.status || 'active'} />,
                         },
                         {
                           component: <Text value={kb.created_by?.display_name || '-'} />,
@@ -737,6 +967,7 @@ const ListAgents = ({ accountId, refreshAgentListing, allAgents, loadingAgents, 
             <Button
               tone='secondary'
               size='md'
+              disabled={isSubmitting}
               onClick={() => {
                 setCreateAgentModal(false);
                 setEditMode(false);
@@ -749,6 +980,8 @@ const ListAgents = ({ accountId, refreshAgentListing, allAgents, loadingAgents, 
             <Button
               tone='primary'
               size='md'
+              loading={isSubmitting}
+              disabled={isSubmitting}
               onClick={() => {
                 setTriggerSubmit(true);
               }}
@@ -759,7 +992,7 @@ const ListAgents = ({ accountId, refreshAgentListing, allAgents, loadingAgents, 
         }
       >
         <CreateAgentNew
-          accountId={accountId}
+          accountId={agentAccountId(selectedAgent)}
           handleClose={(value) => {
             if (value == 'success') {
               refreshAgentListing();
@@ -775,11 +1008,12 @@ const ListAgents = ({ accountId, refreshAgentListing, allAgents, loadingAgents, 
           agentData={selectedAgent}
           triggerSubmit={triggerSubmit}
           onSubmitStart={() => {
-            // Called when submit starts
+            setIsSubmitting(true);
           }}
           onSubmitEnd={() => {
             // Called when submit ends (success or error)
             setTriggerSubmit(false);
+            setIsSubmitting(false);
           }}
         />
       </Modal>
@@ -804,6 +1038,7 @@ const ListAgents = ({ accountId, refreshAgentListing, allAgents, loadingAgents, 
             <Button
               tone='secondary'
               size='md'
+              disabled={isSubmitting}
               onClick={() => {
                 setCreateAgentModal(false);
                 setExtensionMode(false);
@@ -815,6 +1050,8 @@ const ListAgents = ({ accountId, refreshAgentListing, allAgents, loadingAgents, 
             <Button
               tone='primary'
               size='md'
+              loading={isSubmitting}
+              disabled={isSubmitting}
               onClick={() => {
                 setTriggerSubmit(true);
               }}
@@ -840,11 +1077,12 @@ const ListAgents = ({ accountId, refreshAgentListing, allAgents, loadingAgents, 
           editMode={selectedAgent ? extensionsMap[selectedAgent.name]?.length > 0 : false}
           triggerSubmit={triggerSubmit}
           onSubmitStart={() => {
-            // Called when submit starts
+            setIsSubmitting(true);
           }}
           onSubmitEnd={() => {
             // Called when submit ends (success or error)
             setTriggerSubmit(false);
+            setIsSubmitting(false);
           }}
         />
       </Modal>
@@ -959,16 +1197,19 @@ const ListAgents = ({ accountId, refreshAgentListing, allAgents, loadingAgents, 
               isTenantWide
                 ? [
                     { name: 'Name', width: '20%' },
-                    { name: 'Description', width: '40%' },
+                    { name: 'Description', width: '30%' },
                     { name: 'Status', width: '10%' },
                     { name: 'Tools', width: '15%' },
+                    { name: 'Usage', width: '5%', info: USAGE_COLUMN_INFO },
                     { name: 'Account', width: '15%' },
+                    { name: 'Action', width: '5%' },
                   ]
                 : [
                     { name: 'Name', width: '15%' },
-                    { name: 'Description', width: '35%' },
+                    { name: 'Description', width: '30%' },
                     { name: 'Status', width: '10%' },
                     { name: 'Tools', width: '10%' },
+                    { name: 'Usage', width: '5%', info: USAGE_COLUMN_INFO },
                     { name: 'KB', width: '5%', info: 'Knowledge Base count - Click to view or manage knowledge bases mapped to this agent' },
                     { name: 'Action', width: '5%' },
                   ]

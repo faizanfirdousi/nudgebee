@@ -20,6 +20,11 @@ import { Modal } from '@ui/Modal';
 import { Select } from '@ui/Select';
 import { Button } from '@ui/Button';
 import { safeJSONParse } from '@utils/common';
+import SecurityFindingPanel from './SecurityFindingPanel';
+import { fromImageScanRow } from './securityFinding';
+import { AskNubiIconButton, findingPromptContext, useAskNubiAboutSecurityFinding } from './askNubi';
+import { dismissMenuEntry, useRecommendationDismissal } from './dismissal';
+import { useTenantBranding } from '@hooks/useTenantBranding';
 
 const SEVERITY_TO_DS_LEVEL = {
   critical: 'critical',
@@ -30,14 +35,27 @@ const SEVERITY_TO_DS_LEVEL = {
 };
 const toDsSeverityLevel = (s) => SEVERITY_TO_DS_LEVEL[String(s || '').toLowerCase()] || 'info';
 import PRLink, { resolutionsDeepLink } from '@shared/links/PRLink';
-import LinearLoader from '@components/k8s/common/LinearLoader';
+import { ProgressLinear } from '@ui/ProgressLinear';
 import apiTickets from '@api1/tickets';
 import k8sApi from '@api1/kubernetes';
 import { PrOpenIcon } from '@assets';
 import { hasWriteAccess } from '@lib/auth';
-import WidgetCard from '@ui/WidgetCard';
+import { detectGitProvider } from '@components/optimise-new/gitProvider';
 
 const KubernetesSecurityDetails = (props) => {
+  // Rows carry their own account_id; in cross-account mode (the /optimise
+  // Security tab) kubernetes.id is a list, so every per-row action must use the
+  // row's account. Page-level id remains the fallback for injected llm rows,
+  // which are always single-account. A multi-account scope has no single
+  // fallback: returning undefined makes the action fail loudly rather than
+  // silently raise a PR or ticket against an arbitrary cluster.
+  const accountIdForRow = (item) => {
+    if (item?.account_id) return item.account_id;
+    const scope = props?.kubernetes?.id;
+    if (!Array.isArray(scope)) return scope;
+    return scope.length === 1 ? scope[0] : undefined;
+  };
+
   const prevQueryRef = useRef();
 
   const [kubernetesSecurity, setKubernetesSecurity] = useState([]);
@@ -60,15 +78,21 @@ const KubernetesSecurityDetails = (props) => {
   const [prLoading, setPRLoading] = useState(false);
   const [isGitReposLoading, setIsGitReposLoading] = useState(false);
   const [selectedItemForPR, setSelectedItemForPR] = useState(null);
-
-  // Helper to detect git provider from repo URL
-  const detectGitProvider = (repoUrl) => {
-    if (!repoUrl) return null;
-    const url = repoUrl.toLowerCase();
-    if (url.includes('github.com')) return 'github';
-    if (url.includes('gitlab')) return 'gitlab';
-    return null;
-  };
+  // The finding whose detail panel is open. Rows used to expand into an
+  // accordion; a single finding now opens the side panel instead.
+  const [panelFinding, setPanelFinding] = useState(null);
+  const { assistantName } = useTenantBranding();
+  const dismissal = useRecommendationDismissal(() => {
+    setPanelFinding(null);
+    getSecurityDetails();
+  });
+  const askNubi = useAskNubiAboutSecurityFinding();
+  const askAboutFinding = (item) =>
+    askNubi({
+      accountId: item?.account_id,
+      sessionKey: item?.id,
+      context: findingPromptContext(fromImageScanRow(item), props?.accountsById?.[item?.account_id]),
+    });
 
   // Filter integrations based on the repo URL in annotations
   const filteredGitIntegrations = useMemo(() => {
@@ -85,18 +109,42 @@ const KubernetesSecurityDetails = (props) => {
     }
   }, [filteredGitIntegrations, selectedGitIntegration]);
 
+  // A column that repeats the row you opened is not information. Expanded from
+  // an app, every App cell holds that app; expanded from an image, every Image
+  // cell holds that image. Dropping the redundant one hands its width to Title,
+  // which is the only column here whose text has to be read rather than
+  // recognised. Standalone (the Details tab, where no scope is set) keeps both.
+  const scopedToWorkload = Boolean(props?.query?.workload_name);
+  const scopedToImage = Boolean(props?.query?.image);
+
+  // Width budget, measured against the real rendered content rather than
+  // guessed. Every share below except Image and Package Id is wide enough for
+  // its column's longest value plus cell padding, so nothing wraps and no
+  // header breaks across two lines; Image and Package Id are the two columns
+  // whose values are recognised at a glance rather than read, so they take the
+  // truncation (with a tooltip) and Title gets the surplus.
+  //
+  // The old split starved it: Title sat at 20% and cut mid-sentence while
+  // Package Id at 5% cut "zlib1g@..." after six characters, CWEs at 5% broke
+  // every "CWE-416,CWE-611" onto two lines, and Updated At at 5% was narrower
+  // than its own header. Widths are proportional shares of whichever columns
+  // actually render, so they need to be consistent with each other, not sum
+  // to 100 in every branch.
   const BEST_PRACTICES_HEADER = [
-    { name: 'CVE', width: '15%' },
-    { name: 'Image', width: '20%' },
-    { name: 'App', width: '20%' },
-    { name: 'Title', width: '20%' },
-    { name: 'Severity', width: '5%' },
-    { name: 'Package Id', width: '5%' },
-    { name: 'CWEs', width: '5%' },
+    ...(props?.accountsById ? [{ name: 'Cluster', width: '8%' }] : []),
+    // CVE carries an open-in-new glyph beside the id, so it needs more than the
+    // text alone measures.
+    { name: 'CVE', width: '11%' },
+    ...(scopedToImage ? [] : [{ name: 'Image', width: '10%' }]),
+    ...(scopedToWorkload ? [] : [{ name: 'App', width: '10%' }]),
+    { name: 'Title', width: '45%' },
+    { name: 'Severity', width: '6%' },
+    { name: 'Package Id', width: '10%' },
+    { name: 'CWEs', width: '10%' },
   ];
 
   if (!props?.llmTableData?.length) {
-    BEST_PRACTICES_HEADER.push({ name: 'Updated At', width: '5%' }, { name: '', width: '5%' });
+    BEST_PRACTICES_HEADER.push({ name: 'Updated At', width: '8%' }, { name: '', width: '3%' });
   }
 
   const changePage = (page, limit) => {
@@ -128,6 +176,8 @@ const KubernetesSecurityDetails = (props) => {
       setIsTicketCreateFormOpen(true);
     } else if (menuItem.id === 'create-pull-request') {
       openPRModal(data);
+    } else if (menuItem.id === 'dismiss' || menuItem.id === 'reactivate') {
+      dismissal.toggle(data);
     }
   };
 
@@ -159,7 +209,7 @@ const KubernetesSecurityDetails = (props) => {
   const getWorkloadAnnotations = async (data) => {
     try {
       const res = await k8sApi.getK8sWorkload(1, 0, {
-        accountId: props?.kubernetes?.id,
+        accountId: accountIdForRow(data),
         namespaceName: data?.namespace,
         workloadName: data?.workload_name,
         exactNameMatch: true,
@@ -169,7 +219,7 @@ const KubernetesSecurityDetails = (props) => {
         const annotations = workloads[0].meta?.config?.annotations || {};
         // For security recommendations, we need workloads.nudgebee.com (source code repo) or ci.nudgebee.com or argocd
         const filteredKeys = Object.keys(annotations).filter(
-          (key) => key.startsWith(WORKLOADS_PREFIX) || key.startsWith(CI_PREFIX) || key.startsWith('argocd.argoproj.io')
+          (key) => key.startsWith(WORKLOADS_PREFIX) || key.startsWith(CI_PREFIX) || key.startsWith('argocd.argoproj.io/')
         );
         if (filteredKeys.length > 0) {
           const filtered = {};
@@ -221,7 +271,7 @@ const KubernetesSecurityDetails = (props) => {
     setPRLoading(true);
     apiRecommendations
       .applyRecommendation(
-        props?.kubernetes?.id,
+        accountIdForRow(selectedItemForPR),
         selectedItemForPR.id,
         { workload_name: selectedItemForPR?.workload_name, namespace: selectedItemForPR?.namespace },
         integrationType,
@@ -271,8 +321,20 @@ const KubernetesSecurityDetails = (props) => {
     return query;
   };
 
+  // Why a PR cannot be raised for this finding, or '' when it can. A resolution
+  // that is still running or already terminal blocks a new one; only a failed
+  // one is retryable.
+  const prBlockedReason = (data) => {
+    if (!data) return '';
+    if (data.resolution && data.resolution.status !== 'Failed') {
+      return `A pull request resolution is already ${String(data.resolution.status || '').toLowerCase() || 'in progress'}`;
+    }
+    return '';
+  };
+
   const getMenuItems = (data) => {
     const hasFixAvailable = data?.recommendation?.FixedVersion;
+    const dismissEntry = dismissMenuEntry(data?.status, hasWriteAccess(data?.account_id));
     return [
       {
         icon: TicketsIcon,
@@ -288,6 +350,7 @@ const KubernetesSecurityDetails = (props) => {
         // flight, or a terminal one that needs no further action — blocks a new PR.
         disabled: !hasFixAvailable || !hasWriteAccess() || Boolean(data?.resolution && data.resolution.status !== 'Failed'),
       },
+      ...(dismissEntry ? [{ label: dismissEntry.label, id: dismissEntry.id }] : []),
     ];
   };
 
@@ -301,6 +364,12 @@ const KubernetesSecurityDetails = (props) => {
 
   const buildRow = (item) => {
     let data = [];
+    if (props?.accountsById) {
+      data.push({
+        component: <Text value={props.accountsById[item.account_id] || item.account_id} showAutoEllipsis />,
+        data: item.account_id,
+      });
+    }
     data.push({
       component: (
         <Stack direction='column' spacing={1}>
@@ -327,17 +396,23 @@ const KubernetesSecurityDetails = (props) => {
           )}
         </Stack>
       ),
-      drilldownQuery: item,
+      drilldownQuery: { ...item, finding: item },
       data: item.recommendation?.VulnerabilityID,
     });
-    data.push({
-      component: <Text value={item?.image?.split('/').pop()} showAutoEllipsis />,
-      data: item?.image?.split('/')[1],
-    });
-    data.push({
-      component: <Text value={`${item.namespace} / ${item.workload_name}`} showAutoEllipsis />,
-      data: item?.image?.split('/')[1],
-    });
+    // Kept in step with BEST_PRACTICES_HEADER above — a cell pushed here
+    // without its header silently shifts every column after it.
+    if (!scopedToImage) {
+      data.push({
+        component: <Text value={item?.image?.split('/').pop()} showAutoEllipsis />,
+        data: item?.image?.split('/')[1],
+      });
+    }
+    if (!scopedToWorkload) {
+      data.push({
+        component: <Text value={`${item.namespace} / ${item.workload_name}`} showAutoEllipsis />,
+        data: item?.image?.split('/')[1],
+      });
+    }
     data.push({
       component: <Text value={item?.recommendation?.Title} showAutoEllipsis />,
       data: item?.recommendation?.Title,
@@ -362,8 +437,16 @@ const KubernetesSecurityDetails = (props) => {
       data.push({ component: <Datetime value={item.created_at} /> });
       data.push({
         component: (
-          <Box display={'flex'} flexDirection={'row'} alignItems={'space-between'} justifyContent={'flex-end'}>
-            <ThreeDotsMenu sx={{ ...action.primary }} menuItems={getMenuItems(item)} data={item} onMenuClick={onMenuClick} />
+          <Box
+            display={'flex'}
+            flexDirection={'row'}
+            alignItems={'center'}
+            justifyContent={'flex-end'}
+            gap={'var(--ds-space-1)'}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <AskNubiIconButton id={`security-ask-nubi-${item.id}`} assistantName={assistantName} onClick={() => askAboutFinding(item)} />
+            <ThreeDotsMenu sx={{ ...action.primary }} menuItems={getMenuItems(item)} data={item} onMenuClick={onMenuClick} disablePortal={false} />
           </Box>
         ),
       });
@@ -497,7 +580,7 @@ const KubernetesSecurityDetails = (props) => {
         ticketData={{
           subject: 'Security Issue On - ' + ticketData.image,
           description: getTicketDescription(ticketData),
-          accountId: props?.kubernetes?.id,
+          accountId: accountIdForRow(ticketData),
         }}
         ticketUrl={{}}
         reference={{
@@ -508,7 +591,7 @@ const KubernetesSecurityDetails = (props) => {
       <Modal width='md' open={openCreatePR} handleClose={closeCreatePRModal} title='Create Pull Request'>
         {prLoading && (
           <Box sx={{ position: 'absolute', top: 0, left: 0, right: 0, zIndex: 9999 }}>
-            <LinearLoader />
+            <ProgressLinear surface='page-top' />
           </Box>
         )}
         {isGitReposLoading || filteredGitIntegrations.length > 0 ? (
@@ -594,9 +677,24 @@ const KubernetesSecurityDetails = (props) => {
           )}
         </Box>
       )}
+      <SecurityFindingPanel
+        open={Boolean(panelFinding)}
+        onClose={() => setPanelFinding(null)}
+        finding={panelFinding ? fromImageScanRow(panelFinding) : null}
+        accountName={props?.accountsById?.[panelFinding?.account_id] || undefined}
+        scopeAccountId={props?.kubernetes?.id}
+        onCreateTicket={() => {
+          setTicketData(panelFinding);
+          setIsTicketCreateFormOpen(true);
+        }}
+        onCreatePR={() => openPRModal(panelFinding)}
+        onAskNubi={() => askAboutFinding(panelFinding)}
+        onDismiss={panelFinding && hasWriteAccess(panelFinding.account_id) ? () => dismissal.toggle(panelFinding) : undefined}
+        createPRDisabledReason={!hasWriteAccess() ? 'You need write access to raise a pull request' : prBlockedReason(panelFinding)}
+      />
+      {dismissal.modal}
       <CustomTable
         id={props.tableId}
-        showExpandable
         headers={BEST_PRACTICES_HEADER}
         tableData={kubernetesSecurity}
         rowsPerPage={rowsPerPage}
@@ -604,117 +702,13 @@ const KubernetesSecurityDetails = (props) => {
         onPageChange={changePage}
         pageNumber={page + 1}
         tableHeadingCenter={['Severity']}
-        stickyColumnIndex='9'
+        stickyColumnIndex={props?.accountsById ? '10' : '9'}
         showUpdatedEmptyData={kubernetesSecurity?.length == 0}
         sort={{
           name: 'Savings',
           order: 'desc',
         }}
-        expandable={{
-          tabs: [
-            {
-              text: 'Details',
-              value: 0,
-              componentFn: (opt, drilldown, _row) => {
-                // Long image SHAs + CVSS vectors don't break naturally; constrain the
-                // wrapper and force-wrap so the panel stays within the table row.
-                return (
-                  <WidgetCard sx={{ mt: 0, mb: 'var(--ds-space-4)' }}>
-                    <Grid container spacing={2}>
-                      <Grid item md={3}>
-                        <b>Title</b>
-                      </Grid>
-                      <Grid item md={9}>
-                        {drilldown?.recommendation?.Title}
-                      </Grid>
-                      <Grid item md={3}>
-                        <b>Image</b>
-                      </Grid>
-                      <Grid item md={9}>
-                        {drilldown?.image}
-                      </Grid>
-                      <Grid item md={3}>
-                        <b>Package</b>
-                      </Grid>
-                      <Grid item md={9}>
-                        {drilldown?.recommendation?.PkgID || '-'}
-                      </Grid>
-                      <Grid item md={3}>
-                        <b>Fixed Version</b>
-                      </Grid>
-                      <Grid item md={9}>
-                        {drilldown?.recommendation?.FixedVersion || '-'}
-                      </Grid>
-                      <Grid item md={3}>
-                        <b>Installed Version</b>
-                      </Grid>
-                      <Grid item md={9}>
-                        {drilldown?.recommendation?.InstalledVersion || '-'}
-                      </Grid>
-                      <Grid item md={3}>
-                        <b>CVSS Score</b>
-                      </Grid>
-                      <Grid item md={9}>
-                        {drilldown?.recommendation?.CVSS?.nvd?.V3Score || '-'}
-                      </Grid>
-                      <Grid item md={3}>
-                        <b>CVSS Vector</b>
-                      </Grid>
-                      <Grid item md={9}>
-                        {drilldown?.recommendation?.CVSS?.nvd?.V3Vector || '-'}
-                      </Grid>
-                      <Grid item md={3}>
-                        <b>Layer</b>
-                      </Grid>
-                      <Grid item md={9}>
-                        {drilldown?.recommendation?.Layer?.Digest || '-'}
-                      </Grid>
-                    </Grid>
-                  </WidgetCard>
-                );
-              },
-            },
-            {
-              text: 'Description',
-              value: 1,
-              componentFn: (opt, drilldown, _row) => {
-                return (
-                  <WidgetCard sx={{ mt: 0, mb: 'var(--ds-space-4)' }}>
-                    <Typography sx={{ fontSize: 'var(--ds-text-body)', color: 'var(--ds-gray-600)' }}>
-                      {drilldown?.recommendation?.Description || 'No description found'}
-                    </Typography>
-                  </WidgetCard>
-                );
-              },
-            },
-            {
-              text: 'References',
-              value: 2,
-              componentFn: (opt, drilldown, _row) => {
-                const refs = drilldown?.recommendation?.References;
-                return (
-                  <WidgetCard sx={{ mt: 0, mb: 'var(--ds-space-4)' }}>
-                    {refs?.length > 0 ? (
-                      <Box component='ul' sx={{ m: 0, pl: 'var(--ds-space-4)', display: 'flex', flexDirection: 'column', gap: 'var(--ds-space-1)' }}>
-                        {refs.map((r) => (
-                          <li key={r}>
-                            <Link href={r} openInNew>
-                              {r}
-                            </Link>
-                          </li>
-                        ))}
-                      </Box>
-                    ) : (
-                      <Typography sx={{ fontSize: 'var(--ds-text-body)', color: 'var(--ds-gray-400)', fontStyle: 'italic' }}>
-                        No references found
-                      </Typography>
-                    )}
-                  </WidgetCard>
-                );
-              },
-            },
-          ],
-        }}
+        onRowClick={(query) => query?.finding && setPanelFinding(query.finding)}
         loading={loading}
       />
     </>
@@ -722,6 +716,7 @@ const KubernetesSecurityDetails = (props) => {
 };
 
 KubernetesSecurityDetails.propTypes = {
+  accountsById: PropTypes.object,
   kubernetes: PropTypes.object,
   disableInfographic: PropTypes.bool,
   query: PropTypes.object,

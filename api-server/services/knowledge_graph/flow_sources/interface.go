@@ -128,6 +128,17 @@ func (e *CentralizedExternalServiceEnricher) EnrichExternalServices(
 	e.logger.Info("grouped external services by account",
 		"accounts_count", len(externalServicesByAccount))
 
+	// One store for the whole run: prepareMatchingContext is called per account,
+	// so building it there would be a query per account. Nil is valid and means
+	// every Route 53 lookup falls back to the cloud CLI.
+	topology, topoErr := NewCloudTopologyStore(tenantID, e.logger)
+	if topoErr != nil {
+		e.logger.Warn("failed to build cloud topology store, falling back to cloud CLI",
+			"tenant_id", tenantID, "error", topoErr)
+		topology = nil
+	}
+	defer topology.LogStats("external_service_enrichment")
+
 	// Track enriched results
 	newNodes := make([]*core.DbNode, 0)
 	newEdges := make([]*core.DbEdge, 0)
@@ -150,7 +161,7 @@ func (e *CentralizedExternalServiceEnricher) EnrichExternalServices(
 		// slice so the CallerClusterIndex is built only from this account's
 		// ExternalServices — prevents cross-account pollution when raw-IP ES
 		// names collide between accounts in multi-tenant builds.
-		ctx, err := e.prepareMatchingContext(reqCtx, accountID, tenantID, allNodes, accountExternalServices, allEdges)
+		ctx, err := e.prepareMatchingContext(reqCtx, accountID, tenantID, allNodes, accountExternalServices, allEdges, topology)
 		if err != nil {
 			e.logger.Warn("failed to prepare matching context for account",
 				"cloud_account_id", accountID,
@@ -167,6 +178,11 @@ func (e *CentralizedExternalServiceEnricher) EnrichExternalServices(
 
 			// Try all matching strategies
 			matchResult := e.findMatchingNode(name, ctx)
+
+			// Observational only — never gates the match below.
+			if matchResult.ShadowDiff != nil {
+				e.recordShadowDiff(matchResult.ShadowDiff, extSvc, accountID, tenantID)
+			}
 
 			if matchResult.Matched {
 				matchedCount++
@@ -230,6 +246,7 @@ func (e *CentralizedExternalServiceEnricher) prepareMatchingContext(
 	existingNodes []*core.DbNode,
 	accountExternalServices []*core.DbNode,
 	allEdges []*core.DbEdge,
+	topology *CloudTopologyStore,
 ) (*MatchingContext, error) {
 	// Initialize NodeMatcher with ALL nodes
 	allNodes := make([]*core.DbNode, 0, len(existingNodes)+len(accountExternalServices))
@@ -245,6 +262,7 @@ func (e *CentralizedExternalServiceEnricher) prepareMatchingContext(
 		Logger:               e.logger,
 		K8sServiceIPResolver: NewK8sServiceIPResolver(allNodes),
 		CallerClusterIndex:   buildCallerClusterIndex(accountExternalServices, allEdges, allNodes),
+		Topology:             topology,
 	}
 
 	// Get AWS accounts for Route53 resolution
@@ -273,7 +291,7 @@ func (e *CentralizedExternalServiceEnricher) prepareMatchingContext(
 
 	// Pre-fetch Route53 data if we have AWS accounts
 	if len(awsAccountIDs) > 0 {
-		ctx.ZoneCache, ctx.RecordCache = e.prefetchRoute53Data(reqCtx, awsAccountIDs)
+		ctx.ZoneCache, ctx.RecordCache = e.prefetchRoute53Data(reqCtx, awsAccountIDs, topology)
 	}
 
 	// Fetch cloud resources from database
@@ -289,17 +307,74 @@ func (e *CentralizedExternalServiceEnricher) findMatchingNode(name string, ctx *
 		return NoMatch()
 	}
 
+	// A strategy may attach a shadow diff whether or not it matched, so carry
+	// the first one across the loop rather than losing it when an unmatched
+	// result is discarded.
+	var shadowDiff *MatchShadowDiff
 	for _, strategy := range e.strategies {
-		if result := strategy.Match(name, ctx); result.Matched {
+		result := strategy.Match(name, ctx)
+		if shadowDiff == nil && result.ShadowDiff != nil {
+			shadowDiff = result.ShadowDiff
+		}
+		if result.Matched {
 			e.logger.Debug("Strategy matched",
 				"strategy", strategy.Name(),
 				"name", name,
 				"matched_by", result.MatchedBy)
+			result.ShadowDiff = shadowDiff
 			return result
 		}
 	}
 
-	return NoMatch()
+	unmatched := NoMatch()
+	unmatched.ShadowDiff = shadowDiff
+	return unmatched
+}
+
+// recordShadowDiff persists one k8s-DNS matching disagreement for later review.
+// Fire-and-forget by construction, mirroring recordUncertainClassificationIfAny
+// in the traces flow source: a short timeout off context.Background() rather
+// than the build's request context, because a cancelled build must not turn
+// this into an error path, and no error is returned so no caller can let it
+// affect build success.
+func (e *CentralizedExternalServiceEnricher) recordShadowDiff(
+	diff *MatchShadowDiff,
+	extSvc *core.DbNode,
+	accountID, tenantID string,
+) {
+	dbManager, err := database.GetDatabaseManager(database.Metastore)
+	if err != nil {
+		e.logger.Warn("skipping k8s-dns shadow diff record: no db manager", "error", err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	cluster, _ := extSvc.Properties["cluster"].(string)
+
+	core.RecordUncertainClassification(ctx, dbManager, core.UncertainClassificationCandidate{
+		TenantID:           tenantID,
+		Source:             "ebpf",
+		ClassificationKind: "node_match",
+		CandidateType:      diff.CurrentMatchedBy,
+		CandidateName:      diff.Hostname,
+		CandidateNamespace: diff.ParsedNamespace,
+		CandidateCluster:   cluster,
+		ReasonCode:         diff.ReasonCode,
+		ReasonDescription:  "stricter name+namespace k8s-DNS matching would not have produced the edge the current name-only fallback produced",
+		Evidence: map[string]interface{}{
+			"hostname":               diff.Hostname,
+			"parsed_service":         diff.ParsedService,
+			"parsed_namespace":       diff.ParsedNamespace,
+			"current_node_key":       diff.CurrentNodeKey,
+			"current_node_namespace": diff.CurrentNodeNamespace,
+			"current_matched_by":     diff.CurrentMatchedBy,
+			"strict_node_key":        diff.StrictNodeKey,
+			"candidate_count":        diff.CandidateCount,
+			"cloud_account_id":       accountID,
+			"external_service_key":   extSvc.UniqueKey,
+		},
+	})
 }
 
 // createLinkEdge creates an edge linking external service to matched node.
@@ -389,12 +464,13 @@ func (e *CentralizedExternalServiceEnricher) createInferredNodeIfAWS(
 func (e *CentralizedExternalServiceEnricher) prefetchRoute53Data(
 	reqCtx *security.RequestContext,
 	awsAccountIDs []string,
+	topology *CloudTopologyStore,
 ) (*Route53ZoneCache, *Route53RecordCache) {
 	zoneCache := NewRoute53ZoneCache()
 	recordCache := NewRoute53RecordCache()
 
 	for _, awsAccountID := range awsAccountIDs {
-		zones, err := FetchHostedZones(reqCtx, awsAccountID)
+		zones, err := FetchHostedZones(reqCtx, awsAccountID, topology)
 		if err != nil {
 			e.logger.Warn("Failed to fetch hosted zones",
 				"aws_account", awsAccountID,

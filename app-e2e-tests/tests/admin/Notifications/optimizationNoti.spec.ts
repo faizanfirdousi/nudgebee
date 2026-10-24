@@ -7,12 +7,12 @@ import {
   submitAndVerify,
 } from "./notificationHelper";
 
-test("Add Optimization Notification Rule", async ({ page }, testInfo) => {
+test("Add Optimization Notification Rule", { tag: ["@dev", "@test", "@oss", "@regression", "@functional", "@crud", "@quarantine"] }, async ({ page }, testInfo) => {
   test.setTimeout(120000);
 
   const locators = await navigateToNewNotificationRule(page);
 
-  await locators.optimizationTab.click();
+  await locators.selectOnlyType(locators.optimizationTab);
 
   await selectCluster(locators, page);
 

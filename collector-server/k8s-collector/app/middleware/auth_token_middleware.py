@@ -5,11 +5,17 @@ import logging
 from datetime import datetime
 
 from flask import request
+from kombu.exceptions import OperationalError
 from werkzeug.exceptions import HTTPException
 
 from config import Configs
 from db import clickhouse
-from exception.collector_exceptions import BadRequestError, InternalServerError, UnauthorizedError
+from exception.collector_exceptions import (
+    BadRequestError,
+    InternalServerError,
+    ServiceUnavailableError,
+    UnauthorizedError,
+)
 from controllers.base import BaseController, CredCache
 from middleware.utils import validate_key
 
@@ -25,6 +31,11 @@ INTERNAL_TOKEN_HEADER = "X-ACTION-TOKEN"
 INTERNAL_ACCOUNT_HEADER = "X-NB-Account-Id"
 
 cred_cache = CredCache()
+
+
+def _caller() -> str:
+    """Who is failing auth, for logs. Without this an auth failure names nobody."""
+    return f"{request.remote_addr} {request.method} {request.path}"
 
 
 class AuditLogger(BaseController):
@@ -68,6 +79,28 @@ class AuditLogger(BaseController):
                 log_entry["status_code"] = status_code
                 clickhouse.insert_data("agent_audit_log", [log_entry])
             return response
+        except HTTPException as e:
+            # A 401/400 is the client being wrong, not this service failing.
+            # Logging every one at ERROR with a full traceback made agent auth
+            # failures 99.8% of this service's ERROR volume (404k lines / 7d)
+            # while saying nothing about who was calling. 5xx keeps the traceback.
+            #
+            # 503 is grouped with them: it only comes from ErrorCatcher when a
+            # dependency is unreachable, which is already logged there with the
+            # underlying error. A traceback of our own middleware frames adds
+            # nothing, and this fires once per in-flight request for as long as
+            # the dependency is down.
+            if e.code and (e.code < 500 or e.code == 503):
+                logging.warning(
+                    "%s %s from %s -> %s",
+                    request.method,
+                    request.path,
+                    request.remote_addr,
+                    e.code,
+                )
+            else:
+                logging.exception("Failed to handle")
+            raise e
         except Exception as e:
             logging.exception("Failed to handle")
             raise e
@@ -96,6 +129,10 @@ class AuthTokenMiddleware(BaseController):
                 "access_secret_v2": resp[3],
             }
         else:
+            logging.warning(
+                "Agent auth failed: no matching k8s agent (%s)",
+                _caller(),
+            )
             raise UnauthorizedError("Invalid key")
 
     def get_agent_by_account_id(self, account_id):
@@ -143,7 +180,17 @@ class AuthTokenMiddleware(BaseController):
             raise BadRequestError("Authorization header missing")
 
         api_secret = request.headers.get("Authorization")
-        api_secret = api_secret.lstrip("Basic ").strip()
+        # removeprefix, NOT lstrip: str.lstrip(chars) strips a character SET, so
+        # lstrip("Basic ") ate any leading B/a/s/i/c/space from the credential
+        # itself. Five of those are in the base64 alphabet, so roughly 1 in 13
+        # agents enrolled with a credential that silently lost its first
+        # character and could never authenticate -- while the relay, which parses
+        # independently, accepted the same credential and reported the agent
+        # CONNECTED. Confirmed live: the same credential returned 401, and 200
+        # when prefixed with a byte lstrip would not eat.
+        # .strip() first so a header with leading whitespace still matches the
+        # prefix -- the old lstrip tolerated that because space was in its set.
+        api_secret = api_secret.strip().removeprefix("Basic ").strip()
         try:
             # Decode the base64-encoded credentials
             decoded_credentials = base64.b64decode(api_secret).decode("utf-8")
@@ -154,9 +201,8 @@ class AuthTokenMiddleware(BaseController):
             if key is None or api_secret is None:
                 raise BadRequestError("Invalid cred format provided")
 
-            if cred_cache.check_key(key):
-                value = cred_cache.get_value(key)
-            else:
+            value = cred_cache.get_if_fresh(key)
+            if value is None:
                 value = self.get_secret_from_db(key)
                 cred_cache.save_value(key=key, value=value)
             if not value:
@@ -165,15 +211,34 @@ class AuthTokenMiddleware(BaseController):
             # removed in B3 after DB confirmed no active agents on it.
             access_secret_v2 = value.get("access_secret_v2") or ""
             if not access_secret_v2:
+                logging.warning(
+                    "Agent auth failed: agent %s has no access_secret_v2 (%s)",
+                    value.get("agent_id"),
+                    _caller(),
+                )
                 raise UnauthorizedError(INVALID_SECRET)
             if not validate_key(api_secret, access_secret_v2):
+                logging.warning(
+                    "Agent auth failed: secret mismatch for agent %s (%s)",
+                    value.get("agent_id"),
+                    _caller(),
+                )
                 raise UnauthorizedError(INVALID_SECRET)
 
             # add global attributes which can be accessed in the requests
             request.cloud_account_id = value["id"]
             request.tenant = value["tenant"]
             request.agent_id = value["agent_id"]
+        except UnauthorizedError:
+            raise
         except Exception:
+            # Log the real cause before flattening it. Every auth failure used to
+            # surface as "Invalid secret" regardless of what actually went wrong --
+            # a malformed header, a decode error, a database outage -- which is why
+            # the lstrip bug above went unnoticed: operators saw "Invalid secret"
+            # for credentials that were provably correct. The response is
+            # unchanged; only the server-side log gains the reason.
+            logging.exception("agent auth failed while parsing or verifying credentials")
             raise UnauthorizedError(INVALID_SECRET)
         return self.func(*args, **kwargs)
 
@@ -189,6 +254,14 @@ class ErrorCatcher(BaseController):
         except HTTPException as exc:
             print(exc)
             raise exc
+        except OperationalError as e:
+            # Every ingestion endpoint publishes to RabbitMQ inline, so a broker
+            # that is down or mid-reschedule surfaces here. Answering 500
+            # "Something went wrong" pointed the on-call at this service and
+            # told the agent nothing; 503 says "not me, come back". The agent
+            # retries this with backoff -- a 500 it just drops.
+            logging.warning("message broker unavailable: %s", e)
+            raise ServiceUnavailableError("Message broker unavailable, retry later")
         except Exception as e:
             logging.exception(e)
             raise InternalServerError("Something went wrong")

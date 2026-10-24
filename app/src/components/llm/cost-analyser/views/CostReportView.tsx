@@ -13,19 +13,26 @@
  */
 import * as React from 'react';
 import dayjs from 'dayjs';
-import { Box } from '@mui/material';
+import { Box, IconButton } from '@mui/material';
+import Tooltip from '@ui/Tooltip';
+import { ds } from '@utils/colors';
+import SettingsOutlinedIcon from '@mui/icons-material/SettingsOutlined';
 import CustomTable2 from '@shared/tables/CustomTable';
 import CustomDateTimePicker from '@shared/widgets/CustomDateTimePicker';
 import FilterDropdown from '@ui/FilterDropdown';
+import CloudProviderIcon from '@shared/icons/CloudIcon';
 import { Card } from '@ui/Card';
 import { Banner } from '@ui/Banner';
+import { Button } from '@ui/Button';
 import { Chip } from '@ui/Chip';
 import { CostCallout } from '@ui/CostCallout';
 import { EmptyState } from '@ui/EmptyState';
+import { isSuperAdmin, isTenantAdmin } from '@lib/auth';
 import HeaderLabel from '../components/HeaderLabel';
 import SectionHeader from '../components/Section';
 import { fmtCost, fmtPct } from '../format';
 import { makeSeverity, SeverityCell, type Severity } from '../components/severity';
+import CostReportScheduleModal from './CostReportScheduleModal';
 import {
   aggregateAccountCostReport,
   type AiCostAccountRow,
@@ -50,13 +57,18 @@ const numCell = { fontSize: 'var(--ds-text-body)', color: 'var(--ds-gray-700)', 
 
 const H = {
   account: <HeaderLabel label='Account' info='The account the cost was incurred on.' />,
-  daily: <HeaderLabel label='Daily' info='Total AI cost for the date selected in the picker above.' />,
+  daily: (
+    <HeaderLabel
+      label='Daily'
+      info='Total AI cost for the 24 hours starting at your configured send hour on the selected date — see the schedule gear above for that hour.'
+    />
+  ),
   mtd: <HeaderLabel label='MTD' info='Total AI cost from the 1st of the month through the selected date.' />,
   prevMonth: <HeaderLabel label='Prev month' info='Total AI cost for the entire previous calendar month.' />,
   avgThisMonth: <HeaderLabel label='Avg/day (this mo)' info='Month-to-date cost divided by days elapsed this month.' />,
   avgPrevMonth: <HeaderLabel label='Avg/day (prev mo)' info='Previous month’s total cost divided by days in that month.' />,
   delta: <HeaderLabel label='%Δ' info='Change in average daily spend, this month vs previous month.' />,
-  dailyDrivers: <HeaderLabel label='Top daily drivers' info='Top 5 cost contributors on the selected date, by model and by source.' />,
+  dailyDrivers: <HeaderLabel label='Top daily drivers' info='Top 5 cost contributors in that same 24-hour window, by model and by source.' />,
   mtdDrivers: (
     <HeaderLabel label='Top MTD drivers' info='Top 5 cost contributors month-to-date (through the selected date), by model and by source.' />
   ),
@@ -90,11 +102,11 @@ const SORT_VALUE: Record<string, (r: AiCostAccountRow) => number | string> = {
 function DriverChips({ label, drivers }: { label: string; drivers: AiCostDriver[] }) {
   if (!drivers.length) return null;
   return (
-    <Box sx={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+    <Box sx={{ display: 'flex', flexDirection: 'column', gap: ds.space[1] }}>
       <Box component='span' sx={{ fontSize: 'var(--ds-text-caption)', color: 'var(--ds-gray-500)', fontWeight: 'var(--ds-font-weight-medium)' }}>
         {label}
       </Box>
-      <Box sx={{ display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
+      <Box sx={{ display: 'flex', gap: ds.space[1], flexWrap: 'wrap' }}>
         {drivers.map((d) => (
           <Chip key={d.key} size='2xs' variant='tag' tone='subtle'>
             {d.key}
@@ -124,12 +136,17 @@ function DriverList({ model, source }: { model: AiCostDriver[]; source: AiCostDr
   );
 }
 
-function toRow(r: AiCostAccountRow, costSev: (v: number) => Severity) {
+function toRow(r: AiCostAccountRow, costSev: (v: number) => Severity, provider: string) {
   return [
     {
       data: r.account_name,
       component: (
-        <Box sx={{ fontSize: 'var(--ds-text-body)', fontWeight: 'var(--ds-font-weight-medium)', color: 'var(--ds-gray-700)' }}>{r.account_name}</Box>
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 'var(--ds-space-2)', minWidth: 0 }}>
+          <CloudProviderIcon cloud_provider={provider} width='16px' height='16px' sx={{ flexShrink: 0 }} />
+          <Box sx={{ fontSize: 'var(--ds-text-body)', fontWeight: 'var(--ds-font-weight-medium)', color: 'var(--ds-gray-700)' }}>
+            {r.account_name}
+          </Box>
+        </Box>
       ),
     },
     {
@@ -229,8 +246,13 @@ function toTopSourceRow(s: AiCostTopSourceRow) {
   ];
 }
 
+// UTC "today", matching CostAnalyser's own anchorToday() — the reference date is UTC-anchored
+// (see the state's initial value), so local-time shortcuts here could disagree with it near midnight.
+const isoUtc = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+
 export function CostReportView({ accountId, onAccountChange, accountOptions, referenceDate, onReferenceDateChange }: CostReportViewProps) {
   const [sort, setSort] = React.useState<{ name: string; order: 'asc' | 'desc' }>({ name: '', order: 'asc' });
+  const [scheduleModalOpen, setScheduleModalOpen] = React.useState(false);
   const [state, setState] = React.useState<{
     loading: boolean;
     error: string | null;
@@ -288,8 +310,30 @@ export function CostReportView({ accountId, onAccountChange, accountOptions, ref
     return arr;
   }, [state.rows, sort]);
 
+  // The report rows come from ai_aggregate_account_cost_report, which carries no
+  // provider — accountOptions (ai_get_usage_filters) is the only place the
+  // account -> cloud_provider mapping is available on this screen. 'Other' (never
+  // undefined) so an account that list doesn't cover gets the generic cloud glyph:
+  // CloudProviderIcon falls back to the AWS logo on a null provider, which would
+  // mislabel it. Same rule FilterBar's account picker uses.
+  const providerByAccountId = React.useMemo(
+    () => Object.fromEntries(accountOptions.map((a) => [a.id, a.cloud_provider || 'Other'])) as Record<string, string>,
+    [accountOptions]
+  );
+  const accountDropdownOptions = React.useMemo(
+    () =>
+      accountOptions.map((a) => {
+        const provider = providerByAccountId[a.id] ?? 'Other';
+        return { label: a.name, value: a.id, group: provider, icon: <CloudProviderIcon cloud_provider={provider} width='16px' height='16px' /> };
+      }),
+    [accountOptions, providerByAccountId]
+  );
+
   const costSev = React.useMemo(() => makeSeverity(sortedRows.map((r) => r.daily_cost_usd)), [sortedRows]);
-  const tableData = React.useMemo(() => sortedRows.map((r) => toRow(r, costSev)), [sortedRows, costSev]);
+  const tableData = React.useMemo(
+    () => sortedRows.map((r) => toRow(r, costSev, providerByAccountId[r.account_id] ?? 'Other')),
+    [sortedRows, costSev, providerByAccountId]
+  );
   const topModelsTableData = React.useMemo(() => state.topModels.map(toTopModelRow), [state.topModels]);
   const topSourcesTableData = React.useMemo(() => state.topSources.map(toTopSourceRow), [state.topSources]);
   const showEmpty = !state.loading && !state.error && state.rows.length === 0;
@@ -312,34 +356,64 @@ export function CostReportView({ accountId, onAccountChange, accountOptions, ref
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 'var(--ds-space-5)' }}>
       <Card>
-        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 'var(--ds-space-3)' }}>
-          <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 'var(--ds-space-3)', flexWrap: 'wrap' }}>
-            <Box sx={{ fontSize: 'var(--ds-text-caption)', color: 'var(--ds-gray-500)' }}>
-              accounts with zero cost on the selected date, month-to-date, and last month are omitted
-            </Box>
+        <SectionHeader
+          title='Cost by account'
+          subtitle='accounts with zero cost on the selected date, month-to-date, and last month are omitted'
+          right={
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 'var(--ds-space-2)' }}>
               <FilterDropdown
                 id='accounts-account-filter'
                 label='Account'
-                options={accountOptions.map((a) => ({ label: a.name, value: a.id }))}
+                grouped
+                groupIcon={(groupKey: string) => <CloudProviderIcon cloud_provider={groupKey} width='14px' height='14px' />}
+                options={accountDropdownOptions}
                 value={accountId ?? ''}
                 onSelect={(e: { target: { value: string | null } }) => onAccountChange(e?.target?.value ?? '')}
                 clearable
                 size='sm'
               />
-              <CustomDateTimePicker
-                id='accounts-as-of-date'
-                value={dayjs(referenceDate)}
-                onChange={(d) => d && onReferenceDateChange(d.format('YYYY-MM-DD'))}
-                views={['day']}
-                format='MM/DD/YYYY'
-                maxDateTime={dayjs()}
-                size='sm'
-                width='160px'
-              />
+              <Box sx={{ display: 'flex', alignItems: 'flex-end', gap: 'var(--ds-space-1)' }}>
+                <CustomDateTimePicker
+                  id='accounts-as-of-date'
+                  label='As of'
+                  value={dayjs(referenceDate)}
+                  onChange={(d) => d && onReferenceDateChange(d.format('YYYY-MM-DD'))}
+                  views={['day']}
+                  format='MM/DD/YYYY'
+                  maxDateTime={dayjs()}
+                  size='sm'
+                  width='160px'
+                />
+                <Button tone='ghost' size='sm' onClick={() => onReferenceDateChange(isoUtc(Date.now()))} id='cost-report-as-of-today'>
+                  Today
+                </Button>
+                <Button tone='ghost' size='sm' onClick={() => onReferenceDateChange(isoUtc(Date.now() - 86400000))} id='cost-report-as-of-yesterday'>
+                  Yesterday
+                </Button>
+                <Button
+                  tone='ghost'
+                  size='sm'
+                  onClick={() => {
+                    const now = new Date();
+                    onReferenceDateChange(isoUtc(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 0)));
+                  }}
+                  id='cost-report-as-of-end-of-last-month'
+                >
+                  End of last month
+                </Button>
+              </Box>
+              {(isTenantAdmin() || isSuperAdmin()) && (
+                <Tooltip title='Cost report schedule'>
+                  <IconButton id='cost-report-schedule-btn' size='small' onClick={() => setScheduleModalOpen(true)}>
+                    <SettingsOutlinedIcon sx={{ fontSize: '18px', color: 'var(--ds-gray-500)' }} />
+                  </IconButton>
+                </Tooltip>
+              )}
             </Box>
-          </Box>
-
+          }
+        />
+        <CostReportScheduleModal open={scheduleModalOpen} onClose={() => setScheduleModalOpen(false)} />
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 'var(--ds-space-3)' }}>
           {state.error && <Banner tone='critical' title='Could not load account cost report' message={state.error} />}
 
           {showEmpty ? (

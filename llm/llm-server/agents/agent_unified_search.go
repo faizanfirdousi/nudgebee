@@ -80,13 +80,13 @@ func isCrawlContentUsable(data string) bool {
 }
 
 func init() {
-	toolDescription := `A unified search agent that searches across internal docs, skills, and the web in parallel.`
-	toolInput := "A natural language query."
+	toolDescription := `Searches relevant internal docs, skills, and web sources in parallel, or crawls a provided URL directly. Use for internal runbooks, public documentation, error messages, and upstream issues.`
+	toolInput := "A natural language question or a URL with instructions about what to find."
 	toolOutput := "A comprehensive answer based on search results."
 
-	core.RegisterNBAgentFactoryAndTool(WebSearchAgentName, func(accountId string) (core.NBAgent, error) {
+	core.RegisterNBAgentFactoryAndToolWithAliases(WebSearchAgentName, func(accountId string) (core.NBAgent, error) {
 		return newUnifiedSearchAgent(accountId), nil
-	}, toolDescription, toolInput, toolOutput)
+	}, toolDescription, toolInput, toolOutput, "websearch_old")
 }
 
 func newUnifiedSearchAgent(accountId string) UnifiedSearchAgent {
@@ -104,11 +104,11 @@ func (a UnifiedSearchAgent) GetName() string {
 }
 
 func (a UnifiedSearchAgent) GetNameAliases() []string {
-	return []string{"Unified Search", "Search Agent"}
+	return []string{"Knowledge Search", "Unified Search", "Search Agent"}
 }
 
 func (a UnifiedSearchAgent) GetDescription() string {
-	return `Searches across internal documentation, skills, and the web to answer user queries.`
+	return `Searches internal documentation, skills, and the web, or reads a provided URL, to answer user queries.`
 }
 
 func (a UnifiedSearchAgent) GetSupportedTools(ctx *security.RequestContext) []toolcore.NBTool {
@@ -135,6 +135,10 @@ func (a UnifiedSearchAgent) GetSystemPrompt(ctx *security.RequestContext, query 
 
 func (a UnifiedSearchAgent) GetPlannerType() core.AgentPlannerType {
 	return core.AgentPlannerTypeCustom
+}
+
+func (a UnifiedSearchAgent) GetKnowledgeMode() core.AgentKnowledgeMode {
+	return core.AgentKnowledgeAutoChunks
 }
 
 func (a UnifiedSearchAgent) GetModelCategory() core.ModelTier {
@@ -173,6 +177,11 @@ func (a UnifiedSearchAgent) Execute(ctx *security.RequestContext, request core.N
 		}
 	}
 
+	if request.KnowledgePolicy == core.KnowledgeDisabled {
+		analysis.UseDocs = false
+		analysis.UseSkills = false
+	}
+
 	// 2. Execute searches in parallel
 	var wg sync.WaitGroup
 	results := make([]string, 3)
@@ -180,7 +189,7 @@ func (a UnifiedSearchAgent) Execute(ctx *security.RequestContext, request core.N
 	invocations := make([]core.ToolInvocation, 0)
 	var mu sync.Mutex
 
-	if analysis.UseDocs {
+	if analysis.UseDocs && core.AutomaticKnowledgeAllowed(request) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -193,6 +202,8 @@ func (a UnifiedSearchAgent) Execute(ctx *security.RequestContext, request core.N
 				return
 			}
 			toolCtx := toolcore.NewNbToolContext(ctx, tool, request.AccountId, request.UserId, request.ConversationId, request.MessageId, request.AgentId, analysis.DocsQuery, nil, request.QueryContext, request.QueryConfig, "")
+			toolCtx.KnowledgePolicy = string(request.KnowledgePolicy)
+			toolCtx.KnowledgePolicyResolved = request.KnowledgePolicyResolved
 			resp, err := core.CallTool(toolCtx, tool, toolcore.NBToolCallRequest{Command: analysis.DocsQuery})
 
 			mu.Lock()
@@ -209,7 +220,7 @@ func (a UnifiedSearchAgent) Execute(ctx *security.RequestContext, request core.N
 		}()
 	}
 
-	if analysis.UseSkills {
+	if analysis.UseSkills && core.AutomaticKnowledgeAllowed(request) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -246,6 +257,8 @@ func (a UnifiedSearchAgent) Execute(ctx *security.RequestContext, request core.N
 				crawlTool, ok := toolcore.GetNBTool(request.AccountId, tools.ToolExecuteCrawlCommand)
 				if ok {
 					toolCtx := toolcore.NewNbToolContext(ctx, crawlTool, request.AccountId, request.UserId, request.ConversationId, request.MessageId, request.AgentId, analysis.TargetURL, nil, request.QueryContext, request.QueryConfig, "")
+					toolCtx.KnowledgePolicy = string(request.KnowledgePolicy)
+					toolCtx.KnowledgePolicyResolved = request.KnowledgePolicyResolved
 					resp, err := core.CallTool(toolCtx, crawlTool, toolcore.NBToolCallRequest{Command: analysis.TargetURL})
 					if err == nil {
 						mu.Lock()
@@ -269,6 +282,8 @@ func (a UnifiedSearchAgent) Execute(ctx *security.RequestContext, request core.N
 					searchErr = fmt.Errorf("web search tool not found")
 				} else {
 					toolCtx := toolcore.NewNbToolContext(ctx, tool, request.AccountId, request.UserId, request.ConversationId, request.MessageId, request.AgentId, analysis.WebQuery, nil, request.QueryContext, request.QueryConfig, "")
+					toolCtx.KnowledgePolicy = string(request.KnowledgePolicy)
+					toolCtx.KnowledgePolicyResolved = request.KnowledgePolicyResolved
 					resp, err := core.CallTool(toolCtx, tool, toolcore.NBToolCallRequest{Command: analysis.WebQuery})
 					if err != nil {
 						searchErr = err
@@ -291,6 +306,8 @@ func (a UnifiedSearchAgent) Execute(ctx *security.RequestContext, request core.N
 							for _, candidateUrl := range rankedUrls {
 								core.GetConversationDao().UpdateConversationMessageAsync(request.MessageId, fmt.Sprintf("Crawling %s...", candidateUrl), core.ConversationStatusInProgress)
 								crawlCtx := toolcore.NewNbToolContext(ctx, crawlTool, request.AccountId, request.UserId, request.ConversationId, request.MessageId, request.AgentId, candidateUrl, nil, request.QueryContext, request.QueryConfig, "")
+								crawlCtx.KnowledgePolicy = string(request.KnowledgePolicy)
+								crawlCtx.KnowledgePolicyResolved = request.KnowledgePolicyResolved
 								crawlResp, crawlErr := core.CallTool(crawlCtx, crawlTool, toolcore.NBToolCallRequest{Command: candidateUrl})
 								if crawlErr != nil {
 									ctx.GetLogger().Warn("unified_search: crawl failed, trying next URL", "url", candidateUrl, "error", crawlErr)
@@ -495,6 +512,9 @@ Output JSON format:
 }
 
 func (a UnifiedSearchAgent) searchSkills(ctx *security.RequestContext, request core.NBAgentRequest, query string) (string, error) {
+	if !core.AutomaticKnowledgeAllowed(request) {
+		return "", nil
+	}
 	// Query RAG with module="skills" (assuming this module exists or will be populated)
 	// If "skills" module is empty, this might return nothing, which is fine.
 	// We use QueryRAGCollection to target specific module/collection if needed.
@@ -533,15 +553,15 @@ func (a UnifiedSearchAgent) synthesizeAnswer(ctx *security.RequestContext, reque
 		llms.TextParts(llms.ChatMessageTypeSystem, fmt.Sprintf("Context:\n%s", context)),
 	}
 
-	// websearch is AgentPlannerTypeCustom and bypasses the executor's basePrompt →
-	// systemMessage path, so the lazy <skill-lists> + load_skills flow that
-	// ReAct planners use cannot reach this synthesis call. The executor
-	// eagerly loads the active mapped skills (own ∪ inherited, narrowed to the
-	// question-aware selection when LlmServerSkillSelectionTopK is enabled) into
-	// request.SkillsContext — surface it as a system message so any expert
-	// guidance the user mapped to "websearch" actually shapes the final answer.
-	if strings.TrimSpace(request.SkillsContext) != "" {
-		messages = append(messages, llms.TextParts(llms.ChatMessageTypeSystem, request.SkillsContext))
+	// This custom planner has no load_skills loop, so it opts into bounded,
+	// question-relevant knowledge chunks supplied by the executor.
+	knowledgeContext := strings.TrimSpace(request.KBPrestepContent)
+	if knowledgeContext == "" {
+		// Compatibility for callers that still populate the legacy field directly.
+		knowledgeContext = strings.TrimSpace(request.SkillsContext)
+	}
+	if knowledgeContext != "" {
+		messages = append(messages, llms.TextParts(llms.ChatMessageTypeSystem, knowledgeContext))
 	}
 
 	if request.ConversationContext != "" {

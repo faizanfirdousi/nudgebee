@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net"
 	"nudgebee/services/knowledge_graph/core"
 	"nudgebee/services/relay"
 	"nudgebee/services/security"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -156,7 +158,7 @@ func (s *EbpfFlowSource) BuildFlowRelationships(
 			externalServiceNodesByAccount[account.CloudAccountID] = make(map[string]*core.DbNode)
 		}
 
-		accountEdges, accountNewNodes, accountExternalNodes, err := s.processK8sAccount(ctx, req, account, externalServiceNodesByAccount[account.CloudAccountID], ipResolver, nodeIPResolver)
+		accountEdges, accountNewNodes, accountExternalNodes, err := s.processK8sAccount(ctx, reqCtx, req, account, externalServiceNodesByAccount[account.CloudAccountID], ipResolver, nodeIPResolver)
 		if err != nil {
 			s.logger.Error("failed to process K8s account",
 				"cloud_account_id", account.CloudAccountID,
@@ -221,6 +223,7 @@ func (s *EbpfFlowSource) enrichNodeWithLanguage(node *core.DbNode, app *core.Ser
 // account because it queries kube_pod_info via the per-account Prometheus relay.
 func (s *EbpfFlowSource) processK8sAccount(
 	ctx context.Context,
+	reqCtx *security.RequestContext,
 	req *core.FlowSourceBuildRequest,
 	account core.K8sAccount,
 	globalExternalServiceNodes map[string]*core.DbNode,
@@ -284,7 +287,7 @@ func (s *EbpfFlowSource) processK8sAccount(
 	// branch consults it after ResolveIPToK8sService misses, so traffic to a
 	// raw pod IP (e.g. a headless-service backend like rabbitmq-0) becomes a
 	// CALLS edge to the owning Workload instead of an orphan ExternalService.
-	podIPResolver := NewPodIPResolver(K8sAccountID, req.ExistingNodes, s.logger)
+	podIPResolver := NewPodIPResolver(reqCtx, K8sAccountID, req.ExistingNodes, s.logger)
 
 	// Track unmatched services for analysis
 	unmatchedSources := make(map[string]int)
@@ -466,9 +469,11 @@ func (s *EbpfFlowSource) processK8sAccount(
 				//
 				// Caller cluster is unknown here (the bypass branch has no
 				// source-node cluster context) — pass "" and rely on the
-				// resolvers' global-unique fallback.
+				// resolvers' global-unique fallback. K8sAccountID still scopes
+				// that fallback to this account, which is the only guard left
+				// once the cluster is unknown.
 				upstreamNode, resolvedFromIP, resolvedReason, resolutionSource, resolvedOK =
-					resolveIPNamedExternalService(upstreamID.Name, "", ipResolver, podIPResolver, nodeIPResolver)
+					resolveIPNamedExternalService(upstreamID.Name, K8sAccountID, "", ipResolver, podIPResolver, nodeIPResolver)
 				switch {
 				case resolvedOK:
 					skipNodeSearch = true
@@ -695,7 +700,24 @@ func (s *EbpfFlowSource) parseServiceMapFromRelay(relayResponse map[string]any) 
 	// Extract data array
 	dataArrayAny, ok := dataMap["data"]
 	if !ok {
-		return nil, fmt.Errorf("relay response missing 'data.data' field")
+		// Agent-side failures never trip the `success` check above: the Go
+		// k8s-agent answers an unregistered action, a handler error, a task
+		// timeout or an auth reject with
+		// {"status_code": N, "data": {"error": "..."}} (pkg/dispatch/dispatch.go),
+		// a map carrying neither `success` nor `data`. Repeating the agent's own
+		// message here is the difference between "action not registered:
+		// service_map" (PROMETHEUS_URL unset on that cluster, so the agent never
+		// registers the handler) and an opaque "missing 'data.data'" that tells
+		// the reader nothing without pulling the agent's logs.
+		statusCode := "unknown"
+		if sc := relayResponse["status_code"]; sc != nil {
+			statusCode = fmt.Sprintf("%v", sc)
+		}
+		if agentErr, isStr := dataMap["error"].(string); isStr {
+			return nil, fmt.Errorf("relay agent returned an error (status_code %s): %s", statusCode, agentErr)
+		}
+		return nil, fmt.Errorf("relay response missing 'data.data' field (status_code %s, 'data' keys: %v)",
+			statusCode, slices.Sorted(maps.Keys(dataMap)))
 	}
 
 	// Marshal and unmarshal to convert to ServiceApplication slice

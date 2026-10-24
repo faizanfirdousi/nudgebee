@@ -38,16 +38,9 @@ type asgData struct {
 // membership edges, fetched live per region via the autoscaling CLI (ASGs aren't in
 // cloud_resourses).
 func (s *AWSSource) createASGNodesAndEdges(reqCtx *security.RequestContext, ec2Nodes []*core.DbNode, lookup *sources.NodeLookup, req *core.SourceBuildRequest) ([]*core.DbNode, []*core.DbEdge) {
-	regions := make(map[string]struct{})
-	for _, n := range ec2Nodes {
-		if r, ok := n.Properties["region"].(string); ok && r != "" {
-			regions[r] = struct{}{}
-		}
-	}
-
 	nodes := make([]*core.DbNode, 0)
 	edges := make([]*core.DbEdge, 0)
-	for region := range regions {
+	for _, region := range nodeRegions(ec2Nodes) {
 		asgs := s.fetchAutoScalingGroups(reqCtx, req.CloudAccountID, region)
 		n, e := s.buildASGNodesAndEdges(asgs, region, lookup, req)
 		nodes = append(nodes, n...)
@@ -107,4 +100,23 @@ func (s *AWSSource) buildASGNodesAndEdges(asgs []asgData, region string, lookup 
 	}
 
 	return nodes, edges
+}
+
+// The edges the account build asks this file's resources for (see dispatch.go).
+func init() {
+	// AutoScalingGroup nodes + EC2 -BELONGS_TO-> ASG (fetched live per region).
+	registerEdgeStep(edgeStep{NodeType: core.NodeTypeComputeInstance, Name: "asg",
+		Build: func(s *AWSSource, reqCtx *security.RequestContext, nodes []*core.DbNode, lookup *sources.NodeLookup, req *core.SourceBuildRequest) ([]*core.DbEdge, []*core.DbNode) {
+			asgNodes, asgEdges := s.createASGNodesAndEdges(reqCtx, nodes, lookup, req)
+			return asgEdges, asgNodes
+		}})
+}
+
+// Per-resource updates (see patch.go). Auto Scaling groups are fetched live by
+// createASGNodesAndEdges; they are not built from inventory rows.
+func init() {
+	registerPatchSpec(sources.PatchSpec{
+		SpecificTypes: []string{"AutoScalingGroup", string(core.NodeTypeComputeInstancePool)},
+		AccountLevel:  true,
+	}, nil)
 }

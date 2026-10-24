@@ -1,6 +1,7 @@
 package agents
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"nudgebee/llm/agents/aws"
@@ -57,11 +58,19 @@ func newTracesAgent(ctx *security.RequestContext, accountId string, primaryAgent
 	// they stay on their dedicated agents like ClickHouse/Datadog.
 	isCloudCLI := provider == "gcp" || provider == "azure" || provider == "aws"
 
-	// Integration-agnostic (v2) routing: when enabled, every where-clause-capable
-	// provider goes through the canonical TracesDefaultAgentV2 (llm-server emits one
-	// canonical query; services-server translates it per provider). ClickHouse (raw-SQL
-	// aggregations) and Datadog (facet syntax) can't be expressed canonically, so they
-	// stay on their dedicated agents. Flag off → the v1 switch below, byte-identical.
+	// Integration-agnostic (v2) routing: when enabled, a where-clause-capable provider goes
+	// through the canonical TracesDefaultAgentV2 (llm-server emits one canonical query;
+	// services-server translates it per provider).
+	//
+	// ClickHouse and Datadog are excluded — but NOT because their queries cannot be
+	// expressed canonically. Canonical FILTERING works for both today: each source
+	// implements the canonical where-clause path, and DatadogTraceSource.GetLabelMapping
+	// is a complete canonical→facet translation table. What the canonical request cannot
+	// express is a free-form aggregate projection (e.g. quantile(0.95)(duration_ns)
+	// GROUP BY endpoint), which is what these providers' dedicated agents are kept for.
+	// Narrowing this carve-out to aggregation-shaped questions is tracked in #36875.
+	//
+	// Flag off → the v1 switch below, byte-identical.
 	if traceAgentV2Enabled() && !isClickhouse && !isDatadog && !isCloudCLI {
 		return &fallbackTracesAgent{
 			accountId: accountId,
@@ -132,12 +141,60 @@ func isTracesSoftCompletion(response string) bool {
 	return false
 }
 
+// executedTraceQueryProvider recovers the query services-server actually ran and the provider that
+// answered it from the trace tool observations collected during a run — the
+// {"traces":[…],"metadata":{"query","provider"}} envelope tracePayloadForResponse produces.
+// Observations are walked newest-first so the last trace query wins, and matched by shape rather
+// than by tool name so every trace tool (canonical v2, default, jaeger, chronosphere) is covered
+// while non-trace observations simply fail to yield either field. Mirrors executedLogQuery /
+// providerFromLogs on the log path.
+func executedTraceQueryProvider(steps []core.ToolInvocation) (string, string) {
+	for i := len(steps) - 1; i >= 0; i-- {
+		var doc struct {
+			Metadata struct {
+				Query    string `json:"query"`
+				Provider string `json:"provider"`
+			} `json:"metadata"`
+		}
+		if err := json.Unmarshal([]byte(steps[i].Response.Content), &doc); err != nil {
+			continue
+		}
+		if doc.Metadata.Query != "" || doc.Metadata.Provider != "" {
+			return doc.Metadata.Query, doc.Metadata.Provider
+		}
+	}
+	return "", ""
+}
+
+// appendExecutedTraceContext names the provider and executed query alongside a "no traces found"
+// message, so an empty answer is attributable instead of leaving the user to guess what ran
+// (#37406). Returns msg untouched when neither could be recovered — an older services-server, or
+// the Datadog / cloud-CLI trace paths, which serialize their own payloads.
+func appendExecutedTraceContext(msg string, steps []core.ToolInvocation) string {
+	query, provider := executedTraceQueryProvider(steps)
+	var parts []string
+	if provider != "" {
+		parts = append(parts, "provider: "+provider)
+	}
+	if query != "" {
+		// Verbatim: a clipped query is not one the reader can paste into the provider to run
+		// for themselves, which is the point of naming it. Length needs no guard here —
+		// TracesAgentTool saves an oversized response to the workspace and still returns the
+		// full text after the size notice, so nothing is lost.
+		parts = append(parts, "executed query: "+query)
+	}
+	if len(parts) == 0 {
+		return msg
+	}
+	return fmt.Sprintf("%s (%s)", msg, strings.Join(parts, "; "))
+}
+
 func (f *fallbackTracesAgent) GetName() string {
 	return TracesAgentName
 }
 
 func (f *fallbackTracesAgent) GetNameAliases() []string {
-	return []string{"Traces"}
+	return []string{"Trace Investigator", "Traces"}
 }
 
 func (f *fallbackTracesAgent) GetDescription() string {
@@ -183,7 +240,7 @@ func (f *fallbackTracesAgent) Execute(ctx *security.RequestContext, query core.N
 			Ctx:            ctx,
 			AccountId:      f.accountId,
 			ConversationId: query.ConversationId,
-			ParentAgentId:  query.ParentAgentId,
+			ParentAgentId:  nestedAgentParentID(query),
 			MessageId:      query.MessageId,
 			QueryContext:   query.QueryContext,
 			QueryConfig:    query.QueryConfig,
@@ -194,6 +251,8 @@ func (f *fallbackTracesAgent) Execute(ctx *security.RequestContext, query core.N
 			InheritSkillsFromAgents: append(query.InheritSkillsFromAgents, f.GetName()),
 			OriginalQuery:           query.OriginalQuery,
 			SelectedSkillIds:        query.SelectedSkillIds,
+			KnowledgePolicy:         string(query.KnowledgePolicy),
+			KnowledgePolicyResolved: query.KnowledgePolicyResolved,
 		}
 
 		nbToolCallRequest := toolcore.NBToolCallRequest{}
@@ -243,10 +302,15 @@ func (f *fallbackTracesAgent) Execute(ctx *security.RequestContext, query core.N
 	// If any agent legitimately returned a "no traces" style completion, propagate the
 	// last such response as Completed so the user sees a clean message. Only responses
 	// from agents that returned ConversationStatusCompleted qualify here — error strings
-	// from Failed agents must not be promoted to Completed.
+	// from Failed agents must not be promoted to Completed. The message is annotated with the
+	// query and provider recovered from the tool observations, so "no traces found" says what
+	// ran and where instead of leaving it unattributable (#37406). This runs after the
+	// soft-completion classification above, and reads only observations — it cannot change what
+	// counts as empty versus failed.
 	if len(completedNoDataResponses) > 0 {
 		return core.NBAgentResponse{
-			Response:          []string{completedNoDataResponses[len(completedNoDataResponses)-1]},
+			Response: []string{appendExecutedTraceContext(
+				completedNoDataResponses[len(completedNoDataResponses)-1], allAgentStepResponses)},
 			Status:            core.ConversationStatusCompleted,
 			AgentStepResponse: allAgentStepResponses,
 			References:        allReferences,
@@ -396,10 +460,15 @@ func (m TracesAgentTool) Call(nbRequestContext toolcore.NbToolContext, input too
 	}
 
 	resp, err := core.ExecuteAgentToolCall(nbRequestContext, agent, input)
-	if err != nil {
+	preambleResponse, preambleErr, handled := handleNestedAgentCallPreamble(nbRequestContext, resp, err, TracesAgentName)
+	if preambleErr != nil {
 		nbRequestContext.Ctx.GetLogger().Error("traces: unable to process events request", "error", err, "input", input)
-		return toolcore.NBToolResponse{}, err
+		return preambleResponse, preambleErr
 	}
+	if handled {
+		return preambleResponse, nil
+	}
+	additionalDetails := preambleResponse.AdditionalDetails
 
 	if len(resp.Response) > 0 {
 		traceData := resp.Response[0]
@@ -438,13 +507,14 @@ func (m TracesAgentTool) Call(nbRequestContext toolcore.NbToolContext, input too
 		}
 
 		return toolcore.NBToolResponse{
-			Data:             traceData,
-			Type:             toolcore.NBToolResponseTypeText,
-			Status:           toolcore.NBToolResponseStatusSuccess,
-			References:       references,
-			SubAgentEvidence: core.BuildSubAgentEvidenceForTool(nbRequestContext.Ctx, TracesAgentName, resp.AgentStepResponse),
+			Data:              traceData,
+			Type:              toolcore.NBToolResponseTypeText,
+			Status:            toolcore.NBToolResponseStatusSuccess,
+			References:        references,
+			SubAgentEvidence:  core.BuildSubAgentEvidenceForTool(nbRequestContext.Ctx, TracesAgentName, resp.AgentStepResponse),
+			AdditionalDetails: additionalDetails,
 		}, nil
 	}
 
-	return toolcore.NBToolResponse{}, toolcore.ErrUnableToFetchData
+	return toolcore.NBToolResponse{AdditionalDetails: additionalDetails, References: resp.References}, toolcore.ErrUnableToFetchData
 }

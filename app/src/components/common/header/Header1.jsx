@@ -23,8 +23,9 @@ import NotificationOutlineIconDark from '@assets/new/bell-icon-dark.svg';
 import DocumentationIcon from '@assets/header/Documentation.svg';
 import newAwsLogo from '@assets/logo/aws_logo.png';
 import GroupingIcon from '@assets/header/group-icon.svg';
+import ApplicationGroupingIcon from '@assets/kubernetes/app-nodes-icons/ApplicationsIconBlue.icon.svg';
 import VmServerIcon from '@assets/new/vm-server.svg';
-import DashboardIconBlue from '@assets/home/Dashboard_Icon.svg';
+import DashboardIconBlue from '@assets/home/Dashboard_Gauge_Icon.svg';
 import OuK8sIcon from '@assets/ou-management/kubernetes_icon.icon.svg';
 import JiraIcon from '@assets/jira_icon.icon.svg';
 import GithubIcon from '@assets/github-icon.icon.svg';
@@ -40,9 +41,11 @@ import WorkflowIconBlue from '@assets/workflow/workflow-icon-blue.icon.svg';
 
 import SafeIcon from '@shared/icons/SafeIcon';
 import { useRouter } from 'next/router';
+import { useSetupGate } from '@context/SetupGateContext';
 import { useData } from '@context/DataContext';
 import { hasWriteAccess } from '@lib/auth';
 import apiKubernetes from '@api1/kubernetes';
+import apiUser from '@api1/user';
 import ClusterDropdown from '@shared/navigation/ClusterDropDown';
 import GlobalPageSearch from '@shared/navigation/GlobalPageSearch';
 import { useSession } from 'next-auth/react';
@@ -78,6 +81,7 @@ const AGENT_UPGRADE_DOCS_URL = docsUrl('/docs/installation/agent/installation/up
 const Header1 = ({ showBorder = false }) => {
   const { data } = useSession({ required: true });
   const router = useRouter();
+  const { locked: setupLocked } = useSetupGate();
   const { assistantName, baseTitle, nubiIconUrl } = useTenantBranding();
   const { selectedCluster, allCluster } = useData();
   const selectedClusterRef = useRef(selectedCluster);
@@ -113,6 +117,9 @@ const Header1 = ({ showBorder = false }) => {
   const [anchorActiveTab, setAnchorActiveTab] = useState('');
   const [snackbarOpen, setSnackbarOpen] = useState(false);
   const [snackbarMsg, setSnackbarMsg] = useState('');
+  // A disconnected agent makes the whole page stale, so its banner is rendered
+  // critical (red) and non-dismissible. The version-update banner stays warning.
+  const [snackbarCritical, setSnackbarCritical] = useState(false);
   const [showReloadNotification, setShowReloadNotification] = useState(false);
   const [reloadMsg, setReloadMsg] = useState('');
   const [showK8sAccountModal, setShowK8sAccountModal] = useState(false);
@@ -260,17 +267,11 @@ const Header1 = ({ showBorder = false }) => {
       },
       {
         // The fleet-wide overview across every provider's accounts. /kubernetes
-        // keeps an entry because it is still a route — a redirector that shows a
-        // spinner while it resolves which cluster (or /overview) to open.
+        // is intentionally absent here — it is a pure redirector (spinner only),
+        // so giving it a header entry would flash "Account Overview" for a beat
+        // before it resolves to the cluster detail page's own title.
         name: 'Account Overview',
         route: '/overview',
-        icon: ClusterIconBlue,
-        showActiveCluster: false,
-        connectClusterButton: true,
-      },
-      {
-        name: 'Account Overview',
-        route: '/kubernetes',
         icon: ClusterIconBlue,
         showActiveCluster: false,
         connectClusterButton: true,
@@ -481,16 +482,32 @@ const Header1 = ({ showBorder = false }) => {
     return baseOptions;
   }, [selectedCluster]);
 
+  // Fold any legacy per-cluster K8s-agent banner keys into the consolidated
+  // user-preferences object once per mount.
+  useEffect(() => {
+    apiUser.migrateLegacyK8sAgentSnackbarPrefs();
+  }, []);
+
   useEffect(() => {
     setSnackbarOpen(false);
     setSnackbarMsg('');
+    setSnackbarCritical(false);
 
     if (!selectedCluster || Object.keys(selectedCluster).length === 0 || selectedCluster.cloud_provider !== 'K8s') {
       return;
     }
 
-    const hasClosed = localStorage.getItem(`latest-${selectedCluster.value}-K8sAgentSnackbar`);
-    if (hasClosed && hasClosed == 'false') {
+    // A disconnected agent means every value on the page is stale. Surface it up front
+    // as a critical, non-dismissible banner — always shown, never gated by the
+    // per-cluster dismiss flag (that only silences the informational version banner).
+    if (selectedCluster?.agent?.status === 'NOT_CONNECTED') {
+      setSnackbarCritical(true);
+      setSnackbarOpen(true);
+      setSnackbarMsg(`The ${baseTitle} Agent is disconnected. The data shown may be stale — do not rely on it until the agent reconnects.`);
+      return;
+    }
+
+    if (apiUser.isK8sAgentSnackbarDismissed(selectedCluster.value)) {
       return;
     }
 
@@ -498,12 +515,12 @@ const Header1 = ({ showBorder = false }) => {
       // Use ref to read the latest selectedCluster, not the stale closure value
       const cluster = selectedClusterRef.current;
       if (!cluster || cluster.cloud_provider !== 'K8s') return;
+      // A late response must not repaint over the critical disconnected banner (or a
+      // dismissed one): if the cluster went disconnected/dismissed while this call was
+      // in flight, bail rather than overwrite the message under a stale snackbarCritical.
+      if (cluster?.agent?.status === 'NOT_CONNECTED' || apiUser.isK8sAgentSnackbarDismissed(cluster.value)) return;
 
-      if (cluster?.agent?.status === 'NOT_CONNECTED') {
-        setSnackbarOpen(true);
-        setSnackbarMsg(`The ${baseTitle} Agent is not connected.`);
-        localStorage.setItem(`latest-${cluster.value}-K8sAgentSnackbar`, 'true');
-      } else if (res.data?.nudgebee_list_versions && res.data?.nudgebee_list_versions?.agent_version_latest != cluster.agent?.version) {
+      if (res.data?.nudgebee_list_versions && res.data?.nudgebee_list_versions?.agent_version_latest != cluster.agent?.version) {
         let snackMessage = '';
         let disconnectedService = [];
         setSnackbarOpen(true);
@@ -524,7 +541,6 @@ const Header1 = ({ showBorder = false }) => {
           snackMessage = snackMessage + ` The ${disconnectedService.join(', ')} services are disconnected.`;
         }
         setSnackbarMsg(snackMessage);
-        localStorage.setItem(`latest-${cluster.value}-K8sAgentSnackbar`, 'true');
       }
     });
   }, [selectedCluster]);
@@ -543,7 +559,7 @@ const Header1 = ({ showBorder = false }) => {
       const isDashboardGroups = router.pathname === '/dashboards' && router.asPath.includes('#groups');
       setAnchorActiveTab({
         name: isDashboardGroups ? 'Application Group' : matchedTab.name,
-        icon: isDashboardGroups ? GroupingIcon : matchedTab.icon,
+        icon: isDashboardGroups ? ApplicationGroupingIcon : matchedTab.icon,
         showActiveCluster: matchedTab.showActiveCluster,
         disableDropdown: matchedTab.disableDropdown ?? false,
         connectClusterButton: matchedTab.connectClusterButton,
@@ -664,11 +680,12 @@ const Header1 = ({ showBorder = false }) => {
   const updateClusterState = (_e) => {
     setSnackbarOpen(false);
     setSnackbarMsg('');
+    setSnackbarCritical(false);
   };
 
   const handleCloseSnackbar = () => {
     setSnackbarOpen(false);
-    localStorage.setItem(`latest-${selectedCluster.value}-K8sAgentSnackbar`, 'false');
+    apiUser.setK8sAgentSnackbarDismissed(selectedCluster?.value, true);
   };
 
   const handleClusterData = (clusterOption) => {
@@ -689,8 +706,8 @@ const Header1 = ({ showBorder = false }) => {
       )}
       {snackbarOpen && (
         <Banner
-          tone='warning'
-          dismissible
+          tone={snackbarCritical ? 'critical' : 'warning'}
+          dismissible={!snackbarCritical}
           onDismiss={handleCloseSnackbar}
           message={
             <span
@@ -715,7 +732,7 @@ const Header1 = ({ showBorder = false }) => {
           }
         />
       )}
-      {allCluster && allCluster.length > 0 && !allCluster.some((c) => c.value !== 'demo') && !loading && (
+      {!setupLocked && allCluster && allCluster.length > 0 && !allCluster.some((c) => c.value !== 'demo') && !loading && (
         <Box
           data-testid='demo-account-banner'
           sx={{
@@ -824,14 +841,27 @@ const Header1 = ({ showBorder = false }) => {
                   </Box>
                 )}
                 <Typography
-                  sx={{ fontFamily: 'Poppins, sans-serif', fontSize: 'var(--ds-text-heading)', fontWeight: ds.weight.semibold, color: ds.gray[700] }}
+                  sx={{ fontFamily: ds.font.display, fontSize: 'var(--ds-text-heading)', fontWeight: ds.weight.semibold, color: ds.gray[700] }}
                 >
                   {anchorActiveTab.name}
                 </Typography>
               </Box>
             </Box>
             <Box sx={{ display: 'flex', alignItems: 'center', gap: ds.space[2], justifyContent: 'center', flex: 1 }}>
-              <GlobalPageSearch hasClusterDropdown={anchorActiveTab.showActiveCluster} />
+              {/* Global search is the only control in this header that navigates,
+                  and unlike everything around it, it is not behind an
+                  `anchorActiveTab` flag — so on `/setup`, where that never
+                  resolves, it renders while the rest of the bar goes quiet.
+                  Every result it offers is a route the gate bounces straight
+                  back, so it promises a journey it cannot deliver.
+
+                  Hidden, not disabled: a greyed search box invites a click and
+                  explains nothing. Product Updates and Notifications hide the
+                  same way below — a fresh, locked tenant has no updates or
+                  notifications of its own yet, so both read as clutter on
+                  this page. Help stays, since it opens docs rather than
+                  anything scoped to the tenant. */}
+              {!setupLocked && <GlobalPageSearch hasClusterDropdown={anchorActiveTab.showActiveCluster} />}
             </Box>
             <Box display={'flex'} alignItems={'center'} justifyContent={'flex-end'} gap={ds.space[3]}>
               <Box sx={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: ds.space[2] }}>
@@ -1019,50 +1049,56 @@ const Header1 = ({ showBorder = false }) => {
               </Box>
               <DsDivider orientation='vertical' sx={{ minHeight: ds.space.mul(0, 16), marginLeft: 0, marginRight: 0 }} />
               <Box sx={{ display: 'flex', flexDirection: 'row', gap: ds.space[2] }}>
-                <Box sx={{ position: 'relative', display: 'inline-flex' }}>
+                {!setupLocked && (
+                  <Box sx={{ position: 'relative', display: 'inline-flex' }}>
+                    <DsButton
+                      composition='icon-only'
+                      tone='secondary'
+                      size='md'
+                      tooltip='Product Updates'
+                      tooltipPlacement='bottom'
+                      tooltipDisableFlip
+                      aria-label='Product Updates'
+                      icon={<CampaignOutlinedIcon fontSize='small' />}
+                      onClick={openProductUpdates}
+                      data-testid='product-updates-trigger'
+                    />
+                    {productUpdates.unreadCount > 0 && (
+                      <Box
+                        aria-hidden
+                        sx={{
+                          position: 'absolute',
+                          // Superscript: lift above the icon's top-right corner.
+                          top: '-6px',
+                          right: '-6px',
+                          pointerEvents: 'none',
+                        }}
+                      >
+                        <Chip
+                          variant='count'
+                          size='micro'
+                          tone='critical'
+                          solid
+                          count={productUpdates.unreadCount}
+                          // White ring so the count chip reads as a distinct superscript, not part of the icon.
+                          sx={{ boxShadow: '0 0 0 1.5px var(--ds-background-100)' }}
+                        />
+                      </Box>
+                    )}
+                  </Box>
+                )}
+                {!setupLocked && (
                   <DsButton
                     composition='icon-only'
                     tone='secondary'
                     size='md'
-                    tooltip='Product Updates'
+                    tooltip='Coming Soon'
                     tooltipPlacement='bottom'
-                    aria-label='Product Updates'
-                    icon={<CampaignOutlinedIcon fontSize='small' />}
-                    onClick={openProductUpdates}
-                    data-testid='product-updates-trigger'
+                    tooltipDisableFlip
+                    aria-label='Notifications'
+                    icon={<SafeIcon alt='Notification Icon' src={NotificationOutlineIconDark} />}
                   />
-                  {productUpdates.unreadCount > 0 && (
-                    <Box
-                      aria-hidden
-                      sx={{
-                        position: 'absolute',
-                        // Superscript: lift above the icon's top-right corner.
-                        top: '-6px',
-                        right: '-6px',
-                        pointerEvents: 'none',
-                      }}
-                    >
-                      <Chip
-                        variant='count'
-                        size='micro'
-                        tone='critical'
-                        solid
-                        count={productUpdates.unreadCount}
-                        // White ring so the count chip reads as a distinct superscript, not part of the icon.
-                        sx={{ boxShadow: '0 0 0 1.5px var(--ds-background-100)' }}
-                      />
-                    </Box>
-                  )}
-                </Box>
-                <DsButton
-                  composition='icon-only'
-                  tone='secondary'
-                  size='md'
-                  tooltip='Coming Soon'
-                  tooltipPlacement='bottom'
-                  aria-label='Notifications'
-                  icon={<SafeIcon alt='Notification Icon' src={NotificationOutlineIconDark} />}
-                />
+                )}
                 <Box className='headerHelpMenu'>
                   <DropdownMenu
                     align='end'
@@ -1073,6 +1109,7 @@ const Header1 = ({ showBorder = false }) => {
                         size='md'
                         tooltip='Help'
                         tooltipPlacement='bottom'
+                        tooltipDisableFlip
                         aria-label='Help'
                         icon={<SafeIcon alt='Help Icon' src={HelpOutlineDarkIcon} />}
                       />

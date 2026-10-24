@@ -7,7 +7,9 @@ import (
 	"nudgebee/runbook/internal/tasks/types"
 	"nudgebee/runbook/services/cloud"
 	integrationsService "nudgebee/runbook/services/integrations"
+	"nudgebee/runbook/services/relay"
 	"strings"
+	"time"
 )
 
 // RunScriptTask implements the Task interface for executing shell commands.
@@ -159,6 +161,17 @@ func (t *RunScriptTask) Execute(taskCtx types.TaskContext, params map[string]any
 		config.IntegrationID = integrationID
 	}
 
+	if config.ExecutorType == "ssh" {
+		if host, ok := params["host"].(string); ok {
+			config.Host = strings.TrimSpace(host)
+		}
+		port, err := relay.ParseSSHPort(params["port"])
+		if err != nil {
+			return nil, err
+		}
+		config.Port = port
+	}
+
 	if cwd, ok := params["cwd"].(string); ok {
 		config.Cwd = cwd
 	}
@@ -228,6 +241,18 @@ func (t *RunScriptTask) Execute(taskCtx types.TaskContext, params map[string]any
 	executor, err := executors.NewExecutor(config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create executor: %w", err)
+	}
+
+	// A script that runs on our own infrastructure gets the selected account's
+	// credentials. Without them the cloud SDKs fall back to whatever identity
+	// the pod happens to have, which is ours — the failure customers see as
+	// "not authorized" naming a Nudgebee role (#39059). Scripts that run on the
+	// customer's own machines (the agent, SSM, Azure Run Command, GCP SSH, SSH)
+	// already act as that machine, and are left alone.
+	if _, runsOnOurCluster := executor.(*executors.KubernetesExecutor); runsOnOurCluster && accountId != "" {
+		if err := applyAccountCredentials(taskCtx, &config, accountId); err != nil {
+			return nil, err
+		}
 	}
 
 	output, err := executor.Execute(taskCtx, config)
@@ -342,19 +367,37 @@ func (t *RunScriptTask) InputSchema() *types.Schema {
 				DependsOn:   []string{"executor_type"},
 				VisibleWhen: &types.VisibleWhen{Field: "executor_type", Value: []string{"ssh"}},
 			},
+			"host": {
+				Type:        types.PropertyTypeString,
+				Description: "Target host (hostname or IPv4) for SSH. Overrides the integration's default host; required for agent SSH integrations without a fixed host.",
+				Required:    false,
+				Title:       "Host",
+				Order:       11,
+				DependsOn:   []string{"executor_type"},
+				VisibleWhen: &types.VisibleWhen{Field: "executor_type", Value: []string{"ssh"}},
+			},
+			"port": {
+				Type:        types.PropertyTypeInteger,
+				Description: "Target SSH port. Defaults to the integration's port (22 for k8s-mode integrations).",
+				Required:    false,
+				Title:       "Port",
+				Order:       12,
+				DependsOn:   []string{"executor_type"},
+				VisibleWhen: &types.VisibleWhen{Field: "executor_type", Value: []string{"ssh"}},
+			},
 			"cwd": {
 				Type:        types.PropertyTypeString,
 				Description: "The working directory to run the script in.",
 				Required:    false,
 				Title:       "Working Directory",
-				Order:       11,
+				Order:       13,
 			},
 			"image": {
 				Type:        types.PropertyTypeString,
 				Description: "Override the container image for execution. Defaults: bash/python use nudgebee-debug, javascript uses node:22-alpine, powershell uses mcr.microsoft.com/powershell:lts-alpine-3.17.",
 				Required:    false,
 				Title:       "Docker Image",
-				Order:       12,
+				Order:       14,
 				DependsOn:   []string{"executor_type"},
 				VisibleWhen: &types.VisibleWhen{Field: "executor_type", Value: []string{"kubernetes", "agent"}},
 			},
@@ -363,7 +406,7 @@ func (t *RunScriptTask) InputSchema() *types.Schema {
 				Description: "Resource requests and limits. Keys: cpu_request, cpu_limit, memory_request, memory_limit.",
 				Required:    false,
 				Title:       "Resource Limits",
-				Order:       13,
+				Order:       15,
 				DependsOn:   []string{"executor_type"},
 				VisibleWhen: &types.VisibleWhen{Field: "executor_type", Value: []string{"kubernetes"}},
 			},
@@ -372,7 +415,7 @@ func (t *RunScriptTask) InputSchema() *types.Schema {
 				Description: "The format to parse the output as. Supported values: 'json'.",
 				Required:    false,
 				Title:       "Output Parser",
-				Order:       14,
+				Order:       16,
 			},
 		},
 	}
@@ -447,4 +490,56 @@ func countMatches(script string, indicators []string) int {
 		}
 	}
 	return count
+}
+
+// getAccountCredentials is a variable so tests can supply credentials without a
+// cloud-collector to call.
+var getAccountCredentials = cloud.GetAccountCredentials
+
+// applyAccountCredentials fetches credentials for the account the step names and
+// merges them into the script's environment.
+//
+// Values the step set itself win: a workflow carrying its own credentials keeps
+// working exactly as before, and this never silently swaps them for different
+// ones.
+func applyAccountCredentials(taskCtx types.TaskContext, config *executors.ExecutionConfig, accountId string) error {
+	duration := credentialDurationFor(taskCtx)
+	credentials, err := getAccountCredentials(taskCtx.GetNewRequestContext(), accountId, duration)
+	if err != nil {
+		// Failing here is the point: the alternative is running as Nudgebee and
+		// reporting a permissions error that looks like the customer's fault.
+		return fmt.Errorf("this account could not supply credentials for a script running on Nudgebee: %w", err)
+	}
+
+	if config.Env == nil {
+		config.Env = make(map[string]string, len(credentials.Env))
+	}
+	for k, v := range credentials.Env {
+		if _, set := config.Env[k]; !set {
+			config.Env[k] = v
+		}
+	}
+	// With real credentials present, a fall back to the host's identity can only
+	// mask a mistake, so turn it off for both providers that offer one.
+	if _, set := config.Env["AWS_EC2_METADATA_DISABLED"]; !set {
+		config.Env["AWS_EC2_METADATA_DISABLED"] = "true"
+	}
+
+	taskCtx.GetLogger().Info("script will run with the selected account's credentials",
+		"account_id", accountId,
+		"expires", credentials.Expiring(),
+	)
+	return nil
+}
+
+// credentialDurationFor asks for credentials that outlast the step. The
+// provider clamps this to what the account's credential type allows, so a long
+// step on a role-based account gets the maximum rather than an error.
+func credentialDurationFor(taskCtx types.TaskContext) time.Duration {
+	if deadline, ok := taskCtx.GetContext().Deadline(); ok {
+		if remaining := time.Until(deadline); remaining > 0 {
+			return remaining
+		}
+	}
+	return 0
 }

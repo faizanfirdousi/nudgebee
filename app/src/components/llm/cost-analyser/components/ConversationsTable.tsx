@@ -161,6 +161,8 @@ function StartTime({ iso }: { iso: string }) {
   );
 }
 
+const MODEL_NAME_MAX = 32;
+
 function ModelBadges({ models, dense }: { models: ModelStat[]; dense?: boolean }) {
   if (!models.length)
     return (
@@ -170,17 +172,27 @@ function ModelBadges({ models, dense }: { models: ModelStat[]; dense?: boolean }
     );
   return (
     <Box sx={{ display: 'flex', gap: 'var(--ds-space-1)', flexWrap: 'wrap' }}>
-      {models.map((m) => (
-        <Chip key={m.model} size={dense ? '2xs' : 'xs'} variant='tag' tone='subtle'>
-          {m.model}
-          {/* List rows carry no per-model call/cost split — show just the name then. */}
-          {(m.calls > 0 || m.cost > 0) && (
-            <Box component='span' sx={{ ml: '3px', color: 'var(--ds-gray-500)', fontWeight: 'var(--ds-font-weight-regular)' }}>
-              ({m.calls} · {fmtCost(m.cost)})
-            </Box>
-          )}
-        </Chip>
-      ))}
+      {models.map((m) => {
+        const truncated = m.model.length > MODEL_NAME_MAX;
+        const name = truncated ? (
+          <Tooltip title={m.model} placement='top'>
+            <Box component='span'>{`${m.model.slice(0, MODEL_NAME_MAX - 1)}…`}</Box>
+          </Tooltip>
+        ) : (
+          m.model
+        );
+        return (
+          <Chip key={m.model} size={dense ? '2xs' : 'xs'} variant='tag' tone='subtle'>
+            {name}
+            {/* List rows carry no per-model call/cost split — show just the name then. */}
+            {(m.calls > 0 || m.cost > 0) && (
+              <Box component='span' sx={{ ml: '3px', color: 'var(--ds-gray-500)', fontWeight: 'var(--ds-font-weight-regular)' }}>
+                ({m.calls} · {fmtCost(m.cost)})
+              </Box>
+            )}
+          </Chip>
+        );
+      })}
     </Box>
   );
 }
@@ -370,19 +382,21 @@ export function ConversationsTable({
         { name: 'Cost', width: '8%', sortEnabled: true, component: H.cost },
         { name: 'Tokens', width: '11%', sortEnabled: true, component: H.tokens },
       ]
-    : // Fixed layout: widths must sum to ~100%. Conversation takes the bulk;
-      // Models keeps enough room (~16%) that its nowrap chips never overflow.
+    : // Fixed layout: widths must sum to ~100% (previously summed to 75%, which
+      // starved Actions of the room its View/Go-to/Analyse controls need — #37961).
+      // Conversation takes the bulk; Models keeps enough room that its nowrap
+      // chips never overflow; Actions gets enough for all three row controls.
       [
         { name: 'Conversation', width: '24%', component: H.conversation },
-        { name: 'Models (calls · cost)', width: '10%', component: H.models },
-        { name: 'Start time', width: '6%', sortEnabled: true, component: H.start },
-        { name: 'Duration', width: '4%', sortEnabled: true, component: H.duration },
-        { name: 'Latency', width: '6%', sortEnabled: true, component: H.latency },
-        { name: 'Calls', width: '5%', sortEnabled: true, component: H.calls },
-        { name: 'Cost', width: '4%', sortEnabled: true, component: H.cost },
-        { name: 'Tokens', width: '6%', sortEnabled: true, component: H.tokens },
-        { name: 'Status', width: '6%', component: H.status },
-        { name: 'Actions', width: '4%' },
+        { name: 'Models (calls · cost)', width: '13%', component: H.models },
+        { name: 'Start time', width: '8%', sortEnabled: true, component: H.start },
+        { name: 'Duration', width: '5%', sortEnabled: true, component: H.duration },
+        { name: 'Latency', width: '8%', sortEnabled: true, component: H.latency },
+        { name: 'Calls', width: '6%', sortEnabled: true, component: H.calls },
+        { name: 'Cost', width: '5%', sortEnabled: true, component: H.cost },
+        { name: 'Tokens', width: '8%', sortEnabled: true, component: H.tokens },
+        { name: 'Status', width: '8%', component: H.status },
+        { name: 'Actions', width: '15%' },
       ];
 
   // Relative outlier highlighting: rank cost / avg-latency within the rows shown.

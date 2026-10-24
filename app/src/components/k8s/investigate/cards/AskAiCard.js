@@ -18,6 +18,40 @@ import EventRaisePrPanel from './EventRaisePrPanel';
 import { FiArrowRight } from 'react-icons/fi';
 import { useConversationSuggestions } from '@hooks/useConversationSuggestions';
 import { safeJSONParse } from '@utils/common';
+import { reportContainsInvestigation } from '@utils/investigationReport';
+
+// The model returns prose with single newlines between paragraphs, which markdown
+// collapses into one run-on paragraph, so a blank line is inserted between them.
+// That rewrite must not touch a markdown table or a fenced code block: a blank
+// line between two table rows ends the table, and every row after it renders as
+// literal '| Attribute | Value |' text (issue: the Event Details table in the
+// Investigation Analysis card). Fenced blocks are passed through untouched and
+// table rows are joined to their neighbours.
+const isTableRow = (line) => line.trimStart().startsWith('|');
+
+export function expandParagraphBreaks(text) {
+  if (!text) {
+    return '';
+  }
+  // Odd-indexed segments are fenced code blocks — left exactly as written.
+  return text
+    .split(/(```[\s\S]*?```)/g)
+    .map((segment, index) => {
+      if (index % 2 === 1) {
+        return segment;
+      }
+      const lines = segment.split('\n');
+      return lines.reduce((acc, line, i) => {
+        if (i === 0) {
+          return line;
+        }
+        const previous = lines[i - 1];
+        const keepTight = line.trim() === '' || previous.trim() === '' || (isTableRow(line) && isTableRow(previous));
+        return acc + (keepTight ? '\n' : '\n\n') + line;
+      }, '');
+    })
+    .join('');
+}
 
 const ZERO_UUID = '00000000-0000-0000-0000-000000000000';
 
@@ -155,6 +189,22 @@ class AskAiCard {
     return this.renderContent;
   };
 
+  // A budget/GraphQL rejection returns the error string instead of a status
+  // object; render it via the errorMessage view and stop any in-flight refresh
+  // so we don't fake an in-progress run that polls the limit forever.
+  showInvestigationError = (res) => {
+    this.aiData = res;
+    this.errorMessage = res ? `Failed to generate investigation- ${res}` : 'Failed to generate investigation';
+    this.isRefreshing = false;
+    // Match the normal refresh cleanup: an errored run offers no fix to resolve,
+    // so drop any resolve affordance a prior completed run left on (gitDiff).
+    this.resolveButton = false;
+    this.refreshRenderId = (this.refreshRenderId || 0) + 1;
+    if (this.onDataUpdate && typeof this.onDataUpdate === 'function') {
+      this.onDataUpdate(this);
+    }
+  };
+
   refreshInvestigation = async () => {
     // Flag a regenerate in flight. The backend keeps the previous summary text
     // while the new run computes (UpsertEventAnalysisInProgress blanks analysis
@@ -167,6 +217,13 @@ class AskAiCard {
       // in_progress and returns the record (status in_progress, but with the
       // previous run's content still attached).
       const res = await apiKubernetes.generateAiRecommendation(this.event.cloud_account_id, this.event.id, 'pod_log_analysis', true);
+      // A budget/GraphQL rejection comes back as the error string, not a status
+      // object. Show it and stop — otherwise the forced in_progress below mounts
+      // a poll that re-hits the limit every 5s and never resolves.
+      if (typeof res === 'string') {
+        this.showInvestigationError(res);
+        return;
+      }
       // Force status in_progress locally so the remounted card's poll useEffect
       // skips its `status === 'completed'` early-return and sets up the 5s poll.
       this.aiData = res && typeof res === 'object' ? { ...res, status: 'in_progress' } : { ...(this.aiData || {}), status: 'in_progress' };
@@ -399,6 +456,13 @@ class AskAiCard {
         const interval = setInterval(async () => {
           try {
             const res = await apiKubernetes.generateAiRecommendation(event.cloud_account_id, event.id, 'pod_log_analysis');
+            if (typeof res === 'string') {
+              // Budget/GraphQL rejection mid-run: surface the error and stop the
+              // poll instead of looping on a response that has no terminal status.
+              clearInterval(interval);
+              cardInstance.showInvestigationError(res);
+              return;
+            }
             cardInstance.aiData = res;
             setLocalAiData(res);
             if (!hasFetchedInitial) {
@@ -568,9 +632,14 @@ class AskAiCard {
         analysis = parsedAnalysis.analysis || '';
       }
 
-      // detailed_response is the enriched synthesis of summary + investigation + log analysis.
-      // Fall back to initial summary while it is still being generated.
+      // detailed_response is the report assembled from the investigation + event facts + code
+      // findings. Fall back to initial summary while it is still being generated.
       const summaryContent = detailed_response || summary;
+
+      // Fold the Investigation section away once the report carries it. While the report is still
+      // pending, and on older analyses where it was a separate rewrite, the two differ and both
+      // sections stay.
+      const investigationIsInReport = reportContainsInvestigation(summaryContent, investigation);
 
       let sections = [];
       const isTerminal = ['completed', 'failed', 'killed'].includes(localAiData?.status?.toLowerCase());
@@ -597,7 +666,7 @@ class AskAiCard {
             content: summaryContent,
           });
         }
-        if (task_statuses.investigation !== undefined || investigation) {
+        if (!investigationIsInReport && (task_statuses.investigation !== undefined || investigation)) {
           sections.push({
             id: 'investigation',
             label: 'Investigation',
@@ -622,7 +691,7 @@ class AskAiCard {
             content: summaryContent,
           });
         }
-        if (investigation || !isTerminal) {
+        if (!investigationIsInReport && (investigation || !isTerminal)) {
           sections.push({
             id: 'investigation',
             label: 'Investigation',
@@ -645,7 +714,7 @@ class AskAiCard {
         if (finalContent.startsWith('```markdown')) {
           finalContent = finalContent.replace(/^```markdown\s*/, '').replace(/```$/, '');
         }
-        finalContent = finalContent.replace(/(?<!\n)\n(?!\n)/g, '\n\n');
+        finalContent = expandParagraphBreaks(finalContent);
         return DOMPurify.sanitize(finalContent);
       };
 
@@ -710,6 +779,8 @@ class AskAiCard {
                     ? 'Reasoning behind the proposed code changes'
                     : localAiData?.file_details?.files?.[0]?.file_path
                     ? 'Code-level root cause identified'
+                    : source_updates?.outcome === 'failed'
+                    ? "Code check couldn't finish"
                     : 'No Code Changes Required'}
                 </Typography>
                 <MarkDowns data={source_updates.explanation} sx={{ fontSize: 'var(--ds-text-body)', lineHeight: 1.6 }} />
@@ -717,6 +788,9 @@ class AskAiCard {
             )}
 
             {code_analysis_enabled !== false && source_updates?.gitDiff && localAiData?.source_details?.[ANNOTATIONS.WORKLOAD_GIT_REPO] && (
+              /* No gitDiff prop on purpose: the diff is rendered immediately above this button, so
+                 repeating it inside the confirmation would show the same patch twice. The
+                 remediation row, which has no diff on screen, does pass it. */
               <EventRaisePrPanel
                 data={cardInstance.buildResolveData()}
                 repoUrl={localAiData?.source_details?.[ANNOTATIONS.WORKLOAD_GIT_REPO]}
@@ -1123,6 +1197,19 @@ class AskAiCard {
 
   isCompleted = () => {
     return this.aiData?.status?.toLowerCase() === 'completed';
+  };
+
+  isFailed = () => {
+    return this.aiData?.status?.toLowerCase() === 'failed';
+  };
+
+  // A budget/GraphQL rejection (budget exceeded, llm-server down, …) comes back
+  // from generateAiRecommendation as the error string — even an empty one when
+  // the error carries no parseable message — not a status='failed' object, so
+  // isFailed() can't see it. A valid object or the demo-account null never hits
+  // this, so refresh stays correctly gated for those.
+  isError = () => {
+    return typeof this.aiData === 'string';
   };
 }
 

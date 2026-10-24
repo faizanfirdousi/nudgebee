@@ -292,8 +292,12 @@ const ChannelAccountMapping: React.FC<ChannelAccountMappingProps> = ({ provider,
       await loadMappings();
       setOpenModal(false);
       resetForm();
-    } catch {
-      snackbar.error('Failed to save');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to save';
+      // The backend names the conflicting channel by its raw id (it doesn't know
+      // the display name); swap in the name we already resolved for the picker.
+      const channelName = channelNameMap[selectedChannel];
+      snackbar.error(channelName ? message.replace(selectedChannel, channelName) : message);
     } finally {
       setIsLoading(false);
     }
@@ -425,31 +429,29 @@ const ChannelAccountMapping: React.FC<ChannelAccountMappingProps> = ({ provider,
         </Box>
       </Modal>
 
-      <Box mt={ds.space[6]}>
-        <ListingLayout id={`${provider}-channel-account-mappings`}>
-          <ListingLayout.Toolbar
-            actions={
-              canManage('messagingplatforms', 'Write') ? (
-                <DsButton id='add-mapping-btn' tone='primary' size='md' onClick={() => setOpenModal(true)}>
-                  Add Mapping
-                </DsButton>
-              ) : undefined
-            }
-          >
-            <Box display='flex' flexDirection='column'>
-              <Typography sx={{ fontFamily: 'var(--ds-font-display)' }} fontSize={ds.text.title} fontWeight={ds.weight.semibold} color={ds.gray[700]}>
-                Channel-Account Mappings
-              </Typography>
-              <Typography fontSize={ds.text.caption} color={ds.gray[600]}>
-                Map channels to cloud accounts, this will be used to associate account(s) when conversations are started from mapped channel.
-              </Typography>
-            </Box>
-          </ListingLayout.Toolbar>
-          <ListingLayout.Body>
-            <CustomTable id={`${provider}-mappings`} headers={headers} tableData={tableData} loading={isLoading} />
-          </ListingLayout.Body>
-        </ListingLayout>
-      </Box>
+      <ListingLayout id={`${provider}-channel-account-mappings`}>
+        <ListingLayout.Toolbar
+          actions={
+            canManage('messagingplatforms', 'Write') ? (
+              <DsButton id='add-mapping-btn' tone='primary' size='md' onClick={() => setOpenModal(true)}>
+                Add Mapping
+              </DsButton>
+            ) : undefined
+          }
+        >
+          <Box display='flex' flexDirection='column'>
+            <Typography sx={{ fontFamily: 'var(--ds-font-display)' }} fontSize={ds.text.title} fontWeight={ds.weight.semibold} color={ds.gray[700]}>
+              Channel-Account Mappings
+            </Typography>
+            <Typography fontSize={ds.text.caption} color={ds.gray[600]}>
+              Map channels to cloud accounts, this will be used to associate account(s) when conversations are started from mapped channel.
+            </Typography>
+          </Box>
+        </ListingLayout.Toolbar>
+        <ListingLayout.Body>
+          <CustomTable id={`${provider}-mappings`} headers={headers} tableData={tableData} loading={isLoading} />
+        </ListingLayout.Body>
+      </ListingLayout>
     </>
   );
 };

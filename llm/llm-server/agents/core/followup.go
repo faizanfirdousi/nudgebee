@@ -12,7 +12,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/samber/lo"
-	"github.com/tmc/langchaingo/llms"
 
 	toolcore "nudgebee/llm/tools/core"
 )
@@ -62,104 +61,6 @@ type FollowupRequest struct {
 	// per-tool behavior); tools implementing toolcore.ToolConfirmationScope get
 	// a per-action key here so each invocation is approved separately.
 	ConfirmationKey string `json:"confirmationKey,omitempty"`
-}
-
-const PROMPT_IDENTIFY_MISSING_INFORMATION = `
-Context:
---------------------------------
-	You are an assistant specialized in Kubernetes, helping users troubleshoot, analyze, and fetch data related to Kubernetes resources. 
-	Users may ask questions related to fetching logs, events, recommendations, metrics, or performing other investigative tasks on Kubernetes clusters. 
-	Their initial questions might sometimes lack necessary details, such as the specific resource name or namespace. 
-
-Task:
---------------------------------
-Given a user question related to Kubernetes:
-	- Identify missing information like Namespace, Workload etc
-	- Use json format as output, DO not include anything extra, stick to the format provided
-	
-Response Format (JSON):
---------------------------------
-	{
-		"followup_questions": Array of Questions Required To Answer,
-		"reason": Reason to ask above question
-	}
-
-Examples:
---------------------------------
-	History: Can you fetch the logs?
-    Question: xyz server,
-	Response: {
-		"followup_questions":": ["provide namespace name"],
-		"reason": "user wants to get the logs from server but namespace is missing"
-    }
-
-
-    Question: can you fetch me logs of pods xyz in namespace abc?,
-	Response: {
-		"followup_questions": [],
-		"reason": "question has all the information like pod, namespace to pull logs"
-    }
-
-
-History:
---------------------------------
- %v
-
-Current User Question:
---------------------------------
-%v
-
-`
-
-func FollowupRequestForMissingInformation(ctx *security.RequestContext, query NBAgentRequest, agent NBAgent) (FollowupRequest, error) {
-	refineUpPrompt := []llms.MessageContent{
-		llms.TextParts(llms.ChatMessageTypeHuman, fmt.Sprintf(PROMPT_IDENTIFY_MISSING_INFORMATION, "", query.Query)),
-	}
-	res, err := GenerateAndTrackLLMContent(ctx, query.UserId, query.AccountId, query.ConversationId, query.MessageId, "refine", true, refineUpPrompt, true, llms.WithTemperature(0.0), llms.WithJSONMode())
-	if err != nil {
-		ctx.GetLogger().Error("followup: unable to generate content", "error", err)
-		return FollowupRequest{}, nil
-	}
-	if len(res.Choices) == 0 {
-		return FollowupRequest{}, nil
-	}
-
-	// Regular expression to extract the JSON object
-	if res.Choices[0].Content == "" {
-		return FollowupRequest{}, nil
-	}
-
-	followupQuestions := map[string]any{}
-	err = common.UnmarshalJson([]byte(strings.Trim(res.Choices[0].Content, "`")), &followupQuestions)
-	if err != nil {
-		ctx.GetLogger().Error("followup: unable to unmarshal refine response", "error", err)
-		return FollowupRequest{}, err
-	}
-
-	if followupQuestions["followup_questions"] == nil {
-		return FollowupRequest{}, nil
-	}
-
-	followupQuestionsArray, ok := followupQuestions["followup_questions"].([]any)
-	if !ok {
-		return FollowupRequest{}, nil
-	}
-
-	for _, fq := range followupQuestionsArray {
-		return FollowupRequest{
-			Question:     fq.(string),
-			FollowupType: FollowupTypeText,
-			AgentName:    agent.GetName(),
-			AgentId: func() uuid.UUID {
-				if query.AgentId != "" {
-					return uuid.MustParse(query.AgentId)
-				}
-				return uuid.Nil
-			}(),
-		}, nil
-	}
-
-	return FollowupRequest{}, nil
 }
 
 func FollowupRequestForToolOperationConfirmation(ctx *security.RequestContext, query NBAgentRequest, agent NBAgent, action NBAgentPlannerToolAction, toolRequestType toolcore.ToolRequestType, confirmationKey string, questionOverride string) (FollowupRequest, error) {
@@ -217,6 +118,36 @@ func FollowupRequestForMultipleToolConfigs(ctx *security.RequestContext, query N
 		}
 	}
 
+	// matchedTool: what the loop below matches on. Kept separate from action.Tool
+	// so the original as-called casing is never overwritten.
+	matchedTool := action.Tool
+	if _, alreadyKnown := toolsInCompleteFlow[action.Tool]; !alreadyKnown {
+		// doAction dispatches case-insensitively (nameToTool[ToUpper]); this map
+		// lookup doesn't. Check fold-case first so casing alone isn't "unknown".
+		found := false
+		for name := range toolsInCompleteFlow {
+			if strings.EqualFold(name, action.Tool) {
+				matchedTool = name
+				found = true
+				break
+			}
+		}
+		if !found {
+			// action.Tool may be a search_tools discovery (auth_agent.go's
+			// DiscoveredToolCanonicalName) not in GetSupportedTools — else it never gets asked.
+			if canonical, discovered := DiscoveredToolCanonicalName(query.ConversationId, action.Tool); discovered {
+				if t, ok := toolcore.GetNBTool(query.AccountId, canonical); ok && t != nil {
+					if _, hasConfig := t.(toolcore.NBToolConfig); hasConfig {
+						toolsInCompleteFlow[t.Name()] = t
+						// Use t.Name() (the map key just inserted), not canonical: they should
+						// agree, but this guarantees the match loop below actually finds it.
+						matchedTool = t.Name()
+					}
+				}
+			}
+		}
+	}
+
 	existingToolConfigs := map[string]string{}
 	if query.QueryConfig.ToolConfigs != nil {
 		for k, v := range query.QueryConfig.ToolConfigs {
@@ -225,7 +156,7 @@ func FollowupRequestForMultipleToolConfigs(ctx *security.RequestContext, query N
 	}
 
 	for _, tool := range toolsInCompleteFlow {
-		if tool.Name() != action.Tool {
+		if tool.Name() != matchedTool {
 			continue
 		}
 		// there is config already available
@@ -592,6 +523,93 @@ func GenerateFollowup(ctx *security.RequestContext, query NBAgentRequest, follow
 	return followupMessage, err
 }
 
+// FollowupResolutionMarker is the JSON payload written into the followup
+// message's response column when the user dismisses a pending follow-up
+// instead of answering it. Kept small and structured so the frontend and
+// downstream analytics can tell "dismissed" apart from a real answer.
+type FollowupResolutionMarker struct {
+	Resolution string `json:"resolution"`
+	Reason     string `json:"reason,omitempty"`
+}
+
+// agentBelongsToAccount reports whether agent is scoped to accountId.
+// Shared by every follow-up resolution path (dismiss, legacy answer, V2
+// resume) — none of them otherwise cross-check that a caller-supplied
+// agentId actually belongs to the account the caller authenticated as; only
+// conversation-level ownership gets validated upstream. (security review,
+// PR #36564)
+func agentBelongsToAccount(agent ConversationAgent, accountId string) bool {
+	return agent.AccountID.String() == accountId
+}
+
+// HandleFollowupDismiss marks a pending follow-up question as dismissed
+// without answering it. Soft cancel semantics: the associated agent moves to
+// AgentExecutionStatusSkipped and the follow-up message moves to
+// ConversationStatusTerminated with a structured marker (reason optional) in
+// its response column. The caller is expected to terminate the broader
+// conversation separately (see ConversationDao.TerminateConversation).
+// Idempotent — a no-op if the agent is no longer waiting or has no active
+// follow-up message. (#27582)
+func HandleFollowupDismiss(ctx *security.RequestContext, accountId, conversationId, agentId, reason string) error {
+	if agentId == "" {
+		return errors.New("followup dismiss: agent_id is required")
+	}
+	dao := GetConversationDao()
+	agents, err := dao.ListConversationAgents("", agentId)
+	if err != nil {
+		return fmt.Errorf("followup dismiss: lookup agent: %w", err)
+	}
+	if len(agents) == 0 {
+		return errors.New("followup dismiss: agent not found")
+	}
+	agent := agents[0]
+	// Cross-account guard: agentId alone would otherwise be sufficient to
+	// look up and mutate any agent regardless of which account's
+	// conversation it belongs to — the caller only validates
+	// conversation-level ownership before reaching this agent-level
+	// lookup. Same "not found" message as the zero-results case above so
+	// an attacker probing IDs can't distinguish "doesn't exist" from
+	// "exists in another account."
+	if !agentBelongsToAccount(agent, accountId) {
+		return errors.New("followup dismiss: agent not found")
+	}
+	// Cross-conversation guard: unlike HandleFollowupResponse and
+	// TrySkipAndContinueFollowup, this function never calls
+	// GetConversationMessage (whose query is already scoped by both
+	// conversation_id and account_id), so nothing else here confirms the
+	// agent belongs to the SUPPLIED conversationId — only that it belongs
+	// to the right account. Two conversations in the same account would
+	// otherwise let a caller dismiss the wrong one's follow-up. Same
+	// "not found" message, deliberately.
+	if agent.ConversationID.String() != conversationId {
+		return errors.New("followup dismiss: agent not found")
+	}
+	if !strings.EqualFold(string(agent.Status), string(AgentExecutionStatusWaiting)) {
+		ctx.GetLogger().Info("followup dismiss: agent not waiting, no-op",
+			"agent_id", agentId, "status", agent.Status)
+		return nil
+	}
+	if agent.FollowupMessageID == uuid.Nil {
+		ctx.GetLogger().Info("followup dismiss: agent has no active followup message, no-op",
+			"agent_id", agentId)
+		return nil
+	}
+	markerJson, err := common.MarshalJson(FollowupResolutionMarker{
+		Resolution: "dismissed",
+		Reason:     reason,
+	})
+	if err != nil {
+		return fmt.Errorf("followup dismiss: marshal marker: %w", err)
+	}
+	if err := dao.UpdateConversationMessage(agent.FollowupMessageID.String(), string(markerJson), ConversationStatusTerminated); err != nil {
+		return fmt.Errorf("followup dismiss: update followup message: %w", err)
+	}
+	if err := dao.UpdateConversationAgentResponse(agent.ID.String(), "", AgentExecutionStatusSkipped, "", "", "", ""); err != nil {
+		return fmt.Errorf("followup dismiss: update agent status: %w", err)
+	}
+	return nil
+}
+
 func HandleFollowupResponse(ctx *security.RequestContext, query NBAgentRequest) (ConversationMessage, error) {
 
 	if query.AgentId == "" {
@@ -604,6 +622,11 @@ func HandleFollowupResponse(ctx *security.RequestContext, query NBAgentRequest) 
 		return ConversationMessage{}, errors.New("followup: agentid is not found required")
 	}
 	agent := agents[0]
+	// Cross-account guard — see agentBelongsToAccount's doc comment. Same
+	// error as the not-found case above, deliberately.
+	if !agentBelongsToAccount(agent, query.AccountId) {
+		return ConversationMessage{}, errors.New("followup: agentid is not found required")
+	}
 
 	if !strings.EqualFold(string(agent.Status), string(AgentExecutionStatusWaiting)) {
 		return ConversationMessage{}, nil

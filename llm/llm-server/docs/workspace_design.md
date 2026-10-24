@@ -2,7 +2,7 @@
 
 ## Overview
 
-The workspace feature provides dedicated, per-account shell environments for LLM conversations. Each workspace is a Kubernetes pod running the `code-analysis-agent` in server mode, enabling LLM agents to execute shell commands, manage files, and interact with infrastructure tools (kubectl, helm, psql, etc.) in an isolated environment.
+The workspace feature provides dedicated, per-account shell environments for LLM conversations. Each workspace runs the `code-analysis-agent` in server mode as either a Kubernetes pod or a Docker container, enabling LLM agents to execute shell commands, manage files, and interact with infrastructure tools (kubectl, helm, psql, etc.) in an isolated environment.
 
 ## Architecture
 
@@ -86,7 +86,7 @@ Central orchestrator for workspace pod lifecycle.
 LLM-facing tool registered as `shell_execute`. Provides shell access to agents.
 
 **Key behaviors:**
-- Auto-sources `.nb_profile` for environment persistence across stateless commands
+- Keeps shell calls stateless; environment setup must be included in the call that consumes it
 - Injects cloud credentials (AWS/GCP/Azure) based on account type
 - Scrubs credential values from command output
 - Feature-gated via `LlmServerShellToolEnabled`
@@ -137,7 +137,7 @@ Handles `POST /workspace/execute` from workspace pod shims. Validates JWT, resol
 Agent calls shell_execute tool
   → ShellTool.Call()
     → Inject cloud credentials into env
-    → Prepend ".nb_profile" sourcing
+    → Apply the optional working-directory prefix
     → wm.ExecuteOrLazyCreate(accountId, conversationId, command, env)
       → Try ExecuteCommand (direct HTTP to pod IP)
         → POST http://{podIP}:8080/execute
@@ -175,6 +175,10 @@ Code-analysis agent runs "kubectl get pods"
 - **Conversation directory isolation**: Per-conversation working directories
 - **Network isolation**: Helm-managed `NetworkPolicy` (`deploy/kubernetes/llm-server/templates/workspace-networkpolicy.yaml`) restricts workspace pod traffic to the minimum required set — ingress only from llm-server, egress only to DNS, llm-server, relay-server, and the public internet with link-local (IMDS), RFC1918, CGNAT, and loopback CIDRs blocked. Configurable via `workspaceNetworkPolicy.*` in `values.yaml`. Requires NetworkPolicy enforcement on the target cluster (GKE: `--enable-network-policy` or Dataplane V2).
 
+### Docker Compose Isolation
+
+Compose deployments use `LLM_SERVER_WORKSPACE_RUNTIME=docker`. The host Docker socket is mounted into llm-server, which is a host-equivalent trust boundary. Dynamic workspace containers use a fixed image and entrypoint, run as UID 1000/GID 3000, drop all Linux capabilities, enable `no-new-privileges`, publish no host ports, and join only the dedicated workspace network shared with llm-server and relay-server. Docker bridge networking does not enforce the Kubernetes `NetworkPolicy` egress restrictions; installations requiring that boundary should use the Kubernetes runtime.
+
 ### Command Safety
 - Blocklist-based command validation (see [#27731](https://github.com/nudgebee/nudgebee/issues/27731) for limitations)
 - Output truncation (1MB cap in execution handler, 4KB in CLI tool)
@@ -196,6 +200,9 @@ Code-analysis agent runs "kubectl get pods"
 | `LLM_SERVER_CODE_AGENT_IMAGE_PULL_SECRET` | string | K8s imagePullSecret name |
 | `LLM_SERVER_WORKSPACE_PORT` | int | Workspace pod HTTP port (default: 8080) |
 | `LLM_SERVER_WORKSPACE_LOCAL_URL` | string | Local workspace URL (dev mode bypass) |
+| `LLM_SERVER_WORKSPACE_RUNTIME` | string | Lifecycle backend: `kubernetes` (default) or `docker` |
+| `LLM_SERVER_WORKSPACE_DOCKER_HOST` | string | Local Docker Engine Unix socket (default `unix:///var/run/docker.sock`; remote Engines unsupported) |
+| `LLM_SERVER_WORKSPACE_DOCKER_NETWORK` | string | Existing Docker network joined by dynamic workspaces |
 | `LLM_SERVER_WORKSPACE_RESOURCE_REQUEST_CPU` | string | K8s CPU request |
 | `LLM_SERVER_WORKSPACE_RESOURCE_REQUEST_MEMORY` | string | K8s memory request |
 | `LLM_SERVER_WORKSPACE_RESOURCE_LIMIT_CPU` | string | K8s CPU limit (optional) |
@@ -211,7 +218,7 @@ Code-analysis agent runs "kubectl get pods"
 - [#27731](https://github.com/nudgebee/nudgebee/issues/27731) — Command validation blocklist is bypassable
 - [#27733](https://github.com/nudgebee/nudgebee/issues/27733) — JWT token lifetime (365d) and in-memory-only revocation
 - [#27734](https://github.com/nudgebee/nudgebee/issues/27734) — Missing seccomp, capability drops, read-only rootfs
-- [#27735](https://github.com/nudgebee/nudgebee/issues/27735) — Credential exposure via env vars and .nb_profile
+- [#27735](https://github.com/nudgebee/nudgebee-enterprise/issues/27735) — Credential exposure via env vars (automatic `.nb_profile` sourcing removed)
 - [#27736](https://github.com/nudgebee/nudgebee/issues/27736) — Auth bypass when workspace token env var is empty
 
 ### Enhancements

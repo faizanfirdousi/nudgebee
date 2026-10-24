@@ -16,6 +16,7 @@
  */
 import * as React from 'react';
 import { driver } from 'driver.js';
+import { useSetupGate } from '@context/SetupGateContext';
 import { TOURS, brandText, type TourStepDef } from './tours';
 
 type DriverInstance = ReturnType<typeof driver>;
@@ -275,7 +276,7 @@ export function TourProvider({ children }: { children: React.ReactNode }): React
           // Side-effect failed (e.g. trigger missing) — keep advancing so
           // the tour doesn't dead-end. goTo() waits for the next step's
           // element and ends the tour if a required step never mounts.
-          console.warn(`[tour] onBeforeNext failed on "${tourId}" step ${from + 1} (${steps[from].element})`, err);
+          console.warn('[tour] onBeforeNext failed', { tourId, step: from + 1, element: steps[from].element, err });
         }
         // No explicit wait here: goTo() already waits for the next step's
         // element to mount before highlighting it.
@@ -365,6 +366,20 @@ export function TourProvider({ children }: { children: React.ReactNode }): React
       driverRef.current?.destroy();
     };
   }, []);
+
+  // A tour that started just before the Setup gate re-locks (e.g. a K8s wizard
+  // step briefly reading the tenant as done, before its agent-health check
+  // resolves and corrects it — see SetupGateContext's own doc comment) must not
+  // keep stepping through rail items while the user is redirected back to
+  // Setup Center. The auto-trigger components stop offering a *new* tour once
+  // `locked` (layout/index.jsx's `navLocked`), but nothing previously tore down
+  // one already in flight.
+  const { locked } = useSetupGate();
+  React.useEffect(() => {
+    if (locked) {
+      stop();
+    }
+  }, [locked, stop]);
 
   const value = React.useMemo<TourContextValue>(() => ({ start, stop, isActive: activeTourId !== null, activeTourId }), [start, stop, activeTourId]);
 

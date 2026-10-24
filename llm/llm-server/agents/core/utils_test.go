@@ -79,6 +79,13 @@ func TestIsInvestigationRequestTask(t *testing.T) {
 		// --- definitional-but-causal stays an investigation ---
 		{"what is causing checkout-svc to crash", true},
 		{"explain why the pod crashed", true},
+		{"what is the issue with job java-api-checker in namespace app-12", true},
+		{"what is the problem with checkout-svc", true},
+		{"what are the issues with the payments deployment", true},
+		{"what is a security issue", false},
+		{"what are common problems in kubernetes", false},
+		{"what is a crash", false},
+		{"what is a slow query", false},
 
 		// --- causal phrasing survives a retrieval-looking prefix ---
 		{"show me why the pods restarted", true},
@@ -92,6 +99,40 @@ func TestIsInvestigationRequestTask(t *testing.T) {
 		{"why api", true},
 		{"why app", true},
 		{"why svc", true},
+
+		// --- neutral existence / health probes are investigations ---
+		{"were there issues with the cron-scheduler pod in namespace-73b", true},
+		{"any errors in the api pod recently", true},
+		{"is there a problem with checkout-svc", true},
+		{"did the deployment have problems", true},
+		{"is redis healthy", true},
+		// "is X at risk" / "is anything at risk" — the original motivating case
+		// for widening investigationProbeRe.
+		{"review the scaling posture of namespace-233. is anything at risk?", true},
+		{"is checkout-svc at risk", true},
+		// multiple spaces between "at" and "risk" must still match
+		{"is checkout-svc at  risk", true},
+		// (state query "is the error budget exhausted" stays false — asserted above)
+		// retrieval prefix still wins over the probe
+		{"show me any errors in the logs", false},
+		{"list any pods with issues", false},
+
+		// --- continuous / perfect tense crash-fail probes ---
+		{"is checkout-svc failing", true},
+		{"are the pods crashing", true},
+		{"is the deployment broken", true},
+		{"is checkout-svc down", true},
+		{"has checkout-svc had issues", true},
+		{"have they had failures recently", true},
+
+		// --- present tense auxiliary (does/do) joins the issues/errors branch only ---
+		{"does checkout-svc have issues", true},
+		{"do the pods have errors", true},
+		// but NOT the crash/fail branch — "does it crash" would collide with a
+		// definitional "how does a crash happen" the same way a bare crash\w*
+		// stem did on the is/are/was/were branch (see the comment above
+		// investigationProbeRe).
+		{"how does a crash happen", false},
 	}
 
 	for _, tt := range tests {
@@ -197,6 +238,32 @@ func TestMergeAccountPrompts_PreservesPriorityForGlobalPreferencesBlock(t *testi
 		stringsIndex(block, "account global context body"),
 		"event-analysis prompt must appear before the global-context body",
 	)
+}
+
+func TestAccountContextAndRequestPromptHaveDistinctPromptSurfaces(t *testing.T) {
+	request := NBAgentRequest{
+		AccountContext: "cluster_name=prod-us-east-1",
+		AccountPrompt:  "For this event, inspect the linked runbook first.",
+	}
+
+	system := renderAccountContextBlock(request.AccountContext)
+	human := renderGlobalPreferencesBlock(request.AccountPrompt)
+
+	assert.Contains(t, system, "<account_context>")
+	assert.Contains(t, system, "cluster_name=prod-us-east-1")
+	assert.NotContains(t, system, "linked runbook")
+	assert.Contains(t, human, "<global_preferences>")
+	assert.Contains(t, human, "linked runbook")
+	assert.NotContains(t, human, "cluster_name")
+	assert.Equal(t,
+		"For this event, inspect the linked runbook first.\n\ncluster_name=prod-us-east-1",
+		CombinedAccountPrompt(request),
+		"custom planners retain the legacy request-first combined view",
+	)
+}
+
+func TestRenderGlobalPreferencesBlock_WhitespaceOnlyIsEmpty(t *testing.T) {
+	assert.Empty(t, renderGlobalPreferencesBlock(" \n\t "))
 }
 
 func stringsIndex(haystack, needle string) int {

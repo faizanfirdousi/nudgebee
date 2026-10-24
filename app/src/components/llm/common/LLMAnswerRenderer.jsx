@@ -21,7 +21,7 @@ const NB_CHART_BLOCK = /```nb-chart\s*\n([\s\S]*?)```/g;
  */
 const renderMarkdownWithCharts = (text, markDownProps, onLinkClick) => {
   if (!text || !text.includes('```nb-chart')) {
-    return <MarkDowns data={text.replace(/~/g, '\\~')} sx={markDownProps} onLinkClick={onLinkClick} />;
+    return <MarkDowns data={text} sx={markDownProps} onLinkClick={onLinkClick} />;
   }
 
   const parts = [];
@@ -32,7 +32,7 @@ const renderMarkdownWithCharts = (text, markDownProps, onLinkClick) => {
   while ((match = NB_CHART_BLOCK.exec(text)) !== null) {
     const before = text.slice(lastIndex, match.index);
     if (before.trim()) {
-      parts.push(<MarkDowns key={`md-${i}`} data={before.replace(/~/g, '\\~')} sx={markDownProps} onLinkClick={onLinkClick} />);
+      parts.push(<MarkDowns key={`md-${i}`} data={before} sx={markDownProps} onLinkClick={onLinkClick} />);
     }
     let spec = null;
     try {
@@ -48,7 +48,7 @@ const renderMarkdownWithCharts = (text, markDownProps, onLinkClick) => {
   }
   const after = text.slice(lastIndex);
   if (after.trim()) {
-    parts.push(<MarkDowns key={`md-${i}`} data={after.replace(/~/g, '\\~')} sx={markDownProps} onLinkClick={onLinkClick} />);
+    parts.push(<MarkDowns key={`md-${i}`} data={after} sx={markDownProps} onLinkClick={onLinkClick} />);
   }
   return <>{parts}</>;
 };
@@ -268,7 +268,7 @@ const LLMAnswerRenderer = ({ toolCall, messages = [], onNavigateToTask, groupInd
               borderRadius: ds.radius.lg,
               overflow: 'auto',
               fontSize: 'var(--ds-text-body)',
-              fontFamily: 'monospace',
+              fontFamily: ds.font.mono,
               margin: 0,
               whiteSpace: 'pre-wrap',
               wordBreak: 'break-word',
@@ -281,7 +281,7 @@ const LLMAnswerRenderer = ({ toolCall, messages = [], onNavigateToTask, groupInd
 
       if (toolCall.agentName === 'loganalysis' || jsonParsed.stdout || jsonParsed.stderr) {
         const toShowData = jsonParsed.response || jsonParsed.stdout || jsonParsed.stderr;
-        return <MarkDowns data={toShowData.replace(/~/g, '\\~')} sx={{ width: '100%', overflowX: 'auto', p: 0 }} onLinkClick={onLinkClickProp} />;
+        return <MarkDowns data={toShowData} sx={{ width: '100%', overflowX: 'auto', p: 0 }} onLinkClick={onLinkClickProp} />;
       }
       const { headers, tableData } = getTableDataFromArrayOfObject(jsonParsed);
       if (headers.length > 0) {
@@ -306,7 +306,7 @@ const LLMAnswerRenderer = ({ toolCall, messages = [], onNavigateToTask, groupInd
             borderRadius: ds.radius.lg,
             overflow: 'auto',
             fontSize: 'var(--ds-text-small)',
-            fontFamily: '"Roboto Mono", monospace',
+            fontFamily: ds.font.mono,
             margin: 0,
             whiteSpace: 'pre-wrap',
             wordBreak: 'break-word',

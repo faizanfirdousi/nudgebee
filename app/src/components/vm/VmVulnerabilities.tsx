@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Box, Typography } from '@mui/material';
 import CustomTable from '@shared/tables/CustomTable';
 import ListingLayout from '@ui/ListingLayout';
@@ -8,17 +8,20 @@ import ThreeDotsMenu from '@ui/ThreeDotsMenu';
 import { Chip } from '@ui/Chip';
 import { Label } from '@ui/Label';
 import Datetime from '@shared/format/Datetime';
-import Tabs from '@shared/navigation/Tabs';
+import { ToggleGroup } from '@ui/ToggleGroup';
 import DownloadButton from '@shared/buttons/DownloadButton';
-import { Button as DsButton } from '@ui/Button';
-import SafeIcon from '@shared/icons/SafeIcon';
-import { getNubiIconCircleUrl, useTenantBranding } from '@hooks/useTenantBranding';
+import TicketLink from '@shared/links/TicketLink';
+import { useTenantBranding } from '@hooks/useTenantBranding';
 import TicketCreatePopupForm from '@components/tickets/TicketCreatePopupForm';
 import { toast as snackbar } from '@ui/Toast';
 import { usePagination } from '@hooks/usePagination';
 import { toSeverityLevel } from '@utils/common';
 import { hasPermission, hasWriteAccess } from '@lib/auth';
 import apiVm, { SEVERITY_ORDER, VmVulnerability, VmVulnerabilityGroup, VmVulnerabilityGrouping } from '@api1/vm';
+import SecurityFindingPanel from '@components/recommendations/security/SecurityFindingPanel';
+import { fromVmRow } from '@components/recommendations/security/securityFinding';
+import { AskNubiIconButton, findingPromptContext, useAskNubiAboutSecurityFinding } from '@components/recommendations/security/askNubi';
+import { dismissMenuEntry, useRecommendationDismissal } from '@components/recommendations/security/dismissal';
 import { CellText, joinVmNames, useLatestRequest } from './common';
 import { ds } from '@utils/colors';
 
@@ -26,8 +29,8 @@ import { ds } from '@utils/colors';
 // let Severity (a badge) and the version columns starve Last Seen until its
 // relative time wrapped to three lines.
 const HEADERS = [
-  { name: 'Severity', width: '6%' },
-  { name: 'Vulnerability', width: '18%' },
+  { name: 'Severity', width: '8%' },
+  { name: 'Vulnerability', width: '16%' },
   { name: 'Package', width: '19%' },
   { name: 'Installed', width: '17%' },
   { name: 'Fixed In', width: '17%' },
@@ -36,13 +39,31 @@ const HEADERS = [
   { name: 'Actions', width: '8%' },
 ];
 
+// Flat-table headers for the cross-account Security tab: same columns, with the
+// owning account named first. Widths trimmed from the two widest text columns.
+const HEADERS_WITH_ACCOUNT = [
+  { name: 'Account', width: '12%' },
+  { name: 'Severity', width: '8%' },
+  { name: 'Vulnerability', width: '15%' },
+  { name: 'Package', width: '16%' },
+  { name: 'Installed', width: '15%' },
+  { name: 'Fixed In', width: '15%' },
+  { name: 'CVSS', width: '5%' },
+  { name: 'Last Seen', width: '8%' },
+  { name: 'Actions', width: '8%' },
+];
+
 const SEVERITY_OPTIONS = SEVERITY_ORDER.map((severity) => ({ label: severity, value: severity }));
 
 /** Cap on the VM / Package filter lists. Both dropdowns search their options. */
 const FILTER_OPTION_LIMIT = 200;
 
-/** Grouping tabs. `all` is the flat finding list; the rest roll it up server-side. */
-const GROUP_TABS = [
+/**
+ * How the findings are pivoted. `all` is the flat finding list; the rest roll it
+ * up server-side into a different column set (see GROUP_HEADERS) — these are not
+ * filters, which is why the control that selects them says "group by".
+ */
+const GROUP_TABS: Array<{ text: string; value: VmVulnerabilityGrouping | 'all'; id: string }> = [
   { text: 'All', value: 'all', id: 'vm-vulnerability-tab-all' },
   { text: 'Vulnerability', value: 'vulnerability', id: 'vm-vulnerability-tab-vulnerability' },
   { text: 'Package', value: 'package', id: 'vm-vulnerability-tab-package' },
@@ -88,17 +109,28 @@ const severityFromWeight = (weight: number) => WEIGHT_SEVERITY.find(([threshold]
  * in the label because a disabled menu item can't carry a tooltip. Applying the
  * patch is not built yet (the agent has no patch runner), so it's a placeholder.
  */
-const menuItems = (canCreateTicket: boolean) => [
-  {
-    id: 'create-ticket',
-    label: canCreateTicket ? 'Create Ticket' : 'Create Ticket · requires tickets:Write',
-    disabled: !canCreateTicket,
-  },
-  {
-    id: 'apply-patch',
-    label: 'Apply Patch · Coming Soon',
-    disabled: true,
-  },
+const menuItems = (canCreateTicket: boolean, finding: VmVulnerability) => {
+  const dismissEntry = dismissMenuEntry(finding.status, hasWriteAccess(finding.account_id));
+  const existingTicket = finding.ticket?.ticket_id;
+  return [
+    {
+      id: 'create-ticket',
+      label: existingTicket ? `Ticket: ${existingTicket}` : canCreateTicket ? 'Create Ticket' : 'Create Ticket · requires tickets:Write',
+      disabled: !!existingTicket || !canCreateTicket,
+    },
+    {
+      id: 'apply-patch',
+      label: 'Apply Patch · Coming Soon',
+      disabled: true,
+    },
+    ...(dismissEntry ? [{ id: dismissEntry.id, label: dismissEntry.label }] : []),
+  ];
+};
+
+// Dismissed covers snoozed rows too: a snooze is Dismissed plus an expiry.
+const STATUS_OPTIONS = [
+  { label: 'Open', value: 'Open' },
+  { label: 'Dismissed / snoozed', value: 'Dismissed' },
 ];
 
 /** Markdown body for a ticket raised off one CVE finding. */
@@ -118,7 +150,8 @@ const ticketDescription = (finding: VmVulnerability) => {
 };
 
 interface VmVulnerabilitiesProps {
-  accountId: string;
+  /** One VM account, or the list of them (the cross-account Security tab). */
+  accountId: string | string[];
   /** Scope to a single VM. Set by the inventory table's expanded row. */
   cloudResourceId?: string;
   /** Scope to a single CVE. Set by the Vulnerability grouping's expanded row. */
@@ -137,6 +170,21 @@ interface VmVulnerabilitiesProps {
    */
   scopeLabel?: string;
   onClearScope?: () => void;
+  /** Extra filter(s) rendered first in the toolbar — the cross-account Security tab's Account picker. */
+  leadingFilters?: React.ReactNode;
+  /**
+   * Drop the standalone /vm page's own outer padding. Set when this view is
+   * hosted inside another page's tab, where the host already supplies the page
+   * inset — without it the table sits narrower than its sibling tabs.
+   */
+  hidePageInset?: boolean;
+  /**
+   * account id → display name. Set only by the cross-account Security tab, where
+   * it adds an Account column to the flat findings table. The grouped views roll
+   * findings up ACROSS accounts, so a single account per group row would be
+   * wrong there and the column is deliberately omitted.
+   */
+  accountsById?: Record<string, string>;
 }
 
 /**
@@ -158,14 +206,21 @@ const VmVulnerabilities = ({
   initialSeverity,
   scopeLabel,
   onClearScope,
+  leadingFilters,
+  accountsById,
+  hidePageInset = false,
 }: VmVulnerabilitiesProps) => {
   const [loading, setLoading] = useState(false);
   const [rows, setRows] = useState<VmVulnerability[]>([]);
   const [groups, setGroups] = useState<VmVulnerabilityGroup[]>([]);
   const [total, setTotal] = useState(0);
   const [severity, setSeverity] = useState<string | null>(initialSeverity || null);
+  const [statusFilter, setStatusFilter] = useState<string>('Open');
   const [grouping, setGrouping] = useState<VmVulnerabilityGrouping | 'all'>('all');
   const [ticketFinding, setTicketFinding] = useState<VmVulnerability | null>(null);
+  // Flat findings had no detail view at all — the scan already stores a
+  // description, EPSS, KEV and advisory links that nothing rendered.
+  const [panelFinding, setPanelFinding] = useState<VmVulnerability | null>(null);
   // Seeded from the scope props so a link that arrives filtered shows its filter
   // in the control that owns it; from then on the dropdown is authoritative, or
   // the filter could never be cleared.
@@ -176,8 +231,20 @@ const VmVulnerabilities = ({
   const { page, rowsPerPage, changePage, setPage } = usePagination(embedded ? 5 : 10);
   const beginRequest = useLatestRequest();
   const { assistantName } = useTenantBranding();
+  const askNubi = useAskNubiAboutSecurityFinding();
+  const askAboutFinding = useCallback(
+    (finding: VmVulnerability) =>
+      askNubi({
+        accountId: finding.account_id,
+        sessionKey: finding.id,
+        context: findingPromptContext(fromVmRow(finding), accountsById?.[finding.account_id]),
+      }),
+    [askNubi, accountsById]
+  );
 
-  const canCreateTicket = hasWriteAccess(accountId) || hasPermission('tickets', 'Write');
+  // With a multi-account scope the check falls back to tenant-level write; the
+  // ticket itself is always created against the finding's own account.
+  const canCreateTicket = hasWriteAccess(Array.isArray(accountId) ? undefined : accountId) || hasPermission('tickets', 'Write');
 
   // Embedded instances never show the tabs, so grouping stays 'all' for them.
   const isGrouped = grouping !== 'all';
@@ -202,7 +269,13 @@ const VmVulnerabilities = ({
     // the older response overwrite the newer one.
     const isLatest = beginRequest();
     const paging = { limit: rowsPerPage, offset: page * rowsPerPage };
-    const filters = { cloudResourceId: vmScope, vulnId, packageName: packageScope, severity: severity || undefined };
+    const filters = {
+      cloudResourceId: vmScope,
+      vulnId,
+      packageName: packageScope,
+      severity: severity || undefined,
+      status: statusFilter === 'Dismissed' ? ['Dismissed'] : undefined,
+    };
     const request =
       grouping === 'all'
         ? apiVm
@@ -228,7 +301,7 @@ const VmVulnerabilities = ({
       .finally(() => {
         if (isLatest()) setLoading(false);
       });
-  }, [accountId, vmScope, vulnId, packageScope, severity, grouping, page, rowsPerPage, beginRequest]);
+  }, [accountId, vmScope, vulnId, packageScope, severity, statusFilter, grouping, page, rowsPerPage, beginRequest]);
 
   useEffect(() => {
     fetchRows();
@@ -256,9 +329,18 @@ const VmVulnerabilities = ({
     };
   }, [accountId, embedded]);
 
-  const onMenuClick = (item: { id: string }, finding: VmVulnerability) => {
-    if (item.id === 'create-ticket') setTicketFinding(finding);
-  };
+  const dismissal = useRecommendationDismissal(() => {
+    setPanelFinding(null);
+    fetchRows();
+  });
+
+  const onMenuClick = useCallback(
+    (item: { id: string }, finding: VmVulnerability) => {
+      if (item.id === 'create-ticket') setTicketFinding(finding);
+      else if (item.id === 'dismiss' || item.id === 'reactivate') dismissal.toggle(finding);
+    },
+    [dismissal]
+  );
 
   // Where the VM goes depends on what the table is already scoped to. Scoped to
   // one VM (the inventory row's drill-down) it is not worth a line at all. Under
@@ -268,53 +350,69 @@ const VmVulnerabilities = ({
   const vmUnderVulnerability = Boolean(vulnId) && !cloudResourceId;
   const showVm = !cloudResourceId;
 
-  const tableData = rows.map((finding) => {
-    const payload = finding.recommendation || {};
-    const packageSubtext = [payload.package?.type, showVm && !vmUnderVulnerability ? finding.resource_name : undefined].filter(Boolean).join(' · ');
-    const vulnSubtext = [payload.kev ? 'Known exploited' : undefined, vmUnderVulnerability ? finding.resource_name : undefined]
-      .filter(Boolean)
-      .join(' · ');
-    return [
-      { component: <SeverityIcon level={toSeverityLevel(finding.severity)} size={14} aria-label={finding.severity} /> },
-      { component: <CellText text={payload.vuln_id} subtext={vulnSubtext || undefined} mono /> },
-      { component: <CellText text={payload.package?.name} subtext={packageSubtext || undefined} /> },
-      { component: <CellText text={payload.package?.version} mono /> },
-      {
-        component: payload.fixed_version ? (
-          <CellText text={payload.fixed_version} mono />
-        ) : (
-          <Label tone='neutral' size='sm' text={payload.fix_state || 'No fix'} />
-        ),
-      },
-      { component: <CellText text={payload.cvss_v3_score != null ? String(payload.cvss_v3_score) : undefined} /> },
-      { component: <Datetime value={finding.updated_at} /> },
-      {
-        component: (
-          <Box sx={{ display: 'flex', alignItems: 'center', gap: ds.space[1] }}>
-            {/* Asking the assistant about a CVE finding isn't wired up yet — the
-                icon holds its place, disabled, and says so on hover. */}
-            <DsButton
-              tone='ghost'
-              size='xs'
-              composition='icon-only'
-              disabled
-              tooltip={`Ask ${assistantName} · Coming Soon`}
-              aria-label={`Ask ${assistantName} · Coming Soon`}
-              id={`vm-vulnerability-ask-nubi-${finding.id}`}
-              icon={<SafeIcon src={getNubiIconCircleUrl()} alt='' width={18} height={18} />}
-            />
-            <ThreeDotsMenu
-              id={`vm-vulnerability-actions-${finding.id}`}
-              menuItems={menuItems(canCreateTicket)}
-              data={finding}
-              onMenuClick={onMenuClick}
-              menuWidth={260}
-            />
-          </Box>
-        ),
-      },
-    ];
-  });
+  const tableData = useMemo(
+    () =>
+      rows.map((finding) => {
+        const payload = finding.recommendation || {};
+        // arch distinguishes the common case of the same CVE/package appearing
+        // as two rows for one VM — once per architecture the package is
+        // installed under (e.g. noarch and x86_64) — which otherwise look
+        // identical apart from this column (#38976).
+        const packageSubtext = [payload.package?.type, payload.package?.arch, showVm && !vmUnderVulnerability ? finding.resource_name : undefined]
+          .filter(Boolean)
+          .join(' · ');
+        const vulnSubtext = [payload.kev ? 'Known exploited' : undefined, vmUnderVulnerability ? finding.resource_name : undefined]
+          .filter(Boolean)
+          .join(' · ');
+        return [
+          ...(accountsById
+            ? [{ component: <CellText text={accountsById[finding.account_id] || finding.account_id} />, drilldownQuery: { finding } }]
+            : []),
+          {
+            component: <SeverityIcon level={toSeverityLevel(finding.severity)} size={14} aria-label={finding.severity} />,
+            drilldownQuery: { finding },
+          },
+          {
+            component: (
+              <Box sx={{ display: 'flex', flexDirection: 'column', gap: ds.space[0] }}>
+                <CellText text={payload.vuln_id} subtext={vulnSubtext || undefined} mono />
+                {finding.ticket ? <TicketLink ticketURL={finding.ticket.url || ''} ticketID={finding.ticket.ticket_id} /> : null}
+              </Box>
+            ),
+          },
+          { component: <CellText text={payload.package?.name} subtext={packageSubtext || undefined} /> },
+          { component: <CellText text={payload.package?.version} mono /> },
+          {
+            component: payload.fixed_version ? (
+              <CellText text={payload.fixed_version} mono />
+            ) : (
+              <Label tone='neutral' size='sm' text={payload.fix_state || 'No fix'} />
+            ),
+          },
+          { component: <CellText text={payload.cvss_v3_score != null ? String(payload.cvss_v3_score) : undefined} /> },
+          { component: <Datetime value={finding.updated_at} /> },
+          {
+            component: (
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: ds.space[1] }}>
+                <AskNubiIconButton
+                  id={`vm-vulnerability-ask-nubi-${finding.id}`}
+                  assistantName={assistantName}
+                  onClick={() => askAboutFinding(finding)}
+                />
+                <ThreeDotsMenu
+                  id={`vm-vulnerability-actions-${finding.id}`}
+                  menuItems={menuItems(canCreateTicket, finding)}
+                  data={finding}
+                  onMenuClick={onMenuClick}
+                  menuWidth={260}
+                />
+              </Box>
+            ),
+          },
+        ];
+      }),
+    [rows, accountsById, showVm, vmUnderVulnerability, assistantName, canCreateTicket, onMenuClick, askAboutFinding]
+  );
 
   // Which filter the drill-down applies is the only thing that differs per
   // grouping — the expanded row is this same component, scoped.
@@ -323,6 +421,12 @@ const VmVulnerabilities = ({
     if (grouping === 'package') return { packageName: group.key };
     return { cloudResourceId: group.key };
   };
+
+  // An empty result reads as "no open vulnerabilities" (good news) only when
+  // nothing narrowed the query — otherwise it just means the filter (severity,
+  // status, VM, package, or a deep-link scope) matched nothing, which
+  // CustomTable's showUpdatedEmptyData path can't tell apart on its own.
+  const isFiltered = Boolean(severity || vmFilter || packageFilter || scopeLabel || statusFilter === 'Dismissed');
 
   const groupData = groups.map((group) => {
     const groupSeverity = severityFromWeight(group.max_severity_weight);
@@ -341,14 +445,16 @@ const VmVulnerabilities = ({
   const table = (
     <CustomTable
       id={tableId}
-      headers={isGrouped ? GROUP_HEADERS[grouping] : HEADERS}
+      headers={isGrouped ? GROUP_HEADERS[grouping] : accountsById ? HEADERS_WITH_ACCOUNT : HEADERS}
       tableData={isGrouped ? groupData : tableData}
       loading={loading}
       rowsPerPage={rowsPerPage}
       pageNumber={page + 1}
       totalRows={total}
       onPageChange={changePage}
+      tableHeadingCenter={['Severity']}
       showExpandable={isGrouped}
+      onRowClick={isGrouped ? undefined : (query: any) => query?.finding && setPanelFinding(query.finding)}
       expandable={
         isGrouped
           ? {
@@ -358,16 +464,37 @@ const VmVulnerabilities = ({
                   value: 0,
                   key: `vm-vulnerability-group-${grouping}`,
                   componentFn: (_option: any, group: VmVulnerabilityGroup) => (
-                    <VmVulnerabilities accountId={accountId} embedded {...groupScope(group)} />
+                    <VmVulnerabilities accountId={accountId} accountsById={accountsById} embedded {...groupScope(group)} />
                   ),
                 },
               ],
             }
           : undefined
       }
-      emptyHeading='No open vulnerabilities'
-      emptySubHeading='Findings appear here after a VM package scan matches installed packages against the CVE database.'
+      emptyHeading={isFiltered ? 'No vulnerabilities match these filters' : 'No open vulnerabilities'}
+      emptySubHeading={
+        isFiltered
+          ? 'Try adjusting or clearing the Severity, Status, VM, or Package filters.'
+          : 'Findings appear here after a VM package scan matches installed packages against the CVE database.'
+      }
       showUpdatedEmptyData={true}
+    />
+  );
+
+  const findingPanel = (
+    <SecurityFindingPanel
+      open={Boolean(panelFinding)}
+      onClose={() => setPanelFinding(null)}
+      finding={panelFinding ? fromVmRow(panelFinding) : null}
+      accountName={panelFinding ? accountsById?.[panelFinding.account_id] : undefined}
+      scopeAccountId={accountId}
+      onCreateTicket={() => {
+        if (panelFinding) setTicketFinding(panelFinding);
+      }}
+      onAskNubi={() => {
+        if (panelFinding) askAboutFinding(panelFinding);
+      }}
+      onDismiss={panelFinding && hasWriteAccess(panelFinding.account_id) ? () => dismissal.toggle(panelFinding) : undefined}
     />
   );
 
@@ -376,7 +503,18 @@ const VmVulnerabilities = ({
       open={!!ticketFinding}
       handleClose={() => setTicketFinding(null)}
       onClose={() => setTicketFinding(null)}
-      onSuccess={() => setTicketFinding(null)}
+      onSuccess={({ ticketId, url }: { ticketId?: string; url?: string } = {}) => {
+        // Update the row (and open detail panel, if it's the same finding) locally rather than
+        // refetch — the ticket→finding link can lag a re-query.
+        if (ticketFinding && ticketId) {
+          const ticket = { ticket_id: ticketId, url };
+          setRows((prev) => prev.map((row) => (row.id === ticketFinding.id ? { ...row, ticket } : row)));
+          if (panelFinding?.id === ticketFinding.id) {
+            setPanelFinding((prev) => (prev ? { ...prev, ticket } : null));
+          }
+        }
+        setTicketFinding(null);
+      }}
       onFailure={(error: string) => snackbar.error(error || 'Failed to create ticket')}
       ticketData={{
         subject: `${ticketFinding.severity} vulnerability ${ticketFinding.recommendation?.vuln_id || ''} in ${
@@ -399,28 +537,40 @@ const VmVulnerabilities = ({
           <ListingLayout.Body>{table}</ListingLayout.Body>
         </ListingLayout>
         {ticketModal}
+        {findingPanel}
+        {dismissal.modal}
       </Box>
     );
   }
 
   return (
-    <Box sx={{ px: ds.space[5], pb: ds.space[5] }}>
-      {/* Grouping selector — an outer tab bar above the card, so the toolbar
-          below keeps carrying only the filters that apply to every tab. */}
-      <Box sx={{ pb: ds.space[3] }}>
-        <Tabs
-          value={grouping}
-          onChange={(next: VmVulnerabilityGrouping | 'all') => {
-            setPage(0);
-            setGrouping(next);
-          }}
-          options={{ tabOptions: GROUP_TABS }}
-          behavior='filter'
-          ariaLabel='Group vulnerabilities by'
-        />
-      </Box>
+    <Box sx={{ px: hidePageInset ? 0 : ds.space[5], pb: ds.space[5] }}>
       <ListingLayout id='vm-vulnerabilities'>
-        <ListingLayout.Toolbar actions={<DownloadButton id={`${tableId}-download`} onClick={() => ({ tableId })} />}>
+        {/* The grouping selector sits in the toolbar, as a ToggleGroup, because
+            Image Scan's Apps/Images/CVE/Details is the same control over the
+            same kind of data and that is where it lives. It used to be an outer
+            Tabs bar above the card, which put a second full-width strip
+            directly under the Security sub-tab strip. */}
+        <ListingLayout.Toolbar
+          actions={
+            <>
+              {/* No size prop, matching Image Scan's — both take the 'md' default. */}
+              <ToggleGroup
+                id='vm-vulnerability-grouping'
+                selection='single'
+                value={grouping}
+                onChange={(next: VmVulnerabilityGrouping | 'all') => {
+                  setPage(0);
+                  setGrouping(next);
+                }}
+                options={GROUP_TABS.map((t) => ({ value: t.value, label: t.text }))}
+                ariaLabel='Group vulnerabilities by'
+              />
+              <DownloadButton id={`${tableId}-download`} onClick={() => ({ tableId })} />
+            </>
+          }
+        >
+          {leadingFilters}
           <FilterDropdown
             id='vm-vulnerability-severity'
             label='Severity'
@@ -431,6 +581,19 @@ const VmVulnerabilities = ({
               setSeverity(event?.target?.value || null);
             }}
           />
+          {!embedded && (
+            <FilterDropdown
+              id='vm-vulnerability-status'
+              label='Status'
+              value={statusFilter}
+              options={STATUS_OPTIONS}
+              clearable={false}
+              onSelect={(event: any) => {
+                setPage(0);
+                setStatusFilter(event?.target?.value || 'Open');
+              }}
+            />
+          )}
           {vmOptions.length > 0 && (
             <FilterDropdown
               id='vm-vulnerability-vm'
@@ -465,6 +628,8 @@ const VmVulnerabilities = ({
         <ListingLayout.Body>{table}</ListingLayout.Body>
       </ListingLayout>
       {ticketModal}
+      {findingPanel}
+      {dismissal.modal}
     </Box>
   );
 };

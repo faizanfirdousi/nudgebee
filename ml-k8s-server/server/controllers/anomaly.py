@@ -183,6 +183,7 @@ def _predict_inner() -> Response:
         try:
             config_dict = {
                 "account_id": str(data.get("account")),
+                "tenant_id": str(data.get("tenant") or ""),
                 "namespace": data["namespace"],
                 "deployment": data["deployment"],
                 "anomaly_type": data["type"],
@@ -345,6 +346,7 @@ def _detect_inner() -> Response:
             # Instead, we'll manually filter the results after detection to only show evaluation period anomalies
             config_dict = {
                 "account_id": str(data.get("account")),
+                "tenant_id": str(data.get("tenant") or ""),
                 "namespace": data.get("namespace", "custom"),
                 "deployment": data.get("deployment", "custom"),
                 "anomaly_type": anomaly_type,
@@ -372,10 +374,11 @@ def _detect_inner() -> Response:
 
             all_data_result = algo_obj.load_data_from_prometheus(
                 account_id=str(data.get("account")),
-                query=data["query"],
+                column=data["query"],
                 start_time=historical_start_time,
                 end_time=analysis_end_time,
                 step=step,
+                tenant_id=str(data.get("tenant") or ""),
             )
 
             # Unpack data and labels from the result

@@ -1,14 +1,45 @@
 package core
 
 import (
+	"errors"
+	"os"
+	"reflect"
+	"strings"
 	"testing"
+	"time"
 
 	"nudgebee/llm/security"
+	toolcore "nudgebee/llm/tools/core"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestBuildResumeAgentRequestRestoresClientToolRuntimeFields(t *testing.T) {
+	clientTools := []toolcore.NBToolCommand{{
+		Name:        "custom_shell_execute",
+		Description: "Run a command in the custom agent environment",
+	}}
+	capabilities := toolcore.AgentCapabilities{
+		AllowedTools: []string{"custom_shell_execute"},
+	}
+	queryConfig := toolcore.NBQueryConfig{
+		ClientTools:  clientTools,
+		Capabilities: capabilities,
+	}
+
+	got := buildResumeAgentRequest(
+		NBAgentRequest{Query: "investigate", AgentId: "agent-id"},
+		"parent-id",
+		"saved-state",
+		queryConfig,
+	)
+
+	assert.Equal(t, clientTools, got.ClientTools)
+	assert.Equal(t, capabilities, got.Capabilities)
+	assert.Equal(t, queryConfig, got.QueryConfig)
+}
 
 // TestIsResumableAgentStatus locks in the contract for which agent statuses
 // V2's idempotency guard treats as eligible for resume vs already-progressed.
@@ -86,6 +117,116 @@ type bubbleFakeDao struct {
 	persistedContent   string
 	persistedMsgStatus ConversationStatus
 	convStatus         ConversationStatus
+
+	getConversationMessageCalls int
+	// originalQuestion, when set, makes GetConversationMessage succeed and
+	// return it — for the tests that drive grading all the way through.
+	originalQuestion string
+}
+
+type ancestorFakeDao struct {
+	IConversationDao
+	agents       map[string]ConversationAgent
+	parentStates map[string]struct {
+		parentID string
+		state    string
+	}
+}
+
+type resumeTestAgent struct {
+	name string
+}
+
+func (a *resumeTestAgent) GetName() string { return a.name }
+func (a *resumeTestAgent) GetNameAliases() []string {
+	return nil
+}
+func (a *resumeTestAgent) GetDescription() string { return "resume test agent" }
+func (a *resumeTestAgent) GetSupportedTools(_ *security.RequestContext) []toolcore.NBTool {
+	return nil
+}
+func (a *resumeTestAgent) GetSystemPrompt(_ *security.RequestContext, _ NBAgentRequest) NBAgentPrompt {
+	return NBAgentPrompt{}
+}
+func (a *resumeTestAgent) GetPlannerType() AgentPlannerType { return AgentPlannerTypeOrchestrating }
+
+func (f *ancestorFakeDao) ListConversationAgents(_, agentID string) ([]ConversationAgent, error) {
+	agent, ok := f.agents[agentID]
+	if !ok {
+		return nil, nil
+	}
+	return []ConversationAgent{agent}, nil
+}
+
+func (f *ancestorFakeDao) GetConversationAgentParentAgentIdAndPreviousState(agentID string) (string, string) {
+	value := f.parentStates[agentID]
+	return value.parentID, value.state
+}
+
+func TestResolveRegisteredAncestorSkipsDynamicDelegateAgent(t *testing.T) {
+	original := GetConversationDao()
+	defer SetConversationDao(original)
+
+	const registeredName = "test_resume_registered_ancestor"
+	RegisterNBAgentFactory(registeredName, func(string) (NBAgent, error) {
+		return &resumeTestAgent{name: registeredName}, nil
+	})
+
+	rootID := uuid.New()
+	delegateID := uuid.New()
+	SetConversationDao(&ancestorFakeDao{agents: map[string]ConversationAgent{
+		delegateID.String(): {ID: delegateID, AgentName: "delegate_agent", ParentAgentID: rootID},
+		rootID.String():     {ID: rootID, AgentName: registeredName, ParentAgentID: uuid.Nil},
+	}})
+
+	agent, dto, walked, err := resolveRegisteredAncestor(
+		security.NewRequestContextForSuperAdmin(), delegateID, uuid.NewString(), uuid.New(),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, agent)
+	require.NotNil(t, dto)
+	assert.Equal(t, registeredName, agent.GetName())
+	assert.Equal(t, rootID, dto.ID)
+	assert.Equal(t, 1, walked)
+}
+
+func TestResolveBubbleUpParentLoadsExecutableAncestorState(t *testing.T) {
+	original := GetConversationDao()
+	defer SetConversationDao(original)
+
+	const registeredName = "test_bubble_up_registered_ancestor"
+	RegisterNBAgentFactory(registeredName, func(string) (NBAgent, error) {
+		return &resumeTestAgent{name: registeredName}, nil
+	})
+
+	rootID := uuid.New()
+	delegateID := uuid.New()
+	dao := &ancestorFakeDao{
+		agents: map[string]ConversationAgent{
+			delegateID.String(): {ID: delegateID, AgentName: "delegate_agent", ParentAgentID: rootID},
+			rootID.String():     {ID: rootID, AgentName: registeredName, ParentAgentID: uuid.Nil, Query: "original task"},
+		},
+		parentStates: map[string]struct {
+			parentID string
+			state    string
+		}{
+			delegateID.String(): {parentID: rootID.String(), state: "wrong delegate state"},
+			rootID.String():     {parentID: uuid.Nil.String(), state: "saved orchestrator state"},
+		},
+	}
+	SetConversationDao(dao)
+
+	agent, dto, parentID, state, walked, err := resolveBubbleUpParent(
+		security.NewRequestContextForSuperAdmin(), dao, delegateID.String(), uuid.NewString(), uuid.New(),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, agent)
+	require.NotNil(t, dto)
+	assert.Equal(t, registeredName, agent.GetName())
+	assert.Equal(t, rootID, dto.ID)
+	assert.Equal(t, rootID.String(), parentID, "top-level executable ancestor resumes as its own parent")
+	assert.Equal(t, "saved orchestrator state", state)
+	assert.Equal(t, 1, walked)
 }
 
 func (f *bubbleFakeDao) CountWaitingSubAgents(parentAgentId, messageId string) (int, error) {
@@ -112,6 +253,149 @@ func (f *bubbleFakeDao) UpdateConversationStatus(conversationId string, status C
 	return nil
 }
 
+// GetConversationMessage serves the generation message finalizeCompletedConversation
+// reads to recover the original question.
+//
+// With originalQuestion unset it errors instead, which is what the tests using
+// security.NewRequestContextForSuperAdmin() expect: that context carries an
+// empty tenant id, so AnswerConfidenceEnabledForTenant short-circuits before
+// the read ever happens. Erroring keeps that assumption honest — if a change
+// makes those tests reach the read, they fail loudly rather than silently
+// grading a placeholder.
+func (f *bubbleFakeDao) GetConversationMessage(id, accountId, conversationId string) (ConversationMessage, error) {
+	f.getConversationMessageCalls++
+	if f.originalQuestion == "" {
+		return ConversationMessage{}, errors.New("bubbleFakeDao: GetConversationMessage not stubbed")
+	}
+	return ConversationMessage{Message: f.originalQuestion}, nil
+}
+
+// originalQueryFakeDao is a minimal IConversationDao stubbing only
+// GetConversationMessage, so originalQuestionForScoring can be tested without
+// pulling in the rest of bubbleFakeDao's completion-flow stubs.
+type originalQueryFakeDao struct {
+	IConversationDao
+	message ConversationMessage
+	err     error
+
+	calledWithID, calledWithAccountID, calledWithConversationID string
+}
+
+func (f *originalQueryFakeDao) GetConversationMessage(id, accountId, conversationId string) (ConversationMessage, error) {
+	f.calledWithID, f.calledWithAccountID, f.calledWithConversationID = id, accountId, conversationId
+	return f.message, f.err
+}
+
+// TestOriginalQuestionForScoring is the regression test for #37534: a turn
+// that completes via a followup resume must be graded on the user's ORIGINAL
+// question, not the followup answer text (e.g. "yes") that req.Query carries
+// at that point. originalQuestionForScoring is what finalizeCompletedConversation
+// uses to recover it — from the generation message row, which a followup
+// exchange never overwrites.
+func TestOriginalQuestionForScoring(t *testing.T) {
+	original := GetConversationDao()
+	defer SetConversationDao(original)
+
+	msgID := uuid.New().String()
+	accountID := uuid.New().String()
+	convID := uuid.New().String()
+	req := NBAgentRequest{
+		MessageId:      msgID,
+		AccountId:      accountID,
+		ConversationId: convID,
+		Query:          "yes", // the followup answer — must NOT be what gets classified
+	}
+
+	t.Run("resolves the original question from the generation message", func(t *testing.T) {
+		const originalQuestion = "orders-api is down, check what's wrong and fix it"
+		fake := &originalQueryFakeDao{message: ConversationMessage{Message: originalQuestion}}
+		SetConversationDao(fake)
+
+		got, err := originalQuestionForScoring(req)
+
+		require.NoError(t, err)
+		assert.Equal(t, originalQuestion, got)
+		assert.Equal(t, msgID, fake.calledWithID)
+		assert.Equal(t, accountID, fake.calledWithAccountID)
+		assert.Equal(t, convID, fake.calledWithConversationID)
+
+		// This is the actual fix: with the original question in hand instead of
+		// the followup answer, the existing gate now classifies the turn as an
+		// investigation and qualifies it for grading.
+		scoreReq := req
+		scoreReq.OriginalQuery = got
+		assert.True(t, shouldScoreAnswerConfidence(scoreReq, "final answer"))
+		// Without the fix (grading on req.Query="yes" directly), the same gate
+		// rejects the turn — pinning the bug this test guards against.
+		assert.False(t, shouldScoreAnswerConfidence(req, "final answer"))
+	})
+
+	// A DB failure must be distinguishable from "there is no question", so the
+	// caller can log it instead of silently never grading again.
+	t.Run("DB failure returns an error, not a silent empty string", func(t *testing.T) {
+		fake := &originalQueryFakeDao{err: errors.New("boom")}
+		SetConversationDao(fake)
+
+		got, err := originalQuestionForScoring(req)
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "boom", "the underlying cause must survive wrapping")
+		assert.Empty(t, got)
+	})
+
+	// A blank stored message must yield no question so the caller skips scoring.
+	// Whitespace and empty differ in how they'd fail downstream, and only the
+	// empty case is actually dangerous — see the sub-assertions below — but the
+	// contract is the same for both: no usable question was recovered.
+	t.Run("blank stored message yields no question and no error", func(t *testing.T) {
+		for _, blank := range []string{"", "   ", "\n\t "} {
+			fake := &originalQueryFakeDao{message: ConversationMessage{Message: blank}}
+			SetConversationDao(fake)
+
+			got, err := originalQuestionForScoring(req)
+			require.NoError(t, err, "a blank message is not a failure, just nothing to grade")
+			assert.Empty(t, strings.TrimSpace(got), "blank message %q must not count as a recovered question", blank)
+		}
+	})
+
+	// Why the empty case specifically needs the guard: shouldScoreAnswerConfidence
+	// substitutes req.Query only when OriginalQuery is exactly "". On this resume
+	// path req.Query is the followup answer ("yes"), so an investigation-sourced
+	// turn would then pass the gate and be graded against "yes" — the very bug
+	// this PR fixes. A whitespace-only OriginalQuery is NOT substituted and trips
+	// that function's own TrimSpace guard instead, so it already fails closed.
+	t.Run("empty (not whitespace) OriginalQuery is what would reintroduce the bug", func(t *testing.T) {
+		investigationSourced := req
+		investigationSourced.ConversationSource = ConversationSourceInvestigation
+
+		empty := investigationSourced
+		empty.OriginalQuery = ""
+		assert.True(t, shouldScoreAnswerConfidence(empty, "answer"),
+			`"" falls back to req.Query ("yes") and passes on source — this is the hole ok=false closes`)
+
+		whitespace := investigationSourced
+		whitespace.OriginalQuery = "   "
+		assert.False(t, shouldScoreAnswerConfidence(whitespace, "answer"),
+			"whitespace is not substituted, so the gate's own TrimSpace check already rejects it")
+	})
+
+	t.Run("empty account id, message id, or conversation id short-circuits without querying", func(t *testing.T) {
+		fake := &originalQueryFakeDao{message: ConversationMessage{Message: "should never be reached"}}
+		SetConversationDao(fake)
+
+		for _, r := range []NBAgentRequest{
+			func() NBAgentRequest { c := req; c.AccountId = ""; return c }(),
+			func() NBAgentRequest { c := req; c.MessageId = ""; return c }(),
+			func() NBAgentRequest { c := req; c.ConversationId = ""; return c }(),
+		} {
+			got, err := originalQuestionForScoring(r)
+			require.NoError(t, err, "a missing identifier is nothing to look up, not a failure")
+			assert.Empty(t, got)
+		}
+
+		assert.Empty(t, fake.calledWithID, "must not query the DB with any empty id")
+	})
+}
+
 // TestBubbleUpIfSiblingsDone_StatelessParentFinalizesMessage covers the actual
 // user-facing fix: when all siblings are done and the parent has no saved state
 // (it completed out-of-band and its state was cleared), the parent's saved
@@ -127,6 +411,10 @@ func (f *bubbleFakeDao) UpdateConversationStatus(conversationId string, status C
 func TestBubbleUpIfSiblingsDone_StatelessParentFinalizesMessage(t *testing.T) {
 	original := GetConversationDao()
 	defer SetConversationDao(original)
+	const parentAgentName = "test_stateless_bubble_parent"
+	RegisterNBAgentFactory(parentAgentName, func(string) (NBAgent, error) {
+		return &resumeTestAgent{name: parentAgentName}, nil
+	})
 
 	ctx := security.NewRequestContextForSuperAdmin()
 	parentID := uuid.New()
@@ -151,7 +439,7 @@ func TestBubbleUpIfSiblingsDone_StatelessParentFinalizesMessage(t *testing.T) {
 		fake := &bubbleFakeDao{
 			parentState:  "", // stateless → enters the fix branch
 			waitingCount: 0,  // all siblings done
-			parentAgent:  ConversationAgent{ID: parentID, AgentName: "k8s_debug", Response: &parentAnswer},
+			parentAgent:  ConversationAgent{ID: parentID, AgentName: parentAgentName, Response: &parentAnswer},
 		}
 		SetConversationDao(fake)
 
@@ -165,13 +453,15 @@ func TestBubbleUpIfSiblingsDone_StatelessParentFinalizesMessage(t *testing.T) {
 		assert.Equal(t, parentAnswer, fake.persistedContent, "message must be persisted with the parent answer, not left empty")
 		assert.Equal(t, ConversationStatusCompleted, fake.persistedMsgStatus)
 		assert.Equal(t, ConversationStatusCompleted, fake.convStatus)
+		assert.Zero(t, fake.getConversationMessageCalls,
+			"AnswerConfidenceEnabledForTenant's empty-tenant guard must gate out before the original-question DB read")
 	})
 
 	t.Run("parent response nil → falls back to child response", func(t *testing.T) {
 		fake := &bubbleFakeDao{
 			parentState:  "",
 			waitingCount: 0,
-			parentAgent:  ConversationAgent{ID: parentID, AgentName: "k8s_debug", Response: nil},
+			parentAgent:  ConversationAgent{ID: parentID, AgentName: parentAgentName, Response: nil},
 		}
 		SetConversationDao(fake)
 
@@ -183,12 +473,13 @@ func TestBubbleUpIfSiblingsDone_StatelessParentFinalizesMessage(t *testing.T) {
 		assert.Equal(t, childResp.Response[0], fake.persistedContent)
 		assert.Equal(t, ConversationStatusCompleted, fake.persistedMsgStatus)
 		assert.Equal(t, ConversationStatusCompleted, fake.convStatus)
+		assert.Zero(t, fake.getConversationMessageCalls)
 	})
 }
 
 // TestBubbleUpIfSiblingsDone_TerminalChildShortCircuits covers the #31997 fix:
-// when a resumed sub-agent completes with IsTerminal (its answer IS the final
-// answer — e.g. automation_builder returning the built workflow JSON after
+// when an opted-in resumed sub-agent completes with IsTerminal (its answer IS the
+// final answer — e.g. automation_builder returning the built workflow JSON after
 // "Approve and Build"), the bubble-up must finalize from the child and NOT resume
 // the parent. Resuming the parent re-runs an ancestor planner which, for a nested
 // builder (k8s_debug → automation → automation_builder), re-delegates a fresh
@@ -209,13 +500,17 @@ func TestBubbleUpIfSiblingsDone_TerminalChildShortCircuits(t *testing.T) {
 	convID := uuid.New()
 
 	const builtJSON = `{"name":"k8s-pod-inventory","definition":{"triggers":[{"type":"manual"}]}}`
+	const terminalAgentName = "test_parent_terminal_agent"
+	RegisterNBAgentFactory(terminalAgentName, func(string) (NBAgent, error) {
+		return parentTerminalAgent{}, nil
+	})
 	terminalChild := NBAgentResponse{
 		Response:   []string{builtJSON},
 		Status:     ConversationStatusCompleted,
 		IsTerminal: true,
-		AgentName:  "automation_builder",
+		AgentName:  terminalAgentName,
 	}
-	childAgent := ConversationAgent{ID: childID, ParentAgentID: parentID, MessageID: msgID}
+	childAgent := ConversationAgent{ID: childID, ParentAgentID: parentID, MessageID: msgID, AgentName: terminalAgentName}
 	req := NBAgentRequest{
 		ConversationId: convID.String(),
 		MessageId:      msgID.String(),
@@ -236,11 +531,12 @@ func TestBubbleUpIfSiblingsDone_TerminalChildShortCircuits(t *testing.T) {
 
 		assert.Equal(t, []string{builtJSON}, resp.Response, "terminal child's response is the final answer")
 		assert.Equal(t, ConversationStatusCompleted, resp.Status)
-		assert.Equal(t, "automation_builder", resp.AgentName, "non-Response fields preserved from childResp")
+		assert.Equal(t, terminalAgentName, resp.AgentName, "non-Response fields preserved from childResp")
 		assert.Equal(t, msgID.String(), fake.persistedMsgID)
 		assert.Equal(t, builtJSON, fake.persistedContent, "generation message persisted with the built workflow")
 		assert.Equal(t, ConversationStatusCompleted, fake.persistedMsgStatus)
 		assert.Equal(t, ConversationStatusCompleted, fake.convStatus)
+		assert.Zero(t, fake.getConversationMessageCalls)
 	})
 
 	t.Run("terminal child does NOT strand a still-waiting sibling", func(t *testing.T) {
@@ -261,4 +557,234 @@ func TestBubbleUpIfSiblingsDone_TerminalChildShortCircuits(t *testing.T) {
 		assert.Equal(t, []string{builtJSON}, resp.Response)
 		assert.Empty(t, fake.persistedMsgID, "no final message persisted while a sibling is still waiting")
 	})
+}
+
+// TestResumeFollowupLocked_CrossAccountAgentRejected is a security
+// regression test for the V2 resume path — the same class of guard proven
+// for HandleFollowupDismiss/HandleFollowupResponse in
+// followup_cancel_test.go. Checked before the unregistered-agent-impl
+// ancestor walk, so a cross-account agentId can't reach that logic (which
+// would panic on this fake's embedded nil DAO if it were reached).
+func TestResumeFollowupLocked_CrossAccountAgentRejected(t *testing.T) {
+	original := GetConversationDao()
+	defer SetConversationDao(original)
+
+	agentAccountID := uuid.New()
+	SetConversationDao(&crossAccountFakeDao{
+		agent: ConversationAgent{
+			ID:        uuid.New(),
+			AccountID: agentAccountID,
+			Status:    AgentExecutionStatusWaiting,
+		},
+	})
+
+	ctx := security.NewRequestContextForSuperAdmin()
+	agentID := uuid.New().String()
+	resp, err := resumeFollowupLocked(ctx, NBAgentRequest{
+		AgentId:        agentID,
+		AccountId:      uuid.New().String(), // deliberately different from agentAccountID
+		Query:          "some answer",
+		ConversationId: uuid.New().String(),
+	})
+	assert.Equal(t, NBAgentResponse{}, resp)
+	if assert.Error(t, err) {
+		assert.Contains(t, err.Error(), "not found")
+	}
+}
+
+// A turn that completed with no usable answer is not gradeable, so it must
+// short-circuit before either DB read — the tenant-flag lookup and the
+// original-question lookup are both wasted work for it.
+//
+// Swaps package-level seams; must not run in parallel.
+func TestFinalizeCompletedConversation_BlankAnswerTouchesNoDatabase(t *testing.T) {
+	origDao := GetConversationDao()
+	defer SetConversationDao(origDao)
+
+	origGrader, origFlag := scoreAnswerConfidenceFn, answerConfidenceFeatureCheck
+	defer func() { scoreAnswerConfidenceFn, answerConfidenceFeatureCheck = origGrader, origFlag }()
+
+	flagReads := 0
+	answerConfidenceFeatureCheck = func(string, string) (bool, error) { flagReads++; return true, nil }
+	scoreAnswerConfidenceFn = func(_ *security.RequestContext, _, _, _, messageId, _, _ string) error {
+		t.Fatalf("an ungradeable turn reached the grader (message %s)", messageId)
+		return nil
+	}
+
+	msgID := uuid.New()
+	req := NBAgentRequest{
+		ConversationId: uuid.New().String(),
+		MessageId:      msgID.String(),
+		AccountId:      uuid.New().String(),
+		Query:          "yes",
+	}
+	ctx := security.NewRequestContextForTenantAccountAdmin(
+		"44444444-4444-4444-4444-444444444444", "user-under-test", []string{req.AccountId})
+
+	for _, blank := range [][]string{nil, {""}, {"   \n"}} {
+		fake := &bubbleFakeDao{originalQuestion: "why is the checkout deployment unhealthy"}
+		SetConversationDao(fake)
+
+		finalizeCompletedConversation(ctx, req, NBAgentResponse{
+			Response:  blank,
+			Status:    ConversationStatusCompleted,
+			AgentName: "k8s_orchestrator",
+		})
+
+		// The turn is still finalized — only grading is skipped.
+		assert.Equal(t, msgID.String(), fake.persistedMsgID, "the message must still be persisted")
+		assert.Equal(t, ConversationStatusCompleted, fake.convStatus)
+		assert.Zero(t, fake.getConversationMessageCalls,
+			"no original-question lookup for a turn with answer %q", blank)
+	}
+	assert.Zero(t, flagReads, "no tenant-flag lookup either — the answer check is free and comes first")
+}
+
+// TestFinalizeCompletedConversation_ScoresResumedTurn is the end-to-end
+// regression test for #37534: an investigation that paused on a tool
+// confirmation and was resumed must still reach the confidence grader, and
+// must be graded on the user's original question rather than the answer they
+// gave the confirmation prompt.
+//
+// Before the fix this path emitted nothing at all — resume_v2 finalizes the
+// turn itself and never called the grader, so 0 of 91 followup-resumed turns
+// on dev carried a score against a 16.3% baseline.
+//
+// Swaps package-level seams; must not run in parallel.
+func TestFinalizeCompletedConversation_ScoresResumedTurn(t *testing.T) {
+	const originalQuestion = "why is the checkout deployment unhealthy, and restart it"
+
+	origDao := GetConversationDao()
+	defer SetConversationDao(origDao)
+
+	origGrader, origFlag := scoreAnswerConfidenceFn, answerConfidenceFeatureCheck
+	defer func() { scoreAnswerConfidenceFn, answerConfidenceFeatureCheck = origGrader, origFlag }()
+	answerConfidenceFeatureCheck = func(string, string) (bool, error) { return true, nil }
+
+	type graded struct{ messageID, question, answer string }
+	calls := make(chan graded, 4)
+	scoreAnswerConfidenceFn = func(_ *security.RequestContext, _, _, _, messageId, question, answer string) error {
+		calls <- graded{messageID: messageId, question: question, answer: answer}
+		return nil
+	}
+
+	fake := &bubbleFakeDao{originalQuestion: originalQuestion}
+	SetConversationDao(fake)
+
+	msgID := uuid.New()
+	childAgent := ConversationAgent{ID: uuid.New(), ParentAgentID: uuid.Nil, MessageID: msgID}
+	// Shaped like a real resume: Query is the confirmation answer, and
+	// OriginalQuery is empty because it never survives the resume round-trip.
+	req := NBAgentRequest{
+		ConversationId: uuid.New().String(),
+		MessageId:      msgID.String(),
+		AccountId:      uuid.New().String(),
+		Query:          "yes",
+	}
+	childResp := NBAgentResponse{
+		Response:  []string{"**Investigation Summary:** the pod was OOMKilled."},
+		Status:    ConversationStatusCompleted,
+		AgentName: "k8s_orchestrator",
+	}
+
+	ctx := security.NewRequestContextForTenantAccountAdmin(
+		"33333333-3333-3333-3333-333333333333", "user-under-test", []string{req.AccountId})
+
+	resp, err := bubbleUpIfSiblingsDone(ctx, req, childResp, childAgent)
+	require.NoError(t, err)
+	assert.Equal(t, ConversationStatusCompleted, resp.Status)
+
+	// The turn is still finalized exactly as before the grader existed.
+	assert.Equal(t, msgID.String(), fake.persistedMsgID)
+	assert.Equal(t, ConversationStatusCompleted, fake.convStatus)
+
+	select {
+	case got := <-calls:
+		assert.Equal(t, originalQuestion, got.question,
+			"a resumed turn must be graded on the original question")
+		assert.NotEqual(t, "yes", got.question,
+			`grading "yes" is the bug this test exists to catch`)
+		assert.Equal(t, msgID.String(), got.messageID)
+		assert.Equal(t, childResp.Response[0], got.answer)
+	case <-time.After(10 * time.Second):
+		t.Fatal("resumed turn never reached the confidence grader")
+	}
+
+	select {
+	case extra := <-calls:
+		t.Fatalf("resumed turn was graded more than once (second call on %s)", extra.messageID)
+	case <-time.After(750 * time.Millisecond):
+	}
+}
+
+// resumeOverriddenFields are the only fields resume may change. Everything else
+// on the request must survive: it arrives fully populated from the normal
+// conversation path, and rebuilding it field by field is what silently dropped
+// account context, memory, KB content and skills from every resumed turn.
+var resumeOverriddenFields = map[string]bool{
+	"ParentAgentId": true,
+	"PreviousState": true,
+	"QueryConfig":   true,
+	"ClientTools":   true,
+	"Capabilities":  true,
+}
+
+func TestBuildResumeAgentRequestCarriesEveryFieldForward(t *testing.T) {
+	req := NBAgentRequest{
+		Query:               "why is it still restarting?",
+		OriginalQuery:       "why does checkout keep restarting?",
+		AccountId:           "acct-1",
+		UserId:              "user-1",
+		AccountContext:      "=== APPLICATION OVERVIEW ===\nservices: primary backend",
+		AccountPrompt:       "prefer kubectl over helm",
+		MemoryContext:       "<memory>user prefers concise answers</memory>",
+		KBPrestepContent:    "runbook: restart loop triage",
+		SkillListsMenu:      "skill: k8s-triage",
+		ConversationContext: "earlier: checkout deploy at 14:02",
+		EnableCritique:      true,
+	}
+
+	got := buildResumeAgentRequest(req, "parent-1", "state", toolcore.NBQueryConfig{})
+
+	rv, gv := reflect.ValueOf(req), reflect.ValueOf(got)
+	for i := 0; i < rv.NumField(); i++ {
+		// An unexported field would panic on Interface(); skip rather than
+		// crash, so adding one later fails this test honestly or not at all.
+		if !rv.Field(i).CanInterface() {
+			continue
+		}
+		name := rv.Type().Field(i).Name
+		if resumeOverriddenFields[name] {
+			continue
+		}
+		assert.Equal(t, rv.Field(i).Interface(), gv.Field(i).Interface(),
+			"resume dropped or altered %s — it must carry forward from the first turn", name)
+	}
+
+	assert.Equal(t, "parent-1", got.ParentAgentId)
+	assert.Equal(t, "state", got.PreviousState)
+}
+
+// TestBuildResumeAgentRequestKeepsAccountContextFromDB checks the same contract
+// against a real account's stored context, so the rendered <account_context>
+// block — which the provider cache slot is keyed on content-wise — is identical
+// on the first and resumed turn. Needs a database; skips without TEST_ACCOUNT.
+func TestBuildResumeAgentRequestKeepsAccountContextFromDB(t *testing.T) {
+	account, tenant := os.Getenv("TEST_ACCOUNT"), os.Getenv("TEST_TENANT")
+	if account == "" || tenant == "" {
+		t.Skip("set TEST_ACCOUNT and TEST_TENANT to run against a database")
+	}
+
+	ctx := security.NewRequestContextForTenantAdmin(tenant)
+	firstTurn := toolcore.LoadActiveGlobalContext(ctx, account)
+	require.NotEmpty(t, firstTurn, "account has no active global context — pick one that does")
+
+	resumed := buildResumeAgentRequest(
+		NBAgentRequest{Query: "and why is it still failing?", AccountId: account, AccountContext: firstTurn},
+		"parent-1", "saved-state", toolcore.NBQueryConfig{},
+	)
+
+	assert.Equal(t, firstTurn, resumed.AccountContext)
+	assert.Equal(t, renderAccountContextBlock(firstTurn), renderAccountContextBlock(resumed.AccountContext),
+		"rendered account context differs across resume — the two prefixes would evict each other")
 }

@@ -185,7 +185,7 @@ def test_footer_link_pins_dashboard_to_this_digests_reference_date():
     msg = get_ai_cost_account_report_message_template(params)
     footer_url = _action_button_url(msg)
     assert "asOf=2026-08-07" in footer_url
-    assert footer_url.endswith("#cost-analyser/cost-report")
+    assert footer_url.endswith("#llm-analyser/cost-report")
 
 
 def test_action_buttons_follow_accounts_table_view_link_first():
@@ -212,7 +212,7 @@ def test_empty_accounts_still_renders_a_valid_message():
     assert msg["blocks"]
     assert not _table_blocks(msg), "no accounts means no table at all, not an empty one"
     # The "View in Cost Analyser" button still renders even with no accounts.
-    assert _action_button_url(msg).endswith("#cost-analyser/cost-report")
+    assert _action_button_url(msg).endswith("#llm-analyser/cost-report")
     assert "unfurl_links" in msg and msg["unfurl_links"] is False
 
 
@@ -275,6 +275,20 @@ def test_avg_daily_prev_to_cur_includes_trend_arrow_and_delta():
     msg = get_ai_cost_account_report_message_template(params)
     row = _account_rows(_table_blocks(msg)[0])[0]
     assert row["Avg/day (prev → cur)"] == "$10.00 → $10.00 (→ 0%)"
+
+
+def test_avg_daily_hides_trend_when_no_prev_baseline():
+    # prev_month=0 (the _account default) -> avg_daily_prev_month_usd=0.0, the
+    # same "no baseline" case llm-server's pct_delta_avg_daily sentinel covers
+    # (nudgebee-enterprise#38310). A bare "(→ 0%)" misread as "flat" instead of
+    # "nothing to compare against", so the trend is dropped entirely here.
+    params = get_ai_cost_account_report_message_params(
+        reference_date="2026-08-07",
+        accounts=[_account("Acme", mtd=100.0)],  # prev_month=0.0
+    )
+    msg = get_ai_cost_account_report_message_template(params)
+    row = _account_rows(_table_blocks(msg)[0])[0]
+    assert row["Avg/day (prev → cur)"] == "$0.00 → $10.00"
 
 
 def _top_model(model: str, mtd_cost: float, calls: int, p95: float, p99: float) -> Dict[str, Any]:

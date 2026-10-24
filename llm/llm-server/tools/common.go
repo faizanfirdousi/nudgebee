@@ -663,6 +663,74 @@ func parseTimeValue(value any) (time.Time, error) {
 	}
 }
 
+// hasWindowArgs reports whether a tool call carries any explicit time-window control.
+func hasWindowArgs(args map[string]any) bool {
+	for _, k := range []string{"range", "duration", "start_time", "end_time", "start", "end", "starttime", "endtime"} {
+		if _, ok := args[k]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// windowFromTimestampBounds derives a search window from timestamp bounds the agent wrote
+// into the filter itself (`{"timestamp": {"_gte": "…"}}`) when it gave no window argument.
+//
+// Without this the call fell back to the default last hour: the filter asked for 18:18–18:48
+// yesterday, the backend was searched over the last hour, and the answer was zero rows for a
+// window that had plenty. Only bounds that must hold for every row count — top-level and
+// under _and; a bound inside _or or _not does not constrain the window. A lone lower bound
+// runs to now; a lone upper bound covers the hour before it.
+func windowFromTimestampBounds(where core.QueryWhereClause, now time.Time) (time.Time, time.Time, bool) {
+	var lo, hi time.Time
+	var walk func(w core.QueryWhereClause)
+	walk = func(w core.QueryWhereClause) {
+		for field, ops := range w.Binary {
+			switch strings.ToLower(field) {
+			case "timestamp", "_timestamp", "@timestamp", "time":
+			default:
+				continue
+			}
+			for op, v := range ops {
+				t, err := parseTimeValue(v)
+				if err != nil {
+					continue
+				}
+				switch op {
+				case core.Gt, core.Gte:
+					if lo.IsZero() || t.After(lo) {
+						lo = t
+					}
+				case core.Lt, core.Lte:
+					if hi.IsZero() || t.Before(hi) {
+						hi = t
+					}
+				}
+			}
+		}
+		for _, c := range w.And {
+			walk(c)
+		}
+	}
+	walk(where)
+
+	switch {
+	case !lo.IsZero() && !hi.IsZero():
+		if hi.Before(lo) {
+			return time.Time{}, time.Time{}, false
+		}
+		return lo.UTC(), hi.UTC(), true
+	case !lo.IsZero():
+		if lo.After(now) {
+			return time.Time{}, time.Time{}, false
+		}
+		return lo.UTC(), now.UTC(), true
+	case !hi.IsZero():
+		return hi.Add(-time.Hour).UTC(), hi.UTC(), true
+	}
+	return time.Time{}, time.Time{}, false
+}
+
 // ExtractStartEndtimeFromLabels extracts start and end times from a map of labels.
 // It checks for common key pairs like (start_time, end_time) and (start, end).
 // It also checks for a 'range' or 'duration' key to calculate start time relative to end time (defaults to Now).
@@ -680,11 +748,12 @@ func ExtractStartEndtimeFromLabels(nbRequestContext core.NbToolContext, labels m
 	// long-standing bug where an explicit range lost to the event's start/end
 	// pair: within a single set the explicit-pair check runs before the range
 	// check, so a merged event pair would always shadow a caller range.
+	// Returned in UTC so a caller that formats the window never mixes offsets.
 	if start, end, ok := resolveWindowFromLabels(labels); ok {
-		return start, end, nil
+		return start.UTC(), end.UTC(), nil
 	}
 	if start, end, ok := resolveWindowFromLabels(nbRequestContext.QueryConfig.Labels); ok {
-		return start, end, nil
+		return start.UTC(), end.UTC(), nil
 	}
 	return time.Time{}, time.Time{}, errors.New("no valid start/end time key pair or range found in labels")
 }
@@ -728,27 +797,78 @@ func resolveWindowFromLabels(labels map[string]any) (time.Time, time.Time, bool)
 		return startTime, endTime, true
 	}
 
-	// 2. Range/duration, anchored to an explicit end key if present, else now.
-	endTime := time.Now()
-	for _, k := range []string{"end_time", "end", "endtime"} {
-		if val, ok := labels[k]; ok {
-			if parsedEnd, err := parseTimeValue(val); err == nil {
-				endTime = parsedEnd
-				break
-			}
+	// 1b. An ISO-8601 interval in the range slot ("2026-09-25T18:18:00Z/2026-09-25T18:48:00Z").
+	// The logs agent writes absolute windows this way; it is not a duration, so it used to
+	// fail ParseDuration below and the caller silently fell back to the last hour — the
+	// agent then analysed logs from the wrong window and reported zero in the one it asked for.
+	for _, k := range []string{"range", "duration"} {
+		valStr, ok := labels[k].(string)
+		if !ok {
+			continue
 		}
+		startStr, endStr, found := strings.Cut(strings.TrimSpace(valStr), "/")
+		if !found {
+			continue
+		}
+		startTime, errStart := parseTimeValue(strings.TrimSpace(startStr))
+		endTime, errEnd := parseTimeValue(strings.TrimSpace(endStr))
+		if errStart != nil || errEnd != nil {
+			continue
+		}
+		if startTime.After(endTime) {
+			startTime, endTime = endTime, startTime
+		}
+		return startTime, endTime, true
 	}
+
+	// 2. Range/duration, anchored to an explicit end key if present; else it runs
+	// forward from an explicit start key; else back from now. A start plus a range
+	// ("75m from 10:30") used to be anchored to now, which silently replaced an
+	// incident window from hours ago with the last 75 minutes — the query came back
+	// empty and the investigation read that as "logs expired".
+	var duration time.Duration
+	hasRange := false
 	for _, k := range []string{"range", "duration"} {
 		if val, ok := labels[k]; ok {
 			if valStr, ok := val.(string); ok {
-				if duration, err := ParseDuration(valStr); err == nil {
-					return endTime.Add(-duration), endTime, true
+				if d, err := ParseDuration(valStr); err == nil {
+					// "-1h" means the last hour, not an hour into the future.
+					if d < 0 {
+						d = -d
+					}
+					duration, hasRange = d, true
+					break
 				}
 			}
 		}
 	}
+	if !hasRange {
+		return time.Time{}, time.Time{}, false
+	}
+	if endTime, ok := firstTimeValue(labels, "end_time", "end", "endtime"); ok {
+		return endTime.Add(-duration), endTime, true
+	}
+	now := time.Now().UTC()
+	if startTime, ok := firstTimeValue(labels, "start_time", "start", "starttime"); ok && startTime.Before(now) {
+		endTime := startTime.Add(duration)
+		if endTime.After(now) {
+			endTime = now
+		}
+		return startTime, endTime, true
+	}
+	return now.Add(-duration), now, true
+}
 
-	return time.Time{}, time.Time{}, false
+// firstTimeValue returns the first of keys that holds a parseable time.
+func firstTimeValue(labels map[string]any, keys ...string) (time.Time, bool) {
+	for _, k := range keys {
+		if val, ok := labels[k]; ok {
+			if t, err := parseTimeValue(val); err == nil {
+				return t, true
+			}
+		}
+	}
+	return time.Time{}, false
 }
 
 // ExpandNarrowTimeWindow widens a time range that is too narrow for log queries.

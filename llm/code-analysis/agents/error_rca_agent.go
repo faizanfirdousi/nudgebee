@@ -40,6 +40,8 @@ func NewErrorRCAAgentWithTracker(cfg *config.Config, llmClient *llm.Client, gitC
 	// Restrict PR/MR creation — only the orchestrator creates PRs with proper formatting
 	cliTool := tools.NewCLITool(workspaceDir)
 	cliTool.SetRestrictPROperations(true)
+	bgTool := tools.NewBackgroundExecTool(workspaceDir)
+	bgTool.SetRestrictPROperations(true)
 	ghTool := tools.NewGHTool(workspaceDir)
 	ghTool.SetRestrictPROperations(true)
 	glabTool := tools.NewGLabTool(workspaceDir)
@@ -47,6 +49,7 @@ func NewErrorRCAAgentWithTracker(cfg *config.Config, llmClient *llm.Client, gitC
 
 	var rawTools []core.NBTool
 	rawTools = append(rawTools, cliTool)
+	rawTools = append(rawTools, bgTool)
 	rawTools = append(rawTools, tools.NewFileFindTool(workspaceDir))
 	rawTools = append(rawTools, tools.NewFileViewTool(workspaceDir))
 	rawTools = append(rawTools, tools.NewRipgrepTool(workspaceDir)) // Ripgrep for code search (regex, fast, replaces grep)
@@ -85,7 +88,7 @@ func NewErrorRCAAgentWithTracker(cfg *config.Config, llmClient *llm.Client, gitC
 		tools:         trackedTools,
 		promptLoader:  common.NewPromptLoader(),
 		repoCloneTool: repoCloneTool,
-		providerTools: specialistProviderTools{gh: ghTool, glab: glabTool, cli: cliTool},
+		providerTools: specialistProviderTools{gh: ghTool, glab: glabTool, cli: cliTool, bg: bgTool},
 	}
 }
 
@@ -169,9 +172,20 @@ func (a *ErrorRCAAgent) Execute(ctx context.Context, sessionCtx *session.Session
 				// No valid implementation_instructions → ALWAYS override requires_fix to false
 				originalValue := data["requires_fix"]
 				data["requires_fix"] = false
+				// Why we ended up with no fix decides what the user is told. The
+				// specialist saying so is a finding; us forcing it because there
+				// was nothing to act on is the absence of one, and must never be
+				// reported as "the change is already there".
+				stated, _ := data["requires_fix_stated"].(bool)
+				if stated && originalValue == false {
+					data[NoOpBasisKey] = NoOpBasisSpecialistVerdict
+				} else {
+					data[NoOpBasisKey] = NoOpBasisNoInstructions
+				}
 				if a.logger != nil {
 					a.logger.Log(common.EventStepComplete, "Overrode requires_fix=false - no valid implementation_instructions", map[string]any{
 						"original_value": originalValue,
+						"no_op_basis":    data[NoOpBasisKey],
 						"reason":         "implementation_instructions nil or empty - CodeFixer would run blind",
 					})
 				}
@@ -225,24 +239,19 @@ func (a *ErrorRCAAgent) buildEnhancedQuery(ctx context.Context, sessionCtx *sess
 }
 
 func (a *ErrorRCAAgent) buildAuditorPrompt(sessionCtx *session.SessionContext) (string, error) {
-	contextInfo := ""
-	if sessionCtx.RepoContext != nil {
-		contextInfo = sessionCtx.RepoContext.GetRepositoryGuidance()
-	}
+	contextInfo, repoSkills := repoScopedPromptContext(sessionCtx, a.logger)
 
 	// Prepare template data (tools are now passed via native function calling, not prompt text)
-	mode := sessionCtx.Mode
-	if mode == "" {
-		mode = "explore"
-	}
+	mode := effectiveMode(sessionCtx)
 	templateData := map[string]any{
 		"ContextInfo":   contextInfo,
 		"OriginalQuery": sessionCtx.OriginalQuery,
 		"Mode":          mode,
-		"IsExploreMode": mode == "explore",
-		"IsFixMode":     mode == "fix",
+		"IsExploreMode": mode == ModeExplore,
+		"IsFixMode":     mode == ModeFix,
 		"BaseDiff":      sessionCtx.BaseDiff,
 		"Skills":        sessionCtx.SkillsContext,
+		"RepoSkills":    repoSkills,
 	}
 
 	// Choose appropriate prompt template based on context complexity
@@ -267,9 +276,13 @@ func (a *ErrorRCAAgent) choosePromptTemplate(sessionCtx *session.SessionContext)
 
 	complexityIndicators := 0
 
-	// Check repository context complexity
+	// Check repository context complexity. Deliberately RepositoryHeaderGuidance
+	// (URL/branch/working-scope), not GetRepositoryGuidance — the latter also
+	// carries the repo's own AGENTS.md/CLAUDE.md content, arbitrary prose that
+	// routinely contains "services"/"multiple" and would make this indicator
+	// fire on nearly every repo regardless of actual complexity.
 	if sessionCtx.RepoContext != nil {
-		guidance := sessionCtx.RepoContext.GetRepositoryGuidance()
+		guidance := sessionCtx.RepoContext.RepositoryHeaderGuidance()
 		if strings.Contains(strings.ToLower(guidance), "multiple") ||
 			strings.Contains(strings.ToLower(guidance), "services") ||
 			strings.Contains(strings.ToLower(guidance), "microservice") {

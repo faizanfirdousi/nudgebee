@@ -1,10 +1,9 @@
-import hashlib
 import json
 import logging
 import uuid
 from dataclasses import asdict
-from datetime import datetime
-from typing import Dict, Any, List
+from datetime import datetime, timedelta, timezone
+from typing import Dict, Any, List, Optional
 
 from apis.model.namespace_details import NamespaceDetails
 from apis.model.node_details import NodeDetails
@@ -15,7 +14,7 @@ from db import database, clickhouse
 from db.redis_client import acquire_discovery_lock, record_cleanup_done, should_skip_cleanup
 from handlers.batch_reconcile import claim_reconcile, gc_superseded_active_resources, record_batch_progress
 from handlers.alert_rules_handler import handle_alert_rules
-from handlers.kg_update import publish_kg_update
+from handlers.kg_update import deletion_scope, record_deleted_nodes, record_deleted_workloads
 from psycopg2 import extras
 from utils.datetime_utils import utc_from_epoch_millis
 
@@ -58,6 +57,7 @@ pods_on_conflict = (
     "workload_type = EXCLUDED.workload_type, "
     "workload_name = EXCLUDED.workload_name, "
     "status = EXCLUDED.status, "
+    "container_status = EXCLUDED.container_status, "
     "namespace = EXCLUDED.namespace "
     f"WHERE {_version_where('k8s_pods')}"
 )
@@ -144,6 +144,51 @@ def _safe_insert_cloud_resources(resources, on_conflict):
             raise
 
 
+def _collect_replicaset_owners(data):
+    """Map (namespace, replicaset_name) -> (owner_name, owner_kind) from the
+    batch's own ReplicaSet entries. ReplicaSets are skipped as resources, but
+    their ownerReferences name the real controller (Deployment or Rollout) —
+    exactly what pods whose owner stops at the RS need."""
+    owners = {}
+    for k8s_data in data:
+        if not (k8s_data.get("type") and k8s_data.get("type").lower() == "replicaset"):
+            continue
+        rs_owner = (k8s_data.get("config") or {}).get("owner") or []
+        if rs_owner and rs_owner[0] is not None and rs_owner[0].get("name"):
+            owners[(k8s_data.get("namespace") or "", k8s_data.get("name") or "")] = (
+                rs_owner[0].get("name") or "",
+                rs_owner[0].get("kind") or "",
+            )
+    return owners
+
+
+def _resolve_pod_owner(k8s_data, rs_owners):
+    """Resolve a pod's owner past an intermediate ReplicaSet.
+
+    The agent reports the pod's direct ownerReference; ~7% of pods arrive
+    still naming the RS ("postgres-78d9cffd68"), which fragments every
+    consumer keyed on workload_name. Tier 1: the batch's RS entries carry the
+    true controller (name AND kind — Rollouts stay Rollouts). Tier 2: strip
+    the pod-template-hash label suffix — set by the controller itself, so the
+    strip is exact, not a guess; kind defaults to Deployment (the only
+    mislabel risk is a Rollout RS split across batches, rare and cosmetic).
+    """
+    config_owner = (k8s_data.get("config") or {}).get("owner") or []
+    if not (config_owner and len(config_owner) > 0 and config_owner[0] is not None):
+        return None, None
+    owner_name = config_owner[0].get("name") or ""
+    owner_kind = config_owner[0].get("kind") or ""
+    if owner_kind.lower() != "replicaset" or not owner_name:
+        return owner_name, owner_kind
+    mapped = rs_owners.get((k8s_data.get("namespace") or "", owner_name))
+    if mapped and mapped[0]:
+        return mapped
+    template_hash = ((k8s_data.get("config") or {}).get("labels") or {}).get("pod-template-hash") or ""
+    if template_hash and owner_name.endswith("-" + template_hash):
+        return owner_name[: -(len(template_hash) + 1)], "Deployment"
+    return owner_name, owner_kind
+
+
 def _deduplicate_workloads_by_identity(workloads):
     """Deduplicate workloads by (cloud_account_id, namespace, name, kind), keeping last occurrence."""
     unique = {}
@@ -208,11 +253,27 @@ def run_async_discovery_handler(content) -> None:
         logging.error("Empty tenant or cloud_account_id in discovery data")
         return
 
+    # "data" may legitimately be [] (see above) but never None. A null payload
+    # used to reach len(data["data"]) in _process_discovery and raise TypeError,
+    # which the consumer answered by rejecting the message to the DLQ. Reject it
+    # here instead, where the account can be named. Coercing None to [] is NOT an
+    # option: on a last batch that would diff against an empty active set and
+    # mark every resource for the account deleted.
+    if data["data"] is None:
+        logging.error(
+            "Null 'data' in discovery payload for %s/%s type %s -- discarding",
+            data["cloud_account_id"],
+            data["tenant"],
+            data["type"],
+        )
+        return
+
     # Serialize processing per cloud_account_id to prevent PostgreSQL deadlocks
     # on concurrent INSERT ... ON CONFLICT into cloud_resourses for the same account.
     # Uses Redis distributed lock (works across pods); falls back to threading.Lock.
     with acquire_discovery_lock(data["cloud_account_id"], Configs):
-        _process_discovery(data)
+        with deletion_scope(data["tenant"], data["cloud_account_id"]):
+            _process_discovery(data)
 
 
 def _process_discovery(data) -> None:
@@ -319,9 +380,6 @@ def _process_discovery(data) -> None:
     elif data_type == "alert_rules":
         handle_alert_rules(data["data"], data["tenant"], data["cloud_account_id"])
 
-    # Notify KG system that discovery data has been updated for this tenant
-    publish_kg_update(data["tenant"])
-
 
 def run_service_discovery(
     data: List[Dict[str, Any]],
@@ -340,6 +398,9 @@ def run_service_discovery(
     workloads = []
     deleted_resources = {}
     seen_ids = set()
+    # Harvest RS -> controller owners before ReplicaSets are skipped below, so
+    # pods whose ownerReference stops at the RS resolve to the real workload.
+    rs_owners = _collect_replicaset_owners(data)
     for k8s_data in data:
         if k8s_data.get("type") and k8s_data.get("type").lower() == "replicaset":
             continue
@@ -354,7 +415,9 @@ def run_service_discovery(
         if k8s_data["deleted"]:
             deleted_resources[_id] = service_key
             continue
-        process_service_discovery(_id, cloud_account_id, k8s_data, pods, resources, service_key, tenant, workloads)
+        process_service_discovery(
+            _id, cloud_account_id, k8s_data, pods, resources, service_key, tenant, workloads, rs_owners
+        )
 
     # Stage this batch and decide whether to reconcile. For batched snapshots the
     # reconcile is gated on full-sequence completeness (order-independent, once per
@@ -396,7 +459,67 @@ def run_service_discovery(
     )
 
 
-def process_service_discovery(_id, cloud_account_id, k8s_data, pods, resources, service_key, tenant, workloads):
+def pod_container_status(status_info: Optional[Dict[str, Any]]) -> Optional[str]:
+    """The status a human recognises -- what kubectl prints in its STATUS column.
+
+    `status` on the same row is the pod PHASE, and the phase cannot express
+    "running but broken": a pod in CrashLoopBackOff has phase Running and one in
+    ImagePullBackOff has phase Pending. Every surface that counts or filters pods
+    reads a column, so the reason has to be one too -- computing it from
+    meta.status_info at query time costs a jsonb read per pod, which is minutes
+    over the ~330k rows a single account accumulates (#36593).
+
+    Precedence follows kubectl: an init container that is not done blocks the pod,
+    so its reason wins over the app containers'; within each group the current
+    (waiting) state wins over the last (terminated) one.
+
+    A container that exited 0 is not a problem and is skipped, so a pod running
+    alongside a completed sidecar does not read "Completed". A missing exitCode is
+    treated as non-zero -- an unset value is not evidence of a clean exit.
+
+    None when nothing is waiting or terminated -- i.e. a healthy pod -- so readers
+    fall back to the phase. Also None for agents that predate status_dict being
+    sent, which is the same fallback.
+    """
+    if not isinstance(status_info, dict):
+        return None
+
+    def state_of(container_status: Any) -> Dict[str, Any]:
+        # Every level is type-checked rather than assumed: this runs on the agent
+        # payload for every pod in the batch, so one malformed entry raising here
+        # would drop the whole discovery message, not one pod.
+        if not isinstance(container_status, dict):
+            return {}
+        state = container_status.get("state")
+        return state if isinstance(state, dict) else {}
+
+    def waiting_reason(container_status: Any) -> Optional[str]:
+        waiting = state_of(container_status).get("waiting")
+        return waiting.get("reason") if isinstance(waiting, dict) else None
+
+    def terminated_reason(container_status: Any) -> Optional[str]:
+        terminated = state_of(container_status).get("terminated")
+        if not isinstance(terminated, dict) or not terminated.get("reason"):
+            return None
+        if str(terminated.get("exitCode", "")) == "0":
+            return None
+        return terminated.get("reason")
+
+    for key in ("initContainerStatuses", "containerStatuses"):
+        statuses = status_info.get(key)
+        if not isinstance(statuses, list):
+            continue
+        for reason_of in (waiting_reason, terminated_reason):
+            for container_status in statuses:
+                reason = reason_of(container_status)
+                if reason:
+                    return reason
+    return None
+
+
+def process_service_discovery(
+    _id, cloud_account_id, k8s_data, pods, resources, service_key, tenant, workloads, rs_owners=None
+):
     cloud_resource = {
         "id": _id,
         "region": "global",
@@ -466,11 +589,12 @@ def process_service_discovery(_id, cloud_account_id, k8s_data, pods, resources, 
             "node_name": k8s_data.get("node_name", ""),
             "restart_count": k8s_data.get("restart_count", 0),
             "status": k8s_data.get("status") or "UNKNOWN",
+            "container_status": pod_container_status(k8s_data.get("status_dict")),
         }
-        config_owner = k8s_data.get("config", {}).get("owner", [])
-        if config_owner and len(config_owner) > 0 and config_owner[0] is not None:
-            pod_details["workload_name"] = config_owner[0].get("name", "")
-            pod_details["workload_type"] = config_owner[0].get("kind", "")
+        owner_name, owner_kind = _resolve_pod_owner(k8s_data, rs_owners or {})
+        if owner_name is not None:
+            pod_details["workload_name"] = owner_name
+            pod_details["workload_type"] = owner_kind
         pods.append(PodDetails(**pod_details))
     else:
         workload_details = {
@@ -710,7 +834,7 @@ def handle_active_resources_deletion(  # noqa: C901
                   legacy/atomic path (diff against all rows for the type).
     """
     try:
-        logging.warning(
+        logging.info(
             f"PROCESSING RESOURCE DELETIONS for {cloud_account_id}/{tenant}/{resource_type}, "
             f"total_count: {total_resources_count}, batch_id: {batch_id}"
         )
@@ -735,15 +859,22 @@ def handle_active_resources_deletion(  # noqa: C901
             external_ids = [r[0] for r in active_resources]
             resource_ids = [r[1] for r in active_resources]
 
-            # Update cloud_resources based on resource type
+            # Update cloud_resources based on resource type. Each branch RETURNs the
+            # ids it just flipped active->inactive; those ids -- and only those -- drive
+            # the event close below.
+            deactivated_resource_ids = []
             if resource_type == "Pod":
-                database.run_query(
-                    "UPDATE cloud_resourses "
-                    "SET is_active = false, status = 'Inactive' "
-                    "WHERE account = %s AND external_resource_id != ALL(%s) "
-                    "AND is_active IS NOT FALSE AND type = 'Pod'",
-                    [cloud_account_id, external_ids],
-                )
+                deactivated_resource_ids = [
+                    r[0]
+                    for r in database.run_query(
+                        "UPDATE cloud_resourses "
+                        "SET is_active = false, status = 'Inactive' "
+                        "WHERE account = %s AND external_resource_id != ALL(%s) "
+                        "AND is_active IS NOT FALSE AND type = 'Pod' "
+                        "RETURNING id",
+                        [cloud_account_id, external_ids],
+                    )
+                ]
                 # Only update k8s_pods for Pod resources
                 # Cast text array to uuid[] so the index on cloud_resource_id (uuid) is used
                 database.run_query(
@@ -754,29 +885,40 @@ def handle_active_resources_deletion(  # noqa: C901
                     [cloud_account_id, tenant, external_ids],
                 )
             elif resource_type == "workload":
-                database.run_query(
-                    "UPDATE cloud_resourses "
-                    "SET is_active = false, status = 'Inactive' "
-                    "WHERE account = %s AND external_resource_id != ALL(%s) "
-                    "AND is_active IS NOT FALSE "
-                    "AND type NOT IN ('Pod', 'node', 'Namespace', 'External')",
-                    [cloud_account_id, external_ids],
-                )
-                database.run_query(
-                    "UPDATE k8s_workloads "
-                    "SET is_active = false "
-                    "WHERE cloud_account_id = %s AND tenant_id = %s "
-                    "AND cloud_resource_id != ALL(%s::uuid[]) AND is_active = true",
-                    [cloud_account_id, tenant, external_ids],
+                deactivated_resource_ids = [
+                    r[0]
+                    for r in database.run_query(
+                        "UPDATE cloud_resourses "
+                        "SET is_active = false, status = 'Inactive' "
+                        "WHERE account = %s AND external_resource_id != ALL(%s) "
+                        "AND is_active IS NOT FALSE "
+                        "AND type NOT IN ('Pod', 'node', 'Namespace', 'External') "
+                        "RETURNING id",
+                        [cloud_account_id, external_ids],
+                    )
+                ]
+                record_deleted_workloads(
+                    database.run_query(
+                        "UPDATE k8s_workloads "
+                        "SET is_active = false "
+                        "WHERE cloud_account_id = %s AND tenant_id = %s "
+                        "AND cloud_resource_id != ALL(%s::uuid[]) AND is_active = true "
+                        "RETURNING cloud_resource_id, kind",
+                        [cloud_account_id, tenant, external_ids],
+                    )
                 )
             elif resource_type == "Job":
-                database.run_query(
-                    "UPDATE cloud_resourses "
-                    "SET is_active = false, status = 'Inactive' "
-                    "WHERE account = %s AND external_resource_id != ALL(%s) "
-                    "AND is_active IS NOT FALSE AND type = 'Job'",
-                    [cloud_account_id, external_ids],
-                )
+                deactivated_resource_ids = [
+                    r[0]
+                    for r in database.run_query(
+                        "UPDATE cloud_resourses "
+                        "SET is_active = false, status = 'Inactive' "
+                        "WHERE account = %s AND external_resource_id != ALL(%s) "
+                        "AND is_active IS NOT FALSE AND type = 'Job' "
+                        "RETURNING id",
+                        [cloud_account_id, external_ids],
+                    )
+                ]
                 database.run_query(
                     "UPDATE k8s_workloads "
                     "SET is_active = false "
@@ -793,87 +935,70 @@ def handle_active_resources_deletion(  # noqa: C901
                     [cloud_account_id, tenant, resource_ids],
                 )
             elif resource_type == "node":
-                database.run_query(
-                    "UPDATE cloud_resourses "
-                    "SET is_active = false, status = 'Inactive' "
-                    "WHERE account = %s AND external_resource_id != ALL(%s) "
-                    "AND is_active IS NOT FALSE AND type = 'node'",
-                    [cloud_account_id, external_ids],
-                )
-                database.run_query(
-                    "UPDATE k8s_nodes "
-                    "SET is_active = false "
-                    "WHERE cloud_account_id = %s AND tenant_id = %s "
-                    "AND cloud_resource_id != ALL(%s::uuid[]) AND is_active = true",
-                    [cloud_account_id, tenant, external_ids],
+                deactivated_resource_ids = [
+                    r[0]
+                    for r in database.run_query(
+                        "UPDATE cloud_resourses "
+                        "SET is_active = false, status = 'Inactive' "
+                        "WHERE account = %s AND external_resource_id != ALL(%s) "
+                        "AND is_active IS NOT FALSE AND type = 'node' "
+                        "RETURNING id",
+                        [cloud_account_id, external_ids],
+                    )
+                ]
+                record_deleted_nodes(
+                    database.run_query(
+                        "UPDATE k8s_nodes "
+                        "SET is_active = false "
+                        "WHERE cloud_account_id = %s AND tenant_id = %s "
+                        "AND cloud_resource_id != ALL(%s::uuid[]) AND is_active = true "
+                        "RETURNING name",
+                        [cloud_account_id, tenant, external_ids],
+                    )
                 )
             else:  # service or other types
-                database.run_query(
-                    "UPDATE cloud_resourses "
-                    "SET is_active = false, status = 'Inactive' "
-                    "WHERE account = %s AND external_resource_id != ALL(%s) "
-                    "AND is_active IS NOT FALSE AND type != 'External'",
-                    [cloud_account_id, external_ids],
-                )
+                deactivated_resource_ids = [
+                    r[0]
+                    for r in database.run_query(
+                        "UPDATE cloud_resourses "
+                        "SET is_active = false, status = 'Inactive' "
+                        "WHERE account = %s AND external_resource_id != ALL(%s) "
+                        "AND is_active IS NOT FALSE AND type != 'External' "
+                        "RETURNING id",
+                        [cloud_account_id, external_ids],
+                    )
+                ]
 
-            # Close events where the resources are NOT in the active lists
-            # First get affected events to track history
-            select_query = """
-                SELECT id, tenant, cloud_account_id, status
-                FROM events
-                WHERE cloud_account_id = %s AND service_key != ALL(%s) AND status != 'CLOSED'
-            """
-            try:
-                affected_events = database.run_query(
-                    select_query, [cloud_account_id, resource_ids], cursor_factory=extras.RealDictCursor
-                )
-
-                # Batch insert history for all affected events (single query instead of N)
-                if affected_events:
-                    history_records = []
-                    meta_dict = {
+            # Close the events that belonged to the resources this pass just
+            # deactivated.
+            #
+            # Keyed on cloud_resource_id, NOT service_key. `events.service_key` and
+            # `active_resources.resourse_id` describe the same object in three mutually
+            # incompatible formats -- the agent's findings write "<ns>/<name>", discovery
+            # writes "<ns>/<Kind>/<name>", and the webhook subject mappers write
+            # "<ns>:<Kind>:<name>" -- so `service_key != ALL(active_ids)` was true for
+            # EVERY row and each pass closed the account's entire open event list,
+            # including events whose resource was alive and still firing (measured: 0
+            # key matches on every account, ~3.3k agent events closed per week with no
+            # resolve behind any of them). cloud_resource_id is the one identifier both
+            # sides already agree on.
+            #
+            # The ids come from the RETURNING clauses above, so the close is scoped to
+            # the resource type being reconciled and to resources that genuinely
+            # transitioned active -> inactive in this pass. A Job snapshot can no longer
+            # close a Pod's event, and a still-present resource is never touched.
+            if deactivated_resource_ids:
+                close_events_with_history(
+                    cloud_account_id=cloud_account_id,
+                    where_conditions="cloud_resource_id = ANY(%s::uuid[])",
+                    params=[deactivated_resource_ids],
+                    closing_reason="resource_inactive",
+                    metadata={
                         "method": "discovery_cleanup",
                         "resource_type": resource_type,
                         "trigger": "resource_inactive_or_deleted",
-                    }
-                    metadata_json = json.dumps(meta_dict)
-                    new_json = json.dumps("CLOSED")
-                    for event in affected_events:
-                        old_json = json.dumps(event.get("status", "FIRING"))
-                        fingerprint = f"{event['id']}|status|{old_json}|{new_json}"
-                        history_records.append(
-                            {
-                                "id": hashlib.sha256(fingerprint.encode()).hexdigest()[:32],
-                                "event_id": event["id"],
-                                "tenant_id": event.get("tenant"),
-                                "cloud_account_id": event.get("cloud_account_id"),
-                                "change_type": "status",
-                                "old_value": old_json,
-                                "new_value": new_json,
-                                "change_reason": "resource_inactive",
-                                "metadata": metadata_json,
-                            }
-                        )
-                    try:
-                        database.insert_data(
-                            "event_history", history_records, on_conflict="ON CONFLICT (id) DO NOTHING"
-                        )
-                    except Exception:
-                        logging.exception("Failed to batch insert event history for resource cleanup")
-
-                # Now close the events
-                database.run_query(
-                    "UPDATE events "
-                    "SET status = 'CLOSED', ends_at = now() "
-                    "WHERE cloud_account_id = %s AND service_key != ALL(%s) "
-                    "AND status != 'CLOSED'",
-                    [cloud_account_id, resource_ids],
+                    },
                 )
-
-                logging.info(f"Closed {len(affected_events)} events for inactive resources ({resource_type})")
-            except Exception:
-                logging.exception("Failed to close events with history tracking for inactive resources")
-                raise
 
             logging.debug(f"Processed deleted resources against {len(active_resources)} active resources")
         else:
@@ -908,13 +1033,18 @@ def handle_active_resources_deletion(  # noqa: C901
 
             # Only execute bulk cleanup if we're certain it's safe based on explicit zero count metadata
             # Mark all resources of this type as inactive since discovery explicitly reported zero resources
+            deactivated_resource_ids = []
             if resource_type == "Pod":
-                database.run_query(
-                    "UPDATE cloud_resourses "
-                    "SET is_active = false, status = 'Inactive' "
-                    "WHERE account = %s AND is_active IS NOT FALSE AND type = 'Pod'",
-                    [cloud_account_id],
-                )
+                deactivated_resource_ids = [
+                    r[0]
+                    for r in database.run_query(
+                        "UPDATE cloud_resourses "
+                        "SET is_active = false, status = 'Inactive' "
+                        "WHERE account = %s AND is_active IS NOT FALSE AND type = 'Pod' "
+                        "RETURNING id",
+                        [cloud_account_id],
+                    )
+                ]
                 database.run_query(
                     "UPDATE k8s_pods "
                     "SET is_active = false "
@@ -922,26 +1052,37 @@ def handle_active_resources_deletion(  # noqa: C901
                     [cloud_account_id, tenant],
                 )
             elif resource_type == "workload":
-                database.run_query(
-                    "UPDATE cloud_resourses "
-                    "SET is_active = false, status = 'Inactive' "
-                    "WHERE account = %s AND is_active IS NOT FALSE "
-                    "AND type NOT IN ('Pod', 'node', 'Namespace', 'External')",
-                    [cloud_account_id],
-                )
-                database.run_query(
-                    "UPDATE k8s_workloads "
-                    "SET is_active = false "
-                    "WHERE cloud_account_id = %s AND tenant_id = %s AND is_active = true",
-                    [cloud_account_id, tenant],
+                deactivated_resource_ids = [
+                    r[0]
+                    for r in database.run_query(
+                        "UPDATE cloud_resourses "
+                        "SET is_active = false, status = 'Inactive' "
+                        "WHERE account = %s AND is_active IS NOT FALSE "
+                        "AND type NOT IN ('Pod', 'node', 'Namespace', 'External') "
+                        "RETURNING id",
+                        [cloud_account_id],
+                    )
+                ]
+                record_deleted_workloads(
+                    database.run_query(
+                        "UPDATE k8s_workloads "
+                        "SET is_active = false "
+                        "WHERE cloud_account_id = %s AND tenant_id = %s AND is_active = true "
+                        "RETURNING cloud_resource_id, kind",
+                        [cloud_account_id, tenant],
+                    )
                 )
             elif resource_type == "Job":
-                database.run_query(
-                    "UPDATE cloud_resourses "
-                    "SET is_active = false, status = 'Inactive' "
-                    "WHERE account = %s AND is_active IS NOT FALSE AND type = 'Job'",
-                    [cloud_account_id],
-                )
+                deactivated_resource_ids = [
+                    r[0]
+                    for r in database.run_query(
+                        "UPDATE cloud_resourses "
+                        "SET is_active = false, status = 'Inactive' "
+                        "WHERE account = %s AND is_active IS NOT FALSE AND type = 'Job' "
+                        "RETURNING id",
+                        [cloud_account_id],
+                    )
+                ]
                 database.run_query(
                     "UPDATE k8s_workloads "
                     "SET is_active = false "
@@ -949,17 +1090,24 @@ def handle_active_resources_deletion(  # noqa: C901
                     [cloud_account_id, tenant],
                 )
             elif resource_type == "node":
-                database.run_query(
-                    "UPDATE cloud_resourses "
-                    "SET is_active = false, status = 'Inactive' "
-                    "WHERE account = %s AND is_active IS NOT FALSE AND type = 'node'",
-                    [cloud_account_id],
-                )
-                database.run_query(
-                    "UPDATE k8s_nodes "
-                    "SET is_active = false "
-                    "WHERE cloud_account_id = %s AND tenant_id = %s AND is_active = true",
-                    [cloud_account_id, tenant],
+                deactivated_resource_ids = [
+                    r[0]
+                    for r in database.run_query(
+                        "UPDATE cloud_resourses "
+                        "SET is_active = false, status = 'Inactive' "
+                        "WHERE account = %s AND is_active IS NOT FALSE AND type = 'node' "
+                        "RETURNING id",
+                        [cloud_account_id],
+                    )
+                ]
+                record_deleted_nodes(
+                    database.run_query(
+                        "UPDATE k8s_nodes "
+                        "SET is_active = false "
+                        "WHERE cloud_account_id = %s AND tenant_id = %s AND is_active = true "
+                        "RETURNING name",
+                        [cloud_account_id, tenant],
+                    )
                 )
             elif resource_type == "Namespace":
                 database.run_query(
@@ -969,66 +1117,35 @@ def handle_active_resources_deletion(  # noqa: C901
                     [cloud_account_id, tenant],
                 )
 
-            # Close all related events since no resources of this type exist
-            # Track history for this bulk closure
-            select_query = """
-                SELECT id, tenant, cloud_account_id, status
-                FROM events
-                WHERE cloud_account_id = %s AND status != 'CLOSED'
-            """
-            try:
-                affected_events = database.run_query(
-                    select_query, [cloud_account_id], cursor_factory=extras.RealDictCursor
-                )
-
-                # Batch insert history for all affected events (single query instead of N)
-                if affected_events:
-                    history_records = []
-                    meta_dict = {
+            # Close the events of the resources this bulk pass deactivated.
+            #
+            # Same cloud_resource_id keying, and for the same reason, as the
+            # active-resource path above: this branch used to close every open event
+            # on the account whenever ONE resource type reported zero resources, so a
+            # cluster that simply runs no Jobs would clear its pod, node and webhook
+            # alerts on every Job snapshot. Scoping to the ids the deactivation
+            # UPDATEs just returned keeps the blast radius to the type being
+            # reconciled. Namespace passes touch no cloud_resourses rows and so close
+            # nothing, which is correct -- the resources inside a deleted namespace
+            # disappear in their own type's pass.
+            if deactivated_resource_ids:
+                close_events_with_history(
+                    cloud_account_id=cloud_account_id,
+                    where_conditions="cloud_resource_id = ANY(%s::uuid[])",
+                    params=[deactivated_resource_ids],
+                    closing_reason="all_resources_deleted",
+                    metadata={
                         "method": "discovery_cleanup",
                         "resource_type": resource_type,
                         "trigger": "all_resources_deleted",
                         "total_resources": 0,
-                    }
-                    metadata_json = json.dumps(meta_dict)
-                    new_json = json.dumps("CLOSED")
-                    for event in affected_events:
-                        old_json = json.dumps(event.get("status", "FIRING"))
-                        fingerprint = f"{event['id']}|status|{old_json}|{new_json}"
-                        history_records.append(
-                            {
-                                "id": hashlib.sha256(fingerprint.encode()).hexdigest()[:32],
-                                "event_id": event["id"],
-                                "tenant_id": event.get("tenant"),
-                                "cloud_account_id": event.get("cloud_account_id"),
-                                "change_type": "status",
-                                "old_value": old_json,
-                                "new_value": new_json,
-                                "change_reason": "all_resources_deleted",
-                                "metadata": metadata_json,
-                            }
-                        )
-                    try:
-                        database.insert_data(
-                            "event_history", history_records, on_conflict="ON CONFLICT (id) DO NOTHING"
-                        )
-                    except Exception:
-                        logging.exception("Failed to batch insert event history for bulk cleanup")
-
-                # Now close all events
-                database.run_query(
-                    "UPDATE events SET status = 'CLOSED', ends_at = now() "
-                    "WHERE cloud_account_id = %s AND status != 'CLOSED'",
-                    [cloud_account_id],
+                    },
                 )
 
-                logging.warning(
-                    f"Closed ALL {len(affected_events)} events for {cloud_account_id} - "
-                    f"no resources of type {resource_type} exist"
-                )
-            except Exception:
-                logging.exception(f"Failed to close all events with history tracking for {cloud_account_id}")
-                raise
+            logging.warning(
+                f"Deactivated {len(deactivated_resource_ids)} {resource_type} resources for "
+                f"{cloud_account_id} and closed their events - discovery reported none of this type"
+            )
 
     except Exception:
         logging.exception(f"Failed to process deleted resources for {cloud_account_id}/{tenant}/{resource_type}")
@@ -1040,24 +1157,35 @@ def handle_full_load_deleted_resources(cloud_account_id, active_resources, tenan
 
         # Extract resource IDs for parameterized queries
         resource_keys = list(active_resources.keys())
-        service_values = list(active_resources.values())
 
         # Update cloud_resources where resources are not in the active list
-        database.run_query(
-            "UPDATE cloud_resourses "
-            "SET is_active = false, status = 'Inactive' "
-            "WHERE account = %s AND external_resource_id != ALL(%s) "
-            "AND is_active IS NOT FALSE AND \"type\" = 'External'",
-            [cloud_account_id, resource_keys],
-        )
+        deactivated_resource_ids = [
+            r[0]
+            for r in database.run_query(
+                "UPDATE cloud_resourses "
+                "SET is_active = false, status = 'Inactive' "
+                "WHERE account = %s AND external_resource_id != ALL(%s) "
+                "AND is_active IS NOT FALSE AND \"type\" = 'External' "
+                "RETURNING id",
+                [cloud_account_id, resource_keys],
+            )
+        ]
 
-        # Update events where the resources are not in the active list
-        database.run_query(
-            "UPDATE events "
-            "SET status = 'CLOSED' "
-            "WHERE cloud_account_id = %s AND service_key != ALL(%s) AND status != 'CLOSED'",
-            [cloud_account_id, service_values],
-        )
+        # Close the events of the resources this pass deactivated. Same
+        # cloud_resource_id keying as handle_active_resources_deletion -- see the
+        # comment there for why service_key can never be used for this.
+        if deactivated_resource_ids:
+            close_events_with_history(
+                cloud_account_id=cloud_account_id,
+                where_conditions="cloud_resource_id = ANY(%s::uuid[])",
+                params=[deactivated_resource_ids],
+                closing_reason="resource_inactive",
+                metadata={
+                    "method": "full_load_cleanup",
+                    "resource_type": "External",
+                    "trigger": "resource_inactive_or_deleted",
+                },
+            )
 
         # Update k8s_pods where resources are not in the active list
         database.run_query(
@@ -1087,6 +1215,296 @@ def process_services_updates(cloud_account_id, pods, workloads):
         deduped_workloads = _deduplicate_workloads_by_identity(workloads)
         _clean_stale_workloads(cloud_account_id, deduped_workloads[0].tenant_id, deduped_workloads)
         database.insert_data("k8s_workloads", [asdict(p) for p in deduped_workloads], on_conflict=workload_on_conflict)
+        close_events_for_recovered_workloads(cloud_account_id, deduped_workloads)
+
+
+# How long every container of a workload's pods must have been running before the
+# workload counts as recovered. The same value, for the same reason, as the agent's
+# own recovery rule (podCrashLoopStableWindow in the k8s-agent's
+# runner/pkg/triggers/predicates.go): the kubelet caps the CrashLoopBackOff delay at
+# 5 minutes, so a container that is only cycling restarts well inside 10 minutes.
+# Change the two together, or the collector closes alerts the agent will not re-raise.
+RECOVERY_STABLE_WINDOW = timedelta(minutes=10)
+# After an OOM kill the agent raises at most one finding per hour for the workload
+# (pod_oom_killed: 1h rate limit, hour bucket), and nothing resets that early. A
+# memory leak that kills the container every 20-40 minutes is Ready for most of each
+# cycle, so a 10-minute window would close its alert mid-loop and the next kill
+# would be suppressed. Wait out the agent's hour instead.
+RECOVERY_STABLE_WINDOW_AFTER_OOM = timedelta(minutes=60)
+
+
+def close_events_for_recovered_workloads(cloud_account_id: str, workloads: List[Any]):
+    """Close the agent's open events for workloads whose pods are all ready again.
+
+    This is the only recovery signal the agent's own findings have. Matchers like
+    report_crash_loop / pod_oom_killed are fire-and-forget: they re-fire at most once
+    an hour while the problem persists and never send a RESOLVED, so without this an
+    event stays open forever once the resource-deletion path stops closing it by
+    accident.
+
+    "Recovered" is `ready_pods == total_pods` on the workload the event is linked to,
+    with `total_pods > 0` so a scaled-to-zero workload does not read as healthy,
+    AND none of the workload's live pods is unready (see _workloads_with_unready_pods:
+    the counts alone read a stuck rollout as healthy),
+    AND every container of every live pod has been running for at least
+    RECOVERY_STABLE_WINDOW (see _workloads_not_yet_stable).
+    Deliberately NOT the pod phase: a pod stuck in CrashLoopBackOff reports
+    `status.phase = Running` between restarts, which is what made the legacy
+    status-diff path (run_status_update) close crashloop events on a live crashloop.
+
+    Readiness is narrower than phase but was NOT immune to the same defect: a
+    crashlooping pod is genuinely Ready for the seconds its container runs, and the
+    agent reports the Deployment's readyReplicas flipping to 1/1 on exactly that
+    moment. Observed: a Deployment whose container exits after two seconds had its
+    alert closed within a minute of being raised, again and again, without ever
+    having a working replica.
+
+    A restart-count delta between consecutive snapshots did not fix that, and cannot:
+    the agent sends Pod, ReplicaSet and Deployment changes as separate requests, so
+    the Deployment's 1/1 arrives with no pods beside it to compare. The running
+    container's start time does not need a second snapshot -- the kubelet stamps a
+    fresh one on every restart -- and it is read from the stored pod rows, so it
+    holds whichever request arrives first.
+
+    Scoped to `kubernetes_api_server`, the source whose findings are derived from
+    workload health and which has no resolve delivery of its own. Every other source
+    (prometheus, datadog, pagerduty, cloud alarms) sends its own resolve and owns its
+    own lifecycle; closing those here would overrule the producer.
+
+    Scoped further to `finding_type = 'issue'`. That source also carries
+    `configuration_change` findings ("this resource was changed"), which describe an
+    event in the past rather than a condition that can recover -- a healthy workload
+    is the NORMAL state for them, so recovery closed them within seconds of being
+    raised and they never appeared as open at all. Observed live after the first
+    deploy of this function: two config-change events closed 9 seconds and 0 seconds
+    after they were created.
+
+    Only events that START BEFORE the snapshot was taken are closed. `last_seen` is
+    the agent's own observation time (update_time on the wire), not the time this
+    batch was consumed, so a snapshot that sat in the queue cannot close an event
+    describing a failure that began after the snapshot was taken. A wall-clock grace
+    period cannot express that: the agent's 1h rate limit means a live crashloop's
+    event is routinely older than any grace window worth having, so a grace would
+    admit exactly the stale-snapshot close it was meant to stop. Workloads with no
+    usable observation time are skipped rather than closed on an unknown anchor.
+
+    Note the interaction with that same rate limit: if a workload recovers, we close,
+    and it breaks again inside the limiter's window, the agent will not re-fire until
+    the window expires -- so a recurrence can be invisible for up to an hour. That is
+    a property of the agent's limiter, not of this close (the sweep this replaces
+    closed the same events twice as often), but it is the reason to close on an
+    observed recovery only, never on the mere absence of a re-fire.
+    """
+    if not Configs.EVENT_CLOSE_ON_WORKLOAD_RECOVERY:
+        return
+    recovered = [w for w in workloads if w.total_pods > 0 and w.ready_pods == w.total_pods]
+    if not recovered:
+        return
+    unready = _workloads_with_unready_pods(cloud_account_id, recovered)
+    recovered = [w for w in recovered if (w.namespace, w.name) not in unready]
+    if not recovered:
+        return
+
+    observed_at = None
+    for w in recovered:
+        seen = _naive_utc(w.last_seen)
+        # utc_from_epoch_millis(0) is the "agent sent no update_time" sentinel.
+        if seen is None or seen.year <= 1970:
+            continue
+        observed_at = seen if observed_at is None else min(observed_at, seen)
+    if observed_at is None:
+        logging.warning(
+            "Skipping recovery close for %s: %d recovered workloads carry no observation time",
+            cloud_account_id,
+            len(recovered),
+        )
+        return
+
+    unstable = _workloads_not_yet_stable(cloud_account_id, recovered, observed_at)
+    recovered = [w for w in recovered if (w.namespace, w.name) not in unstable]
+    if not recovered:
+        return
+
+    close_events_with_history(
+        cloud_account_id=cloud_account_id,
+        where_conditions=(
+            "cloud_resource_id = ANY(%s::uuid[]) "
+            "AND source = 'kubernetes_api_server' "
+            "AND finding_type = 'issue' "
+            "AND starts_at < %s"
+        ),
+        params=[[w.cloud_resource_id for w in recovered], observed_at],
+        closing_reason="workload_recovered",
+        metadata={"method": "discovery", "trigger": "all_pods_ready"},
+    )
+
+
+def _naive_utc(value: Any) -> Optional[datetime]:
+    """A datetime or ISO-8601 string as naive UTC, or None when it is neither.
+
+    utc_from_epoch_millis already produces naive UTC and events.starts_at is
+    `timestamp` (no zone), so an aware value would make Postgres reinterpret the naive
+    column through the session TimeZone -- a silent offset -- and comparing an aware
+    with a naive value raises.
+    """
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    parsed: datetime = value
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def _pod_is_stable(status_info: Any, observed_at: datetime) -> Optional[bool]:
+    """Whether every container of a pod has run, ready, for the whole stable window.
+
+    True when it has, False when a container is not ready, not running, or started
+    inside the window, None when the stored status cannot answer -- no container list
+    or an unreadable start time.
+
+    The window is RECOVERY_STABLE_WINDOW, or RECOVERY_STABLE_WINDOW_AFTER_OOM for a
+    container whose last exit was an OOM kill. Init containers are not inspected,
+    as in the agent: they exit in a healthy pod, and one stuck crashlooping keeps the
+    regular containers from running, which fails this check anyway.
+
+    Reads both shapes agents store in meta.status_info: the Go agent sends the
+    Kubernetes PodStatus (`containerStatuses`, `startedAt`, `lastState`) and the
+    Python agent the client library's dict (`container_statuses`, `started_at`,
+    `last_state`).
+    """
+    if not isinstance(status_info, dict):
+        return None
+    statuses = status_info.get("containerStatuses") or status_info.get("container_statuses")
+    if not isinstance(statuses, list) or not statuses:
+        return None
+    for status in statuses:
+        if not isinstance(status, dict):
+            return None
+        if status.get("ready") is not True:
+            return False
+        state = status.get("state")
+        running = state.get("running") if isinstance(state, dict) else None
+        if not isinstance(running, dict):
+            return False
+        started = _naive_utc(running.get("startedAt") or running.get("started_at"))
+        if started is None:
+            return None
+        last_state = status.get("lastState") or status.get("last_state")
+        terminated = last_state.get("terminated") if isinstance(last_state, dict) else None
+        oom = isinstance(terminated, dict) and terminated.get("reason") == "OOMKilled"
+        window = RECOVERY_STABLE_WINDOW_AFTER_OOM if oom else RECOVERY_STABLE_WINDOW
+        if started > observed_at - window:
+            return False
+    return True
+
+
+def _workloads_not_yet_stable(cloud_account_id: str, workloads: List[Any], observed_at: datetime) -> set:
+    """(namespace, name) of the given workloads that have not been stable for long enough.
+
+    A workload is held when any of its live pods fails _pod_is_stable at the time the
+    agent observed the workload ready, cannot answer, or when it has no stored pod.
+
+    Reads the stored pod rows rather than the pods in the incoming request: the agent
+    sends a Deployment's change and its pods' changes as separate requests, in no fixed
+    order, so the request that says "1/1 ready" usually carries no pods. A stored row
+    that lags behind still carries the recent start or the exit that holds the close;
+    one that runs ahead only adds a later start.
+
+    Unknown holds, as it does in the agent's own rule: a status that cannot say the
+    containers have been running is not evidence that they have. That leaves agents
+    too old to send the container status with no recovery close at all -- their
+    alerts stay open until the resource is deleted, the behaviour before this close
+    existed -- which is logged per request so it does not pass for a working check.
+
+    Same scoping as _workloads_with_unready_pods: namespace + workload name, live and
+    unfinished pods only.
+    """
+    wanted = {(w.namespace, w.name) for w in workloads}
+    # tenant_id + `is_active IS NOT FALSE` match idx_k8s_pods_active_account_namespace.
+    rows = database.run_query(
+        "SELECT namespace, workload_name, meta->'status_info' FROM k8s_pods "
+        "WHERE cloud_account_id = %s AND tenant_id = %s AND is_active IS NOT FALSE "
+        "AND namespace = ANY(%s) AND workload_name = ANY(%s) "
+        "AND lower(status) NOT IN ('completed', 'succeeded', 'failed')",
+        [
+            cloud_account_id,
+            workloads[0].tenant_id,
+            list({ns for ns, _ in wanted}),
+            list({name for _, name in wanted}),
+        ],
+    )
+    held: set = set()
+    unknown: set = set()
+    with_pods: set = set()
+    for namespace, workload_name, status_info in rows or []:
+        key = (namespace, workload_name)
+        if key not in wanted:
+            continue
+        with_pods.add(key)
+        stable = _pod_is_stable(status_info, observed_at)
+        if stable is None:
+            unknown.add(key)
+        elif not stable:
+            held.add(key)
+    unknown |= wanted - with_pods
+    held |= unknown
+    if unknown:
+        logging.warning(
+            "Holding recovery close for %s: %d workloads have a pod with no usable container status stored, "
+            "or no stored pod (agent too old to send it, or pods not stored yet)",
+            cloud_account_id,
+            len(unknown),
+        )
+    return held
+
+
+def _workloads_with_unready_pods(cloud_account_id: str, workloads: List[Any]) -> set:
+    """(namespace, name) of the given workloads that still own a live pod that is not ready.
+
+    The workload's own counts cannot see a stuck rollout: the agent sends
+    `total_pods = spec.replicas` and `ready_pods = status.readyReplicas`, so while a
+    new ReplicaSet's pod sits in ImagePullBackOff the old ReplicaSet's pods keep the
+    Deployment at 2/2 and it reads as recovered -- which closed the ImagePullBackOff
+    event of a pod that was still failing (observed on production, hello-world).
+    The pod rows are written from the same batch just before this runs, so they are
+    the current view.
+
+    For a pod, the agent's `ready_pods` is its count of READY CONTAINERS and
+    `total_pods` is always 1, so ready < total misses a pod whose sidecar is ready
+    and whose main container is not. Ready containers are compared with the
+    containers in the pod spec instead; on production that agrees with the pod's
+    Ready condition on every live row, and unlike that condition it is present
+    for older agents too.
+
+    Matched on namespace + name, not kind: _resolve_pod_owner's fallback labels a
+    pod "Deployment" when its ReplicaSet is not in the batch, which would hide an
+    Argo Rollout's unready pod. A same-named workload of another kind only keeps
+    events open longer, which is the safe direction.
+
+    Completed / succeeded / failed pods are skipped: they are finished, not
+    unhealthy, and discovery already treats them as inactive (see the is_deleted
+    handling in process_service_discovery).
+    """
+    rows = database.run_query(
+        "SELECT DISTINCT namespace, workload_name FROM k8s_pods "
+        "WHERE cloud_account_id = %s AND is_active "
+        "AND namespace = ANY(%s) AND workload_name = ANY(%s) "
+        "AND lower(status) NOT IN ('completed', 'succeeded', 'failed') "
+        "AND jsonb_typeof(meta->'ready_pods') = 'number' "
+        "AND jsonb_typeof(meta->'config'->'containers') = 'array' "
+        "AND (meta->>'ready_pods')::int < jsonb_array_length(meta->'config'->'containers')",
+        [
+            cloud_account_id,
+            list({w.namespace for w in workloads}),
+            list({w.name for w in workloads}),
+        ],
+    )
+    return {(r[0], r[1]) for r in rows or []}
 
 
 def process_deleted_resources(cloud_account_id, deleted_resources, tenant):
@@ -1103,10 +1521,31 @@ def process_deleted_resources(cloud_account_id, deleted_resources, tenant):
 
         # Close events with history tracking
         # Note: Don't store deleted_resources list in metadata to avoid TOAST bloat
+        #
+        # Matched on cloud_resource_id FIRST, service_key second. `service_key`
+        # alone closed nothing for agent-sourced events: discovery writes
+        # `<ns>/<Kind>/<name>` while the agent's own findings write `<ns>/<name>`
+        # (event_handler.py `_resolve_prometheus_subject` / the finding path), so
+        # the two never matched and a deleted workload kept its alerts open
+        # forever -- 2,288 of them on production, against 1,509 resources that no
+        # longer exist. Same format mismatch #36551 fixed for
+        # handle_active_resources_deletion; this path was left on the old key.
+        #
+        # `resource_ids` are the keys of deleted_resources, which are the
+        # cloud_resourses PKs (`_id` = uuid5(service_key + account), written as
+        # both `id` and `external_resource_id` in process_service_discovery), so
+        # the id needs no lookup -- it is the same value the two UPDATEs below
+        # already use.
+        #
+        # service_key is KEPT as an OR arm, not replaced: on Robusta clusters the
+        # two formats do agree and that arm is the only thing closing those events
+        # (`service_deleted` closes 384 events in 21 days on production). Unlike
+        # the `!= ALL(...)` predicate that caused #36550, `= ANY(...)` matches only
+        # the resources this deletion actually named, so it cannot over-close.
         close_events_with_history(
             cloud_account_id=cloud_account_id,
-            where_conditions="service_key = ANY(%s)",
-            params=[service_keys],
+            where_conditions="(cloud_resource_id = ANY(%s::uuid[]) OR service_key = ANY(%s))",
+            params=[resource_ids, service_keys],
             closing_reason="resource_deleted",
             metadata={
                 "method": "process_deleted_resources",
@@ -1121,10 +1560,14 @@ def process_deleted_resources(cloud_account_id, deleted_resources, tenant):
             [cloud_account_id, tenant, resource_ids],
         )
 
-        database.run_query(
-            "UPDATE k8s_workloads SET is_active = false "
-            "WHERE cloud_account_id = %s AND tenant_id = %s AND cloud_resource_id = ANY(%s::uuid[])",
-            [cloud_account_id, tenant, resource_ids],
+        record_deleted_workloads(
+            database.run_query(
+                "UPDATE k8s_workloads SET is_active = false "
+                "WHERE cloud_account_id = %s AND tenant_id = %s AND cloud_resource_id = ANY(%s::uuid[]) "
+                "AND is_active = true "
+                "RETURNING cloud_resource_id, kind",
+                [cloud_account_id, tenant, resource_ids],
+            )
         )
 
 
@@ -1352,20 +1795,27 @@ def extract_disabled_nodes(cloud_account_id, deleted_resources, tenant):
     delete_resources(cloud_account_id, deleted_resources)
     if len(deleted_resources) > 0:
         resource_ids = list(deleted_resources)
-        database.run_query(
-            "UPDATE k8s_nodes SET is_active = false "
-            "WHERE cloud_account_id = %s AND tenant_id = %s AND cloud_resource_id = ANY(%s::uuid[])",
-            [cloud_account_id, tenant, resource_ids],
+        record_deleted_nodes(
+            database.run_query(
+                "UPDATE k8s_nodes SET is_active = false "
+                "WHERE cloud_account_id = %s AND tenant_id = %s AND cloud_resource_id = ANY(%s::uuid[]) "
+                "AND is_active = true "
+                "RETURNING name",
+                [cloud_account_id, tenant, resource_ids],
+            )
         )
 
 
 def handle_full_load_node_updates(tenant, cloud_account_id, nodes_data):
     node_ids = list(nodes_data)
-    database.run_query(
-        "UPDATE k8s_nodes SET is_active = false "
-        "WHERE cloud_account_id = %s AND tenant_id = %s "
-        "AND cloud_resource_id != ALL(%s) AND is_active = true",
-        [cloud_account_id, tenant, node_ids],
+    record_deleted_nodes(
+        database.run_query(
+            "UPDATE k8s_nodes SET is_active = false "
+            "WHERE cloud_account_id = %s AND tenant_id = %s "
+            "AND cloud_resource_id != ALL(%s) AND is_active = true "
+            "RETURNING name",
+            [cloud_account_id, tenant, node_ids],
+        )
     )
 
     database.run_query(
@@ -1493,13 +1943,22 @@ def run_job_discovery(
         if k8s_data["deleted"]:
             deleted_resources.append(_id)
             continue
+        # The agent names this value `updated_at` for Jobs and CronJobs but
+        # `update_time` for Deployments/StatefulSets/DaemonSets (jobDict vs
+        # serviceDict). Resolve it once, accept either name, and use it for both
+        # halves of the record -- they used to read different keys, so the
+        # cloud_resourses row was correct while the k8s_workloads row fell through
+        # to `or 0` and landed at 1970-01-01. On dev that was every Job (82) and
+        # every CronJob (4), while no other kind was affected. Accepting either
+        # name fixes agents that are already deployed.
+        seen_at_ms = k8s_data.get("update_time") or k8s_data.get("updated_at") or 0
         cloud_resource = {
             "id": _id,
             "region": "global",
             "arn": "k8s://" + k8s_data["service_key"],
             "tenant": tenant,
             "first_seen": k8s_data["created_at"],
-            "last_seen": utc_from_epoch_millis(k8s_data["updated_at"]).isoformat(),
+            "last_seen": utc_from_epoch_millis(seen_at_ms).isoformat(),
             "resourse_id": k8s_data["service_key"],
             "name": k8s_data["name"],
             "account": cloud_account_id,
@@ -1540,7 +1999,7 @@ def run_job_discovery(
             "labels": k8s_data.get("config", {}).get("labels", {}),
             "meta": meta,
             "name": k8s_data.get("name", ""),
-            "last_seen": utc_from_epoch_millis(k8s_data.get("update_time") or 0).isoformat(),
+            "last_seen": utc_from_epoch_millis(seen_at_ms).isoformat(),
             "kind": k8s_data.get("type", ""),
         }
         if _id not in resources:
@@ -2070,7 +2529,12 @@ def close_events_with_history(
 def run_status_update(data: Dict[str, Any], tenant: str, cloud_account_id: str):
     service_keys = []
     for value in data:
-        if "new_status" in value and value["new_status"].lower() in ["succeeded", "running"]:
+        # "running" is NOT a recovery signal: a pod stuck in CrashLoopBackOff reports
+        # phase=Running between restarts, so accepting it closed live crashloop events
+        # the moment the legacy agent reported a status change. "succeeded" is terminal
+        # and safe. Workload-level recovery is handled by
+        # close_events_for_recovered_workloads, which uses ready_pods/total_pods.
+        if "new_status" in value and value["new_status"].lower() == "succeeded":
             service_keys.append(value["service_key"])
 
     if len(service_keys) == 0:

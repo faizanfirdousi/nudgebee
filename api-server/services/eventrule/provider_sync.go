@@ -34,15 +34,15 @@ type syncableProvider struct {
 	// *_webhook source so a synced definition lands on the same row as the
 	// webhook that reports its firings, keeping one row per rule in the UI.
 	//
-	// Consequence, deliberate: upsertEventRule guards `expr`, `duration` and
-	// `alert_type` behind `EXCLUDED.source NOT LIKE '%\_webhook'`, so on a row
-	// that already exists those three fields are NOT refreshed by a sync —
-	// only external_rule_id / provider_config / metric_provider are (their
-	// guards have an extra OR for a webhook-sourced existing row). A rule the
-	// sync creates first gets everything; a rule the webhook created first
-	// keeps the webhook's expr. Relaxing those guards would reopen #33024,
-	// where firing webhooks blanked agent-synced PromQL, because source is the
-	// only signal separating a firing from a definition.
+	// Because this source ends in `_webhook`, it also matches upsertEventRule's
+	// firing guard on `expr` / `duration` / `alert_type`. That used to mean a
+	// sync could never refresh those fields on a row the webhook created first,
+	// so an ES rule stayed pinned to the per-instance `{{context.conditions}}`
+	// text the first firing happened to carry. SyncProviderRules therefore
+	// passes upsertEventRule's `isDefinition` argument, which is the real
+	// signal separating a firing from a definition — source no longer has to
+	// carry that meaning. #33024 (firing webhooks blanking agent-synced PromQL)
+	// stays fixed: firings arrive via CreateEventRule, which passes false.
 	ruleSource string
 	// reconcileDeletions says whether "absent from the listing" can be trusted
 	// to mean "deleted upstream". False where a *successful* listing may still
@@ -57,12 +57,21 @@ var syncableProviders = map[string]syncableProvider{
 	"dynatrace": {"dynatrace", "user", "dynatrace_webhook", true},
 	"signoz":    {"signoz", "user", "signoz_webhook", true},
 	"splunk":    {"splunk_observability_platform", "user", "splunk_webhook", true},
+	// CubeAPM's admin API returns the full rule set in one call with no
+	// permission filtering, so an absent rule can be trusted to mean deleted.
+	"cubeapm": {"cubeapm", "user", "cubeapm_webhook", true},
 	// Kibana filters _find by the caller's Kibana feature privileges and still
 	// returns 200 — a credential holding feature_stackAlerts.read but not
 	// feature_logs.read sees a subset, with `total` reporting only the visible
 	// rules. There is no signal to distinguish that from rules having been
 	// deleted, so deletions are never reconciled for this source.
 	"elasticsearch": {"ES", "user", "elasticsearch_webhook", false},
+	// The direct (agentless) Prometheus only: an in-cluster agent pushes its own
+	// inventory through the collector. Rows land on the Alertmanager webhook's
+	// source so a synced definition and the firings the webhook reports share one
+	// row; that source name predates the *_webhook convention, hence the exception
+	// in TestSyncableProvidersAreWellFormed.
+	"prometheus": {"prometheus", "user", "prometheus_alertmanager_webhook", true},
 }
 
 // SyncableProviders lists the source values SyncProviderRules accepts, whether
@@ -225,7 +234,11 @@ func SyncProviderRules(sc *security.RequestContext, accountId, source string) (P
 			accountId, tenantId,
 			ruleSource, "alert", normalizeSyncSeverity(rule.Severity), rule.Enabled,
 			rule.AlertType, provider, providerSource,
-			rule.ExternalRuleId, rule.ProviderConfig)
+			// isDefinition: these rules were read from the provider's own rule
+			// API, so they ARE the definition. Without this the write lands under
+			// a *_webhook ruleSource and upsertEventRule's firing guard discards
+			// the query on every rule that already has a row.
+			rule.ExternalRuleId, rule.ProviderConfig, true)
 		if err != nil {
 			// One malformed rule must not abort the whole sync.
 			result.Skipped++

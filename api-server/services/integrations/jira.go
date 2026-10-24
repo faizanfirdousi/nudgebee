@@ -3,6 +3,9 @@ package integrations
 import (
 	"context"
 	"fmt"
+	"net/http"
+	neturl "net/url"
+	"strings"
 	"time"
 
 	"github.com/andygrunwald/go-jira"
@@ -19,6 +22,22 @@ const (
 	JiraConfigPriorities    = "priorities"
 	JiraConfigLastConnected = "last_connected"
 )
+
+// Jira auth types. Cloud and Server/Data Center username+password both use HTTP
+// Basic; Data Center personal access tokens must be sent as a bearer token and
+// are rejected with 401 over Basic. Existing integrations store "token" or have
+// no auth_type row, and both keep resolving to Basic.
+//
+// ticket-server and llm-server build their own Jira clients from the same
+// stored config, so a change here must be mirrored there.
+const (
+	JiraAuthToken         = "token"
+	JiraAuthDataCenterPAT = "datacenter_pat"
+)
+
+func jiraIsDataCenterPAT(authType string) bool {
+	return strings.TrimSpace(authType) == JiraAuthDataCenterPAT
+}
 
 func init() {
 	core.RegisterIntegration(Jira{})
@@ -39,25 +58,28 @@ func (j Jira) Category() core.IntegrationCategory {
 func (j Jira) ConfigSchema() core.IntegrationSchema {
 	return core.IntegrationSchema{
 		Type:     core.ToolSchemaTypeObject,
-		Required: []string{JiraConfigUrl, JiraConfigUsername, JiraConfigPassword},
+		Required: []string{JiraConfigUrl, JiraConfigPassword},
 		Properties: map[string]core.IntegrationSchemaProperty{
 			JiraConfigUrl: {
 				Type:        core.ToolSchemaTypeString,
 				Description: "Jira instance URL (e.g., company.atlassian.net)",
 			},
 			JiraConfigUsername: {
-				Type:        core.ToolSchemaTypeString,
-				Description: "Jira username or email",
+				Type:         core.ToolSchemaTypeString,
+				Description:  "Jira username or email",
+				ShowWhen:     map[string]any{JiraConfigAuthType: []any{JiraAuthToken}},
+				RequiredWhen: map[string]any{JiraConfigAuthType: []any{JiraAuthToken}},
 			},
 			JiraConfigPassword: {
 				Type:        core.ToolSchemaTypeString,
-				Description: "API token or password",
+				Description: "API token, password, or Data Center personal access token — whichever the selected authentication method uses",
 				IsEncrypted: true,
 			},
 			JiraConfigAuthType: {
 				Type:        core.ToolSchemaTypeString,
-				Description: "Authentication type (token or application)",
-				Default:     "token",
+				Description: "Authentication method: username + API token/password (Cloud or Data Center), or Data Center personal access token",
+				Default:     JiraAuthToken,
+				Enum:        []any{JiraAuthToken, JiraAuthDataCenterPAT},
 			},
 			JiraConfigProjects: {
 				Type:        core.ToolSchemaTypeString,
@@ -79,6 +101,7 @@ func (j Jira) ValidateConfig(ctx *security.SecurityContext, values []core.Integr
 	url := ""
 	username := ""
 	password := ""
+	authType := ""
 
 	// Extract config values
 	for _, config := range values {
@@ -89,6 +112,8 @@ func (j Jira) ValidateConfig(ctx *security.SecurityContext, values []core.Integr
 			username = config.Value
 		case JiraConfigPassword:
 			password = config.Value
+		case JiraConfigAuthType:
+			authType = config.Value
 		}
 	}
 
@@ -96,15 +121,18 @@ func (j Jira) ValidateConfig(ctx *security.SecurityContext, values []core.Integr
 	if url == "" {
 		return []error{fmt.Errorf("jira url is required")}
 	}
-	if username == "" {
+	if username == "" && !jiraIsDataCenterPAT(authType) {
 		return []error{fmt.Errorf("jira username is required")}
 	}
 	if password == "" {
 		return []error{fmt.Errorf("jira password/token is required")}
 	}
+	if u, err := neturl.Parse(normalizeJiraURL(url)); err != nil || u.Host == "" {
+		return []error{fmt.Errorf("jira url %q is not a valid address; use a host such as company.atlassian.net or jira.company.com/jira", url)}
+	}
 
 	// Test connection by creating client and fetching projects
-	jiraClient, err := newJiraClient(url, username, password, 15*time.Second)
+	jiraClient, err := newJiraClient(url, authType, username, password, 15*time.Second)
 	if err != nil {
 		return []error{err}
 	}
@@ -130,35 +158,73 @@ const (
 	jiraMaxPages     = 200 // safety cap → up to 10k users
 )
 
-// newJiraClient builds a basic-auth Jira client for the given instance with the
-// supplied request timeout. Shared by ValidateConfig and ListUsers so the client
-// construction lives in one place.
-func newJiraClient(url, username, password string, timeout time.Duration) (*jira.Client, error) {
-	tp := jira.BasicAuthTransport{Username: username, Password: password}
-	httpClient := tp.Client()
+// normalizeJiraURL turns the stored Jira "url" config value into a base URL. The
+// value is whatever the tenant typed: a bare host, a host with a context path
+// ("jira.company.com/jira"), or a full address with https:// or http://. A scheme
+// is added only when none is present, so http:// instances keep working, and
+// trailing slashes are dropped. Keep in step with ticket-server's NormalizeJiraURL
+// and llm-server's sanitizeURL.
+func normalizeJiraURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	lower := strings.ToLower(raw)
+	if !strings.HasPrefix(lower, "http://") && !strings.HasPrefix(lower, "https://") {
+		raw = "https://" + raw
+	}
+	u, err := neturl.Parse(raw)
+	if err != nil {
+		return strings.TrimRight(raw, "/")
+	}
+	return strings.TrimRight(u.String(), "/")
+}
+
+// newJiraClient builds a Jira client for the given instance with the supplied
+// request timeout: bearer auth for Data Center personal access tokens, Basic
+// otherwise. Shared by ValidateConfig and ListUsers so the client construction
+// lives in one place.
+func newJiraClient(url, authType, username, password string, timeout time.Duration) (*jira.Client, error) {
+	var httpClient *http.Client
+	if jiraIsDataCenterPAT(authType) {
+		tp := jira.BearerAuthTransport{Token: password}
+		httpClient = tp.Client()
+	} else {
+		tp := jira.BasicAuthTransport{Username: username, Password: password}
+		httpClient = tp.Client()
+	}
 	httpClient.Timeout = timeout
-	client, err := jira.NewClient(httpClient, "https://"+url)
+	client, err := jira.NewClient(httpClient, normalizeJiraURL(url))
 	if err != nil {
 		return nil, fmt.Errorf("jira: failed to create client: %w", err)
 	}
 	return client, nil
 }
 
-// ListUsers enumerates Jira users for identity sync via the bulk users/search
-// endpoint. Jira Cloud frequently omits emailAddress (GDPR), in which case the
-// account is login-only (manual-map, like GitHub); Server/DC returns the email.
+// ListUsers enumerates Jira users for identity sync. Cloud serves the bulk
+// users/search endpoint; Server/Data Center lacks it and instead matches every
+// user through user/search with a wildcard username. Jira Cloud frequently
+// omits emailAddress (GDPR), in which case the account is login-only
+// (manual-map, like GitHub); Server/DC returns the email.
 // Implements core.UserLister.
 func (j Jira) ListUsers(ctx context.Context, values []core.IntegrationConfigValue) ([]core.ExternalUser, error) {
 	url := core.ConfigValue(values, JiraConfigUrl)
 	username := core.ConfigValue(values, JiraConfigUsername)
 	password := core.ConfigValue(values, JiraConfigPassword)
-	if url == "" || username == "" || password == "" {
+	authType := core.ConfigValue(values, JiraConfigAuthType)
+	if url == "" || password == "" || (username == "" && !jiraIsDataCenterPAT(authType)) {
 		return nil, fmt.Errorf("jira: url, username and password/token are required")
 	}
 
-	jiraClient, err := newJiraClient(url, username, password, 20*time.Second)
+	jiraClient, err := newJiraClient(url, authType, username, password, 20*time.Second)
 	if err != nil {
 		return nil, err
+	}
+
+	cloud, err := jiraIsCloud(ctx, jiraClient)
+	if err != nil {
+		return nil, fmt.Errorf("jira: detect deployment: %w", err)
+	}
+	listPath := "rest/api/2/users/search?"
+	if !cloud {
+		listPath = "rest/api/2/user/search?username=.&"
 	}
 
 	var out []core.ExternalUser
@@ -166,7 +232,7 @@ func (j Jira) ListUsers(ctx context.Context, values []core.IntegrationConfigValu
 		if err := ctx.Err(); err != nil {
 			return out, err
 		}
-		endpoint := fmt.Sprintf("rest/api/2/users/search?startAt=%d&maxResults=%d", page*jiraUserPageSize, jiraUserPageSize)
+		endpoint := fmt.Sprintf("%sstartAt=%d&maxResults=%d", listPath, page*jiraUserPageSize, jiraUserPageSize)
 		req, err := jiraClient.NewRequestWithContext(ctx, "GET", endpoint, nil)
 		if err != nil {
 			return nil, fmt.Errorf("jira: build request: %w", err)
@@ -188,6 +254,22 @@ func (j Jira) ListUsers(ctx context.Context, values []core.IntegrationConfigValu
 		}
 	}
 	return out, nil
+}
+
+// jiraIsCloud reports whether the instance is Jira Cloud rather than
+// Server/Data Center, which expose different user endpoints.
+func jiraIsCloud(ctx context.Context, jiraClient *jira.Client) (bool, error) {
+	req, err := jiraClient.NewRequestWithContext(ctx, "GET", "rest/api/2/serverInfo", nil)
+	if err != nil {
+		return false, err
+	}
+	var info struct {
+		DeploymentType string `json:"deploymentType"`
+	}
+	if _, err := jiraClient.Do(req, &info); err != nil {
+		return false, err
+	}
+	return strings.EqualFold(info.DeploymentType, "Cloud"), nil
 }
 
 // mapJiraUser converts a Jira user to an ExternalUser, skipping app/bot accounts

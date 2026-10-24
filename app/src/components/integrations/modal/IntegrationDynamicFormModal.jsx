@@ -1,5 +1,6 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import PropTypes from 'prop-types';
+import { getBrandTitle } from '@hooks/useTenantBranding';
 import { FormControlLabel, Box, Typography, Grid, Collapse } from '@mui/material';
 import KeyboardArrowDownIcon from '@mui/icons-material/KeyboardArrowDown';
 import VisibilityIcon from '@mui/icons-material/Visibility';
@@ -8,9 +9,11 @@ import { Switch } from '@ui/Switch';
 import { Checkbox } from '@ui/Checkbox';
 import { Input } from '@ui/Input';
 import FilterDropdown from '@ui/FilterDropdown';
+import Tooltip from '@ui/Tooltip';
 import apiUser from '@api1/user';
 import { Modal } from '@ui/Modal';
 import { Button } from '@ui/Button';
+import { Link } from '@ui/Link';
 import apiIntegrations from '@api1/integrations';
 import observability from '@api1/observability';
 import { ENCRYPTED_MASK } from '@api1/integrations/helpers';
@@ -26,24 +29,162 @@ import apiTicketIntegrations from '@api1/tickets';
 import cache from '@lib/cache';
 import VmAgentCredentialsDialog from './VmAgentCredentialsDialog';
 import { docsUrl } from '@lib/externalUrls';
+import ModelAliasList from '@components/common/forms/ModelAliasList';
+import LabelMappingCards, { parseLogLabelMappings, serializeLogLabelMappings } from './LabelMappingCards';
+import useLogFieldOptions, { fieldOptionsKey, indexForAccount } from './useLogFieldOptions';
+import DefaultFiltersCard, { emptyFilterCard, hasCardMissingAccount, parseDefaultFilters, serializeDefaultFilters } from './DefaultFiltersCard';
+import { TRACE_LABEL_ADVANCED_FIELDS, TRACE_LABEL_FIELDS } from '@components/common/settings/labelMapperFields';
+
+// Array-typed config fields travel as one comma-joined string in
+// integration_config_values; chips may be plain values or {label, value}.
+const joinConfigArray = (values) => values.map((v) => (v && typeof v === 'object' ? v.value : v)).join(',');
 
 // Group-header icon for the account dropdown — maps a group (the account's
 // cloud_provider: K8S/AWS/Azure/GCP) to its provider icon. Same pattern as the
 // Account filter on the Troubleshoot/Events page.
 const renderAccountGroupIcon = (provider) => <CloudProviderIcon cloud_provider={provider} width='16px' height='16px' />;
 
+// Drop the on-demand validation results the edit just invalidated. Cards are matched
+// by index, so any change in card count clears everything; otherwise only the cards
+// whose contents actually differ lose their result.
+const dropStaleValidation = (validation, prevCards, nextCards) => {
+  if (prevCards.length !== nextCards.length) return {};
+  const next = { ...validation };
+  nextCards.forEach((card, idx) => {
+    if (JSON.stringify(card) !== JSON.stringify(prevCards[idx])) next[idx] = undefined;
+  });
+  return next;
+};
+
 // Log/observability integrations that support per-account "Default Log Filters"
 // (always-apply where-clause filters injected into every log query for the account).
-const LOG_FILTER_INTEGRATIONS = new Set(['pinot', 'ES', 'loki', 'signoz', 'openobserve', 'datadog', 'dynatrace', 'chronosphere']);
+// The add flow receives an empty object rather than undefined, so presence alone does not
+// distinguish add from edit.
+const hasEditData = (editData) => !!(editData && Object.keys(editData).length > 0);
+
+const LOG_FILTER_INTEGRATIONS = new Set([
+  'pinot',
+  'ES',
+  'elasticsearch',
+  'loki',
+  'signoz',
+  'openobserve',
+  'cubeapm',
+  'datadog',
+  'dynatrace',
+  'chronosphere',
+  'splunk_enterprise',
+]);
+
+// Trace integrations that support per-account "Default Trace Filters". Members are the
+// providers getTraceSource actually serves AND that have an integration form, so the
+// card never appears where a saved value could not be read back. Note the differences
+// from the log set above: 'otel_clickhouse' (the agent trace provider) rather than
+// 'clickhouse' (an unrelated database integration), and no 'signoz' — signoz has no
+// trace source today. 'gcp' is resolver-synthesized and has no form at all.
+// Also gates the Trace Label Mapping section. Deliberately NOT keyed off
+// `config.properties?.trace_label_mappings` the way the log mapping is: the backend
+// injects that property for every Log AND ObservabilityPlatform integration, which is
+// broader than the set getTraceSource serves — a schema-driven gate would render a dead
+// trace section on loki, pinot and hive.
+const TRACE_INTEGRATIONS = new Set([
+  'otel_clickhouse',
+  'jaeger',
+  'chronosphere',
+  'datadog',
+  'dynatrace',
+  'ES',
+  'elasticsearch',
+  'openobserve',
+  'newrelic',
+  'splunk_observability_platform',
+  'solarwinds',
+  'azure_app_insights',
+  'splunk_enterprise',
+  'cubeapm',
+]);
+
+// Canonical trace field names, reused from the Settings trace label mapper so the two
+// screens cannot drift: the server stores and applies trace filters in exactly this
+// vocabulary (canonicalTraceFields in observability/service.go).
+const ALL_TRACE_LABEL_FIELDS = [...TRACE_LABEL_FIELDS, ...TRACE_LABEL_ADVANCED_FIELDS];
+
+// Label stays the bare canonical name on purpose: these dropdowns are inputs whose VALUE
+// is the canonical field, and the Default Trace Filters card round-trips the displayed
+// text. The human names are used where they read as prose — the effective-mapping panel.
+const CANONICAL_TRACE_FIELD_OPTIONS = ALL_TRACE_LABEL_FIELDS.map(({ field }) => ({
+  label: field,
+  value: field,
+}));
+
+// canonical -> human name, and the order an operator meets these fields on the Settings
+// trace mapper: the five most-retuned first, the rarer ones behind its disclosure after.
+// Reused rather than re-listed so the panel, the mapper and the filter dropdown cannot
+// drift.
+const TRACE_CONCEPT_LABELS = Object.fromEntries(ALL_TRACE_LABEL_FIELDS.map(({ field, label }) => [field, label]));
+const TRACE_CONCEPT_ORDER = ALL_TRACE_LABEL_FIELDS.map(({ field }) => field);
+
+// Alert Template body NudgeBee expects from OpenObserve. Every `{variable}` is
+// substituted by OpenObserve at delivery; the k8s_* keys resolve from the
+// matching stream row and are simply dropped when the stream has no such field,
+// so the same template works for log, metric and trace alerts.
+const OPENOBSERVE_ALERT_TEMPLATE = `{
+  "alert_name": "{alert_name}",
+  "alert_type": "{alert_type}",
+  "stream_name": "{stream_name}",
+  "stream_type": "{stream_type}",
+  "org_name": "{org_name}",
+  "alert_period": "{alert_period}",
+  "alert_operator": "{alert_operator}",
+  "alert_threshold": "{alert_threshold}",
+  "alert_count": "{alert_count}",
+  "alert_agg_value": "{alert_agg_value}",
+  "alert_start_time": "{alert_start_time}",
+  "alert_end_time": "{alert_end_time}",
+  "alert_url": "{alert_url}",
+  "severity": "{severity}",
+  "k8s_cluster_name": "{k8s_cluster_name}",
+  "k8s_namespace_name": "{k8s_namespace_name}",
+  "k8s_pod_name": "{k8s_pod_name}",
+  "k8s_deployment_name": "{k8s_deployment_name}",
+  "k8s_node_name": "{k8s_node_name}",
+  "service_name": "{service_name}"
+}`;
 
 // Display labels for enum values whose stored form doesn't title-case into
 // something readable. Values not listed here fall back to snakeToTitleCase.
 const ENUM_VALUE_LABELS = {
   vm_agent: 'Proxy Agent',
+  // Prometheus auth_type values that snakeToTitleCase mangles ("Aws Sigv4",
+  // "Azure Ad"). The scheme's other values ('none', 'basic', 'bearer_token',
+  // 'coralogix') title-case correctly and are shared with other integrations,
+  // so they are deliberately left alone.
+  aws_sigv4: 'AWS SigV4 (Amazon Managed Prometheus)',
+  azure_ad: 'Azure AD (Azure Monitor managed Prometheus)',
+  // snakeToTitleCase would render "Mimir Cortex", which names neither the API nor
+  // Grafana Cloud — the deployments an operator is actually choosing between.
+  mimir_cortex: 'Mimir / Cortex / Grafana Cloud',
   cloud_api_token: 'Confluence Cloud — email + API token',
   datacenter_pat: 'Data Center / Server — personal access token',
   datacenter_password: 'Data Center / Server — username + password',
+  // Elasticsearch trace_schema. snakeToTitleCase renders these as "Data Prepper",
+  // "Otel Native" and "Elastic Apm" — none of which names the thing that WROTE the
+  // data, which is what the operator actually knows. Each label pairs the writer
+  // with the index pattern it produces, since that is how they recognise it.
+  data_prepper: 'Data Prepper (otel-v1-apm-span-*)',
+  otel_native: 'OpenTelemetry native (traces-*.otel)',
+  elastic_apm: 'Elastic APM Server (traces-apm*)',
 };
+
+// Options for the per-account Trace Schema selector in the ES "Per-Account Index"
+// cards. The top-level trace_schema field is schema-driven and gets its options from
+// the integration's Enum automatically; these cards are hand-built, so the same set is
+// listed here. Keep in sync with ESTraceSchemas in
+// api-server/services/integrations/elasticsearch.go.
+const ES_TRACE_SCHEMA_OPTIONS = ['data_prepper', 'otel_native', 'elastic_apm'].map((value) => ({
+  label: ENUM_VALUE_LABELS[value],
+  value,
+}));
 
 const COMMON_WEBHOOK_LABEL_KEYS = [
   'alertname',
@@ -83,11 +224,21 @@ const COMMON_WEBHOOK_LABEL_KEYS = [
   'rule_type',
 ];
 
+/**
+ * `editData`'s default of `null` with no other annotation left TypeScript
+ * inferring the prop as `null | undefined` for any `.tsx` caller — narrower
+ * than what the component actually does with it (`editData.integrations_cloud_accounts`,
+ * `editData?.source`, …), just never hit before because every caller so far
+ * has been a `.jsx` file, unchecked either way. `propTypes` below already
+ * documents it as `PropTypes.object`; this just gives that same fact to `tsc`.
+ * @param {{ editData?: Record<string, unknown> | null }} props
+ */
 const IntegrationDynamicFormModal = ({
   integrationName,
   openModal,
   handleClose,
   title,
+  subtitle,
   integrationData = [],
   editData = null,
   listIntegrationConfigurationById,
@@ -112,9 +263,27 @@ const IntegrationDynamicFormModal = ({
   // Per-account "Default Log Filters" (log integrations only): each card is an
   // account + a list of key=value filters always AND-ed into that account's log queries.
   const [defaultFilterRules, setDefaultFilterRules] = useState([{ accountId: '', filters: [{ key: '', value: '' }] }]);
-  // Per-account ES index override (Advanced Settings): each card maps an account to
-  // its own log/metrics/trace index; unmapped accounts fall back to the top-level index.
-  const [indexRules, setIndexRules] = useState([{ accountId: '', log_index: '', metrics_index: '', trace_index: '' }]);
+  // Per-account "Default Trace Filters" (trace integrations only). Same editor and the
+  // same stored shape as the log filters above, but a SEPARATE config value: one
+  // integration record commonly serves both logs and traces, so a shared list would
+  // apply log filters to trace queries.
+  const [defaultTraceFilterRules, setDefaultTraceFilterRules] = useState([emptyFilterCard()]);
+  // Per-account ES override (Advanced Settings): each card maps an account to its own
+  // log/metrics/trace index, plus the trace schema that index is in; unmapped accounts
+  // fall back to the top-level values.
+  const [indexRules, setIndexRules] = useState([{ accountId: '', log_index: '', metrics_index: '', trace_index: '', trace_schema: '' }]);
+  // Per-account canonical -> provider log field mapping (Advanced Settings). Highest
+  // precedence layer of the mapping merge, above the account and tenant settings.
+  const [labelMappingCards, setLabelMappingCards] = useState([{ accountId: '', rows: [{ canonical: '', field: '' }] }]);
+  // The same cards as first hydrated from the saved config, so each card can tell an
+  // in-progress edit from a mapping that is already live.
+  const [savedLabelMappingCards, setSavedLabelMappingCards] = useState([]);
+  // Per-account canonical -> provider TRACE field mapping (Advanced Settings). Same
+  // tier and the same stored shape as the log mapping above, under a separate config
+  // value for the reason the trace filters are separate: one integration record
+  // commonly serves both signals.
+  const [traceLabelMappingCards, setTraceLabelMappingCards] = useState([{ accountId: '', rows: [{ canonical: '', field: '' }] }]);
+  const [savedTraceLabelMappingCards, setSavedTraceLabelMappingCards] = useState([]);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   // On-demand column validation per card: { [cardIdx]: { loading, done, invalid: [colNames] } }.
   const [columnValidation, setColumnValidation] = useState({});
@@ -125,7 +294,11 @@ const IntegrationDynamicFormModal = ({
   const [providerFields, setProviderFields] = useState([]);
   const [vmAgentCredentials, setVmAgentCredentials] = useState(null);
   const [isTesting, setIsTesting] = useState(false);
-  const [connectionVerified, setConnectionVerified] = useState(!!editData);
+  // Object.keys, not !!editData: ListIntegrations passes `editData={selectedIntegration || {}}`,
+  // so the add flow receives an empty object and `!!{}` is true — a brand-new integration
+  // started out "verified" and every Advanced Settings editor rendered before a single
+  // connection had been proven. Matches the `isEdit` test used further down.
+  const [connectionVerified, setConnectionVerified] = useState(hasEditData(editData));
   // Which encrypted secret fields are currently revealed (eye toggle), keyed by field key.
   const [revealedSecrets, setRevealedSecrets] = useState({});
   // Cluster indices for the ES per-account index picker; fetched once the
@@ -140,6 +313,21 @@ const IntegrationDynamicFormModal = ({
   })();
 
   const isAgentSource = editData?.source === 'agent';
+
+  // Advanced Settings editors are gated on a proven connection, because their dropdowns
+  // are filled from the backend. But a provider whose schema is not `testable` renders no
+  // Test Connection button — agent-sourced ES and Loki are the live cases — so gating them
+  // on it strands the add flow behind an instruction the user cannot follow. Nothing to
+  // verify means nothing to wait for; their config is the relay agent, not a URL in this
+  // form, so there is no unsaved endpoint to preview either.
+  const advancedSettingsUnlocked = !isTestable || connectionVerified;
+
+  // Gated on the backend's own answer — it emits the `log_label_mappings` property
+  // only for integrations that resolve to a real log source. No provider list lives
+  // here, so this cannot drift from what a save will accept. LOG_FILTER_INTEGRATIONS is
+  // deliberately not reused: it excludes ES, the provider with no other way to set a
+  // mapping at all.
+  const supportsLogLabelMapping = !!config.properties?.log_label_mappings;
 
   useEffect(() => {
     if (openModal && isAgentSource && editData?.integrations_cloud_accounts) {
@@ -171,7 +359,7 @@ const IntegrationDynamicFormModal = ({
 
   useEffect(() => {
     if (openModal) {
-      setConnectionVerified(!!editData);
+      setConnectionVerified(hasEditData(editData));
       setIsLoadingSchema(true);
       const fetchData = async (configs) => {
         const updatedConfig = { ...configs };
@@ -186,7 +374,23 @@ const IntegrationDynamicFormModal = ({
         //   never cloud-eligible, hence !isAgentSource.
         // 'es' is the ES page's integrationName (account-form.jsx passes {'ES'}); the
         // check lowercases it, so 'es' — not 'elasticsearch' — is what matches here.
-        const CLOUD_CAPABLE_INTEGRATIONS = ['datadog', 'observe', 'dynatrace', 'splunk_observability_platform', 'solarwinds', 'elasticsearch', 'es'];
+        // chronosphere/jaeger: both are hosted/SaaS-reachable backends with no
+        // proprietary k8s-column dependency (unlike the loggly/pinot/hive/
+        // azure_app_insights/signoz group above), and neither carries a documented
+        // product decision restricting it the way New Relic does — their absence
+        // here looked like an oversight, not a decision (interim call, pending
+        // product confirmation — see docs/setup-center-build-spec.md §9).
+        const CLOUD_CAPABLE_INTEGRATIONS = [
+          'datadog',
+          'observe',
+          'dynatrace',
+          'splunk_observability_platform',
+          'solarwinds',
+          'elasticsearch',
+          'es',
+          'chronosphere',
+          'jaeger',
+        ];
         const isWebhook = configs.category === 'incident_webhook' || (integrationName || '').toLowerCase().includes('webhook');
         // The VM agent (forager) is the exception to the !isAgentSource rule above.
         // That rule excludes agent-sourced providers because they need an
@@ -288,6 +492,14 @@ const IntegrationDynamicFormModal = ({
                 // and submit path see a scalar.
                 if (prop.single_select && Array.isArray(val)) {
                   val = val[0] ?? '';
+                }
+                // Array-typed config fields (other than account_id, which has its own
+                // pivot table) are stored as one comma-joined string.
+                if (prop.type === 'array' && key !== 'account_id' && typeof val === 'string') {
+                  val = val
+                    .split(',')
+                    .map((v) => v.trim())
+                    .filter(Boolean);
                 }
                 if (key == 'default_log_provider' || key == 'default_traces_provider' || key == 'default_metrics_provider') {
                   if (editData?.integrations_cloud_accounts?.length) {
@@ -484,19 +696,24 @@ const IntegrationDynamicFormModal = ({
     if (!raw) return;
     const parsed = safeJSONParse(raw);
     if (!Array.isArray(parsed) || parsed.length === 0) return;
-    const normalizeAcc = (a) => (typeof a === 'object' && a !== null ? a.value || '' : a || '');
-    const next = parsed.map((e) => ({
-      accountId: normalizeAcc(e.accountId),
-      filters:
-        Array.isArray(e.filters) && e.filters.length > 0
-          ? e.filters.map((f) => ({ key: f.key || '', value: String(f.value ?? '') }))
-          : [{ key: '', value: '' }],
-    }));
-    setDefaultFilterRules(next);
+    setDefaultFilterRules(parseDefaultFilters(parsed));
+  }, [editData]);
+
+  // Same, for Default Trace Filters. Kept as its own effect rather than folded into
+  // the one above because the two configs are independent: an integration can carry
+  // one, the other, or both.
+  useEffect(() => {
+    const raw = editData?.integration_config_values?.default_trace_filters;
+    if (!raw) return;
+    const parsed = safeJSONParse(raw);
+    if (!Array.isArray(parsed) || parsed.length === 0) return;
+    setDefaultTraceFilterRules(parseDefaultFilters(parsed));
   }, [editData]);
 
   // Hydrate the ES per-account index override from the saved index_account_mapping
-  // blob (JSON array of { account_id, log_index?, metrics_index?, trace_index? }).
+  // blob (JSON array of { account_id, log_index?, metrics_index?, trace_index?,
+  // trace_schema? }). trace_schema rides in the same blob because the layout is a
+  // property of what that account's trace index holds.
   useEffect(() => {
     const raw = editData?.integration_config_values?.index_account_mapping;
     if (!raw) return;
@@ -509,17 +726,45 @@ const IntegrationDynamicFormModal = ({
         log_index: e.log_index || '',
         metrics_index: e.metrics_index || '',
         trace_index: e.trace_index || '',
+        trace_schema: e.trace_schema || '',
       }))
     );
   }, [editData]);
 
-  // Auto-expand Advanced Settings for ES so the Per-Account Index cards are visible
-  // without an extra click (collapsed by default for other integrations).
+  // Hydrate the per-account log label mapping from the saved log_label_mappings blob
+  // (JSON array of { accountId, mappings }).
   useEffect(() => {
-    if (openModal && (integrationName === 'ES' || integrationName === 'elasticsearch')) {
-      setAdvancedOpen(true);
+    const raw = editData?.integration_config_values?.log_label_mappings;
+    if (!raw) {
+      setSavedLabelMappingCards([]);
+      return;
     }
-  }, [openModal, integrationName]);
+    const parsed = parseLogLabelMappings(raw);
+    setLabelMappingCards(parsed);
+    setSavedLabelMappingCards(parsed);
+  }, [editData]);
+
+  // Same, for the trace label mapping. Its own effect rather than folded into the one
+  // above because the two configs are independent: an integration can carry one, the
+  // other, or both.
+  useEffect(() => {
+    const raw = editData?.integration_config_values?.trace_label_mappings;
+    if (!raw) {
+      setSavedTraceLabelMappingCards([]);
+      return;
+    }
+    const parsed = parseLogLabelMappings(raw);
+    setTraceLabelMappingCards(parsed);
+    setSavedTraceLabelMappingCards(parsed);
+  }, [editData]);
+
+  // Advanced Settings stays collapsed on open, for every provider.
+  //
+  // Elasticsearch used to force it open so the Per-Account Index cards were visible
+  // without an extra click. That made sense when the section held one card; it now
+  // holds three (default filters, per-account index, label mapping), so opening the
+  // form dumped the whole panel on you before you had touched anything — and it was
+  // the one provider that behaved differently.
 
   // Hydrate the per-source label mapping (webhook_label_mapping) from the saved
   // config value. Stored as arrays; rendered as arrays for FilterDropdown multi-select.
@@ -651,6 +896,145 @@ const IntegrationDynamicFormModal = ({
       // Sort in descending order (highest priority first)
       return priorityB - priorityA;
     });
+  };
+
+  const renderAdvancedToggle = () => (
+    <Box
+      sx={{ display: 'flex', alignItems: 'center', cursor: 'pointer', mb: ds.space[2] }}
+      onClick={() => setAdvancedOpen((v) => !v)}
+      data-testid='advanced-settings-toggle'
+    >
+      <KeyboardArrowDownIcon
+        sx={{ transform: advancedOpen ? 'rotate(0deg)' : 'rotate(-90deg)', transition: 'transform 0.2s', color: ds.brand[500] }}
+      />
+      <Typography sx={{ color: ds.brand[500], fontSize: 'var(--ds-text-body-lg)', fontWeight: 'var(--ds-font-weight-medium)' }}>
+        Advanced Settings
+      </Typography>
+    </Box>
+  );
+
+  // Form-context-dependent autocomplete (e.g. Hive column names, Confluence
+  // pages), fed by the field's auto_generate_func. freeSolo lets the customer
+  // adopt a typed value that isn't in the suggestions. Array-typed fields
+  // collect several values as chips; the stored form is the comma-joined
+  // values (see joinConfigArray).
+  const renderAutogenField = (key, field, isRequired, errorText) => {
+    const ag = autogenState[key] || { options: [], message: '', loading: false };
+    const isMulti = field.type === 'array';
+    const fieldLabel = field.display_name || snakeToTitleCase(key);
+    // Selected entries also render as a removable row below the field. The
+    // dropdown can only untick what it can list, so a picker whose suggestions
+    // failed to load — an edit form with no re-typed secret, most of all —
+    // leaves the field-level clear as the only way out, and that drops every
+    // entry at once.
+    const selectedValues = isMulti && Array.isArray(formValues[key]) ? formValues[key] : [];
+    const labelForValue = (v) => ag.options.find((opt) => String(opt?.value ?? opt) === String(v))?.label ?? String(v);
+    return (
+      <Box key={`wrapper-${key}`} sx={{ mb: ds.space[1] }}>
+        <Typography
+          variant='body2'
+          sx={{
+            color: ds.gray[400],
+            fontSize: 'var(--ds-text-small)',
+            lineHeight: 1.5,
+            mb: ds.space[2],
+            pl: ds.space[1],
+            display: 'flex',
+            alignItems: 'center',
+            gap: ds.space[1],
+          }}
+        >
+          {field.advanced ? fieldLabel : field.description}
+          {isRequired && <span style={{ color: ds.red[500] }}> *</span>}
+          {field.advanced && (
+            <Tooltip title={field.description} maxWidth='360px'>
+              <Box component='span' sx={{ cursor: 'pointer', display: 'inline-flex', alignItems: 'center' }}>
+                <SafeIcon src={infoIcon} alt='info' width={14} height={14} />
+              </Box>
+            </Tooltip>
+          )}
+        </Typography>
+        <FilterDropdown
+          key={key}
+          id={toKebabCase(field.display_name || key)}
+          label={fieldLabel}
+          options={ag.options}
+          multiple={isMulti}
+          limitTag={3}
+          value={isMulti ? (Array.isArray(formValues[key]) ? formValues[key] : []) : formValues[key] || ''}
+          freeSolo
+          onSelect={(_event, value) =>
+            handleChange(key, isMulti ? (value || []).map((v) => (v && typeof v === 'object' ? v.value : v)) : value?.value ?? value)
+          }
+          isOptionsLoading={ag.loading}
+          sx={{ width: '100%' }}
+          disabled={field.disabled || field.allow_edit === false}
+          searchPlaceholder={field.search_placeholder || 'Search or type to add…'}
+        />
+        {selectedValues.length > 0 && (
+          <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: ds.space[2], mt: ds.space[2] }} data-testid={`${key}-selected`}>
+            {selectedValues.map((v) => (
+              <Box
+                key={String(v)}
+                sx={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: ds.space[1],
+                  border: `1px solid ${ds.gray[200]}`,
+                  borderRadius: 'var(--ds-radius-sm)',
+                  pl: ds.space[2],
+                  pr: ds.space[1],
+                  py: ds.space[1],
+                  fontSize: 'var(--ds-text-small)',
+                  color: ds.gray[600],
+                }}
+              >
+                <span>{labelForValue(v)}</span>
+                <Box
+                  component='button'
+                  type='button'
+                  aria-label={`Remove ${labelForValue(v)}`}
+                  data-testid={`${key}-remove-${String(v)}`}
+                  onClick={() =>
+                    handleChange(
+                      key,
+                      selectedValues.filter((x) => x !== v)
+                    )
+                  }
+                  sx={{
+                    border: 'none',
+                    background: 'none',
+                    cursor: 'pointer',
+                    lineHeight: 1,
+                    padding: ds.space[1],
+                    color: ds.gray[500],
+                    fontSize: 'var(--ds-text-small)',
+                    '&:hover': { color: ds.red[500] },
+                  }}
+                >
+                  ×
+                </Box>
+              </Box>
+            ))}
+          </Box>
+        )}
+        {errorText && (
+          <Typography variant='body2' color='error' sx={{ mt: 0.5, fontSize: 'var(--ds-text-small)' }}>
+            {errorText}
+          </Typography>
+        )}
+        {!errorText && ag.message && (
+          <Typography variant='body2' sx={{ mt: 0.5, fontSize: 'var(--ds-text-caption)', color: ds.gray[400] }}>
+            {ag.message}
+          </Typography>
+        )}
+        {!errorText && !ag.message && !ag.loading && ag.options.length > 0 && (
+          <Typography variant='body2' sx={{ mt: 0.5, fontSize: 'var(--ds-text-caption)', color: ds.gray[400] }}>
+            {ag.options.length} suggestion{ag.options.length === 1 ? '' : 's'}
+          </Typography>
+        )}
+      </Box>
+    );
   };
 
   const handleChange = (key, value) => {
@@ -791,42 +1175,16 @@ const IntegrationDynamicFormModal = ({
     );
   };
 
-  // --- Default Log Filters (per-account) handlers ---
-  // Clear a card's stale validation result whenever it is edited.
-  const clearCardValidation = (cardIdx) => setColumnValidation((prev) => ({ ...prev, [cardIdx]: undefined }));
-  const handleAddDefaultFilterCard = () => {
-    setDefaultFilterRules([...defaultFilterRules, { accountId: '', filters: [{ key: '', value: '' }] }]);
+  // --- Default Log / Trace Filters (per-account) handlers ---
+  // DefaultFiltersCard owns the row and card mutations; the modal only stores the
+  // result and drops validation results the edit invalidated. Only the cards that
+  // actually changed lose their result — clearing all of them would throw away a
+  // neighbouring card's answer on every keystroke.
+  const handleDefaultFilterRulesChange = (next) => {
+    setDefaultFilterRules(next);
+    setColumnValidation((prev) => dropStaleValidation(prev, defaultFilterRules, next));
   };
-  const handleRemoveDefaultFilterCard = (cardIdx) => {
-    setDefaultFilterRules(defaultFilterRules.filter((_, i) => i !== cardIdx));
-    setColumnValidation({}); // indices shift on removal — clear all
-  };
-  const handleDefaultFilterAccountChange = (cardIdx, accountId) => {
-    setDefaultFilterRules(defaultFilterRules.map((c, i) => (i === cardIdx ? { ...c, accountId } : c)));
-    clearCardValidation(cardIdx);
-  };
-  const handleAddDefaultFilterRow = (cardIdx) => {
-    setDefaultFilterRules(defaultFilterRules.map((c, i) => (i === cardIdx ? { ...c, filters: [...c.filters, { key: '', value: '' }] } : c)));
-    clearCardValidation(cardIdx);
-  };
-  const handleRemoveDefaultFilterRow = (cardIdx, rowIdx) => {
-    setDefaultFilterRules(
-      defaultFilterRules.map((c, i) => {
-        if (i !== cardIdx) return c;
-        const next = c.filters.filter((_, j) => j !== rowIdx);
-        return { ...c, filters: next.length > 0 ? next : [{ key: '', value: '' }] };
-      })
-    );
-    clearCardValidation(cardIdx);
-  };
-  const handleDefaultFilterRowChange = (cardIdx, rowIdx, field, value) => {
-    setDefaultFilterRules(
-      defaultFilterRules.map((c, i) =>
-        i === cardIdx ? { ...c, filters: c.filters.map((f, j) => (j === rowIdx ? { ...f, [field]: value } : f)) } : c
-      )
-    );
-    clearCardValidation(cardIdx);
-  };
+
   // On-demand: fetch the card's account log labels and flag any column that isn't a known label.
   const handleValidateCard = async (cardIdx) => {
     const card = defaultFilterRules[cardIdx];
@@ -847,7 +1205,7 @@ const IntegrationDynamicFormModal = ({
 
   // --- Per-account ES index (Advanced Settings) handlers ---
   const handleAddIndexCard = () => {
-    setIndexRules([...indexRules, { accountId: '', log_index: '', metrics_index: '', trace_index: '' }]);
+    setIndexRules([...indexRules, { accountId: '', log_index: '', metrics_index: '', trace_index: '', trace_schema: '' }]);
   };
   const handleRemoveIndexCard = (cardIdx) => {
     setIndexRules(indexRules.filter((_, i) => i !== cardIdx));
@@ -863,15 +1221,21 @@ const IntegrationDynamicFormModal = ({
     setErrors({});
     setShowModal(false);
     setRules([{ match: [{ key: '', value: '' }], accountId: '' }]);
-    setDefaultFilterRules([{ accountId: '', filters: [{ key: '', value: '' }] }]);
+    setDefaultFilterRules([emptyFilterCard()]);
+    setDefaultTraceFilterRules([emptyFilterCard()]);
+    setColumnValidation({});
     setIndexRules([{ accountId: '', log_index: '', metrics_index: '', trace_index: '' }]);
+    setLabelMappingCards([{ accountId: '', rows: [{ canonical: '', field: '' }] }]);
+    setTraceLabelMappingCards([{ accountId: '', rows: [{ canonical: '', field: '' }] }]);
+    setSavedTraceLabelMappingCards([]);
+    setSavedLabelMappingCards([]);
     setAdvancedOpen(false);
     setLabelMapping({ subject_name_labels: [], namespace_labels: [], severity_labels: [] });
     setAgentAccountProviders([]);
     setProviderFields([]);
     setVmAgentCredentials(null);
     setIsTesting(false);
-    setConnectionVerified(!!editData);
+    setConnectionVerified(hasEditData(editData));
     handleClose(trigger);
   };
 
@@ -955,14 +1319,50 @@ const IntegrationDynamicFormModal = ({
         transformedValue = String(value);
       } else if (field?.is_encrypted && editData?.integration_config_values?.[key] && value === ENCRYPTED_MASK) {
         transformedValue = editData?.integration_config_values?.[key];
+      } else if (Array.isArray(value)) {
+        transformedValue = joinConfigArray(value);
       }
       return {
         name: key,
-        value: transformedValue,
-        is_encrypted: field?.is_encrypted && !!editData?.integration_config_values?.[key] && value === ENCRYPTED_MASK,
+        // Both coerced, never left undefined. `&&` yields undefined when the schema
+        // carries no is_encrypted, and callers that inline this into a GraphQL string
+        // (gqlStringify) then emit the bare token `undefined`, which the Go decoder
+        // rejects with "expected type 'bool', got unconvertible type 'string'". The
+        // variables-based callers never saw it, because JSON.stringify drops undefined.
+        value: transformedValue ?? '',
+        is_encrypted: !!(field?.is_encrypted && editData?.integration_config_values?.[key] && value === ENCRYPTED_MASK),
       };
     });
   };
+
+  // One field-list probe shared by both Advanced Settings sections that need it:
+  // Default Log Filters (which column to filter on) and Log Label Mapping (which field
+  // holds each concept) ask the backend the same question. Fires only once the
+  // connection is verified, and clears when it is invalidated.
+  const logFieldAccountPairs = useMemo(() => {
+    const pairs = [];
+    const seen = new Set();
+    const add = (accountId) => {
+      if (!accountId) return;
+      const index = indexForAccount(indexRules, accountId, formValues.log_index);
+      const key = fieldOptionsKey(accountId, index);
+      if (seen.has(key)) return;
+      seen.add(key);
+      pairs.push({ accountId, index });
+    };
+    labelMappingCards.forEach((c) => add(c.accountId));
+    defaultFilterRules.forEach((c) => add(c.accountId));
+    return pairs;
+  }, [labelMappingCards, defaultFilterRules, indexRules, formValues.log_index]);
+
+  const logFieldOptions = useLogFieldOptions({
+    enabled: advancedSettingsUnlocked,
+    provider: integrationName,
+    providerSource: editData?.source || 'user',
+    integrationId: editData?.id,
+    buildProbeConfigValues,
+    accountIndexPairs: logFieldAccountPairs,
+  });
 
   const currentAccountIds = () =>
     Array.isArray(formValues.account_id) ? formValues.account_id : formValues.account_id ? [formValues.account_id] : [];
@@ -999,6 +1399,86 @@ const IntegrationDynamicFormModal = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [openModal, connectionVerified, isLoadingSchema, formValues?.url]);
 
+  // Label names available on the connected Prometheus, shown under the
+  // additional-labels field so the operator knows what to put in the JSON.
+  // metrics_list_labels resolves the endpoint from the SAVED integration row, so
+  // this only runs on edit — a not-yet-created integration has nothing to read.
+  const [promLabels, setPromLabels] = useState([]);
+
+  // Alert delivery for a Prometheus connected without an agent. There is no
+  // runner in the cluster to receive Alertmanager's webhook, so alerts reach
+  // Nudgebee through the public Alertmanager-webhook integration instead — and
+  // an operator setting this up has no way to discover that from this form. On
+  // edit, list the account's Alertmanager webhooks and show the receiver URL
+  // with the account name pinned as the cluster, the same value an agent-
+  // delivered alert would carry.
+  const isDirectPrometheus = integrationName === 'prometheus' && !!editData?.id && editData?.source !== 'agent';
+  const [alertmanagerWebhooks, setAlertmanagerWebhooks] = useState([]);
+
+  useEffect(() => {
+    if (!openModal || !isDirectPrometheus) return;
+    let cancelled = false;
+    apiIntegrations
+      .listIntegrations({ type: 'prometheus_alertmanager_webhook', limit: 50 })
+      .then((res) => {
+        if (!cancelled) {
+          setAlertmanagerWebhooks(res?.data?.data?.integrations_list?.rows || []);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setAlertmanagerWebhooks([]);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [openModal, isDirectPrometheus]);
+
+  // The endpoint returns EVERY label in the Prometheus — hundreds — which is
+  // unusable as a list and overflows the modal. Surface only the ones that
+  // plausibly identify a cluster (what this field is for) and report the rest
+  // as a count, so the hint stays one or two lines.
+  const promLabelHint = useMemo(() => {
+    if (promLabels.length === 0) {
+      return null;
+    }
+    const candidates = promLabels.filter((l) => /cluster|region|environment|^env$|tenant|datacenter|^dc$|site/i.test(l)).slice(0, 8);
+    if (candidates.length === 0) {
+      return `${promLabels.length} labels available on this endpoint — none look cluster-identifying. Type the label name your setup uses.`;
+    }
+    return `Likely cluster labels: ${candidates.join(', ')} — ${promLabels.length} labels available in total.`;
+  }, [promLabels]);
+
+  useEffect(() => {
+    if (!openModal || isLoadingSchema || integrationName !== 'prometheus' || !editData?.id) return;
+    const accountId = currentAccountIds()[0];
+    if (!accountId) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await observability.metricsLabelList(accountId, '');
+        const raw = res?.data?.data?.metrics_list_labels || [];
+        const names = raw
+          .map((l) => (typeof l === 'string' ? l : l?.label))
+          .filter(Boolean)
+          .filter((l) => l !== '__name__');
+        if (!cancelled) {
+          setPromLabels(names);
+        }
+      } catch {
+        // A failed lookup must not block editing: the field still accepts input.
+        if (!cancelled) {
+          setPromLabels([]);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openModal, isLoadingSchema, integrationName, editData?.id, formValues?.account_id]);
+
   const handleTestConnection = async () => {
     if (!validateForm()) return;
     setIsTesting(true);
@@ -1012,7 +1492,16 @@ const IntegrationDynamicFormModal = ({
       );
       if (result?.success) {
         setConnectionVerified(true);
-        snackbar.success(`${snakeToTitleCase(integrationName)} connection successful`);
+        // A passing test can still carry an advisory note — a part of the
+        // integration that is configured but not usable, such as CubeAPM's
+        // alert-rule API answering with a different credential. The note rides in
+        // `message`; showing only the hardcoded string threw it away.
+        const note = (result.message || '').replace(/^Connection successful\.?\s*/, '');
+        if (note) {
+          snackbar.warning(`${snakeToTitleCase(integrationName)} connection successful. ${note}`);
+        } else {
+          snackbar.success(`${snakeToTitleCase(integrationName)} connection successful`);
+        }
       } else {
         snackbar.error(result?.error || `${snakeToTitleCase(integrationName)} connection test failed`);
       }
@@ -1027,20 +1516,43 @@ const IntegrationDynamicFormModal = ({
     if (!validateForm()) {
       return;
     }
-    if (LOG_FILTER_INTEGRATIONS.has(integrationName)) {
+    if (LOG_FILTER_INTEGRATIONS.has(integrationName) && hasCardMissingAccount(defaultFilterRules)) {
       // Any card that has a filter entered must have an account selected.
-      const cardMissingAccount = defaultFilterRules.some(
-        (c) => !c.accountId && (c.filters || []).some((f) => (f.key || '').trim() || (f.value || '').trim())
+      snackbar.error('Default Log Filters: please select an account for each filter card.');
+      return;
+    }
+    if (TRACE_INTEGRATIONS.has(integrationName) && hasCardMissingAccount(defaultTraceFilterRules)) {
+      snackbar.error('Default Trace Filters: please select an account for each filter card.');
+      return;
+    }
+    if (supportsLogLabelMapping) {
+      // Any mapping card with a row entered must have an account selected — without
+      // one there is nothing to attach the mapping to and it would be silently dropped.
+      const mappingCardMissingAccount = labelMappingCards.some(
+        (c) => !c.accountId && (c.rows || []).some((r) => (r.canonical || '').trim() || (r.field || '').trim())
       );
-      if (cardMissingAccount) {
-        snackbar.error('Default Log Filters: please select an account for each filter card.');
+      if (mappingCardMissingAccount) {
+        snackbar.error('Log Label Mapping: please select an account for each mapping card.');
+        return;
+      }
+    }
+    if (showTraceLabelMapping) {
+      const traceMappingCardMissingAccount = traceLabelMappingCards.some(
+        (c) => !c.accountId && (c.rows || []).some((r) => (r.canonical || '').trim() || (r.field || '').trim())
+      );
+      if (traceMappingCardMissingAccount) {
+        snackbar.error('Trace Label Mapping: please select an account for each mapping card.');
         return;
       }
     }
     if (integrationName === 'ES' || integrationName === 'elasticsearch') {
-      // Any index card with an index entered must have an account selected.
+      // Any index card with something entered must have an account selected —
+      // including a lone Trace Schema, which the serializer would otherwise drop
+      // without saying so.
       const indexCardMissingAccount = indexRules.some(
-        (c) => !c.accountId && ((c.log_index || '').trim() || (c.metrics_index || '').trim() || (c.trace_index || '').trim())
+        (c) =>
+          !c.accountId &&
+          ((c.log_index || '').trim() || (c.metrics_index || '').trim() || (c.trace_index || '').trim() || (c.trace_schema || '').trim())
       );
       if (indexCardMissingAccount) {
         snackbar.error('Per-Account Index: please select an account for each index card.');
@@ -1162,6 +1674,8 @@ const IntegrationDynamicFormModal = ({
         transformedValue = String(value);
       } else if (field?.is_encrypted && editData?.integration_config_values?.[key] && value === '*************************************************') {
         transformedValue = editData?.integration_config_values?.[key];
+      } else if (Array.isArray(value)) {
+        transformedValue = joinConfigArray(value);
       }
       return {
         name: key,
@@ -1215,19 +1729,61 @@ const IntegrationDynamicFormModal = ({
     // { key, op:'_eq', value } (equality only for now). Emit an empty array when a
     // previously-saved config is cleared so filters can be removed.
     if (LOG_FILTER_INTEGRATIONS.has(integrationName)) {
-      const cleanedFilters = defaultFilterRules
-        .map((c) => ({
-          accountId: c.accountId || '',
-          filters: (c.filters || [])
-            .map((f) => ({ key: (f.key || '').trim(), op: '_eq', value: (f.value || '').trim() }))
-            .filter((f) => f.key && f.value),
-        }))
-        .filter((c) => c.accountId && c.filters.length > 0);
+      const cleanedFilters = serializeDefaultFilters(defaultFilterRules);
       const previouslySet = !!editData?.integration_config_values?.default_filters;
       if (cleanedFilters.length > 0 || previouslySet) {
         transformedValues.push({
           name: 'default_filters',
           value: JSON.stringify(cleanedFilters),
+          is_encrypted: false,
+        });
+      }
+    }
+
+    // Per-account Default Trace Filters → default_trace_filters. Same shape and the
+    // same clear-to-empty-array rule as the log filters above, under a separate config
+    // name: one integration record often serves both logs and traces, so sharing
+    // `default_filters` would apply log filters to trace queries.
+    if (TRACE_INTEGRATIONS.has(integrationName)) {
+      const cleanedTraceFilters = serializeDefaultFilters(defaultTraceFilterRules);
+      const previouslySet = !!editData?.integration_config_values?.default_trace_filters;
+      if (cleanedTraceFilters.length > 0 || previouslySet) {
+        transformedValues.push({
+          name: 'default_trace_filters',
+          value: JSON.stringify(cleanedTraceFilters),
+          is_encrypted: false,
+        });
+      }
+    }
+
+    // Per-account log label mapping → log_label_mappings. Emitted for every log /
+    // observability-platform integration; the backend auto-allows the key for exactly
+    // those categories. Emit an empty array when a previously-saved mapping is cleared,
+    // because config values are upserted per name and omitting the key would leave the
+    // old mapping in force.
+    if (supportsLogLabelMapping) {
+      const cleanedMappings = serializeLogLabelMappings(labelMappingCards);
+      const mappingPreviouslySet = !!editData?.integration_config_values?.log_label_mappings;
+      if (cleanedMappings.length > 0 || mappingPreviouslySet) {
+        transformedValues.push({
+          name: 'log_label_mappings',
+          value: JSON.stringify(cleanedMappings),
+          is_encrypted: false,
+        });
+      }
+    }
+
+    // Per-account trace label mapping → trace_label_mappings. Same shape and the same
+    // clear-to-empty-array rule as the log mapping above, under a separate config name:
+    // one integration record often serves both signals, so sharing `log_label_mappings`
+    // would apply a log field mapping to trace queries.
+    if (showTraceLabelMapping) {
+      const cleanedTraceMappings = serializeLogLabelMappings(traceLabelMappingCards);
+      const tracePreviouslySet = !!editData?.integration_config_values?.trace_label_mappings;
+      if (cleanedTraceMappings.length > 0 || tracePreviouslySet) {
+        transformedValues.push({
+          name: 'trace_label_mappings',
+          value: JSON.stringify(cleanedTraceMappings),
           is_encrypted: false,
         });
       }
@@ -1244,12 +1800,16 @@ const IntegrationDynamicFormModal = ({
           const log = (c.log_index || '').trim();
           const metrics = (c.metrics_index || '').trim();
           const trace = (c.trace_index || '').trim();
+          const traceSchema = (c.trace_schema || '').trim();
           if (log) row.log_index = log;
           if (metrics) row.metrics_index = metrics;
           if (trace) row.trace_index = trace;
+          if (traceSchema) row.trace_schema = traceSchema;
           return row;
         })
-        .filter((r) => r.account_id && (r.log_index || r.metrics_index || r.trace_index));
+        // trace_schema counts as content on its own: an account can share the
+        // top-level trace index and still need its own layout declared.
+        .filter((r) => r.account_id && (r.log_index || r.metrics_index || r.trace_index || r.trace_schema));
       const indexPreviouslySet = !!editData?.integration_config_values?.index_account_mapping;
       if (cleanedIndexRows.length > 0 || indexPreviouslySet) {
         transformedValues.push({
@@ -1471,10 +2031,119 @@ const IntegrationDynamicFormModal = ({
         text: 'how to configure Elasticsearch/Kibana Webhook',
       },
     },
+    openobserve_webhook: {
+      endpoint: 'openobserve',
+      message: 'Configure the following URL as a Webhook destination in OpenObserve (Management → Alert Destinations)',
+      // OpenObserve delivers whatever the alert Template renders — there is no
+      // fixed payload schema — so the destination is only half the setup. The
+      // template below is what NudgeBee parses best; it is shown inline because
+      // a user who skips it gets an event with no severity, subject or link.
+      template: OPENOBSERVE_ALERT_TEMPLATE,
+      templateMessage:
+        'OpenObserve has no fixed webhook payload — the body is whatever the alert Template renders. Create a Template (Management → Templates, type: Webhook) with the JSON below and select it on the destination above.',
+    },
     workflow_webhook: {
       endpoint: 'workflow',
       message: 'Point your external system at the following URL to trigger the associated automation',
     },
+    cubeapm_webhook: {
+      endpoint: 'cubeapm',
+      message:
+        'Add the following URL as a Webhook notification channel in CubeAPM. Leave the payload template unset — CubeAPM’s default body is already Alertmanager-compatible, which is the expected format',
+    },
+  };
+
+  // List rows carry integrations_cloud_accounts / integration_config_values as
+  // JSON strings; the edit row arrives already parsed. Accept either.
+  const asList = (value) => {
+    if (Array.isArray(value)) return value;
+    const parsed = safeJSONParse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  };
+  const webhookToken = (row) => {
+    const values = row?.integration_config_values;
+    const parsed = typeof values === 'string' ? safeJSONParse(values) : values;
+    if (Array.isArray(parsed)) {
+      return parsed.find((c) => c?.name === 'token')?.value || '';
+    }
+    return parsed?.token || '';
+  };
+
+  const renderAlertDelivery = () => {
+    if (!isDirectPrometheus) {
+      return null;
+    }
+    const receivers = [];
+    asList(editData?.integrations_cloud_accounts).forEach((acc) => {
+      alertmanagerWebhooks.forEach((row) => {
+        const linked = asList(row?.integrations_cloud_accounts).some((a) => a?.cloud_account_id === acc?.cloud_account_id);
+        const token = webhookToken(row);
+        if (!linked || !token) {
+          return;
+        }
+        const accountName = acc?.cloud_account_name || '';
+        const cluster = accountName ? `&cluster=${encodeURIComponent(accountName)}` : '';
+        receivers.push({
+          key: `${row.id}-${acc.cloud_account_id}`,
+          accountName: accountName || acc.cloud_account_id,
+          webhookName: row.name,
+          url: `${window.location.origin}/api/webhooks/prometheus-alertmanager?token=${encodeURIComponent(token)}${cluster}`,
+        });
+      });
+    });
+
+    return (
+      <Box data-testid='prometheus-alert-delivery' sx={{ mt: ds.space[5] }}>
+        <Typography variant='subtitle1' sx={{ fontSize: 'var(--ds-text-body-lg)' }}>
+          Alert delivery
+        </Typography>
+        <Typography variant='body2' sx={{ fontSize: 'var(--ds-text-body)', color: ds.gray[400], mt: ds.space[1] }}>
+          {`A Prometheus connected without an agent delivers alerts through its Alertmanager. Add a webhook receiver pointing at the URL below; the account name rides along as the cluster. Rules created in ${getBrandTitle()} are written to the ruler configured above.`}
+        </Typography>
+        {receivers.length === 0 ? (
+          <Typography
+            variant='body2'
+            sx={{ mt: ds.space[2], fontSize: 'var(--ds-text-body)', color: ds.gray[400] }}
+            data-testid='prometheus-alert-delivery-missing'
+          >
+            No Prometheus Alertmanager Webhook integration is linked to this account yet —{' '}
+            <Link href='/accounts/account-form?cloudProvider=prometheus_alertmanager_webhook' openInNew>
+              create one
+            </Link>{' '}
+            for the same account, then come back here for its URL.
+          </Typography>
+        ) : (
+          receivers.map((receiver) => (
+            <Box
+              key={receiver.key}
+              sx={{
+                mt: ds.space[3],
+                p: 2,
+                borderRadius: ds.radius.lg,
+                border: `1px solid ${ds.brand[200]}`,
+                backgroundColor: ds.gray[100],
+                display: 'flex',
+                alignItems: 'flex-start',
+                gap: ds.space[2],
+              }}
+            >
+              <Box sx={{ flex: 1 }}>
+                <Typography variant='body2' sx={{ fontSize: 'var(--ds-text-body)', color: ds.gray[600], mb: ds.space[1] }}>
+                  {receiver.accountName} · {receiver.webhookName}
+                </Typography>
+                <Typography
+                  sx={{ color: ds.gray[600], fontSize: 'var(--ds-text-body)', wordBreak: 'break-all', lineHeight: 1.6 }}
+                  data-testid='prometheus-alert-delivery-url'
+                >
+                  {receiver.url}
+                </Typography>
+              </Box>
+              <CopyButton text={receiver.url} />
+            </Box>
+          ))
+        )}
+      </Box>
+    );
   };
 
   const renderWebhookContent = (integrationName, response) => {
@@ -1514,6 +2183,45 @@ const IntegrationDynamicFormModal = ({
           <CopyButton text={url} />
         </Box>
 
+        {config.template && (
+          <>
+            <Typography variant='subtitle1' sx={{ fontSize: 'var(--ds-text-body-lg)' }}>
+              {config.templateMessage}
+            </Typography>
+            <Box
+              sx={{
+                mt: 'var(--ds-space-4)',
+                mb: 'var(--ds-space-4)',
+                p: 2,
+                borderRadius: ds.radius.lg,
+                border: `1px solid ${ds.brand[200]}`,
+                backgroundColor: ds.gray[100],
+                display: 'flex',
+                alignItems: 'flex-start',
+                gap: ds.space[2],
+              }}
+            >
+              <Typography
+                component='pre'
+                sx={{
+                  color: ds.gray[600],
+                  fontSize: 'var(--ds-text-body)',
+                  fontFamily: ds.font.mono,
+                  lineHeight: 1.6,
+                  flex: 1,
+                  m: 0,
+                  maxHeight: ds.space.mul(0, 160),
+                  overflow: 'auto',
+                }}
+                id={`${config.endpoint}-template`}
+              >
+                {config.template}
+              </Typography>
+              <CopyButton text={config.template} />
+            </Box>
+          </>
+        )}
+
         {integrationName === 'workflow_webhook' ? (
           <Box
             sx={{
@@ -1544,14 +2252,13 @@ const IntegrationDynamicFormModal = ({
             <Typography sx={{ fontSize: 'var(--ds-text-body)', color: ds.brand[500], lineHeight: 1.6, textAlign: 'justify' }}>
               <strong>Tip (optional):</strong> When you paste this URL into your webhook provider, you can optionally append extra query parameters
               (e.g. <code>&amp;env=prod</code>, <code>&amp;cluster=us-east-1</code>) directly to the URL inside the provider&apos;s configuration.
-              Every event delivered through that URL will be tagged with those labels in Nudgebee.
+              {` Every event delivered through that URL will be tagged with those labels in ${getBrandTitle()}.`}
               <br />
               <br />
               <strong>Why add them?</strong> The webhook payload itself rarely carries deployment context like environment or cluster, so multiple
-              senders pointing at the same Nudgebee webhook (e.g. dev and prod alertmanagers) produce events that look identical. Adding query labels
-              on the provider side lets you tell those events apart, route them to different accounts, and filter them in the Nudgebee inbox without
-              changing alert payloads. Reserved keys (<code>token</code>, <code>authorization</code>) are stripped automatically and any label the
-              integration extracts from the payload wins on collision.
+              {`senders pointing at the same ${getBrandTitle()} webhook (e.g. dev and prod alertmanagers) produce events that look identical. Adding query labels on the provider side lets you tell those events apart, route them to different accounts, and filter them in the ${getBrandTitle()} inbox without changing alert payloads.`}{' '}
+              Reserved keys (<code>token</code>, <code>authorization</code>) are stripped automatically and any label the integration extracts from
+              the payload wins on collision.
             </Typography>
           </Box>
         )}
@@ -1559,9 +2266,9 @@ const IntegrationDynamicFormModal = ({
         {config.learnMore && (
           <Typography sx={{ fontSize: 'var(--ds-text-body-lg)' }}>
             Learn more about{' '}
-            <a style={{ textDecoration: 'none', color: ds.blue[500] }} href={config.learnMore.url} target='_blank' rel='noopener noreferrer'>
+            <Link href={config.learnMore.url} openInNew>
               {config.learnMore.text}
-            </a>
+            </Link>
           </Typography>
         )}
       </Grid>
@@ -1578,11 +2285,18 @@ const IntegrationDynamicFormModal = ({
   const accountOptions = config.properties?.account_id?.possible_values || [];
 
   // ES (integrationName is 'ES' or 'elasticsearch') shows the Advanced Settings
-  // section for the Per-Account Index mapping in BOTH add and edit flows. Default
-  // Log Filters is not shown for ES (per product decision), but for the other
-  // LOG_FILTER_INTEGRATIONS it's now shown in both add and edit flows too.
+  // section for the Per-Account Index mapping in BOTH add and edit flows, and now
+  // for Default Log Filters too — the backend applies them provider-agnostically
+  // in FetchLogs, so ES honoured a saved default_filters value all along while the
+  // form was the only thing hiding it. Every LOG_FILTER_INTEGRATIONS entry shows
+  // the filter editor in both add and edit flows.
   const isESIntegration = integrationName === 'ES' || integrationName === 'elasticsearch';
-  const showLogFilters = LOG_FILTER_INTEGRATIONS.has(integrationName) && !isESIntegration;
+  const showLogFilters = LOG_FILTER_INTEGRATIONS.has(integrationName);
+  const showTraceFilters = TRACE_INTEGRATIONS.has(integrationName);
+  // Same gate as the trace filters: the providers getTraceSource actually serves and
+  // that have an integration form. See the comment on TRACE_INTEGRATIONS for why this
+  // is not derived from the schema property the way supportsLogLabelMapping is.
+  const showTraceLabelMapping = TRACE_INTEGRATIONS.has(integrationName);
 
   // A fresh tenant with no onboarded cluster / cloud account has nothing to link
   // an account-scoped integration to. The `account_id` schema field is present
@@ -1610,11 +2324,12 @@ const IntegrationDynamicFormModal = ({
         }}
         title={
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 'var(--ds-space-1)' }}>
-            <Typography component='h2' variant='h6' fontWeight={600}>
+            <Typography component='h2' variant='h6' fontWeight={ds.weight.semibold}>
               {`Set up ${titleCase(integrationName)}`}
             </Typography>
           </Box>
         }
+        subtitle={subtitle}
         open={
           showModal &&
           [
@@ -1631,6 +2346,7 @@ const IntegrationDynamicFormModal = ({
             'grafana_webhook',
             'solarwinds_webhook',
             'elasticsearch_webhook',
+            'openobserve_webhook',
             'workflow_webhook',
           ].includes(integrationName)
         }
@@ -1644,6 +2360,7 @@ const IntegrationDynamicFormModal = ({
         open={openModal && !showModal}
         handleClose={() => handleCloseModal(false)}
         title={title}
+        subtitle={subtitle}
         loader={isSubmitting || isLoadingSchema}
       >
         {isAgentSource ? (
@@ -1736,14 +2453,9 @@ const IntegrationDynamicFormModal = ({
                   {webhookConfig[integrationName]?.learnMore && (
                     <Typography variant='body2' sx={{ fontSize: 'var(--ds-text-body)', color: ds.gray[400] }}>
                       Learn more about{' '}
-                      <a
-                        style={{ textDecoration: 'none', color: ds.blue[500] }}
-                        href={webhookConfig[integrationName].learnMore.url}
-                        target='_blank'
-                        rel='noopener noreferrer'
-                      >
+                      <Link href={webhookConfig[integrationName].learnMore.url} openInNew>
                         {webhookConfig[integrationName].learnMore.text}
-                      </a>
+                      </Link>
                     </Typography>
                   )}
                   {config?.description && (
@@ -1787,269 +2499,125 @@ const IntegrationDynamicFormModal = ({
                     </Box>
                   )}
                   {Object.keys(config?.properties || {}).length > 0 ? (
-                    getSortedFieldKeys().map((key) => {
-                      const field = config.properties[key];
-                      let inputComponent;
-                      const errorText = errors[key] || '';
+                    (() => {
+                      const renderField = (key) => {
+                        const field = config.properties[key];
+                        let inputComponent;
+                        const errorText = errors[key] || '';
 
-                      if (!field.description) {
-                        return null;
-                      }
+                        if (!field.description) {
+                          return null;
+                        }
 
-                      const isRequired = isFieldRequired(key, field);
+                        const isRequired = isFieldRequired(key, field);
 
-                      switch (field.type) {
-                        case 'array':
-                        case 'list':
-                          if (field.possible_values) {
-                            if (Array.isArray(field.default)) {
-                              const rawValue = formValues[key];
-                              const value =
-                                rawValue != null
-                                  ? field.possible_values?.filter(
-                                      (op) =>
-                                        Array.isArray(rawValue)
-                                          ? rawValue.includes(op.value) || rawValue.includes(op) // array case
-                                          : op.value === rawValue || op === rawValue // single value case
-                                    )
-                                  : null;
-                              inputComponent = (
-                                <Box key={`wrapper-${key}`} sx={{ mb: ds.space[1] }}>
-                                  <Typography
-                                    variant='body2'
-                                    sx={{
-                                      color: ds.gray[400],
-                                      fontSize: 'var(--ds-text-small)',
-                                      lineHeight: 1.5,
-                                      mb: ds.space[2],
-                                      pl: ds.space[1],
-                                    }}
-                                  >
-                                    {field.description}
-                                    {isRequired && <span style={{ color: ds.red[500] }}> *</span>}
-                                  </Typography>
-                                  <Box>
-                                    <FilterDropdown
-                                      key={`auto-complete-${key}`}
-                                      multiple
-                                      label={field.display_name || snakeToTitleCase(key)}
-                                      value={value || []}
-                                      options={field.possible_values ?? []}
-                                      grouped={field.grouped}
-                                      groupIcon={field.grouped ? renderAccountGroupIcon : undefined}
-                                      disabled={field.possible_values?.length === 0}
-                                      onSelect={(_, value) => handleChange(key, value)}
-                                      isOptionsLoading={loadingOptions[key]}
-                                    />
-                                    {errorText && (
-                                      <Typography variant='body2' color='error' sx={{ mt: 0.5, fontSize: 'var(--ds-text-small)' }}>
-                                        {errorText}
-                                      </Typography>
-                                    )}
-                                  </Box>
-                                </Box>
-                              );
-                            } else {
-                              const value =
-                                formValues[key] != null
-                                  ? field.possible_values?.find((op) => op.value == formValues[key] || op == formValues[key])
-                                  : null;
-                              inputComponent = (
-                                <Box key={`wrapper-${key}`} sx={{ mb: ds.space[1] }}>
-                                  <Typography
-                                    variant='body2'
-                                    sx={{
-                                      color: ds.gray[400],
-                                      fontSize: 'var(--ds-text-small)',
-                                      lineHeight: 1.5,
-                                      mb: ds.space[2],
-                                      pl: ds.space[1],
-                                    }}
-                                  >
-                                    {field.description}
-                                    {isRequired && <span style={{ color: ds.red[500] }}> *</span>}
-                                  </Typography>
-                                  <Box>
-                                    <FilterDropdown
-                                      key={`auto-complete-${key}`}
-                                      label={field.display_name || snakeToTitleCase(key)}
-                                      value={value}
-                                      options={field.possible_values || []}
-                                      grouped={field.grouped}
-                                      groupIcon={field.grouped ? renderAccountGroupIcon : undefined}
-                                      disabled={
-                                        field.possible_values?.length == 0 ||
-                                        (editData?.integration_config_values?.account_id && key == 'account_id') ||
-                                        false
-                                      }
-                                      onSelect={(_, _value) => handleChange(key, _value?.value || _value)}
-                                      isOptionsLoading={loadingOptions[key]}
-                                    />
-                                    {errorText && (
-                                      <Typography variant='body2' color='error' sx={{ mt: 0.5, fontSize: 'var(--ds-text-small)' }}>
-                                        {errorText}
-                                      </Typography>
-                                    )}
-                                  </Box>
-                                </Box>
-                              );
-                            }
-                          }
-                          break;
-
-                        case 'int':
-                        case 'integer':
-                          inputComponent = (
-                            <Box key={`wrapper-${key}`} sx={{ mb: ds.space[1] }}>
-                              <Typography
-                                variant='body2'
-                                sx={{
-                                  color: ds.gray[400],
-                                  fontSize: 'var(--ds-text-small)',
-                                  lineHeight: 1.5,
-                                  mb: ds.space[2],
-                                  pl: ds.space[1],
-                                }}
-                              >
-                                {field.description}
-                                {isRequired && <span style={{ color: ds.red[500] }}> *</span>}
-                              </Typography>
-                              <Box>
-                                <Input
-                                  id={toKebabCase(field.display_name || key)}
-                                  key={key}
-                                  label={field.display_name || snakeToTitleCase(key)}
-                                  type='number'
-                                  value={String(formValues[key] ?? '')}
-                                  onChange={(value) => handleChange(key, parseInt(value, 10))}
-                                  size='sm'
-                                  error={errorText || undefined}
-                                />
-                              </Box>
-                            </Box>
-                          );
-                          break;
-
-                        case 'bool':
-                        case 'boolean':
-                          inputComponent = (
-                            <Box key={`wrapper-${key}`} sx={{ mb: ds.space[1] }}>
-                              <Typography
-                                variant='body2'
-                                sx={{
-                                  color: ds.gray[400],
-                                  fontSize: 'var(--ds-text-small)',
-                                  lineHeight: 1.5,
-                                  mb: ds.space[2],
-                                  pl: ds.space[1],
-                                }}
-                              >
-                                {field.description}
-                              </Typography>
-                              <Box>
-                                <Checkbox
-                                  key={key}
-                                  id={toKebabCase(field.display_name || key)}
-                                  checked={!!formValues[key]}
-                                  onChange={(next) => handleChange(key, next)}
-                                  label={`${field.display_name || snakeToTitleCase(key)}${isRequired ? ' *' : ''}`}
-                                />
-                                {errorText && (
-                                  <Typography variant='body2' color='error' sx={{ mt: 0.5, fontSize: 'var(--ds-text-small)' }}>
-                                    {errorText}
-                                  </Typography>
-                                )}
-                              </Box>
-                            </Box>
-                          );
-                          break;
-
-                        case 'string':
-                          if (field.possible_values?.length > 0) {
-                            inputComponent = (
-                              <Box key={`wrapper-${key}`} sx={{ mb: ds.space[1] }}>
-                                <Typography
-                                  variant='body2'
-                                  sx={{
-                                    color: ds.gray[400],
-                                    fontSize: 'var(--ds-text-small)',
-                                    lineHeight: 1.5,
-                                    mb: ds.space[2],
-                                    pl: ds.space[1],
-                                  }}
-                                >
-                                  {field.description}
-                                  {isRequired && <span style={{ color: ds.red[500] }}> *</span>}
-                                </Typography>
-                                <Box>
-                                  <FilterDropdown
-                                    key={key}
-                                    label={field.display_name || snakeToTitleCase(key)}
-                                    options={field.possible_values}
-                                    value={formValues[key] || ''}
-                                    onSelect={(_event, value) => handleChange(key, value?.value ?? value)}
-                                    isOptionsLoading={loadingOptions[key]}
-                                  />
-                                  {errorText && (
-                                    <Typography variant='body2' color='error' sx={{ mt: 0.5, fontSize: 'var(--ds-text-small)' }}>
-                                      {errorText}
+                        switch (field.type) {
+                          case 'array':
+                          case 'list':
+                            if (field.possible_values) {
+                              if (Array.isArray(field.default)) {
+                                const rawValue = formValues[key];
+                                const value =
+                                  rawValue != null
+                                    ? field.possible_values?.filter(
+                                        (op) =>
+                                          Array.isArray(rawValue)
+                                            ? rawValue.includes(op.value) || rawValue.includes(op) // array case
+                                            : op.value === rawValue || op === rawValue // single value case
+                                      )
+                                    : null;
+                                inputComponent = (
+                                  <Box key={`wrapper-${key}`} sx={{ mb: ds.space[1] }}>
+                                    <Typography
+                                      variant='body2'
+                                      sx={{
+                                        color: ds.gray[400],
+                                        fontSize: 'var(--ds-text-small)',
+                                        lineHeight: 1.5,
+                                        mb: ds.space[2],
+                                        pl: ds.space[1],
+                                      }}
+                                    >
+                                      {field.description}
+                                      {isRequired && <span style={{ color: ds.red[500] }}> *</span>}
                                     </Typography>
-                                  )}
-                                </Box>
-                              </Box>
-                            );
-                          } else if (field.auto_generate_func && field.auto_generate_func !== 'listAccounts') {
-                            // Form-context-dependent autocomplete (e.g. Hive
-                            // column names). Renders through the same
-                            // FilterDropdownButton used for the account
-                            // selector — freeSolo lets the customer adopt a
-                            // typed value that isn't in the suggestions.
-                            const ag = autogenState[key] || { options: [], message: '', loading: false };
-                            inputComponent = (
-                              <Box key={`wrapper-${key}`} sx={{ mb: ds.space[1] }}>
-                                <Typography
-                                  variant='body2'
-                                  sx={{
-                                    color: ds.gray[400],
-                                    fontSize: 'var(--ds-text-small)',
-                                    lineHeight: 1.5,
-                                    mb: ds.space[2],
-                                    pl: ds.space[1],
-                                  }}
-                                >
-                                  {field.description}
-                                  {isRequired && <span style={{ color: ds.red[500] }}> *</span>}
-                                </Typography>
-                                <FilterDropdown
-                                  key={key}
-                                  id={toKebabCase(field.display_name || key)}
-                                  label={field.display_name || snakeToTitleCase(key)}
-                                  options={ag.options}
-                                  value={formValues[key] || ''}
-                                  freeSolo
-                                  onSelect={(_event, value) => handleChange(key, value?.value ?? value)}
-                                  isOptionsLoading={ag.loading}
-                                  disabled={field.disabled || field.allow_edit === false}
-                                  searchPlaceholder='Search columns or type to add…'
-                                />
-                                {errorText && (
-                                  <Typography variant='body2' color='error' sx={{ mt: 0.5, fontSize: 'var(--ds-text-small)' }}>
-                                    {errorText}
-                                  </Typography>
-                                )}
-                                {!errorText && ag.message && (
-                                  <Typography variant='body2' sx={{ mt: 0.5, fontSize: 'var(--ds-text-caption)', color: ds.gray[400] }}>
-                                    {ag.message}
-                                  </Typography>
-                                )}
-                                {!errorText && !ag.message && !ag.loading && ag.options.length > 0 && (
-                                  <Typography variant='body2' sx={{ mt: 0.5, fontSize: 'var(--ds-text-caption)', color: ds.gray[400] }}>
-                                    {ag.options.length} suggestion{ag.options.length === 1 ? '' : 's'}
-                                  </Typography>
-                                )}
-                              </Box>
-                            );
-                          } else {
+                                    <Box>
+                                      <FilterDropdown
+                                        key={`auto-complete-${key}`}
+                                        multiple
+                                        label={field.display_name || snakeToTitleCase(key)}
+                                        value={value || []}
+                                        options={field.possible_values ?? []}
+                                        grouped={field.grouped}
+                                        groupIcon={field.grouped ? renderAccountGroupIcon : undefined}
+                                        disabled={field.possible_values?.length === 0}
+                                        onSelect={(_, value) => handleChange(key, value)}
+                                        isOptionsLoading={loadingOptions[key]}
+                                        sx={{ width: '100%' }}
+                                      />
+                                      {errorText && (
+                                        <Typography variant='body2' color='error' sx={{ mt: 0.5, fontSize: 'var(--ds-text-small)' }}>
+                                          {errorText}
+                                        </Typography>
+                                      )}
+                                    </Box>
+                                  </Box>
+                                );
+                              } else {
+                                const value =
+                                  formValues[key] != null
+                                    ? field.possible_values?.find((op) => op.value == formValues[key] || op == formValues[key])
+                                    : null;
+                                inputComponent = (
+                                  <Box key={`wrapper-${key}`} sx={{ mb: ds.space[1] }}>
+                                    <Typography
+                                      variant='body2'
+                                      sx={{
+                                        color: ds.gray[400],
+                                        fontSize: 'var(--ds-text-small)',
+                                        lineHeight: 1.5,
+                                        mb: ds.space[2],
+                                        pl: ds.space[1],
+                                      }}
+                                    >
+                                      {field.description}
+                                      {isRequired && <span style={{ color: ds.red[500] }}> *</span>}
+                                    </Typography>
+                                    <Box>
+                                      <FilterDropdown
+                                        key={`auto-complete-${key}`}
+                                        label={field.display_name || snakeToTitleCase(key)}
+                                        value={value}
+                                        options={field.possible_values || []}
+                                        grouped={field.grouped}
+                                        groupIcon={field.grouped ? renderAccountGroupIcon : undefined}
+                                        disabled={
+                                          field.possible_values?.length == 0 ||
+                                          (editData?.integration_config_values?.account_id && key == 'account_id') ||
+                                          false
+                                        }
+                                        onSelect={(_, _value) => handleChange(key, _value?.value || _value)}
+                                        isOptionsLoading={loadingOptions[key]}
+                                        sx={{ width: '100%' }}
+                                      />
+                                      {errorText && (
+                                        <Typography variant='body2' color='error' sx={{ mt: 0.5, fontSize: 'var(--ds-text-small)' }}>
+                                          {errorText}
+                                        </Typography>
+                                      )}
+                                    </Box>
+                                  </Box>
+                                );
+                              }
+                            } else if (field.auto_generate_func && field.auto_generate_func !== 'listAccounts') {
+                              // No fixed option list: a multi-value picker fed by the
+                              // backend (e.g. Confluence page trees).
+                              inputComponent = renderAutogenField(key, field, isRequired, errorText);
+                            }
+                            break;
+
+                          case 'int':
+                          case 'integer':
                             inputComponent = (
                               <Box key={`wrapper-${key}`} sx={{ mb: ds.space[1] }}>
                                 <Typography
@@ -2067,75 +2635,238 @@ const IntegrationDynamicFormModal = ({
                                 </Typography>
                                 <Box>
                                   <Input
-                                    key={key}
                                     id={toKebabCase(field.display_name || key)}
+                                    key={key}
                                     label={field.display_name || snakeToTitleCase(key)}
-                                    type={
-                                      // Password masking (with the eye toggle) applies to SINGLE-LINE secrets only —
-                                      // a multiline encrypted field (e.g. a service-account JSON) can't be a password
-                                      // input, so it renders as a textarea (still encrypted at rest + masked on edit).
-                                      field.is_encrypted && !field.multiline
-                                        ? // Reveal only applies to a freshly-typed value. A stored secret is
-                                          // never sent to the UI — on edit the field holds the mask, which stays
-                                          // masked (and offers no eye), so a saved key can't be exposed.
-                                          revealedSecrets[key] && formValues[key] && formValues[key] !== ENCRYPTED_MASK
-                                          ? 'text'
-                                          : 'password'
-                                        : field.multiline
-                                        ? 'textarea'
-                                        : 'text'
-                                    }
-                                    value={formValues[key] || ''}
-                                    onChange={(value) => handleChange(key, value)}
-                                    trailingIcon={
-                                      // Eye toggle only while inserting a new single-line value (not for the stored
-                                      // mask, and not for multiline secrets which render as a textarea).
-                                      field.is_encrypted && !field.multiline && formValues[key] && formValues[key] !== ENCRYPTED_MASK ? (
-                                        <Box
-                                          component='button'
-                                          type='button'
-                                          aria-label={revealedSecrets[key] ? 'Hide value' : 'Show value'}
-                                          onClick={() => setRevealedSecrets((prev) => ({ ...prev, [key]: !prev[key] }))}
-                                          sx={{
-                                            cursor: 'pointer',
-                                            display: 'inline-flex',
-                                            alignItems: 'center',
-                                            padding: 0,
-                                            border: 'none',
-                                            background: 'none',
-                                            color: ds.gray[500],
-                                          }}
-                                        >
-                                          {revealedSecrets[key] ? (
-                                            <VisibilityOffIcon sx={{ fontSize: 16 }} />
-                                          ) : (
-                                            <VisibilityIcon sx={{ fontSize: 16 }} />
-                                          )}
-                                        </Box>
-                                      ) : undefined
-                                    }
+                                    type='number'
+                                    value={String(formValues[key] ?? '')}
+                                    onChange={(value) => handleChange(key, parseInt(value, 10))}
                                     size='sm'
                                     error={errorText || undefined}
-                                    minRows={field.multiline ? 3 : undefined}
-                                    disabled={
-                                      field.disabled ||
-                                      field.allow_edit === false ||
-                                      (editData?.integration_config_values?.integration_config_name && key == 'integration_config_name') ||
-                                      false
-                                    }
                                   />
+                                  {key === 'prometheus_additional_labels' && promLabelHint && (
+                                    <Box
+                                      sx={{ display: 'flex', alignItems: 'flex-start', gap: ds.space[2], mt: ds.space[2] }}
+                                      data-testid='prometheus-available-labels'
+                                    >
+                                      <SafeIcon src={infoIcon} alt='info' width={16} height={16} style={{ marginTop: 2, flexShrink: 0 }} />
+                                      <Typography variant='body2' sx={{ fontSize: 'var(--ds-text-body)', color: ds.gray[400], lineHeight: 1.5 }}>
+                                        {promLabelHint}
+                                      </Typography>
+                                    </Box>
+                                  )}
                                 </Box>
                               </Box>
                             );
-                          }
-                          break;
+                            break;
 
-                        default:
-                          inputComponent = null;
-                      }
+                          case 'bool':
+                          case 'boolean':
+                            inputComponent = (
+                              <Box key={`wrapper-${key}`} sx={{ mb: ds.space[1] }}>
+                                <Typography
+                                  variant='body2'
+                                  sx={{
+                                    color: ds.gray[400],
+                                    fontSize: 'var(--ds-text-small)',
+                                    lineHeight: 1.5,
+                                    mb: ds.space[2],
+                                    pl: ds.space[1],
+                                  }}
+                                >
+                                  {field.description}
+                                </Typography>
+                                <Box>
+                                  <Checkbox
+                                    key={key}
+                                    id={toKebabCase(field.display_name || key)}
+                                    checked={!!formValues[key]}
+                                    onChange={(next) => handleChange(key, next)}
+                                    label={`${field.display_name || snakeToTitleCase(key)}${isRequired ? ' *' : ''}`}
+                                  />
+                                  {errorText && (
+                                    <Typography variant='body2' color='error' sx={{ mt: 0.5, fontSize: 'var(--ds-text-small)' }}>
+                                      {errorText}
+                                    </Typography>
+                                  )}
+                                </Box>
+                              </Box>
+                            );
+                            break;
 
-                      return inputComponent || null;
-                    })
+                          case 'string':
+                            if (field.widget === 'model_alias_list') {
+                              inputComponent = (
+                                <Box key={`wrapper-${key}`} sx={{ mb: ds.space[1] }}>
+                                  <Typography
+                                    variant='body2'
+                                    sx={{
+                                      color: ds.gray[400],
+                                      fontSize: 'var(--ds-text-small)',
+                                      lineHeight: 1.5,
+                                      mb: ds.space[2],
+                                      pl: ds.space[1],
+                                    }}
+                                  >
+                                    {field.description}
+                                    {isRequired && <span style={{ color: ds.red[500] }}> *</span>}
+                                  </Typography>
+                                  <ModelAliasList
+                                    value={formValues[key] || ''}
+                                    onChange={(value) => handleChange(key, value)}
+                                    disabled={field.disabled || field.allow_edit === false}
+                                  />
+                                  {errorText && (
+                                    <Typography variant='body2' color='error' sx={{ mt: 0.5, fontSize: 'var(--ds-text-small)' }}>
+                                      {errorText}
+                                    </Typography>
+                                  )}
+                                </Box>
+                              );
+                            } else if (field.possible_values?.length > 0) {
+                              inputComponent = (
+                                <Box key={`wrapper-${key}`} sx={{ mb: ds.space[1] }}>
+                                  <Typography
+                                    variant='body2'
+                                    sx={{
+                                      color: ds.gray[400],
+                                      fontSize: 'var(--ds-text-small)',
+                                      lineHeight: 1.5,
+                                      mb: ds.space[2],
+                                      pl: ds.space[1],
+                                    }}
+                                  >
+                                    {field.description}
+                                    {isRequired && <span style={{ color: ds.red[500] }}> *</span>}
+                                  </Typography>
+                                  <Box>
+                                    <FilterDropdown
+                                      key={key}
+                                      label={field.display_name || snakeToTitleCase(key)}
+                                      options={field.possible_values}
+                                      value={formValues[key] || ''}
+                                      onSelect={(_event, value) => handleChange(key, value?.value ?? value)}
+                                      isOptionsLoading={loadingOptions[key]}
+                                      sx={{ width: '100%' }}
+                                    />
+                                    {errorText && (
+                                      <Typography variant='body2' color='error' sx={{ mt: 0.5, fontSize: 'var(--ds-text-small)' }}>
+                                        {errorText}
+                                      </Typography>
+                                    )}
+                                  </Box>
+                                </Box>
+                              );
+                            } else if (field.auto_generate_func && field.auto_generate_func !== 'listAccounts') {
+                              inputComponent = renderAutogenField(key, field, isRequired, errorText);
+                            } else {
+                              inputComponent = (
+                                <Box key={`wrapper-${key}`} sx={{ mb: ds.space[1] }}>
+                                  <Typography
+                                    variant='body2'
+                                    sx={{
+                                      color: ds.gray[400],
+                                      fontSize: 'var(--ds-text-small)',
+                                      lineHeight: 1.5,
+                                      mb: ds.space[2],
+                                      pl: ds.space[1],
+                                    }}
+                                  >
+                                    {field.description}
+                                    {isRequired && <span style={{ color: ds.red[500] }}> *</span>}
+                                  </Typography>
+                                  <Box>
+                                    <Input
+                                      key={key}
+                                      id={toKebabCase(field.display_name || key)}
+                                      label={field.display_name || snakeToTitleCase(key)}
+                                      type={
+                                        // Password masking (with the eye toggle) applies to SINGLE-LINE secrets only —
+                                        // a multiline encrypted field (e.g. a service-account JSON) can't be a password
+                                        // input, so it renders as a textarea (still encrypted at rest + masked on edit).
+                                        field.is_encrypted && !field.multiline
+                                          ? // Reveal only applies to a freshly-typed value. A stored secret is
+                                            // never sent to the UI — on edit the field holds the mask, which stays
+                                            // masked (and offers no eye), so a saved key can't be exposed.
+                                            revealedSecrets[key] && formValues[key] && formValues[key] !== ENCRYPTED_MASK
+                                            ? 'text'
+                                            : 'password'
+                                          : field.multiline
+                                          ? 'textarea'
+                                          : 'text'
+                                      }
+                                      // Nothing on this form is a saved browser login. The secret opts out
+                                      // via `new-password`; its neighbours opt out too, so the browser can't
+                                      // pair a config field like Username with the adjacent secret and fill both.
+                                      autoComplete={field.is_encrypted ? 'new-password' : 'off'}
+                                      value={formValues[key] || ''}
+                                      onChange={(value) => handleChange(key, value)}
+                                      trailingIcon={
+                                        // Eye toggle only while inserting a new single-line value (not for the stored
+                                        // mask, and not for multiline secrets which render as a textarea).
+                                        field.is_encrypted && !field.multiline && formValues[key] && formValues[key] !== ENCRYPTED_MASK ? (
+                                          <Box
+                                            component='button'
+                                            type='button'
+                                            aria-label={revealedSecrets[key] ? 'Hide value' : 'Show value'}
+                                            onClick={() => setRevealedSecrets((prev) => ({ ...prev, [key]: !prev[key] }))}
+                                            sx={{
+                                              cursor: 'pointer',
+                                              display: 'inline-flex',
+                                              alignItems: 'center',
+                                              padding: 0,
+                                              border: 'none',
+                                              background: 'none',
+                                              color: ds.gray[500],
+                                            }}
+                                          >
+                                            {revealedSecrets[key] ? (
+                                              <VisibilityOffIcon sx={{ fontSize: 16 }} />
+                                            ) : (
+                                              <VisibilityIcon sx={{ fontSize: 16 }} />
+                                            )}
+                                          </Box>
+                                        ) : undefined
+                                      }
+                                      size='sm'
+                                      error={errorText || undefined}
+                                      minRows={field.multiline ? 3 : undefined}
+                                      disabled={
+                                        field.disabled ||
+                                        field.allow_edit === false ||
+                                        (editData?.integration_config_values?.integration_config_name && key == 'integration_config_name') ||
+                                        false
+                                      }
+                                    />
+                                  </Box>
+                                </Box>
+                              );
+                            }
+                            break;
+
+                          default:
+                            inputComponent = null;
+                        }
+
+                        return inputComponent || null;
+                      };
+                      // Schema fields flagged `advanced` render inside the same
+                      // collapsed section the ES/log integrations use, so every
+                      // integration's "Advanced Settings" looks and behaves alike.
+                      const sortedKeys = getSortedFieldKeys();
+                      const advancedKeys = sortedKeys.filter((key) => config.properties[key]?.advanced);
+                      return (
+                        <>
+                          {sortedKeys.filter((key) => !config.properties[key]?.advanced).map(renderField)}
+                          {advancedKeys.length > 0 && (
+                            <Box sx={{ mt: ds.space[6] }}>
+                              {renderAdvancedToggle()}
+                              <Collapse in={advancedOpen}>{advancedKeys.map(renderField)}</Collapse>
+                            </Box>
+                          )}
+                        </>
+                      );
+                    })()
                   ) : (
                     <Box
                       sx={{
@@ -2207,7 +2938,7 @@ const IntegrationDynamicFormModal = ({
                         </Typography>
                         {rules.length > 1 && (
                           <Button
-                            tone='danger'
+                            tone='ghost'
                             size='xs'
                             composition='icon-only'
                             icon={<SafeIcon src={NewDelete} alt='Remove rule' style={{ width: ds.space.mul(0, 7), height: ds.space.mul(0, 7) }} />}
@@ -2375,167 +3106,67 @@ const IntegrationDynamicFormModal = ({
                 </Box>
               </>
             )}
-            {(showLogFilters || isESIntegration) && (
+            {(showLogFilters || showTraceFilters || isESIntegration || supportsLogLabelMapping || showTraceLabelMapping) && (
               <Box sx={{ mt: ds.space[6] }}>
-                <Box
-                  sx={{ display: 'flex', alignItems: 'center', cursor: 'pointer', mb: ds.space[2] }}
-                  onClick={() => setAdvancedOpen((v) => !v)}
-                  data-testid='advanced-settings-toggle'
-                >
-                  <KeyboardArrowDownIcon
-                    sx={{ transform: advancedOpen ? 'rotate(0deg)' : 'rotate(-90deg)', transition: 'transform 0.2s', color: ds.brand[500] }}
-                  />
-                  <Typography sx={{ color: ds.brand[500], fontSize: 'var(--ds-text-body-lg)', fontWeight: 'var(--ds-font-weight-medium)' }}>
-                    Advanced Settings
-                  </Typography>
-                </Box>
+                {renderAdvancedToggle()}
                 <Collapse in={advancedOpen}>
                   {showLogFilters && (
-                    <>
-                      <Typography
-                        sx={{ color: ds.brand[500], fontSize: 'var(--ds-text-body)', fontWeight: 'var(--ds-font-weight-medium)', mb: ds.space[1] }}
-                      >
-                        Default Log Filters (Optional)
-                      </Typography>
-                      <Typography sx={{ color: ds.gray[400], fontSize: 'var(--ds-text-small)', mb: ds.space[4], pl: ds.space[1] }}>
-                        Filters always applied to every log query for the selected account (e.g. a central provider scoped to one cluster:{' '}
-                        <em>cluster_id = nudgebee</em>). Enter the provider-native column name. Conditions in a card are combined with AND.
-                      </Typography>
-                      {defaultFilterRules.map((card, cardIdx) => {
-                        const cardNeedsAccount = !card.accountId && (card.filters || []).some((f) => (f.key || '').trim() || (f.value || '').trim());
-                        const cardVal = columnValidation[cardIdx];
-                        return (
-                          <Box
-                            key={cardIdx}
-                            sx={{
-                              border: `1px solid ${ds.blue[400]}`,
-                              borderRadius: 'var(--ds-radius-lg)',
-                              p: 2,
-                              mb: ds.space[4],
-                              backgroundColor: ds.blue[100],
-                            }}
-                            data-testid={`default-filter-card-${cardIdx}`}
-                          >
-                            <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: ds.space[3] }}>
-                              <Typography sx={{ fontSize: 'var(--ds-text-body)', fontWeight: 'var(--ds-font-weight-semibold)', color: ds.blue[500] }}>
-                                Account {cardIdx + 1}
-                              </Typography>
-                              {defaultFilterRules.length > 1 && (
-                                <Button
-                                  tone='secondary'
-                                  size='xs'
-                                  composition='icon-only'
-                                  icon={
-                                    <SafeIcon
-                                      src={NewDelete}
-                                      alt='Remove account'
-                                      style={{ width: ds.space.mul(0, 7), height: ds.space.mul(0, 7) }}
-                                    />
-                                  }
-                                  aria-label='Remove account'
-                                  onClick={() => handleRemoveDefaultFilterCard(cardIdx)}
-                                />
-                              )}
-                            </Box>
-                            <FilterDropdown
-                              label='Account'
-                              grouped
-                              groupIcon={renderAccountGroupIcon}
-                              options={accountOptions}
-                              value={card.accountId}
-                              onSelect={(_event, value) => handleDefaultFilterAccountChange(cardIdx, value?.value ?? value)}
-                              isOptionsLoading={loadingOptions.account_id}
-                              disabled={!accountOptions.length}
-                              sx={{
-                                height: ds.space.mul(0, 22),
-                                mb: cardNeedsAccount ? ds.space[1] : ds.space[3],
-                                ...(cardNeedsAccount ? { borderColor: 'var(--ds-red-500)', boxShadow: '0 0 0 3px var(--ds-red-100)' } : {}),
-                              }}
-                            />
-                            {cardNeedsAccount && (
-                              <Typography sx={{ color: 'var(--ds-red-600)', fontSize: 'var(--ds-text-caption)', mb: ds.space[3], pl: ds.space[1] }}>
-                                Select an account to apply these filters.
-                              </Typography>
-                            )}
-                            <Typography
-                              sx={{
-                                fontSize: 'var(--ds-text-small)',
-                                fontWeight: 'var(--ds-font-weight-semibold)',
-                                color: ds.brand[500],
-                                mb: ds.space[2],
-                              }}
-                            >
-                              ALWAYS APPLY
-                            </Typography>
-                            {card.filters.map((f, rowIdx) => (
-                              <Box key={rowIdx} sx={{ display: 'flex', gap: ds.space[3], alignItems: 'flex-end', mb: ds.space[2] }}>
-                                <Box sx={{ flex: 1 }}>
-                                  <Input
-                                    label={rowIdx === 0 ? 'Column' : ''}
-                                    placeholder='e.g. cluster_id'
-                                    value={f.key}
-                                    onChange={(value) => handleDefaultFilterRowChange(cardIdx, rowIdx, 'key', value)}
-                                    size='sm'
-                                    error={
-                                      cardVal?.done && (f.key || '').trim() && cardVal.invalid.includes((f.key || '').trim())
-                                        ? 'Not a known log column for this account.'
-                                        : undefined
-                                    }
-                                  />
-                                </Box>
-                                <Typography sx={{ fontSize: 'var(--ds-text-body-lg)', color: ds.brand[500], pb: ds.space[1] }}>=</Typography>
-                                <Box sx={{ flex: 1 }}>
-                                  <Input
-                                    label={rowIdx === 0 ? 'Value' : ''}
-                                    placeholder='e.g. nudgebee'
-                                    value={f.value}
-                                    onChange={(value) => handleDefaultFilterRowChange(cardIdx, rowIdx, 'value', value)}
-                                    size='sm'
-                                  />
-                                </Box>
-                                <Box sx={{ paddingBottom: ds.space[1] }}>
-                                  <Button
-                                    tone='secondary'
-                                    size='xs'
-                                    composition='icon-only'
-                                    icon={<SafeIcon src={NewDelete} alt='Remove' style={{ width: ds.space.mul(0, 7), height: ds.space.mul(0, 7) }} />}
-                                    aria-label='Remove filter'
-                                    disabled={card.filters.length === 1}
-                                    onClick={() => handleRemoveDefaultFilterRow(cardIdx, rowIdx)}
-                                  />
-                                </Box>
-                              </Box>
-                            ))}
-                            <Box sx={{ mt: ds.space[2], display: 'flex', alignItems: 'center', gap: ds.space[3], flexWrap: 'wrap' }}>
-                              <Button tone='secondary' size='sm' onClick={() => handleAddDefaultFilterRow(cardIdx)}>
-                                + Add filter
-                              </Button>
-                              <Button
-                                tone='secondary'
-                                size='sm'
-                                onClick={() => handleValidateCard(cardIdx)}
-                                disabled={!card.accountId || cardVal?.loading}
-                              >
-                                {cardVal?.loading ? 'Validating…' : 'Validate columns'}
-                              </Button>
-                              {cardVal?.done &&
-                                (cardVal.invalid.length === 0 ? (
-                                  <Typography sx={{ color: 'var(--ds-green-600)', fontSize: 'var(--ds-text-caption)' }}>
-                                    All columns valid ✓
-                                  </Typography>
-                                ) : (
-                                  <Typography sx={{ color: 'var(--ds-red-600)', fontSize: 'var(--ds-text-caption)' }}>
-                                    {cardVal.invalid.length} unknown column{cardVal.invalid.length > 1 ? 's' : ''}
-                                  </Typography>
-                                ))}
-                            </Box>
-                          </Box>
-                        );
-                      })}
-                      <Button tone='secondary' size='md' onClick={handleAddDefaultFilterCard}>
-                        + Add account
-                      </Button>
-                    </>
+                    <DefaultFiltersCard
+                      title='Default Log Filters (Optional)'
+                      helpText={
+                        <>
+                          Filters always applied to every log query for the selected account (e.g. a central provider scoped to one cluster:{' '}
+                          <em>cluster_id = nudgebee</em>). Enter the provider-native column name. Conditions in a card are combined with AND.
+                        </>
+                      }
+                      lockedText="Run Test Connection to load the backend's columns and configure default filters."
+                      unlocked={advancedSettingsUnlocked}
+                      cards={defaultFilterRules}
+                      onCardsChange={handleDefaultFilterRulesChange}
+                      accountOptions={accountOptions}
+                      accountOptionsLoading={loadingOptions.account_id}
+                      renderAccountGroupIcon={renderAccountGroupIcon}
+                      fieldLabel='Column'
+                      fieldPlaceholder='e.g. cluster_id'
+                      valuePlaceholder='e.g. nudgebee'
+                      fieldOptionsForCard={(card) =>
+                        logFieldOptions[fieldOptionsKey(card.accountId, indexForAccount(indexRules, card.accountId, formValues.log_index))] || {
+                          loading: false,
+                          options: [],
+                        }
+                      }
+                      validation={columnValidation}
+                      onValidateCard={handleValidateCard}
+                      validateLabel='Validate columns'
+                      invalidFieldError='Not a known log column for this account.'
+                      testIdPrefix='default-filter'
+                    />
+                  )}
+                  {showTraceFilters && (
+                    <DefaultFiltersCard
+                      title='Default Trace Filters (Optional)'
+                      helpText={
+                        <>
+                          Filters always applied to every trace query for the selected account — the traces screen, investigation evidence and
+                          nubi&apos;s answers (e.g. a shared backend scoped to one environment: <em>workload_namespace = production</em>). Use the
+                          canonical field name, not the backend&apos;s: it is translated per provider, so it survives a provider change. Conditions in
+                          a card are combined with AND.
+                        </>
+                      }
+                      lockedText='Run Test Connection to configure default trace filters.'
+                      unlocked={advancedSettingsUnlocked}
+                      cards={defaultTraceFilterRules}
+                      onCardsChange={setDefaultTraceFilterRules}
+                      accountOptions={accountOptions}
+                      accountOptionsLoading={loadingOptions.account_id}
+                      renderAccountGroupIcon={renderAccountGroupIcon}
+                      fieldLabel='Field'
+                      fieldPlaceholder='e.g. workload_namespace'
+                      valuePlaceholder='e.g. production'
+                      fieldOptionsForCard={() => ({ loading: false, options: CANONICAL_TRACE_FIELD_OPTIONS })}
+                      testIdPrefix='default-trace-filter'
+                      sx={{ mt: showLogFilters ? ds.space[6] : 0 }}
+                    />
                   )}
                   {isESIntegration && (
                     <>
@@ -2544,7 +3175,7 @@ const IntegrationDynamicFormModal = ({
                           color: ds.brand[500],
                           fontSize: 'var(--ds-text-body)',
                           fontWeight: 'var(--ds-font-weight-medium)',
-                          mt: showLogFilters ? ds.space[6] : 0,
+                          mt: showLogFilters || showTraceFilters ? ds.space[6] : 0,
                           mb: ds.space[1],
                         }}
                       >
@@ -2554,7 +3185,7 @@ const IntegrationDynamicFormModal = ({
                         When one Elasticsearch endpoint serves multiple accounts, map each account to its own index. Leave a field blank to fall back
                         to the index configured above.
                       </Typography>
-                      {!connectionVerified ? (
+                      {!advancedSettingsUnlocked ? (
                         <Typography sx={{ color: ds.gray[400], fontSize: 'var(--ds-text-small)', pl: ds.space[1], mb: ds.space[3] }}>
                           Run Test Connection to load the cluster&apos;s indices and configure per-account mapping.
                         </Typography>
@@ -2655,6 +3286,23 @@ const IntegrationDynamicFormModal = ({
                                       placeholder={formValues.trace_index ? `inherit: ${formValues.trace_index}` : 'inherit top-level'}
                                     />
                                   </Box>
+                                  {/* The three trace layouts share no field names, so the reader
+                                      cannot be inferred from the index above — it is declared. Only
+                                      needed when this account's cluster writes a different layout
+                                      than the integration's top-level Trace Schema. */}
+                                  <Box sx={{ flex: '1 1 30%', minWidth: 180 }}>
+                                    <FilterDropdown
+                                      label='Trace Schema'
+                                      options={ES_TRACE_SCHEMA_OPTIONS}
+                                      value={card.trace_schema}
+                                      onSelect={(_e, v) => handleIndexCardChange(cardIdx, 'trace_schema', v?.value ?? v ?? '')}
+                                      placeholder={
+                                        formValues.trace_schema
+                                          ? `inherit: ${ENUM_VALUE_LABELS[formValues.trace_schema] || formValues.trace_schema}`
+                                          : 'inherit top-level'
+                                      }
+                                    />
+                                  </Box>
                                 </Box>
                               </Box>
                             );
@@ -2666,9 +3314,66 @@ const IntegrationDynamicFormModal = ({
                       )}
                     </>
                   )}
+                  {supportsLogLabelMapping && (
+                    <Box sx={{ mt: showLogFilters || showTraceFilters || isESIntegration ? ds.space[6] : 0 }}>
+                      <LabelMappingCards
+                        cards={labelMappingCards}
+                        setCards={setLabelMappingCards}
+                        savedCards={savedLabelMappingCards}
+                        connectionVerified={advancedSettingsUnlocked}
+                        fieldOptions={logFieldOptions}
+                        indexRules={indexRules}
+                        topLevelIndex={formValues.log_index}
+                        accountOptions={accountOptions}
+                        accountOptionsLoading={loadingOptions.account_id}
+                        grouped={config.properties?.account_id?.grouped}
+                        renderAccountGroupIcon={renderAccountGroupIcon}
+                        provider={integrationName}
+                        providerSource={editData?.source || 'user'}
+                      />
+                    </Box>
+                  )}
+                  {showTraceLabelMapping && (
+                    <Box sx={{ mt: showLogFilters || showTraceFilters || isESIntegration || supportsLogLabelMapping ? ds.space[6] : 0 }}>
+                      <LabelMappingCards
+                        cards={traceLabelMappingCards}
+                        setCards={setTraceLabelMappingCards}
+                        savedCards={savedTraceLabelMappingCards}
+                        connectionVerified={advancedSettingsUnlocked}
+                        accountOptions={accountOptions}
+                        accountOptionsLoading={loadingOptions.account_id}
+                        grouped={config.properties?.account_id?.grouped}
+                        renderAccountGroupIcon={renderAccountGroupIcon}
+                        provider={integrationName}
+                        providerSource={editData?.source || 'user'}
+                        providerType='traces'
+                        signalNoun='trace'
+                        testIdPrefix='trace-label-mapping'
+                        title='Trace Label Mapping (Optional)'
+                        helpText={
+                          <>
+                            {`Tell ${getBrandTitle()} which span or resource attribute in this backend holds each canonical trace field (e.g. `}
+                            <em>service_name → service.name</em>
+                            {`). What you set here wins over the account and tenant mappings. Leave a field out and it falls through to those.`}
+                          </>
+                        }
+                        lockedText='Run Test Connection to configure the trace field mapping.'
+                        canonicalOptions={CANONICAL_TRACE_FIELD_OPTIONS}
+                        canonicalPlaceholder='e.g. service_name'
+                        fieldPlaceholder='e.g. service.name'
+                        // No field probe for traces: traces_list_labels has no client wrapper and needs a
+                        // saved integration, so the right-hand input is free text and the panel below is
+                        // what confirms a typed value actually took.
+                        fieldOptionsForCard={() => ({ loading: false, options: [], message: '' })}
+                        conceptLabels={TRACE_CONCEPT_LABELS}
+                        conceptOrder={TRACE_CONCEPT_ORDER}
+                      />
+                    </Box>
+                  )}
                 </Collapse>
               </Box>
             )}
+            {!isLoadingSchema && renderAlertDelivery()}
             <Box
               sx={{
                 display: 'flex',
@@ -2722,6 +3427,7 @@ IntegrationDynamicFormModal.propTypes = {
   openModal: PropTypes.bool,
   handleClose: PropTypes.func,
   title: PropTypes.string,
+  subtitle: PropTypes.string,
   integrationData: PropTypes.array,
   editData: PropTypes.object,
   listIntegrationConfigurationById: PropTypes.func,

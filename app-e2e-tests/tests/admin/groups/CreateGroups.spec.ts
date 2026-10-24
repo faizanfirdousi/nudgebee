@@ -1,128 +1,112 @@
 import { test, expect } from "@playwright/test";
-import { LoginPage } from "../../../pages/LoginPage";
-import { Groups, GroupLocators } from "./groupLocatorsConstants";
-import { CommonLocators } from "../../GlobalLocators";
-// Added for the CRUD/edge-case suite below.
 import type { Page } from "@playwright/test";
 import {
   setup,
   ensureGroupExists,
+  groupExists,
+  prepareMember,
+  requireMemberAccount,
+  requireAccountName,
+  openUsersPage,
+  assignGroupFromUsersPage,
   restoreGroup,
   FIXTURE_GROUPS,
-  FIXTURE_DESCRIPTION,
+  FIXTURE_DESCRIPTIONS,
+  FIXTURE_ALIASES,
+  EDIT_DESCRIPTIONS,
+  SAVE_EXIT_DESCRIPTIONS,
+  otherDescription,
+  UNSAVED_GROUP_NAMES,
   GROUP_ERRORS,
   GROUP_TOASTS,
+  ACCOUNT_ROLE_VALUES,
 } from "./groupLocatorsConstants";
 
-test("Add User Groups", async ({ page }) => {
-  test.setTimeout(120000);
-
-  const loginPage = new LoginPage(page);
-  const locators = new GroupLocators(page);
-  const commonLocators = new CommonLocators(page);
-  await loginPage.doFullLogin();
-
-  await expect(locators.homeBtn).toBeVisible({ timeout: 3000 });
-  await locators.homeBtn.click();
-  await commonLocators.adminBtn.click();
-
-  console.log("Clicked on Admin button", commonLocators.adminBtn);
-  await locators.groupsTab.click();
-
-  await expect(locators.newUserGroupIdentifier).toBeVisible();
-
-  for (const group of Groups) {
-    await test.step(`Processing Group: ${group.name}`, async () => {
-      await locators.newUserGroupIdentifier.click();
-
-      await locators.groupNameInput.fill(group.name);
-      await locators.descriptionInput.fill("Auto-test generated");
-
-      await locators.createGroupBtn.click();
-
-      const result = await Promise.race([
-        locators.group_creation_successMsg
-          .waitFor({ state: "visible", timeout: 300000 })
-          .then(() => "success"),
-        locators.group_creation_duplicateMsg
-          .waitFor({ state: "visible", timeout: 300000 })
-          .then(() => "duplicate"),
-      ]);
-
-      if (result === "success") {
-        await expect(locators.group_creation_successMsg).toBeVisible();
-      } else {
-        await locators.cancelBtn.click();
-      }
-    });
-  }
-});
-
 test.describe("Groups - CRUD & edge cases", () => {
-  test.describe.configure({ timeout: 180000 });
+  // mode "default" because the project sets fullyParallel, which splits even one file across workers - and these
+  // tests share three fixture groups, so concurrent runs of them fight over the same rows. Not "serial": that
+  // skips every remaining test once one fails, which would cost the whole file's signal for a single failure.
+  // Per-test isolation is the usual answer instead, but here it would mean a group per test and groups cannot
+  // be deleted, which is the leak this suite exists to stop.
+  // 5 minutes: a members test activates its account, normalises membership, then does its own work, and each modal cycle is slow on a loaded runner.
+  test.describe.configure({ mode: "default", timeout: 300000 });
 
   // ── CREATE ──
 
   test(
-    "Create - group is created and appears in the list",
-    { tag: ["@smoke", "@crud", "@snackbar"] },
+    "User Groups - add the roles fixture when it is missing, verify the success snackbar and the listing row with its description",
+    { tag: ["@oss", "@dev", "@test", "@smoke", "@functional", "@crud", "@snackbar"] },
     async ({ page }) => {
       const locators = await setup(page);
 
-      // A run-unique name. The product has no delete, so a fixed name would be
-      // created once and every later run would take the duplicate path and assert
-      // nothing. The cost of staying honest is one permanent group per run.
-      const name = `e2e grp create ${Date.now()}`;
+      const name = FIXTURE_GROUPS.roles;
+      const description = FIXTURE_DESCRIPTIONS[name];
 
-      await locators.newUserGroupIdentifier.click();
+      // Groups cannot be deleted, so creating unconditionally left one undeletable row per run. On a tenant that
+      // still has the fixture this asserts the fixture is intact; on a fresh one it creates it and proves the
+      // create flow. The test env builds a new tenant per run, so the create path is exercised there every time.
+      if (await groupExists(locators, name)) {
+        await expect(locators.getGroupRow(name)).toContainText(description);
+        return;
+      }
+
+      await locators.openAddGroupForm();
       await expect(locators.modalTitle).toHaveText("Add Group");
 
       await locators.nameInput.fill(name);
-      await locators.descInput.fill("Created by e2e create test");
+      await locators.descInput.fill(description);
       await locators.modalSubmitBtn.click();
 
-      await expect(locators.toast(GROUP_TOASTS.created)).toBeVisible();
+      // Page-wide for presence; the region-scoped locator stays for the absence checks further down, where
+      // scoping is what makes "no success toast" mean something.
+      await expect(locators.toastText(GROUP_TOASTS.created)).toBeVisible();
       await locators.nameInput.waitFor({ state: "hidden", timeout: 10000 });
 
       // The toast alone is not proof the group persisted — confirm it reached the list.
       await locators.searchGroup(name);
-      await expect(locators.getGroupRow(name)).toBeVisible();
+      await expect(locators.getGroupRow(name)).toContainText(description);
     }
   );
 
   test(
-    "Create - group with members shows correct member count",
-    { tag: ["@regression", "@crud"] },
+    "User Groups - add the members fixture with a member picked during creation, verify the member count in the listing",
+    { tag: ["@oss", "@dev", "@test", "@regression", "@functional", "@crud"] },
     async ({ page }) => {
       const locators = await setup(page);
 
-      const name = `e2e grp members create ${Date.now()}`;
+      const name = FIXTURE_GROUPS.members;
+      const description = FIXTURE_DESCRIPTIONS[name];
 
-      await locators.newUserGroupIdentifier.click();
+      // Same find-or-create shape as the test above. The member count is only asserted on the create path:
+      // the members tests each seed and then remove their own member, so this fixture settles back to empty.
+      if (await groupExists(locators, name)) {
+        await expect(locators.getGroupRow(name)).toContainText(description);
+        return;
+      }
+
+      // A named account from .env, never whichever user the picker happens to list first. This branch only
+      // runs on a tenant without the fixture, so it went unnoticed on dev and seeded the fixture with a real
+      // colleague's account - permanently, since the create path never removes what it added.
+      const member = requireMemberAccount("add");
+      await prepareMember(locators, page, member);
+
+      await locators.openAddGroupForm();
       await locators.nameInput.fill(name);
+      await locators.descInput.fill(description);
 
-      // Pick the first available user. Capture its username first so the member
-      // can be verified by identity rather than by row count alone.
-      await locators.membersPicker.click();
-      const firstOption = page.locator('[role="option"]').first();
-      await firstOption.waitFor({ state: "visible", timeout: 15000 });
-      const username = ((await firstOption.textContent()) ?? "").trim();
-      // Every string contains "", so an empty username would make the
-      // toContainText assertion below pass vacuously.
-      expect(username, "member picker option had no text").not.toBe("");
-      await firstOption.click();
-      await page.keyboard.press("Escape"); // multi-select stays open after picking
+      await locators.addMember(member.email);
 
       // The picked user lands in the members table and the card header counts it.
-      await expect(locators.selectedUsersTable).toContainText(username);
+      await expect(locators.selectedUsersTable).toContainText(member.name);
       await expect(page.getByText("Members · 1")).toBeVisible();
 
       await locators.modalSubmitBtn.click();
-      await expect(locators.toast(GROUP_TOASTS.created)).toBeVisible();
+      // Page-wide, like every other toast assertion here: scoping to the Notifications region ties the test
+      // to container markup that differs between builds.
+      await expect(locators.toastText(GROUP_TOASTS.created)).toBeVisible();
       await locators.nameInput.waitFor({ state: "hidden", timeout: 10000 });
 
-      // Total Members in the list must reflect the single member. Matched by cell
-      // content rather than column index — the list has a leading expander cell.
+      // Matched by cell content, not column index, because the list has a leading expander cell.
       await locators.searchGroup(name);
       await expect(locators.getGroupRow(name)).toBeVisible();
       await expect(locators.getGroupRow(name).locator("td").filter({ hasText: /^1$/ })).toBeVisible();
@@ -132,80 +116,55 @@ test.describe("Groups - CRUD & edge cases", () => {
   // ── VIEW / SEARCH (non-mutating) ──
 
   test(
-    "Search - finds a group by name",
-    { tag: ["@smoke", "@search"] },
+    "User Groups sanity - search the listing by name and by a name that cannot exist, verify the matching row and the empty state",
+    { tag: ["@oss", "@dev", "@test", "@sanity", "@search", "@negative"] },
     async ({ page }) => {
       const locators = await setup(page);
 
-      // Fixture is created on the first run against a tenant, reused thereafter.
-      // Nothing in the suite ever mutates this group, so its row content is stable.
-      await ensureGroupExists(locators, FIXTURE_GROUPS.read);
+      // The roles fixture's name and description are never written by any test - only its role assignments are,
+      // and those live in a different column - so the row content asserted below is stable whatever else ran first.
+      await ensureGroupExists(locators, FIXTURE_GROUPS.roles);
 
-      await locators.searchGroup(FIXTURE_GROUPS.read);
+      await test.step("a matching name returns the row with its description", async () => {
+        await locators.searchGroup(FIXTURE_GROUPS.roles);
 
-      const row = locators.getGroupRow(FIXTURE_GROUPS.read);
-      await expect(row).toBeVisible();
-      await expect(row).toContainText(FIXTURE_DESCRIPTION);
+        const row = locators.getGroupRow(FIXTURE_GROUPS.roles);
+        await expect(row).toBeVisible();
+        await expect(row).toContainText(FIXTURE_DESCRIPTIONS[FIXTURE_GROUPS.roles]);
+      });
+
+      await test.step("a name that cannot exist shows the empty state, and clearing brings the listing back", async () => {
+        await locators.searchGroup("zzz_nonexistent_group_000");
+        await expect(page.getByText("No Data Available")).toBeVisible();
+
+        await locators.clearGroupSearch();
+        // Count, not toBeHidden: the empty state is conditionally rendered, so it leaves the DOM entirely
+        // and a hidden-but-present element would mean the listing had not actually come back.
+        await expect(page.getByText("No Data Available")).toHaveCount(0);
+      });
     }
   );
 
+  // EDIT: each card saves itself and reports its own toast; there is no combined submit and the footer button is Close.
+
   test(
-    "Search - no match shows empty state, clear restores list",
-    { tag: ["@regression", "@search"] },
+    "User Groups - open a group, edit the description, save the section, verify the snackbar and that the new description persists",
+    { tag: ["@oss", "@dev", "@test", "@smoke", "@functional", "@crud", "@snackbar"] },
     async ({ page }) => {
       const locators = await setup(page);
 
-      // A name that cannot exist -> empty state.
-      await locators.searchGroup("zzz_nonexistent_group_000");
-      await expect(page.getByText("No Data Available")).toBeVisible();
-
-      // Clearing the search restores the list.
-      await locators.clearGroupSearch();
-      await expect(page.getByText("No Data Available")).toBeHidden();
-    }
-  );
-
-  test(
-    "View - expanding a group row lists its members",
-    { tag: ["@regression"] },
-    async ({ page }) => {
-      const locators = await setup(page);
-
-      await ensureGroupExists(locators, FIXTURE_GROUPS.read);
-      await locators.searchGroup(FIXTURE_GROUPS.read);
-
-      const row = locators.getGroupRow(FIXTURE_GROUPS.read);
-      await expect(row).toBeVisible();
-
-      // A row toggles its expanded panel when non-interactive cell chrome is
-      // clicked (clicks originating from buttons/links are ignored), so the
-      // plain-text group-name cell is a safe target.
-      await row.getByText(FIXTURE_GROUPS.read).click();
-
-      await expect(page.getByRole("tab", { name: "Users" })).toBeVisible();
-    }
-  );
-
-  // ── EDIT ──
-  // The edit modal saves per section: each card has its own Save button, enabled
-  // only while that section is dirty, and each reports its own toast. There is no
-  // combined submit, and the footer button is Close.
-
-  test(
-    "Edit - description update persists",
-    { tag: ["@smoke", "@crud", "@snackbar"] },
-    async ({ page }) => {
-      const locators = await setup(page);
-
-      await ensureGroupExists(locators, FIXTURE_GROUPS.update);
-      const editedDescription = `edited by e2e ${Date.now()}`;
+      await ensureGroupExists(locators, FIXTURE_GROUPS.info);
+      let editedDescription: string = EDIT_DESCRIPTIONS[0];
 
       try {
-        await locators.openEditFor(FIXTURE_GROUPS.update);
+        await locators.openEditFor(FIXTURE_GROUPS.info);
         await expect(locators.modalTitle).toHaveText("Edit Group");
 
         // Nothing changed yet, so the section's Save is inert.
         await expect(locators.saveGroupInfoBtn).toBeDisabled();
+
+        // Whichever value is not stored right now, so a leftover from a crashed run cannot make this a no-op.
+        editedDescription = otherDescription(await locators.descInput.inputValue(), EDIT_DESCRIPTIONS);
 
         await locators.armAndClickSave(locators.saveGroupInfoBtn, async () => {
           await locators.fillStable(locators.descInput, editedDescription);
@@ -214,37 +173,36 @@ test.describe("Groups - CRUD & edge cases", () => {
         await locators.expectSectionToast(GROUP_TOASTS.infoUpdated);
         await locators.closeModal();
 
-        // A toast only says the request was accepted. Reopen the group so the
-        // value is read back from the API, and check the list rendered it too.
-        await locators.openEditFor(FIXTURE_GROUPS.update);
+        // Reopen the group so the value is read back from the API, then check the list rendered it too.
+        await locators.openEditFor(FIXTURE_GROUPS.info);
         await expect(locators.descInput).toHaveValue(editedDescription);
         await locators.closeModal();
 
-        await locators.searchGroup(FIXTURE_GROUPS.update);
-        await expect(locators.getGroupRow(FIXTURE_GROUPS.update)).toContainText(editedDescription);
+        await locators.searchGroup(FIXTURE_GROUPS.info);
+        await expect(locators.getGroupRow(FIXTURE_GROUPS.info)).toContainText(editedDescription);
       } finally {
-        await restoreGroup(locators, [FIXTURE_GROUPS.update], {
-          name: FIXTURE_GROUPS.update,
-          description: FIXTURE_DESCRIPTION,
+        await restoreGroup(locators, [FIXTURE_GROUPS.info], {
+          name: FIXTURE_GROUPS.info,
+          description: FIXTURE_DESCRIPTIONS[FIXTURE_GROUPS.info],
         });
       }
     }
   );
 
   test(
-    "Edit - group name update persists",
-    { tag: ["@regression", "@crud"] },
+    "User Groups - open a group, rename it, save the section, verify the group is found under the new name and not the old one",
+    { tag: ["@oss", "@dev", "@test", "@regression", "@functional", "@crud"] },
     async ({ page }) => {
       const locators = await setup(page);
 
-      // Unique per run. A fixed rename target collides with itself: groups cannot
-      // be deleted, so one crashed run leaves that name taken forever and every
-      // later run is rejected with "Group name already in use".
-      const editedName = `${FIXTURE_GROUPS.update} r${Date.now()}`;
-      await ensureGroupExists(locators, FIXTURE_GROUPS.update);
+      // Fixed, not timestamped, and taken from FIXTURE_ALIASES so every other test heals a crashed rename too.
+      // A per-run name could never be found again, which is how "e2e grp update r<ts>" rows were orphaned on
+      // dev, one per crash.
+      const editedName = FIXTURE_ALIASES[FIXTURE_GROUPS.info][0];
+      await ensureGroupExists(locators, FIXTURE_GROUPS.info);
 
       try {
-        await locators.openEditFor(FIXTURE_GROUPS.update);
+        await locators.openEditFor(FIXTURE_GROUPS.info);
         await expect(locators.saveGroupInfoBtn).toBeDisabled();
 
         await locators.armAndClickSave(locators.saveGroupInfoBtn, async () => {
@@ -257,37 +215,43 @@ test.describe("Groups - CRUD & edge cases", () => {
         // Found under the new name, and no longer under the old one.
         await locators.searchGroup(editedName);
         await expect(locators.getGroupRow(editedName)).toBeVisible();
-        await expect(locators.getGroupRow(FIXTURE_GROUPS.update)).toHaveCount(0);
+        await expect(locators.getGroupRow(FIXTURE_GROUPS.info)).toHaveCount(0);
       } finally {
-        await restoreGroup(locators, [editedName, FIXTURE_GROUPS.update], {
-          name: FIXTURE_GROUPS.update,
-          description: FIXTURE_DESCRIPTION,
+        await restoreGroup(locators, [editedName, FIXTURE_GROUPS.info], {
+          name: FIXTURE_GROUPS.info,
+          description: FIXTURE_DESCRIPTIONS[FIXTURE_GROUPS.info],
         });
       }
     }
   );
 
   test(
-    "Edit - tenant role assignment persists",
-    { tag: ["@regression", "@rbac", "@snackbar"] },
+    "User Groups - open a group, assign the ReadOnly Admin tenant role, save the section, verify the role appears in the listing",
+    { tag: ["@oss", "@dev", "@test", "@regression", "@functional", "@rbac", "@snackbar"] },
     async ({ page }) => {
       const locators = await setup(page);
 
-      await ensureGroupExists(locators, FIXTURE_GROUPS.rbac);
+      await ensureGroupExists(locators, FIXTURE_GROUPS.roles);
 
-      // ReadOnly Admin rather than Admin: least privilege, in case a crashed run
-      // ever leaves the role assigned on a shared tenant.
+      // ReadOnly Admin for least privilege, in case a crashed run leaves the role assigned on a shared tenant.
       const roleLabel = "ReadOnly Admin";
-      // The list humanizes the stored role, so it reads differently from the
-      // picker's label and from the raw value (tenant_admin_readonly).
+      // The list humanizes the stored role, so it differs from both the picker label and the raw value.
       const roleInList = "Tenant Admin Readonly";
 
       try {
-        await locators.openEditFor(FIXTURE_GROUPS.rbac);
+        await locators.openEditFor(FIXTURE_GROUPS.roles);
 
-        // Start from a known baseline — a crashed run may have left a role set,
-        // and re-picking the same role would leave the section clean and Save inert.
-        await locators.clearTenantRoles();
+        // Start from a genuinely empty baseline: a role left behind by an earlier run has to be cleared *and*
+        // saved, because an unsaved clear leaves the section dirty and Save armed before the real edit is made.
+        if (await locators.clearTenantRoles()) {
+          await locators.saveTenantRolesBtn.click();
+          await locators.expectSectionToast(GROUP_TOASTS.tenantUpdated);
+          // Let it fade, or the identical toast from the save below would match this one instead.
+          await page
+            .getByText(GROUP_TOASTS.tenantUpdated, { exact: true })
+            .first()
+            .waitFor({ state: "hidden", timeout: 15000 });
+        }
         await expect(locators.saveTenantRolesBtn).toBeDisabled();
 
         await locators.armAndClickSave(locators.saveTenantRolesBtn, async () => {
@@ -297,21 +261,315 @@ test.describe("Groups - CRUD & edge cases", () => {
         await locators.expectSectionToast(GROUP_TOASTS.tenantUpdated);
         await locators.closeModal();
 
-        await locators.searchGroup(FIXTURE_GROUPS.rbac);
-        await expect(locators.getGroupRow(FIXTURE_GROUPS.rbac)).toContainText(roleInList);
+        await locators.searchGroup(FIXTURE_GROUPS.roles);
+        await expect(locators.getGroupRow(FIXTURE_GROUPS.roles)).toContainText(roleInList);
       } finally {
         // Clear the role again so the fixture goes back to having none.
         try {
           await locators.closeModalIfOpen();
-          await locators.openEditFor(FIXTURE_GROUPS.rbac);
-          await locators.armAndClickSave(locators.saveTenantRolesBtn, async () => {
-            await locators.clearTenantRoles();
-          });
-          await locators.expectSectionToast(GROUP_TOASTS.tenantUpdated);
-          await locators.closeModal();
+          await locators.openEditFor(FIXTURE_GROUPS.roles);
+          // clearTenantRoles reports whether anything was actually selected. Handing a no-op to armAndClickSave
+          // left Save disabled and its final assert threw, so an already-clean fixture logged a swallowed
+          // "toBeEnabled failed" that read like the cleanup had failed when there was nothing to clean.
+          if (await locators.clearTenantRoles()) {
+            await locators.saveTenantRolesBtn.click();
+            await locators.expectSectionToast(GROUP_TOASTS.tenantUpdated);
+          }
         } catch (error) {
-          console.warn(`Could not clear tenant role on "${FIXTURE_GROUPS.rbac}":`, error);
+          console.warn(`Could not clear tenant role on "${FIXTURE_GROUPS.roles}":`, error);
+        } finally {
+          await locators.closeModalIfOpen();
         }
+      }
+    }
+  );
+
+  test(
+    "User Groups - assign an account role, save the section, verify it persists after reopening",
+    { tag: ["@oss", "@dev", "@test", "@regression", "@functional", "@rbac", "@snackbar"] },
+    async ({ page }) => {
+      const locators = await setup(page);
+
+      await ensureGroupExists(locators, FIXTURE_GROUPS.roles);
+      const roleLabel = "ReadOnly Admin";
+
+      try {
+        await locators.openEditFor(FIXTURE_GROUPS.roles);
+        await locators.accountRbacTab.click();
+
+        // The account comes back from the picker rather than from .env: which accounts a tenant has differs
+        // per environment, and the assertions below only need to name the one that was actually used.
+        const accountName = await locators.addAccountRole(roleLabel, requireAccountName("CLUSTER"));
+
+        await locators.saveAccountRolesBtn.click();
+        await locators.expectSectionToast(GROUP_TOASTS.accountUpdated);
+        await locators.closeModal();
+
+        await locators.openEditFor(FIXTURE_GROUPS.roles);
+        await locators.accountRbacTab.click();
+        await expect(locators.selectedAccountsTable).toContainText(accountName);
+        await locators.closeModal();
+      } finally {
+        await locators.clearAccountRoles(FIXTURE_GROUPS.roles);
+      }
+    }
+  );
+
+  test(
+    "User Groups - assign an account role then save the info section on its own, verify the account role is not wiped",
+    { tag: ["@oss", "@dev", "@test", "@regression", "@functional", "@rbac"] },
+    async ({ page }) => {
+      const locators = await setup(page);
+
+      // The info fixture, not the roles one: proving the account role survives needs a second section to be
+      // saved, and the only other section is the group's own name and description. The roles fixture's
+      // description is asserted verbatim by the create and sanity tests, so churning it there left those two
+      // failing on a LATER run whenever this test's best-effort restore did not land. Nothing asserts the info
+      // fixture's description - churning it is what that fixture is for.
+      await ensureGroupExists(locators, FIXTURE_GROUPS.info);
+
+      try {
+        await locators.openEditFor(FIXTURE_GROUPS.info);
+        await locators.accountRbacTab.click();
+
+        const accountName = await locators.addAccountRole("ReadOnly Admin", requireAccountName("CLUSTER"));
+        await locators.saveAccountRolesBtn.click();
+        await locators.expectSectionToast(GROUP_TOASTS.accountUpdated);
+        await locators.closeModal();
+
+        // The account save is replace-all and runs off a list the modal fetches on open. Saving a different
+        // section without ever opening the Account tab used to write that empty list back and drop every
+        // account role. This is the regression test for that.
+        await locators.openEditFor(FIXTURE_GROUPS.info);
+        await locators.armAndClickSave(locators.saveGroupInfoBtn, async () => {
+          await locators.fillStable(locators.descInput, otherDescription(await locators.descInput.inputValue(), EDIT_DESCRIPTIONS));
+        });
+        await locators.expectSectionToast(GROUP_TOASTS.infoUpdated);
+        await locators.closeModal();
+
+        await locators.openEditFor(FIXTURE_GROUPS.info);
+        await locators.accountRbacTab.click();
+        await expect(locators.selectedAccountsTable).toContainText(accountName);
+        await locators.closeModal();
+      } finally {
+        await locators.clearAccountRoles(FIXTURE_GROUPS.info);
+        await restoreGroup(locators, [FIXTURE_GROUPS.info], {
+          name: FIXTURE_GROUPS.info,
+          description: FIXTURE_DESCRIPTIONS[FIXTURE_GROUPS.info],
+        });
+      }
+    }
+  );
+
+  test(
+    "User Groups - change an assigned account role to the other one, then delete the row, verify the account keeps a single row with the new role and that the removal persists",
+    { tag: ["@oss", "@dev", "@test", "@regression", "@functional", "@rbac"] },
+    async ({ page }) => {
+      const locators = await setup(page);
+
+      await ensureGroupExists(locators, FIXTURE_GROUPS.roles);
+      // Filled in by the first add: the override this test is about has to land on the SAME account, and which
+      // account that is depends on what the tenant holds.
+      let accountName = "";
+
+      // Three saves raise the same toast, so each one has to be watched away before the next is asserted,
+      // or a lingering toast satisfies the following assertion without a save having happened.
+      const settle = async () => {
+        await locators.expectSectionToast(GROUP_TOASTS.accountUpdated);
+        await page.getByText(GROUP_TOASTS.accountUpdated, { exact: true }).first().waitFor({ state: "hidden", timeout: 15000 });
+      };
+
+      try {
+        await locators.openEditFor(FIXTURE_GROUPS.roles);
+        await locators.accountRbacTab.click();
+        accountName = await locators.addAccountRole("ReadOnly Admin", requireAccountName("CLUSTER"));
+        await locators.saveAccountRolesBtn.click();
+        await settle();
+        await locators.closeModal();
+
+        await locators.openEditFor(FIXTURE_GROUPS.roles);
+        await locators.accountRbacTab.click();
+        // Assert the saved role before changing it: the table fills in only once the modal's account fetch
+        // lands, and adding to an empty table would be a fresh add, not the override this test is about.
+        await expect(locators.getAccountRoleCell(accountName)).toHaveText(ACCOUNT_ROLE_VALUES["ReadOnly Admin"]);
+
+        await locators.addAccountRole("Admin", accountName);
+        // The app also raises an info snackbar here ("Replaced the existing role for 1 account."), and asserting
+        // it was a mistake: whether it fires depends on the modal classifying the picked role as built-in, which
+        // is internal state this test cannot see. When that went wrong the failure read "no toast" while the real
+        // question is whether the role was replaced - and the two assertions below answer exactly that.
+        // Only one built-in role per account, so the new one must take the old row's place rather than stack beside it.
+        await expect(locators.getAccountRoleRow(accountName)).toHaveCount(1);
+        await expect(locators.getAccountRoleCell(accountName)).toHaveText(ACCOUNT_ROLE_VALUES.Admin);
+
+        await locators.saveAccountRolesBtn.click();
+        await settle();
+        await locators.closeModal();
+
+        await locators.openEditFor(FIXTURE_GROUPS.roles);
+        await locators.accountRbacTab.click();
+        await expect(locators.getAccountRoleCell(accountName)).toHaveText(ACCOUNT_ROLE_VALUES.Admin);
+
+        // The account save is replace-all, and clearing the last row is its own write path - an emptied role
+        // still needs an explicit empty write or the removal never reaches the server.
+        await locators.getAccountRoleDeleteBtn(accountName).click();
+        await expect(locators.getAccountRoleRow(accountName)).toHaveCount(0);
+        await locators.saveAccountRolesBtn.click();
+        await settle();
+        await locators.closeModal();
+
+        await locators.openEditFor(FIXTURE_GROUPS.roles);
+        await locators.accountRbacTab.click();
+        await expect(locators.getAccountRoleRow(accountName)).toHaveCount(0);
+        await locators.closeModal();
+      } finally {
+        await locators.clearAccountRoles(FIXTURE_GROUPS.roles);
+      }
+    }
+  );
+
+  test(
+    "User Groups - change the tenant role from ReadOnly Admin to Admin and then clear it, verify the listing shows the new role alone and then none",
+    { tag: ["@oss", "@dev", "@test", "@regression", "@functional", "@rbac", "@snackbar"] },
+    async ({ page }) => {
+      const locators = await setup(page);
+
+      await ensureGroupExists(locators, FIXTURE_GROUPS.roles);
+      // The listing humanizes the stored role, so both differ from the picker labels.
+      const readonlyInList = "Tenant Admin Readonly";
+      const adminInList = "Tenant Admin";
+
+      // The picker toggles, so a role left behind by an earlier run would be switched off by the first select.
+      // Clearing has to be saved as well: an unsaved clear leaves the section dirty and Save armed before the
+      // real edit is made.
+      const settle = async () => {
+        await locators.expectSectionToast(GROUP_TOASTS.tenantUpdated);
+        // Let it fade, or the identical toast from the next save would match this one instead.
+        await page.getByText(GROUP_TOASTS.tenantUpdated, { exact: true }).first().waitFor({ state: "hidden", timeout: 15000 });
+      };
+
+      try {
+        await locators.openEditFor(FIXTURE_GROUPS.roles);
+
+        if (await locators.clearTenantRoles()) {
+          await locators.saveTenantRolesBtn.click();
+          await settle();
+        }
+
+        await locators.armAndClickSave(locators.saveTenantRolesBtn, async () => {
+          await locators.selectTenantRole("ReadOnly Admin");
+        });
+        await settle();
+
+        // One picker holds the built-in role and the custom roles together and allows a single built-in, so
+        // choosing the other one has to replace it rather than leave both assigned.
+        await locators.armAndClickSave(locators.saveTenantRolesBtn, async () => {
+          await locators.selectTenantRole("Admin");
+        });
+        await settle();
+        await locators.closeModal();
+
+        await locators.searchGroup(FIXTURE_GROUPS.roles);
+        await expect(locators.getGroupRow(FIXTURE_GROUPS.roles)).toBeVisible();
+        await expect(locators.getGroupRow(FIXTURE_GROUPS.roles)).toContainText(adminInList);
+        await expect(locators.getGroupRow(FIXTURE_GROUPS.roles)).not.toContainText(readonlyInList);
+
+        // Removing sends an empty role rather than skipping the call, so the clear needs its own assertion.
+        await locators.openEditFor(FIXTURE_GROUPS.roles);
+        await locators.armAndClickSave(locators.saveTenantRolesBtn, async () => {
+          await locators.clearTenantRoles();
+        });
+        await locators.expectSectionToast(GROUP_TOASTS.tenantUpdated);
+        await locators.closeModal();
+
+        await locators.searchGroup(FIXTURE_GROUPS.roles);
+        await expect(locators.getGroupRow(FIXTURE_GROUPS.roles)).toBeVisible();
+        await expect(locators.getGroupRow(FIXTURE_GROUPS.roles)).not.toContainText(adminInList);
+      } finally {
+        try {
+          await locators.closeModalIfOpen();
+          await locators.openEditFor(FIXTURE_GROUPS.roles);
+          // clearTenantRoles reports whether anything was actually selected. Handing a no-op to armAndClickSave
+          // left Save disabled and its final assert threw, so an already-clean fixture logged a swallowed
+          // "toBeEnabled failed" that read like the cleanup had failed when there was nothing to clean.
+          if (await locators.clearTenantRoles()) {
+            await locators.saveTenantRolesBtn.click();
+            await locators.expectSectionToast(GROUP_TOASTS.tenantUpdated);
+          }
+        } catch (error) {
+          console.warn(`Could not clear tenant role on "${FIXTURE_GROUPS.roles}":`, error);
+        } finally {
+          await locators.closeModalIfOpen();
+        }
+      }
+    }
+  );
+
+  // ── CROSS-SCREEN: membership is writable from the group and from the user, and both write the same rows ──
+
+  test(
+    "User Groups - assign a group from the Users page, verify the user appears in that group's members",
+    { tag: ["@oss", "@dev", "@test", "@regression", "@functional", "@crud"] },
+    async ({ page }) => {
+      const locators = await setup(page);
+
+      const member = requireMemberAccount("remove");
+      await prepareMember(locators, page, member);
+      await ensureGroupExists(locators, FIXTURE_GROUPS.members);
+
+      try {
+        await assignGroupFromUsersPage(page, member, FIXTURE_GROUPS.members);
+
+        // Written from the Users side, read back from the group: the two screens must agree.
+        await locators.openGroupsTab();
+        await locators.openEditFor(FIXTURE_GROUPS.members);
+        await expect(locators.getMemberRow(member.email)).toBeVisible();
+        await locators.closeModal();
+      } finally {
+        await locators.closeModalIfOpen();
+        await locators.openGroupsTab();
+        await locators.openEditFor(FIXTURE_GROUPS.members);
+        await locators.armAndClickSave(locators.saveMembersBtn, async () => {
+          await locators.removeMemberIfPresent(member.email);
+        });
+        await locators.expectSectionToast(GROUP_TOASTS.membersUpdated);
+        await locators.closeModal();
+      }
+    }
+  );
+
+  test(
+    "User Groups - add a member from the group, verify the group is listed against that user on the Users page",
+    { tag: ["@oss", "@dev", "@test", "@regression", "@functional", "@crud"] },
+    async ({ page }) => {
+      const locators = await setup(page);
+
+      const member = requireMemberAccount("add");
+      await prepareMember(locators, page, member);
+      await ensureGroupExists(locators, FIXTURE_GROUPS.members);
+
+      try {
+        await locators.openEditFor(FIXTURE_GROUPS.members);
+        await locators.armAndClickSave(locators.saveMembersBtn, async () => {
+          await locators.addMember(member.email);
+        });
+        await locators.expectSectionToast(GROUP_TOASTS.membersUpdated);
+        await locators.closeModal();
+
+        // The Users listing carries a Group column, so the write has to show up there too.
+        const users = await openUsersPage(page);
+        await users.selectStatusFilter("Active");
+        await users.searchByName(member.name);
+        await expect(users.getUserRow(member.email)).toContainText(FIXTURE_GROUPS.members);
+      } finally {
+        await locators.closeModalIfOpen();
+        await locators.openGroupsTab();
+        await locators.openEditFor(FIXTURE_GROUPS.members);
+        await locators.armAndClickSave(locators.saveMembersBtn, async () => {
+          await locators.removeMemberIfPresent(member.email);
+        });
+        await locators.expectSectionToast(GROUP_TOASTS.membersUpdated);
+        await locators.closeModal();
       }
     }
   );
@@ -319,32 +577,32 @@ test.describe("Groups - CRUD & edge cases", () => {
   // ── MEMBERS ──
 
   test(
-    "Members - adding an active user persists after save",
-    { tag: ["@regression", "@crud", "@snackbar"] },
+    "User Groups - open a group, add an active user, save the members section, verify the member persists after reopening",
+    { tag: ["@oss", "@dev", "@test", "@regression", "@functional", "@crud", "@snackbar"] },
     async ({ page }) => {
       const locators = await setup(page);
 
+      const addedUser = requireMemberAccount("add");
+      await prepareMember(locators, page, addedUser);
       await ensureGroupExists(locators, FIXTURE_GROUPS.members);
-      let addedUser = "";
 
       try {
         await locators.openEditFor(FIXTURE_GROUPS.members);
         await expect(locators.saveMembersBtn).toBeDisabled();
 
         await locators.armAndClickSave(locators.saveMembersBtn, async () => {
-          addedUser = await locators.addFirstAvailableMember();
+          await locators.addMember(addedUser.email);
         });
 
-        // The member appears in the table before saving — the table is local
-        // state until Save is pressed.
-        await expect(locators.getMemberRow(addedUser)).toBeVisible();
+        // The members table is local state until Save is pressed.
+        await expect(locators.getMemberRow(addedUser.email)).toBeVisible();
 
         await locators.expectSectionToast(GROUP_TOASTS.membersUpdated);
         await locators.closeModal();
 
         // Reopen so membership is read back from the API.
         await locators.openEditFor(FIXTURE_GROUPS.members);
-        await expect(locators.getMemberRow(addedUser)).toBeVisible();
+        await expect(locators.getMemberRow(addedUser.email)).toBeVisible();
         await locators.closeModal();
       } finally {
         // Remove the member again so the fixture goes back to empty.
@@ -353,52 +611,52 @@ test.describe("Groups - CRUD & edge cases", () => {
           if (addedUser) {
             await locators.openEditFor(FIXTURE_GROUPS.members);
             await locators.armAndClickSave(locators.saveMembersBtn, async () => {
-              await locators.getMemberDeleteBtn(addedUser).click();
+              await locators.removeMemberIfPresent(addedUser.email);
             });
             await locators.expectSectionToast(GROUP_TOASTS.membersUpdated);
             await locators.closeModal();
           }
         } catch (error) {
-          console.warn(`Could not remove member "${addedUser}" from "${FIXTURE_GROUPS.members}":`, error);
+          console.warn(`Could not remove the seeded member from "${FIXTURE_GROUPS.members}":`, error);
         }
       }
     }
   );
 
   test(
-    "Members - removing a member persists after save",
-    { tag: ["@regression", "@crud", "@snackbar"] },
+    "User Groups - open a group, remove a member, save the members section, verify the member is gone after reopening",
+    { tag: ["@oss", "@dev", "@test", "@regression", "@functional", "@crud", "@snackbar"] },
     async ({ page }) => {
       const locators = await setup(page);
 
+      const member = requireMemberAccount("remove");
+      await prepareMember(locators, page, member);
       await ensureGroupExists(locators, FIXTURE_GROUPS.members);
-      let member = "";
 
       try {
-        // Seed a member to remove, so this test does not depend on another one
-        // having left the fixture populated.
+        // Seeds its own member, so this test does not depend on another having left the fixture populated.
         await locators.openEditFor(FIXTURE_GROUPS.members);
         await locators.armAndClickSave(locators.saveMembersBtn, async () => {
-          member = await locators.addFirstAvailableMember();
+          await locators.addMember(member.email);
         });
         await locators.expectSectionToast(GROUP_TOASTS.membersUpdated);
         await locators.closeModal();
 
         // Now remove it.
         await locators.openEditFor(FIXTURE_GROUPS.members);
-        await expect(locators.getMemberRow(member)).toBeVisible();
+        await expect(locators.getMemberRow(member.email)).toBeVisible();
 
         await locators.armAndClickSave(locators.saveMembersBtn, async () => {
-          await locators.getMemberDeleteBtn(member).click();
+          await locators.removeMemberIfPresent(member.email);
         });
-        await expect(locators.getMemberRow(member)).toHaveCount(0);
+        await expect(locators.getMemberRow(member.email)).toHaveCount(0);
 
         await locators.expectSectionToast(GROUP_TOASTS.membersUpdated);
         await locators.closeModal();
 
         // Reopen: the removal must have stuck.
         await locators.openEditFor(FIXTURE_GROUPS.members);
-        await expect(locators.getMemberRow(member)).toHaveCount(0);
+        await expect(locators.getMemberRow(member.email)).toHaveCount(0);
         await locators.closeModal();
       } finally {
         await locators.closeModalIfOpen();
@@ -406,118 +664,104 @@ test.describe("Groups - CRUD & edge cases", () => {
     }
   );
 
-  // The three tests below never press Save. The members table is local state
-  // until then, so they exercise real behaviour while writing nothing at all —
-  // which also means they need no cleanup.
+  // The three tests below never press Save, so they exercise real behaviour while writing nothing and needing no cleanup.
 
   test(
-    "Members - status filter shows only members with that status",
-    { tag: ["@regression"] },
+    "User Groups - search the member picker, add the user, filter by status and reopen the picker, verify the picker and filters track the pending member",
+    { tag: ["@oss", "@dev", "@test", "@regression", "@functional", "@search"] },
     async ({ page }) => {
       const locators = await setup(page);
 
-      await ensureGroupExists(locators, FIXTURE_GROUPS.members);
-
-      await locators.openEditFor(FIXTURE_GROUPS.members);
-      // The picker only offers active users, so anything added here is Active.
-      const addedUser = await locators.addFirstAvailableMember();
-
-      await locators.selectMemberFilter("Active");
-      await expect(locators.getMemberRow(addedUser)).toBeVisible();
-
-      // The same member must disappear under the other two statuses.
-      await locators.selectMemberFilter("Inactive");
-      await expect(locators.getMemberRow(addedUser)).toHaveCount(0);
-
-      await locators.selectMemberFilter("Suspended");
-      await expect(locators.getMemberRow(addedUser)).toHaveCount(0);
-
-      await locators.selectMemberFilter("Active");
-      await expect(locators.getMemberRow(addedUser)).toBeVisible();
-
-      await locators.closeModal(); // discard — nothing was saved
-    }
-  );
-
-  test(
-    "Members - picker search narrows the user list",
-    { tag: ["@regression", "@search"] },
-    async ({ page }) => {
-      const locators = await setup(page);
-
+      // One account, one activation and one modal for all three checks. Run separately these each paid a
+      // login, a navigation and a prepareMember, which was most of their runtime.
+      const addedUser = requireMemberAccount("add");
+      await prepareMember(locators, page, addedUser);
       await ensureGroupExists(locators, FIXTURE_GROUPS.members);
       await locators.openEditFor(FIXTURE_GROUPS.members);
 
-      await locators.membersPicker.click();
       const options = page.locator('[role="option"]');
-      await options.first().waitFor({ state: "visible", timeout: 15000 });
 
-      const firstUser = ((await options.first().textContent()) ?? "").trim();
-      // An empty value would make both search assertions below meaningless.
-      expect(firstUser, "member picker option had no text").not.toBe("");
-      const fragment = firstUser.slice(0, 4);
+      // Ordered so each step sets up the next: search the picker while the user is still offered, add them,
+      // then reopen the picker to prove they are gone. Nothing is saved, so the fixture is untouched.
+      await test.step("a partial username offers the matching user, a fragment that cannot match offers none", async () => {
+        await locators.membersPicker.click();
+        await options.first().waitFor({ state: "visible", timeout: 15000 });
 
-      await locators.searchInMemberPicker(fragment);
-      await expect(locators.memberOption(firstUser)).toBeVisible();
+        // The ds Select renders its search box only above 8 options, and a tenant with few users stays under that.
+        if ((await options.count()) > 8) {
+          await locators.searchInMemberPicker(addedUser.email.slice(0, 4));
+          await expect(locators.memberOption(addedUser.email)).toBeVisible();
 
-      // A fragment that cannot match anything empties the list.
-      await locators.searchInMemberPicker("zzz_nonexistent_user_000");
-      await expect(options).toHaveCount(0);
+          await locators.searchInMemberPicker("zzz_nonexistent_user_000");
+          await expect(options).toHaveCount(0);
+        }
 
-      await page.keyboard.press("Escape");
-      await locators.closeModal();
-    }
-  );
+        await page.keyboard.press("Escape");
+      });
 
-  test(
-    "Members - an existing member is not offered in the picker",
-    { tag: ["@regression"] },
-    async ({ page }) => {
-      const locators = await setup(page);
+      await test.step("the added member is listed under Active and hidden under Inactive and Suspended", async () => {
+        // The picker only offers active users, so anything added here is Active.
+        await locators.addMember(addedUser.email);
 
-      await ensureGroupExists(locators, FIXTURE_GROUPS.members);
-      await locators.openEditFor(FIXTURE_GROUPS.members);
+        await locators.selectMemberFilter("Active");
+        await expect(locators.getMemberRow(addedUser.email)).toBeVisible();
 
-      const addedUser = await locators.addFirstAvailableMember();
-      await expect(locators.getMemberRow(addedUser)).toBeVisible();
+        await locators.selectMemberFilter("Inactive");
+        await expect(locators.getMemberRow(addedUser.email)).toHaveCount(0);
 
-      // Reopen the picker: the user just added must no longer be selectable,
-      // so the same person cannot be added twice.
-      await locators.membersPicker.click();
-      await expect(locators.memberOption(addedUser)).toHaveCount(0);
+        await locators.selectMemberFilter("Suspended");
+        await expect(locators.getMemberRow(addedUser.email)).toHaveCount(0);
 
-      await page.keyboard.press("Escape");
+        await locators.selectMemberFilter("Active");
+        await expect(locators.getMemberRow(addedUser.email)).toBeVisible();
+      });
+
+      await test.step("reopening the picker no longer offers the user just added", async () => {
+        await locators.membersPicker.click();
+        await expect(locators.memberOption(addedUser.email)).toHaveCount(0);
+        await page.keyboard.press("Escape");
+      });
+
       await locators.closeModal(); // discard — nothing was saved
     }
   );
 
   test(
-    "Members - removing a member then closing discards the change",
-    { tag: ["@regression", "@crud"] },
+    "User Groups - remove a member, close without saving, discard the guard, verify the member is still there",
+    { tag: ["@oss", "@dev", "@test", "@regression", "@functional", "@crud"] },
     async ({ page }) => {
       const locators = await setup(page);
 
+      const member = requireMemberAccount("discard");
+      await prepareMember(locators, page, member);
       await ensureGroupExists(locators, FIXTURE_GROUPS.members);
-      let member = "";
 
       try {
         // Seed a saved member, so there is something whose removal could persist.
         await locators.openEditFor(FIXTURE_GROUPS.members);
         await locators.armAndClickSave(locators.saveMembersBtn, async () => {
-          member = await locators.addFirstAvailableMember();
+          await locators.addMember(member.email);
         });
         await locators.expectSectionToast(GROUP_TOASTS.membersUpdated);
         await locators.closeModal();
 
         // Remove it, then close WITHOUT saving.
         await locators.openEditFor(FIXTURE_GROUPS.members);
-        await locators.getMemberDeleteBtn(member).click();
-        await expect(locators.getMemberRow(member)).toHaveCount(0);
-        await locators.closeModal();
+        await locators.getMemberDeleteBtn(member.email).click();
+        await expect(locators.getMemberRow(member.email)).toHaveCount(0);
+
+        // The removal is unsaved, so closing raises the guard; discard it.
+        await locators.cancelExpectingGuard(async () => {
+          await locators.openEditFor(FIXTURE_GROUPS.members);
+          await locators.removeMemberIfPresent(member.email);
+        });
+        await locators.discardChangesBtn.click();
+        await locators.nameInput.waitFor({ state: "hidden", timeout: 10000 });
+        await locators.waitForBackdropGone();
 
         // The member must still be there — table edits only apply on Save.
         await locators.openEditFor(FIXTURE_GROUPS.members);
-        await expect(locators.getMemberRow(member)).toBeVisible();
+        await expect(locators.getMemberRow(member.email)).toBeVisible();
         await locators.closeModal();
       } finally {
         // Actually remove the seeded member so the fixture ends up empty.
@@ -526,135 +770,60 @@ test.describe("Groups - CRUD & edge cases", () => {
           if (member) {
             await locators.openEditFor(FIXTURE_GROUPS.members);
             await locators.armAndClickSave(locators.saveMembersBtn, async () => {
-              await locators.getMemberDeleteBtn(member).click();
+              await locators.removeMemberIfPresent(member.email);
             });
             await locators.expectSectionToast(GROUP_TOASTS.membersUpdated);
             await locators.closeModal();
           }
         } catch (error) {
-          console.warn(`Could not remove seeded member "${member}":`, error);
+          console.warn(`Could not remove the seeded member from "${FIXTURE_GROUPS.members}":`, error);
         }
       }
     }
   );
 
-  // ── VALIDATION ──
-  // Group name is checked on every keystroke against four rules, in order:
-  // required -> must start with a letter or digit -> at least 5 characters ->
-  // letters/digits/dash/underscore/space only. The first failure wins, so each
-  // test below uses a value that reaches exactly the rule it is checking.
-  // These never submit, so nothing is ever written and no cleanup is needed.
+  // VALIDATION: the four name rules short-circuit in order, so each test below uses a value that reaches exactly the rule it checks.
 
   test(
-    "Create - name is required",
-    { tag: ["@regression", "@validation", "@negative"] },
+    "User Groups - enter each kind of invalid and valid name in the add-group form, verify the inline error for each",
+    { tag: ["@oss", "@dev", "@test", "@regression", "@validation", "@negative"] },
     async ({ page }) => {
       const locators = await setup(page);
-      await locators.newUserGroupIdentifier.click();
 
-      // Type then clear: validation runs on change, so an untouched field is silent.
-      await locators.nameInput.fill("Valid name");
-      await locators.nameInput.fill("");
-      await expect(locators.nameError).toHaveText(GROUP_ERRORS.required);
+      // One form open for every case: these only type into the name field and read the inline error, so
+      // paying the login and navigation cost seven times bought nothing.
+      await locators.openAddGroupForm();
 
-      // Submitting an invalid form is rejected and the modal stays open.
-      await locators.modalSubmitBtn.click();
-      await expect(locators.nameInput).toBeVisible();
+      // `error: null` means the value is legal and no message should be rendered.
+      const cases: { label: string; name: string; error: string | null }[] = [
+        { label: "only spaces, which the required rule trims", name: "     ", error: GROUP_ERRORS.required },
+        { label: "a leading dash, legal elsewhere in the name", name: "-abc12", error: GROUP_ERRORS.firstChar },
+        { label: "four characters, one below the minimum", name: "abcd", error: GROUP_ERRORS.minLength },
+        { label: "five characters, the first legal length", name: "abcde", error: null },
+        { label: "special characters", name: "test@#$%", error: GROUP_ERRORS.alphaNum },
+        { label: "dashes, underscores and spaces, all permitted", name: "test-grp_1 x", error: null },
+        // Documents that no maximum is enforced; if a limit is ever added this case should fail and be updated.
+        { label: "255 characters, since no maximum is enforced", name: "a".repeat(255), error: null },
+      ];
 
-      await locators.closeModal();
-    }
-  );
+      for (const { label, name, error } of cases) {
+        await test.step(`${label} -> ${error ?? "no error"}`, async () => {
+          await locators.nameInput.fill(name);
+          // Soft: the cases are independent, so one wrong message must not hide the six behind it.
+          if (error) await expect.soft(locators.nameError).toHaveText(error);
+          else await expect.soft(locators.nameError).toHaveCount(0);
+        });
+      }
 
-  test(
-    "Create - whitespace-only name is rejected",
-    { tag: ["@regression", "@validation", "@negative"] },
-    async ({ page }) => {
-      const locators = await setup(page);
-      await locators.newUserGroupIdentifier.click();
+      await test.step("clearing a filled name reports it as required and submitting keeps the form open", async () => {
+        // Validation runs on change, so the field has to be typed into before it can be emptied.
+        await locators.nameInput.fill("Valid name");
+        await locators.nameInput.fill("");
+        await expect.soft(locators.nameError).toHaveText(GROUP_ERRORS.required);
 
-      // The required rule trims, so spaces alone count as empty.
-      await locators.nameInput.fill("     ");
-      await expect(locators.nameError).toHaveText(GROUP_ERRORS.required);
-
-      await locators.closeModal();
-    }
-  );
-
-  test(
-    "Create - name must start with a letter or digit",
-    { tag: ["@regression", "@validation", "@negative"] },
-    async ({ page }) => {
-      const locators = await setup(page);
-      await locators.newUserGroupIdentifier.click();
-
-      // A dash is a legal character, just not as the first one.
-      await locators.nameInput.fill("-abc12");
-      await expect(locators.nameError).toHaveText(GROUP_ERRORS.firstChar);
-
-      await locators.closeModal();
-    }
-  );
-
-  test(
-    "Create - name below 5 characters is rejected, 5 is accepted",
-    { tag: ["@regression", "@validation"] },
-    async ({ page }) => {
-      const locators = await setup(page);
-      await locators.newUserGroupIdentifier.click();
-
-      // Boundary: 4 rejected, 5 accepted.
-      await locators.nameInput.fill("abcd");
-      await expect(locators.nameError).toHaveText(GROUP_ERRORS.minLength);
-
-      await locators.nameInput.fill("abcde");
-      await expect(locators.nameError).toHaveCount(0);
-
-      await locators.closeModal();
-    }
-  );
-
-  test(
-    "Create - name rejects special characters",
-    { tag: ["@regression", "@validation", "@negative"] },
-    async ({ page }) => {
-      const locators = await setup(page);
-      await locators.newUserGroupIdentifier.click();
-
-      // Long enough and starts with a letter, so it reaches the character rule.
-      await locators.nameInput.fill("test@#$%");
-      await expect(locators.nameError).toHaveText(GROUP_ERRORS.alphaNum);
-
-      await locators.closeModal();
-    }
-  );
-
-  test(
-    "Create - name accepts dashes, underscores and spaces",
-    { tag: ["@regression", "@validation"] },
-    async ({ page }) => {
-      const locators = await setup(page);
-      await locators.newUserGroupIdentifier.click();
-
-      // The positive case for the character rule — these are all permitted.
-      await locators.nameInput.fill("test-grp_1 x");
-      await expect(locators.nameError).toHaveCount(0);
-
-      await locators.closeModal();
-    }
-  );
-
-  test(
-    "Create - name has no maximum length",
-    { tag: ["@regression", "@validation"] },
-    async ({ page }) => {
-      const locators = await setup(page);
-      await locators.newUserGroupIdentifier.click();
-
-      // Documents that no upper bound is enforced: a 255-character name is
-      // accepted client-side. If a limit is ever added, this test should fail
-      // and be updated to assert it.
-      await locators.nameInput.fill("a".repeat(255));
-      await expect(locators.nameError).toHaveCount(0);
+        await locators.modalSubmitBtn.click();
+        await expect.soft(locators.nameInput).toBeVisible();
+      });
 
       await locators.closeModal();
     }
@@ -663,23 +832,21 @@ test.describe("Groups - CRUD & edge cases", () => {
   // ── DUPLICATE NAME ──
 
   test(
-    "Create - duplicate name is rejected inline",
-    { tag: ["@regression", "@negative"] },
+    "User Groups - add a group using an existing name, submit, verify the duplicate error inline and that no second group is created",
+    { tag: ["@oss", "@dev", "@test", "@regression", "@negative", "@validation"] },
     async ({ page }) => {
       const locators = await setup(page);
 
-      await ensureGroupExists(locators, FIXTURE_GROUPS.read);
+      await ensureGroupExists(locators, FIXTURE_GROUPS.roles);
 
-      await locators.newUserGroupIdentifier.click();
-      await locators.nameInput.fill(FIXTURE_GROUPS.read);
+      await locators.openAddGroupForm();
+      await locators.nameInput.fill(FIXTURE_GROUPS.roles);
 
-      // Uniqueness is checked on submit, not while typing, so the field is clean
-      // until Create is pressed.
+      // Uniqueness is checked on submit, not while typing, so the field stays clean until Create is pressed.
       await expect(locators.nameError).toHaveCount(0);
       await locators.modalSubmitBtn.click();
 
-      // Rejected inline — this is a field error, not a snackbar — and the modal
-      // stays open so the name can be corrected.
+      // Rejected as a field error rather than a snackbar, and the modal stays open so the name can be corrected.
       await expect(locators.nameError).toHaveText(GROUP_ERRORS.duplicate);
       await expect(locators.toast(GROUP_TOASTS.created)).toHaveCount(0);
       await expect(locators.nameInput).toBeVisible();
@@ -687,90 +854,155 @@ test.describe("Groups - CRUD & edge cases", () => {
       await locators.closeModal();
 
       // No second group was created under that name.
-      await locators.searchGroup(FIXTURE_GROUPS.read);
-      await expect(locators.getGroupRow(FIXTURE_GROUPS.read)).toHaveCount(1);
+      await locators.searchGroup(FIXTURE_GROUPS.roles);
+      await expect(locators.getGroupRow(FIXTURE_GROUPS.roles)).toHaveCount(1);
     }
   );
 
   // ── CANCEL / CLOSE ──
 
   test(
-    "Cancel - cancelling create does not create a group",
-    { tag: ["@regression", "@crud"] },
+    "User Groups - fill the add-group form and abandon it with Cancel and with the X, verify neither creates a group and the form reopens blank",
+    { tag: ["@oss", "@dev", "@test", "@regression", "@functional"] },
     async ({ page }) => {
       const locators = await setup(page);
 
-      const name = `e2e grp cancelled ${Date.now()}`;
+      await test.step("Cancel discards the form and creates nothing", async () => {
+        const name = UNSAVED_GROUP_NAMES.cancelled;
 
-      await locators.newUserGroupIdentifier.click();
-      await locators.nameInput.fill(name);
-      await locators.descInput.fill("should never be saved");
-      await locators.closeModal(); // Cancel
+        await locators.openAddGroupForm();
+        await locators.nameInput.fill(name);
+        await locators.descInput.fill("should never be saved");
+        await locators.closeModal(); // Cancel
 
-      await expect(locators.toast(GROUP_TOASTS.created)).toHaveCount(0);
+        await expect(locators.toast(GROUP_TOASTS.created)).toHaveCount(0);
 
-      await locators.searchGroup(name);
-      await expect(locators.getGroupRow(name)).toHaveCount(0);
+        await locators.searchGroup(name);
+        // The empty state first: the table blanks while the search refetches, so a bare toHaveCount(0) would
+        // pass during loading and report "no group created" without the search having finished.
+        await expect(page.getByText("No Data Available")).toBeVisible();
+        await expect(locators.getGroupRow(name)).toHaveCount(0);
 
-      // Reopening gives a clean form rather than the abandoned input.
-      await locators.newUserGroupIdentifier.click();
-      await expect(locators.nameInput).toHaveValue("");
-      await expect(locators.descInput).toHaveValue("");
-      await locators.closeModal();
+        // Reopening gives a clean form rather than the abandoned input.
+        await locators.openAddGroupForm();
+        await expect(locators.nameInput).toHaveValue("");
+        await expect(locators.descInput).toHaveValue("");
+        await locators.closeModal();
+      });
+
+      await test.step("the header X behaves exactly like Cancel", async () => {
+        const name = UNSAVED_GROUP_NAMES.dismissed;
+
+        await locators.openAddGroupForm();
+        await locators.nameInput.fill(name);
+
+        await locators.closeModalBtn.click();
+        await locators.nameInput.waitFor({ state: "hidden", timeout: 10000 });
+
+        await expect(locators.toast(GROUP_TOASTS.created)).toHaveCount(0);
+
+        await locators.searchGroup(name);
+        // Settled empty state before the count, for the same reason as the Cancel step above.
+        await expect(page.getByText("No Data Available")).toBeVisible();
+        await expect(locators.getGroupRow(name)).toHaveCount(0);
+      });
     }
   );
 
   test(
-    "Cancel - closing the create modal with X does not create a group",
-    { tag: ["@regression"] },
+    "User Groups - edit a description and close without saving, verify Continue Editing keeps the edit and Discard throws it away",
+    { tag: ["@oss", "@dev", "@test", "@regression", "@functional"] },
     async ({ page }) => {
       const locators = await setup(page);
 
-      const name = `e2e grp dismissed ${Date.now()}`;
+      await ensureGroupExists(locators, FIXTURE_GROUPS.info);
+      const pendingDescription = "Kept by Continue Editing";
 
-      await locators.newUserGroupIdentifier.click();
-      await locators.nameInput.fill(name);
+      try {
+        await locators.openEditFor(FIXTURE_GROUPS.info);
+        // Read rather than assumed, so the test holds if a previous run left a different description.
+        const originalDescription = await locators.descInput.inputValue();
 
-      // The header X must behave exactly like Cancel.
-      await locators.closeModalBtn.click();
-      await locators.nameInput.waitFor({ state: "hidden", timeout: 10000 });
+        // Must stay dirty: an un-dirtied form closes without ever raising the guard this test is about.
+        await locators.fillUntilDirty(locators.descInput, pendingDescription, locators.saveGroupInfoBtn);
 
-      await expect(locators.toast(GROUP_TOASTS.created)).toHaveCount(0);
+        // One journey through both answers: the edit has to survive Continue Editing before Discard has
+        // anything to throw away, so these read better together than as two tests that each set it up.
+        const redirtyDescription = async () => {
+          await locators.openEditFor(FIXTURE_GROUPS.info);
+          await locators.fillUntilDirty(locators.descInput, pendingDescription, locators.saveGroupInfoBtn);
+        };
 
-      await locators.searchGroup(name);
-      await expect(locators.getGroupRow(name)).toHaveCount(0);
+        await test.step("Continue Editing dismisses the guard and leaves the edit in place", async () => {
+          await locators.cancelExpectingGuard(redirtyDescription);
+
+          await locators.continueEditingBtn.click();
+          await expect(locators.unsavedGuard).toBeHidden();
+          await expect(locators.descInput).toHaveValue(pendingDescription);
+
+          // Still unsaved, so the section Save is still armed.
+          await expect(locators.saveGroupInfoBtn).toBeEnabled();
+        });
+
+        await test.step("Discard closes without saving and the edit is gone on reopen", async () => {
+          await locators.cancelExpectingGuard(redirtyDescription);
+          await locators.discardChangesBtn.click();
+          await locators.nameInput.waitFor({ state: "hidden", timeout: 10000 });
+          await locators.waitForBackdropGone();
+
+          await expect(locators.toast(GROUP_TOASTS.infoUpdated)).toHaveCount(0);
+
+          await locators.openEditFor(FIXTURE_GROUPS.info);
+          await expect(locators.descInput).toHaveValue(originalDescription);
+          await locators.closeModal();
+        });
+      } finally {
+        // Leave without saving; closeModalIfOpen discards through the guard.
+        await locators.closeModalIfOpen();
+      }
     }
   );
 
   test(
-    "Cancel - closing the edit modal discards unsaved changes",
-    { tag: ["@regression", "@crud"] },
+    "User Groups - edit a description, close without saving, choose Save and Exit, verify the snackbar and that the edit persists",
+    { tag: ["@oss", "@dev", "@test", "@regression", "@functional", "@crud", "@snackbar"] },
     async ({ page }) => {
       const locators = await setup(page);
 
-      await ensureGroupExists(locators, FIXTURE_GROUPS.update);
+      await ensureGroupExists(locators, FIXTURE_GROUPS.info);
+      let editedDescription: string = SAVE_EXIT_DESCRIPTIONS[0];
 
-      await locators.openEditFor(FIXTURE_GROUPS.update);
-      // Read the stored value rather than assuming it, so the test still holds
-      // if a previous run left a different description behind.
-      const originalDescription = await locators.descInput.inputValue();
+      try {
+        await locators.openEditFor(FIXTURE_GROUPS.info);
+        // Whichever value is not stored right now, so a leftover from a crashed run cannot make this a no-op.
+        editedDescription = otherDescription(await locators.descInput.inputValue(), SAVE_EXIT_DESCRIPTIONS);
+        await locators.fillUntilDirty(locators.descInput, editedDescription, locators.saveGroupInfoBtn);
 
-      await locators.fillStable(locators.descInput, `discarded edit ${Date.now()}`);
-      await locators.closeModal(); // Close without saving any section
+        await locators.cancelExpectingGuard(async () => {
+          await locators.openEditFor(FIXTURE_GROUPS.info);
+          await locators.fillUntilDirty(locators.descInput, editedDescription, locators.saveGroupInfoBtn);
+        });
 
-      await expect(locators.toast(GROUP_TOASTS.infoUpdated)).toHaveCount(0);
+        // Save & Exit saves every dirty section, then closes.
+        await locators.saveAndExitBtn.click();
+        await expect(locators.toastText(GROUP_TOASTS.infoUpdated)).toBeVisible();
+        await locators.nameInput.waitFor({ state: "hidden", timeout: 15000 });
+        await locators.waitForBackdropGone();
 
-      // Reopen: the edit must be gone.
-      await locators.openEditFor(FIXTURE_GROUPS.update);
-      await expect(locators.descInput).toHaveValue(originalDescription);
-      await locators.closeModal();
+        // The edit was written, not discarded.
+        await locators.openEditFor(FIXTURE_GROUPS.info);
+        await expect(locators.descInput).toHaveValue(editedDescription);
+        await locators.closeModal();
+      } finally {
+        await restoreGroup(locators, [FIXTURE_GROUPS.info], {
+          name: FIXTURE_GROUPS.info,
+          description: FIXTURE_DESCRIPTIONS[FIXTURE_GROUPS.info],
+        });
+      }
     }
   );
 
-  // ── ERROR HANDLING ──
-  // These force the API to fail so the error paths can be exercised. The stub
-  // only matches the one operation under test and lets every other request
-  // through, and nothing is ever written, so they need no cleanup.
+  // ERROR HANDLING: each stub matches only the operation under test, lets every other request through, and writes nothing.
 
   // Fail a single GraphQL operation with the given errors payload.
   async function failOperation(page: Page, operationName: string, errors: unknown[]) {
@@ -789,20 +1021,19 @@ test.describe("Groups - CRUD & edge cases", () => {
   }
 
   test(
-    "Create - a failed create is not reported as success",
-    { tag: ["@regression", "@negative", "@snackbar"] },
+    "User Groups - add a group with the create request failing, verify no success snackbar and no group created",
+    { tag: ["@oss", "@dev", "@test", "@regression", "@negative", "@snackbar"] },
     async ({ page }) => {
       const locators = await setup(page);
 
-      const name = `e2e grp failcreate ${Date.now()}`;
+      const name = UNSAVED_GROUP_NAMES.failedCreate;
       await failOperation(page, "CreateUserGroup", [{ message: "Simulated backend failure" }]);
 
-      await locators.newUserGroupIdentifier.click();
+      await locators.openAddGroupForm();
       await locators.nameInput.fill(name);
       await locators.modalSubmitBtn.click();
 
-      // Wait for the app to report *something* before judging, otherwise the
-      // assertions below would pass simply by running before any toast rendered.
+      // Wait for the app to report something first, or the assertions below pass simply by running before any toast rendered.
       const success = locators.toast(GROUP_TOASTS.created);
       await Promise.race([
         success.waitFor({ state: "visible", timeout: 15000 }).catch(() => {}),
@@ -816,60 +1047,66 @@ test.describe("Groups - CRUD & edge cases", () => {
       await page.unroute("**/api/graphql");
       await locators.closeModalIfOpen();
       await locators.searchGroup(name);
+      // Settled empty state before the count: a blank table mid-refetch would otherwise report "not created".
+      await expect(page.getByText("No Data Available")).toBeVisible();
       await expect(locators.getGroupRow(name)).toHaveCount(0);
     }
   );
 
   test(
-    "Edit - a failed section save surfaces the API error message",
-    { tag: ["@regression", "@negative", "@snackbar"] },
+    "User Groups - save a section with the update request failing with and without an API message, verify each error is surfaced and nothing is written",
+    { tag: ["@oss", "@dev", "@test", "@regression", "@negative", "@snackbar"] },
     async ({ page }) => {
       const locators = await setup(page);
 
-      await ensureGroupExists(locators, FIXTURE_GROUPS.update);
+      await ensureGroupExists(locators, FIXTURE_GROUPS.info);
       const apiMessage = "Simulated backend failure";
+      const pendingDescription = "Will not save, the API is forced to fail";
 
-      await locators.openEditFor(FIXTURE_GROUPS.update);
-      await failOperation(page, "UpdateUserGroup", [{ message: apiMessage }]);
-
-      await locators.armAndClickSave(locators.saveGroupInfoBtn, async () => {
-        await locators.descInput.fill(`will not save ${Date.now()}`);
-      });
-
-      // The API's own message is surfaced to the user, not swallowed.
-      await expect(page.getByText(apiMessage, { exact: true }).first()).toBeVisible();
-      await expect(locators.toast(GROUP_TOASTS.infoUpdated)).toHaveCount(0);
-
-      await page.unroute("**/api/graphql");
+      // Snapshot what the fixture holds right now rather than comparing against the canonical description:
+      // earlier tests in the file legitimately leave this fixture on one of the EDIT_DESCRIPTIONS, so a
+      // canonical comparison would fail here for something this test did not do. The only claim being made
+      // is that these two forced-failure saves changed nothing, which is exactly before === after.
+      await locators.openEditFor(FIXTURE_GROUPS.info);
+      const descriptionBefore = await locators.descInput.inputValue();
       await locators.closeModal();
 
-      // Nothing was written.
-      await locators.openEditFor(FIXTURE_GROUPS.update);
-      await expect(locators.descInput).not.toHaveValue(/will not save/);
-      await locators.closeModal();
-    }
-  );
+      await test.step("the API's own message is surfaced rather than swallowed", async () => {
+        await locators.openEditFor(FIXTURE_GROUPS.info);
+        await failOperation(page, "UpdateUserGroup", [{ message: apiMessage }]);
 
-  test(
-    "Edit - a failed section save falls back to a generic error message",
-    { tag: ["@regression", "@negative", "@snackbar"] },
-    async ({ page }) => {
-      const locators = await setup(page);
+        await locators.armAndClickSave(locators.saveGroupInfoBtn, async () => {
+          await locators.descInput.fill(pendingDescription);
+        });
 
-      await ensureGroupExists(locators, FIXTURE_GROUPS.update);
+        await expect(page.getByText(apiMessage, { exact: true }).first()).toBeVisible();
+        await expect(locators.toast(GROUP_TOASTS.infoUpdated)).toHaveCount(0);
 
-      await locators.openEditFor(FIXTURE_GROUPS.update);
-      // An error with no message, so the app has to supply its own wording.
-      await failOperation(page, "UpdateUserGroup", [{}]);
-
-      await locators.armAndClickSave(locators.saveGroupInfoBtn, async () => {
-        await locators.descInput.fill(`will not save ${Date.now()}`);
+        await page.unroute("**/api/graphql");
+        await locators.closeModal();
       });
 
-      await expect(page.getByText("Failed to update group", { exact: true }).first()).toBeVisible();
-      await expect(locators.toast(GROUP_TOASTS.infoUpdated)).toHaveCount(0);
+      await test.step("an error carrying no message falls back to the app's own wording", async () => {
+        await locators.openEditFor(FIXTURE_GROUPS.info);
+        await failOperation(page, "UpdateUserGroup", [{}]);
 
-      await page.unroute("**/api/graphql");
+        await locators.armAndClickSave(locators.saveGroupInfoBtn, async () => {
+          await locators.descInput.fill(pendingDescription);
+        });
+
+        await expect(page.getByText("Failed to update group", { exact: true }).first()).toBeVisible();
+        await expect(locators.toast(GROUP_TOASTS.infoUpdated)).toHaveCount(0);
+
+        await page.unroute("**/api/graphql");
+        await locators.closeModal();
+      });
+
+      // Neither failed save reached the database. Asserted as a positive match on the value read before the
+      // two attempts: the previous check here was `not.toHaveValue(/will not save/)`, which could never match
+      // "Will not save..." - capital W, no `i` flag - so the one line proving nothing was written passed even
+      // if both writes had landed.
+      await locators.openEditFor(FIXTURE_GROUPS.info);
+      await expect(locators.descInput).toHaveValue(descriptionBefore);
       await locators.closeModal();
     }
   );

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -13,9 +14,11 @@ import (
 	"github.com/lib/pq"
 
 	"nudgebee/llm/common"
+	"nudgebee/llm/config"
 	"nudgebee/llm/events"
 	"nudgebee/llm/security"
 	"nudgebee/llm/tools/core"
+	"nudgebee/llm/workspace"
 )
 
 // This file backs the events_v2 agent (agents/agent_events_v2.go): three
@@ -157,6 +160,14 @@ func resolveTimeRange(input core.NBToolCallRequest) (startISO, endISO string, er
 	return start, end, nil
 }
 
+func appendDefaultEventStart(whereClauses []string, startTime string, now time.Time) []string {
+	if startTime != "" {
+		return whereClauses
+	}
+	defaultStart := now.AddDate(0, 0, -30).UTC().Format(time.RFC3339)
+	return append(whereClauses, fmt.Sprintf("starts_at >= %s", pq.QuoteLiteral(defaultStart)))
+}
+
 // buildManifestOnlyEvidence replaces each row's raw evidences JSON with a
 // lightweight manifest (available evidence types + key insights), regardless
 // of row count. list_events is a discovery tool, not a deep-dive tool — full
@@ -180,6 +191,27 @@ func buildManifestOnlyEvidence(data []map[string]any) {
 			continue
 		}
 		et.buildEvidenceManifest(row, evs)
+	}
+}
+
+func mergeEvidenceManifests(data, evidenceData []map[string]any) {
+	manifestsByID := make(map[string]any, len(evidenceData))
+	for _, row := range evidenceData {
+		id, ok := row["id"].(string)
+		if !ok || row["evidences"] == nil {
+			continue
+		}
+		manifestsByID[id] = row["evidences"]
+	}
+
+	for _, row := range data {
+		id, ok := row["id"].(string)
+		if !ok {
+			continue
+		}
+		if manifest, found := manifestsByID[id]; found {
+			row["evidences"] = manifest
+		}
 	}
 }
 
@@ -211,7 +243,7 @@ func (t GetEventByIdTool) GetType() core.NBToolType { return core.NBToolTypeTool
 func (t GetEventByIdTool) Description() string {
 	return "Fetch full details (all columns, full evidence — logs, metrics, traces, deployment diffs) " +
 		"for a single event by its UUID. Use for deep investigation of one specific event, including " +
-		"'why was this event triaged this way' questions (combine with get_triage_explanation). " +
+		"'why was this event triaged this way' questions (combine with get_event_triage_explanation). " +
 		"Input: event_id."
 }
 
@@ -264,11 +296,15 @@ func (t GetEventByIdTool) Call(nbCtx core.NbToolContext, input core.NBToolCallRe
 	et := EventsExecuteTool{}
 	et.enrichData(data) // single row → full-evidence path
 
+	var overflowRefs []core.NBToolResponseReference
 	for _, row := range data {
-		if investigateData, ok := row["evidences"].(events.InvestigateData); ok {
-			capInvestigateDataEvidence(&investigateData)
-			row["evidences"] = investigateData
+		investigateData, ok := row["evidences"].(events.InvestigateData)
+		if !ok {
+			continue
 		}
+		inline, refs := offloadEventEvidence(nbCtx.Ctx, wm, nbCtx.AccountId, nbCtx.ConversationId, eventID, investigateData)
+		row["evidences"] = inline
+		overflowRefs = append(overflowRefs, refs...)
 	}
 
 	bytesData, marshalErr := common.MarshalJson(data)
@@ -276,8 +312,70 @@ func (t GetEventByIdTool) Call(nbCtx core.NbToolContext, input core.NBToolCallRe
 		return core.NBToolResponse{}, marshalErr
 	}
 	resp.Data = string(bytesData)
-	resp.References = eventReferences(nbCtx, data)
+	resp.References = append(eventReferences(nbCtx, data), overflowRefs...)
 	return resp, nil
+}
+
+// EventEvidenceFileName is the workspace file holding one event's structured
+// evidence (the InvestigateData object). get_event_by_id and the event analyzer
+// both write it, with the same shape, so an investigation finds one file under
+// one name whichever stage produced it.
+func EventEvidenceFileName(eventID string) string {
+	return fmt.Sprintf("event_%s_evidence.json", eventID)
+}
+
+// offloadEventEvidence returns the inline form of one event's evidence plus the
+// workspace-file reference, if any.
+//
+// The workspace file must hold the UNCAPPED evidence. capInsight cuts each
+// field's Data at maxEvidenceInsightDataChars, and that Data is usually a JSON
+// document stored as a string (pod_metrics series, pod_data, others) — cutting
+// it mid-document leaves invalid JSON. Agents told the file is the "full
+// evidence" then json.load it and fail at char ~3000, losing exactly the metric
+// series and pod status they needed (dev events 2271fe6b, f1580e90, f6d8fa9e,
+// 509532e3). So: marshal the full struct first, cap afterwards for the inline
+// preview only.
+//
+// Marshal before capping is load-bearing: capInsightSlice rewrites slice
+// elements in place, and a struct copy shares those backing arrays.
+//
+// Evidence under LlmServerEventEvidenceOverflowThreshold is returned whole
+// (uncapped). A marshal or workspace-save failure falls back to the inline
+// capped struct rather than losing the response.
+func offloadEventEvidence(ctx *security.RequestContext, wm workspace.WorkspaceManager, accountId, conversationId, eventID string, investigateData events.InvestigateData) (any, []core.NBToolResponseReference) {
+	fullBytes, fullErr := common.MarshalJson(investigateData)
+	if fullErr != nil {
+		ctx.GetLogger().Error("get_event_by_id: failed to marshal full evidence, returning capped evidence inline", "error", fullErr, "event_id", eventID)
+		capInvestigateDataEvidence(&investigateData)
+		return investigateData, nil
+	}
+	if len(fullBytes) <= config.Config.LlmServerEventEvidenceOverflowThreshold {
+		// Small enough to return whole: nothing to cap, nothing to save.
+		return investigateData, nil
+	}
+	capInvestigateDataEvidence(&investigateData)
+
+	outputFile := EventEvidenceFileName(eventID)
+	if err := wm.SaveFile(ctx, accountId, conversationId, outputFile, string(fullBytes)); err != nil {
+		ctx.GetLogger().Error("get_event_by_id: failed to save evidence to workspace", "error", err, "path", outputFile)
+		return investigateData, nil
+	}
+
+	cappedBytes, err := common.MarshalJson(investigateData)
+	if err != nil {
+		ctx.GetLogger().Error("get_event_by_id: failed to marshal capped evidence preview", "error", err, "event_id", eventID)
+		cappedBytes = nil
+	}
+	inline := fmt.Sprintf("Output large (%d bytes). Evidence saved to %s with every section complete — read and parse that file. "+
+		"Logs are reduced here: error lines are in error_log_data, and log_data is empty or a short tail; use get_event_evidence with evidence_type=logs for the full log body. "+
+		"Fields ending in \"... (truncated)\" in the preview below are shortened and are not valid JSON on their own.\nPreview: %s",
+		len(fullBytes), outputFile, truncateUTF8Safe(string(cappedBytes), evidencePreviewBytes))
+	return inline, []core.NBToolResponseReference{{
+		Text:        "Full event evidence saved to workspace",
+		Url:         outputFile,
+		Type:        "file",
+		Description: "Full event evidence collected by system",
+	}}
 }
 
 // get_event_by_id always selects the `evidences` column (unlike events_execute,
@@ -317,15 +415,25 @@ func truncateAtRuneBoundary(s string, maxBytes int) string {
 func capInsight(insight events.InvestigateDataInsight) events.InvestigateDataInsight {
 	if insight.Data != nil {
 		// Evidence data is almost always a string (raw JSON already stringified
-		// upstream); the type switch skips fmt.Sprintf's reflection path for
-		// that common case, which matters here since insight.Data can be up to
-		// ~1MB before capping.
+		// upstream); the type switch skips the JSON-marshal path for that
+		// common case, which matters here since insight.Data can be up to
+		// ~1MB before capping. For anything else (a native Go struct/map —
+		// e.g. a Prometheus query result), JSON-marshal rather than
+		// fmt.Sprintf("%v", ...): %v produces Go's debug syntax
+		// (map[k:v ...], scientific-notation floats), which is both more
+		// verbose than the equivalent JSON for the same data and not valid
+		// JSON itself — a model asked to reproduce it ends up re-encoding
+		// malformed pseudo-JSON instead of parsing a clean structure.
 		var dataStr string
 		switch v := insight.Data.(type) {
 		case string:
 			dataStr = v
 		default:
-			dataStr = fmt.Sprintf("%v", v)
+			if jsonBytes, err := common.MarshalJson(v); err == nil {
+				dataStr = string(jsonBytes)
+			} else {
+				dataStr = fmt.Sprintf("%v", v)
+			}
 		}
 		if len(dataStr) > maxEvidenceInsightDataChars {
 			insight.Data = truncateAtRuneBoundary(dataStr, maxEvidenceInsightDataChars) + "\n... (truncated)"
@@ -344,6 +452,48 @@ func capInsightSlice(insights []events.InvestigateDataInsight) []events.Investig
 	return insights
 }
 
+// capTracesInsight bounds Traces.Data's size by capping the inner trace-span
+// array to maxEvidenceInsightEntries, instead of collapsing the whole map to a
+// truncated string the way the generic capInsight does. agent_events.go's
+// reduceEventData reads Traces.Data as map[string]any{"data": []any{...}} —
+// stringifying it here would silently corrupt that shape (a Go type-assertion
+// panic downstream, since capInsight's %v dump isn't valid JSON either). Falls
+// back to capInsight for any other shape (e.g. Data already arrived as a
+// string).
+func capTracesInsight(insight events.InvestigateDataInsight) events.InvestigateDataInsight {
+	tracesMap, ok := insight.Data.(map[string]any)
+	if !ok {
+		return capInsight(insight)
+	}
+	spans, ok := tracesMap["data"].([]any)
+	if !ok || len(spans) <= maxEvidenceInsightEntries {
+		return insight
+	}
+	capped := make(map[string]any, len(tracesMap))
+	for k, v := range tracesMap {
+		capped[k] = v
+	}
+	capped["data"] = spans[:maxEvidenceInsightEntries]
+	insight.Data = capped
+	return insight
+}
+
+// capAlertLabelsInsight bounds AlertLabels.Data's size by capping the label
+// array's length, instead of collapsing it to a truncated string. reduceEventData
+// iterates AlertLabels.Data as a []any directly — stringifying it here would
+// corrupt that shape the same way capTracesInsight's comment describes. Falls
+// back to capInsight for any other shape.
+func capAlertLabelsInsight(insight events.InvestigateDataInsight) events.InvestigateDataInsight {
+	labels, ok := insight.Data.([]any)
+	if !ok {
+		return capInsight(insight)
+	}
+	if len(labels) > maxEvidenceInsightEntries {
+		insight.Data = labels[:maxEvidenceInsightEntries]
+	}
+	return insight
+}
+
 func capInvestigateDataEvidence(id *events.InvestigateData) {
 	id.PodMetrics = capInsightSlice(id.PodMetrics)
 	id.NodeMetrics = capInsightSlice(id.NodeMetrics)
@@ -360,15 +510,127 @@ func capInvestigateDataEvidence(id *events.InvestigateData) {
 	id.PodData = capInsight(id.PodData)
 	id.NodeData = capInsight(id.NodeData)
 	id.Deployment = capInsight(id.Deployment)
-	id.AlertLabels = capInsight(id.AlertLabels)
+	id.AlertLabels = capAlertLabelsInsight(id.AlertLabels)
 	id.JobInformation = capInsight(id.JobInformation)
 	id.JobEvents = capInsight(id.JobEvents)
 	id.JobPodEvents = capInsight(id.JobPodEvents)
 	id.RelatedEvents = capInsight(id.RelatedEvents)
 	id.ContainerMetrics = capInsight(id.ContainerMetrics)
-	id.Traces = capInsight(id.Traces)
+	id.Traces = capTracesInsight(id.Traces)
 	id.AlertData = capInsight(id.AlertData)
 	id.ServiceMap = capInsight(id.ServiceMap)
+
+	capTotalEvidenceSize(id)
+}
+
+// maxTotalEvidenceChars bounds the SUM of every insight field's Data across
+// the whole InvestigateData object, once each field is already capped
+// individually above. Per-field capping alone doesn't bound the total: 11
+// slice fields x maxEvidenceInsightEntries x maxEvidenceInsightDataChars,
+// plus 12 single fields x maxEvidenceInsightDataChars, comes to ~531KB in
+// the worst case even with every per-field cap already applied (an event
+// with many moderately-sized fields, each individually under its own cap,
+// still sums to something unbounded). Once the combined size crosses this
+// budget, the largest remaining fields are replaced with a pointer to
+// get_event_evidence — which has its own workspace offload for full detail
+// — until the total is back under budget.
+const maxTotalEvidenceChars = 50000
+
+// capTotalEvidenceSize re-checks the sum of every already-per-field-capped
+// insight's Data size and, if over maxTotalEvidenceChars, drops the largest
+// remaining fields (replacing their Data with a short pointer) until the
+// total fits. Traces and AlertLabels are counted toward the total but never
+// dropped here: capTracesInsight/capAlertLabelsInsight's doc comments note
+// downstream consumers read their Data as a map/[]any respectively, so
+// replacing it with a plain string would corrupt that shape. Both are
+// already small (bounded to maxEvidenceInsightEntries items), so excluding
+// them from dropping costs little.
+func capTotalEvidenceSize(id *events.InvestigateData) {
+	type field struct {
+		size int
+		drop func()
+	}
+
+	fields := []field{
+		{insightSliceSize(id.MetricsData), func() { id.MetricsData = []events.InvestigateDataInsight{evidenceOmittedInsight("metrics_data")} }},
+		{insightSliceSize(id.PodMetrics), func() { id.PodMetrics = []events.InvestigateDataInsight{evidenceOmittedInsight("pod_metrics")} }},
+		{insightSliceSize(id.NodeMetrics), func() { id.NodeMetrics = []events.InvestigateDataInsight{evidenceOmittedInsight("node_metrics")} }},
+		{insightSliceSize(id.PodEvents), func() { id.PodEvents = []events.InvestigateDataInsight{evidenceOmittedInsight("pod_events")} }},
+		{insightSliceSize(id.NodeEvents), func() { id.NodeEvents = []events.InvestigateDataInsight{evidenceOmittedInsight("node_events")} }},
+		{insightSliceSize(id.ApiFailures), func() { id.ApiFailures = []events.InvestigateDataInsight{evidenceOmittedInsight("api_failures")} }},
+		{insightSliceSize(id.NoisyNeighbours), func() {
+			id.NoisyNeighbours = []events.InvestigateDataInsight{evidenceOmittedInsight("noisy_neighbours")}
+		}},
+		{insightSliceSize(id.UserActions), func() { id.UserActions = []events.InvestigateDataInsight{evidenceOmittedInsight("user_actions")} }},
+		{insightSliceSize(id.RDBMSQueryData), func() {
+			id.RDBMSQueryData = []events.InvestigateDataInsight{evidenceOmittedInsight("rdbms_query_response")}
+		}},
+		{insightSliceSize(id.Markdowns), func() { id.Markdowns = []events.InvestigateDataInsight{evidenceOmittedInsight("markdowns")} }},
+		{insightSliceSize(id.Others), func() { id.Others = []events.InvestigateDataInsight{evidenceOmittedInsight("all")} }},
+		{insightSize(id.Deployment), func() { id.Deployment = evidenceOmittedInsight("deployment") }},
+		{insightSize(id.PodData), func() { id.PodData = evidenceOmittedInsight("pod_data") }},
+		{insightSize(id.NodeData), func() { id.NodeData = evidenceOmittedInsight("all") }},
+		{insightSize(id.RelatedEvents), func() { id.RelatedEvents = evidenceOmittedInsight("related_events") }},
+		{insightSize(id.JobInformation), func() { id.JobInformation = evidenceOmittedInsight("job_information") }},
+		{insightSize(id.JobEvents), func() { id.JobEvents = evidenceOmittedInsight("job_events") }},
+		{insightSize(id.JobPodEvents), func() { id.JobPodEvents = evidenceOmittedInsight("all") }},
+		{insightSize(id.ContainerMetrics), func() { id.ContainerMetrics = evidenceOmittedInsight("container_metrics") }},
+		{insightSize(id.AlertData), func() { id.AlertData = evidenceOmittedInsight("alert_data") }},
+		{insightSize(id.ServiceMap), func() { id.ServiceMap = evidenceOmittedInsight("all") }},
+	}
+
+	total := insightSize(id.Traces) + insightSize(id.AlertLabels)
+	for _, f := range fields {
+		total += f.size
+	}
+	if total <= maxTotalEvidenceChars {
+		return
+	}
+
+	// Largest first: the biggest contributors to the overage, and — being
+	// metric/event streams rather than a single fact — the least costly to
+	// defer to an explicit get_event_evidence follow-up.
+	sort.Slice(fields, func(i, j int) bool { return fields[i].size > fields[j].size })
+	for _, f := range fields {
+		if total <= maxTotalEvidenceChars {
+			break
+		}
+		total -= f.size
+		f.drop()
+	}
+}
+
+// evidenceOmittedInsight replaces a field dropped by capTotalEvidenceSize.
+// evidenceType is the get_event_evidence argument that recovers the full
+// data ("all" when the field has no dedicated evidence_type).
+func evidenceOmittedInsight(evidenceType string) events.InvestigateDataInsight {
+	return events.InvestigateDataInsight{
+		Data: fmt.Sprintf("omitted — event evidence exceeded the %d-char total budget. Call get_event_evidence with evidence_type=%q for this data.", maxTotalEvidenceChars, evidenceType),
+	}
+}
+
+// insightSize measures how large an insight's Data will actually serialize
+// to — string Data measured directly, anything else JSON-marshaled first
+// (mirrors capInsight's own handling).
+func insightSize(insight events.InvestigateDataInsight) int {
+	if insight.Data == nil {
+		return 0
+	}
+	if s, ok := insight.Data.(string); ok {
+		return len(s)
+	}
+	if b, err := common.MarshalJson(insight.Data); err == nil {
+		return len(b)
+	}
+	return len(fmt.Sprintf("%v", insight.Data))
+}
+
+func insightSliceSize(insights []events.InvestigateDataInsight) int {
+	total := 0
+	for _, insight := range insights {
+		total += insightSize(insight)
+	}
+	return total
 }
 
 // ---------------------------------------------------------------------------
@@ -456,23 +718,31 @@ func (t ListEventsTool) Call(nbCtx core.NbToolContext, input core.NBToolCallRequ
 	if endTime != "" {
 		whereClauses = append(whereClauses, fmt.Sprintf("starts_at <= %s", pq.QuoteLiteral(endTime)))
 	}
+	whereClauses = appendDefaultEventStart(whereClauses, startTime, time.Now())
 
 	limit := intArg(input, "limit", 10)
 
-	query := "SELECT id, title, starts_at, priority, source, aggregation_key, finding_type, subject_type, " +
-		"subject_name, subject_namespace, evidences, nb_status, computed_priority, computed_score, event_count FROM events"
-	if len(whereClauses) > 0 {
-		query += " WHERE " + strings.Join(whereClauses, " AND ")
-	}
-	query += " ORDER BY starts_at DESC"
-
-	view := resolveEventsViewPlaceholders(eventsViewWithRanking, nbCtx.AccountId, false)
-	resp, data, err := sqlToolCall(nbCtx, query, "events", view, limit, nil)
+	metadataView := buildListEventsMetadataView(nbCtx.AccountId, whereClauses)
+	metadataQuery := "SELECT id, title, starts_at, priority, source, aggregation_key, finding_type, subject_type, " +
+		"subject_name, subject_namespace, nb_status, computed_priority, computed_score, event_count " +
+		"FROM events ORDER BY starts_at DESC"
+	resp, data, err := sqlToolCall(nbCtx, metadataQuery, "events", metadataView, limit, nil)
 	if err != nil {
 		return resp, err
 	}
 
-	buildManifestOnlyEvidence(data)
+	if len(data) > 0 {
+		evidenceView := buildListEventsEvidenceView(nbCtx.AccountId, data)
+		if evidenceView != "" {
+			evidenceQuery := "SELECT id, evidences FROM events"
+			_, evidenceData, evidenceErr := sqlToolCall(nbCtx, evidenceQuery, "events", evidenceView, len(data), nil)
+			if evidenceErr != nil {
+				return core.NBToolResponse{}, evidenceErr
+			}
+			buildManifestOnlyEvidence(evidenceData)
+			mergeEvidenceManifests(data, evidenceData)
+		}
+	}
 
 	bytesData, marshalErr := common.MarshalJson(data)
 	if marshalErr != nil {
@@ -481,6 +751,38 @@ func (t ListEventsTool) Call(nbCtx core.NbToolContext, input core.NBToolCallRequ
 	resp.Data = string(bytesData)
 	resp.References = eventReferences(nbCtx, data)
 	return resp, nil
+}
+
+func buildListEventsMetadataView(accountID string, whereClauses []string) string {
+	where := append([]string{
+		fmt.Sprintf("cloud_account_id = %s::uuid", pq.QuoteLiteral(accountID)),
+	}, whereClauses...)
+
+	return `SELECT id::text, title, starts_at, priority, source, aggregation_key, finding_type, ` +
+		`subject_type, subject_name, subject_namespace, nb_status, computed_priority, computed_score, event_count ` +
+		`FROM (` +
+		`SELECT id, title, starts_at, priority, source, aggregation_key, finding_type, subject_type, ` +
+		`subject_name, subject_namespace, nb_status, computed_priority, computed_score, ` +
+		`COUNT(*) OVER (PARTITION BY aggregation_key, subject_name, subject_type, subject_namespace, fingerprint) AS event_count, ` +
+		`ROW_NUMBER() OVER (PARTITION BY aggregation_key, subject_name, subject_type, subject_namespace, fingerprint ORDER BY starts_at DESC) AS rn ` +
+		`FROM events WHERE ` + strings.Join(where, " AND ") +
+		`) ranked_events WHERE rn = 1`
+}
+
+func buildListEventsEvidenceView(accountID string, data []map[string]any) string {
+	ids := make([]string, 0, len(data))
+	for _, row := range data {
+		if id, ok := row["id"].(string); ok {
+			if _, err := uuid.Parse(id); err == nil {
+				ids = append(ids, pq.QuoteLiteral(id)+"::uuid")
+			}
+		}
+	}
+	if len(ids) == 0 {
+		return ""
+	}
+	return "SELECT id::text, evidences::text FROM events WHERE cloud_account_id = " +
+		pq.QuoteLiteral(accountID) + "::uuid AND id IN (" + strings.Join(ids, ", ") + ")"
 }
 
 // ---------------------------------------------------------------------------
@@ -509,7 +811,7 @@ func (t AggregateEventsTool) GetType() core.NBToolType { return core.NBToolTypeT
 
 func (t AggregateEventsTool) Description() string {
 	return "Count or group events by a single column (aggregation_key, subject_namespace, subject_type, " +
-		"finding_type, priority, source, or nb_status), optionally scoped by subject_namespace/finding_type/" +
+		"finding_type, priority, source, or nb_status), optionally scoped by subject_namespace/finding_type/priority/" +
 		"time range. Set count_distinct_fingerprint=true to count unique event patterns (dedup) instead of " +
 		"raw occurrences. Use this for 'how many X' / 'top N by Y' / alert-noise questions instead of " +
 		"writing raw SQL with GROUP BY/COUNT."
@@ -532,6 +834,10 @@ func (t AggregateEventsTool) InputSchema() core.ToolSchema {
 			"finding_type": {
 				Type: core.ToolSchemaTypeArray, Items: map[string]any{"type": "string"},
 				Description: "Optional: one or more of issue, configuration_change, SLO, Anomaly.",
+			},
+			"priority": {
+				Type: core.ToolSchemaTypeArray, Items: map[string]any{"type": "string"},
+				Description: "Optional: one or more of DEBUG, INFO, LOW, MEDIUM, HIGH.",
 			},
 			"start_time":     {Type: core.ToolSchemaTypeString, Description: "ISO8601. Alternative to relative_range."},
 			"end_time":       {Type: core.ToolSchemaTypeString, Description: "ISO8601. Defaults to now."},
@@ -563,6 +869,9 @@ func (t AggregateEventsTool) Call(nbCtx core.NbToolContext, input core.NBToolCal
 	if vs := stringArrayArg(input, "finding_type"); len(vs) > 0 {
 		whereClauses = append(whereClauses, "finding_type IN ("+quotedList(vs)+")")
 	}
+	if vs := stringArrayArg(input, "priority"); len(vs) > 0 {
+		whereClauses = append(whereClauses, "priority IN ("+quotedList(vs)+")")
+	}
 	startTime, endTime, err := resolveTimeRange(input)
 	if err != nil {
 		return eventsV2ErrorResponse(err), nil
@@ -573,6 +882,7 @@ func (t AggregateEventsTool) Call(nbCtx core.NbToolContext, input core.NBToolCal
 	if endTime != "" {
 		whereClauses = append(whereClauses, fmt.Sprintf("starts_at <= %s", pq.QuoteLiteral(endTime)))
 	}
+	whereClauses = appendDefaultEventStart(whereClauses, startTime, time.Now())
 
 	// group_by is enum-validated above against a fixed allowlist, so it's safe
 	// to interpolate directly — this is the one column name events_v2 lets
@@ -583,7 +893,10 @@ func (t AggregateEventsTool) Call(nbCtx core.NbToolContext, input core.NBToolCal
 	}
 	query += fmt.Sprintf(" GROUP BY %s ORDER BY count DESC", groupBy)
 
-	view := resolveEventsViewPlaceholders(eventsViewWithId, nbCtx.AccountId, false)
+	// The typed time predicates above are authoritative. Do not reapply the
+	// legacy view's fixed 30-day lower bound: explicit older ranges must remain
+	// queryable, while calls without a start bound already received the default.
+	view := resolveEventsViewPlaceholders(eventsViewWithId, nbCtx.AccountId, true)
 	resp, _, err := sqlToolCall(nbCtx, query, "events", view, 0, nil)
 	if err != nil {
 		return resp, err

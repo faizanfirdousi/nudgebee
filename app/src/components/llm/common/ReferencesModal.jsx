@@ -1,4 +1,4 @@
-import { Popover, Box, Typography, List, ListItem, CircularProgress } from '@mui/material';
+import { Popover, Box, Typography, List, ListItem } from '@mui/material';
 import { Button } from '@ui/Button';
 import PropTypes from 'prop-types';
 import React, { useEffect, useRef, useCallback, useState } from 'react';
@@ -184,7 +184,7 @@ const ReferencesPopover = ({ anchorEl, open, onClose, references = [], accountId
             fontWeight: 'var(--ds-font-weight-semibold)',
             color: 'var(--ds-blue-500)',
             mb: ds.space[3],
-            fontFamily: '"Poppins", sans-serif',
+            fontFamily: ds.font.display,
             pb: ds.space[2],
             borderBottom: '1px solid var(--ds-gray-200)',
           }}
@@ -219,7 +219,7 @@ const ReferencesPopover = ({ anchorEl, open, onClose, references = [], accountId
                       fontSize: 'var(--ds-text-body)',
                       lineHeight: '1.5',
                       wordBreak: 'break-word',
-                      fontFamily: '"Poppins", sans-serif',
+                      fontFamily: ds.font.display,
                     }}
                   >
                     • {ref.text || ref.url}
@@ -227,9 +227,9 @@ const ReferencesPopover = ({ anchorEl, open, onClose, references = [], accountId
                   <Button
                     tone='ghost'
                     size='sm'
-                    icon={downloadingUrl === ref.url ? <CircularProgress size={16} /> : <FileDownloadIcon fontSize='small' />}
+                    icon={<FileDownloadIcon fontSize='small' />}
+                    loading={downloadingUrl === ref.url}
                     onClick={(e) => handleDownloadFile(ref, e)}
-                    disabled={downloadingUrl === ref.url}
                     aria-label='Download file'
                   />
                 </Box>
@@ -245,7 +245,7 @@ const ReferencesPopover = ({ anchorEl, open, onClose, references = [], accountId
                     lineHeight: '1.5',
                     display: 'block',
                     wordBreak: 'break-word',
-                    fontFamily: '"Poppins", sans-serif',
+                    fontFamily: ds.font.display,
                   }}
                   onMouseOver={(e) => (e.target.style.textDecoration = 'underline')}
                   onMouseOut={(e) => (e.target.style.textDecoration = 'none')}

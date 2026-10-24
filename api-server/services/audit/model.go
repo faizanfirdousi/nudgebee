@@ -35,6 +35,21 @@ const (
 	EventCategoryTriage      EventCategory = "TRIAGE"
 	EventCategoryOwnership   EventCategory = "OWNERSHIP"
 	EventCategoryDashboard   EventCategory = "DASHBOARDS"
+	// Runtime branding overrides (tenant_branding_override). Writes are
+	// super-admin-only, and audit.LogChange skips super-admin actors, so these
+	// rows appear only for a non-super-admin actor; recovery does not depend on
+	// them (see tenant_branding_override.previous_overrides).
+	EventCategoryBranding EventCategory = "BRANDING"
+	// Operator edits to what the Knowledge Graph is built from: the coverage
+	// filter (cloud accounts / flow sources) and manual dependency
+	// declarations. Both deactivate nodes or edges on write, so who changed
+	// them is worth keeping. Mirror any addition here in the Audits page's
+	// CategoryListing (app/src/components/audits/common.ts) or the rows are
+	// written but cannot be filtered.
+	EventCategoryKnowledgeGraph EventCategory = "KNOWLEDGE_GRAPH"
+	// Kept in sync with llm-server's audit/model.go (separate Go module —
+	// cannot import this package); budget config writes happen in llm-server.
+	EventCategoryBudget EventCategory = "BUDGET"
 )
 
 type EventType string
@@ -44,6 +59,10 @@ const (
 	EventTypeOwnershipDelete     EventType = "OWNERSHIP_DELETE"
 	EventTypeOwnershipRuleUpsert EventType = "OWNERSHIP_RULE_UPSERT"
 	EventTypeOwnershipRuleDelete EventType = "OWNERSHIP_RULE_DELETE"
+
+	EventTypeBrandingOverrideUpsert  EventType = "BRANDING_OVERRIDE_UPSERT"
+	EventTypeBrandingOverrideDelete  EventType = "BRANDING_OVERRIDE_DELETE"
+	EventTypeBrandingOverrideRestore EventType = "BRANDING_OVERRIDE_RESTORE"
 
 	EventTypeUserCreate EventType = "USER_CREATE"
 	EventTypeUserUpdate EventType = "USER_UPDATE"
@@ -72,6 +91,15 @@ const (
 	EventTypeCustomRoleUpdate EventType = "CUSTOM_ROLE_UPDATE"
 	EventTypeCustomRoleDelete EventType = "CUSTOM_ROLE_DELETE"
 	EventTypeCustomRoleAssign EventType = "CUSTOM_ROLE_ASSIGN"
+
+	EventTypeKGCoverageUpdate      EventType = "KG_COVERAGE_UPDATE"
+	EventTypeKGDependencyCreate    EventType = "KG_DEPENDENCY_CREATE"
+	EventTypeKGDependencyUpdate    EventType = "KG_DEPENDENCY_UPDATE"
+	EventTypeKGDependencyDelete    EventType = "KG_DEPENDENCY_DELETE"
+	EventTypeKGDependencyDeleteAll EventType = "KG_DEPENDENCY_DELETE_ALL"
+	EventTypeKGDependencyImport    EventType = "KG_DEPENDENCY_IMPORT"
+	EventTypeKGDependencyResolve   EventType = "KG_DEPENDENCY_RESOLVE"
+	EventTypeKGDependencyReresolve EventType = "KG_DEPENDENCY_RERESOLVE"
 
 	EventTypeUserLogin       EventType = "USER_AUTH_LOGIN"
 	EventTypeUserLoginCreate EventType = "USER_AUTH_CREATE"
@@ -230,6 +258,16 @@ const (
 
 	// Chat Actions (EventCategoryChatActions) — follow-up answers are emitted by llm-server; conversation delete is emitted by api-server's feedback handler.
 	EventTypeChatConversationDelete EventType = "CHAT_CONVERSATION_DELETE"
+
+	// Budget config change history (EventCategoryBudget), emitted by llm-server
+	// (llm_budget_config lives there). Kept in sync with llm-server's
+	// audit/model.go — separate Go module, cannot import this package.
+	EventTypeBudgetConfigCreate   EventType = "BUDGET_CONFIG_CREATE"
+	EventTypeBudgetConfigDelete   EventType = "BUDGET_CONFIG_DELETE"
+	EventTypeBudgetConfigIncrease EventType = "BUDGET_CONFIG_INCREASE"
+	EventTypeBudgetConfigDecrease EventType = "BUDGET_CONFIG_DECREASE"
+	EventTypeBudgetConfigEnable   EventType = "BUDGET_CONFIG_ENABLE"
+	EventTypeBudgetConfigDisable  EventType = "BUDGET_CONFIG_DISABLE"
 )
 
 type EventActor string

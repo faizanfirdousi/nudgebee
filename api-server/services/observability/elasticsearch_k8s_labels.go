@@ -1,6 +1,7 @@
 package observability
 
 import (
+	"sort"
 	"strings"
 
 	"nudgebee/services/query"
@@ -31,6 +32,21 @@ import (
 // expansion only ever widens.
 // esCanonicalBodyField is the canonical log-body name llm-server advertises.
 const esCanonicalBodyField = "_body"
+
+// esLogBodyCandidates are the field names a shipper may write the log line to, in the
+// same index. Shared by every canonical spelling of the log-text field.
+//
+// esCandidateFields copies this into a fresh slice before returning, so sharing one
+// backing array between keys is safe.
+var esLogBodyCandidates = []string{
+	"log",
+	"message",
+	// JSON-structured loggers (zap, logrus, bunyan, winston) write the line to
+	// `msg`, which a shipper with a JSON parse filter lands as its own field.
+	"msg",
+	"body",
+	"content",
+}
 
 var esCanonicalK8sFields = map[string][]string{
 	"namespace": {
@@ -66,15 +82,14 @@ var esCanonicalK8sFields = map[string][]string{
 	//
 	// Verified on the dev cluster: logs-kubernetes.container_logs-* maps `log`
 	// (keyword) and has no `_body` field at all.
-	esCanonicalBodyField: {
-		"log",
-		"message",
-		// JSON-structured loggers (zap, logrus, bunyan, winston) write the line to
-		// `msg`, which a shipper with a JSON parse filter lands as its own field.
-		"msg",
-		"body",
-		"content",
-	},
+	esCanonicalBodyField: esLogBodyCandidates,
+	// `message` is the canonical spelling every producer is moving to (#39573).
+	// esCandidateFields returns nil for an unknown key and the caller then renders the
+	// name verbatim, so without an entry `message` would reach ES as a literal field
+	// rather than through the per-shipper expansion. It shares one slice with the
+	// legacy `_body` token rather than repeating the list — two copies of the same
+	// shipper spellings is the drift this change exists to remove.
+	"message": esLogBodyCandidates,
 	"app": {
 		"app",
 		"kubernetes.labels.app",
@@ -187,4 +202,50 @@ func binaryClauseForField(field string, op query.BinaryWhereClauseType, val any)
 			"minimum_should_match": 1,
 		},
 	}, negate, nil
+}
+
+// esQueryFieldAliases returns the field names binaryClauseForField accepts on top of
+// the ones the index `_mapping` reports:
+//
+//   - the canonical names it expands (the esCanonicalK8sFields keys). No shipper writes
+//     a field called `namespace`, `app` or `_body`, so none is ever in a mapping, yet
+//     all of them query correctly. llm-server advertises `_body` unconditionally and its
+//     few-shots emit `app`/`namespace`, so these are the names real agent traffic uses —
+//     and every one of them was being reported unknown.
+//   - `<field>.keyword` for each discovered field. esKeywordSuffixCandidates matches a
+//     suffixed name against BOTH spellings, so it works even where the index maps the
+//     parent as plain keyword with no subfield — which is what Fluent-Bit does, and what
+//     the ES few-shots emit. Mappings that DO define the subfield already report it; the
+//     duplicate is harmless because the caller only builds a set from these.
+//
+// Deliberately does NOT suffix the canonical names: `namespace.keyword` is not canonical,
+// so binaryClauseForField would fall through to esKeywordSuffixCandidates and emit a term
+// on a literal `namespace` field that no shipper writes. It really is unknown, and stays
+// flagged.
+//
+// Pure by contract (QueryFieldAliasSource): no I/O, so the empty-result diagnosis pays
+// for no extra round trip.
+func esQueryFieldAliases(discovered []string) []string {
+	out := make([]string, 0, len(esCanonicalK8sFields)+len(discovered))
+	for canonical := range esCanonicalK8sFields {
+		out = append(out, canonical)
+	}
+	for _, f := range discovered {
+		if !strings.HasSuffix(f, ".keyword") {
+			out = append(out, f+".keyword")
+		}
+	}
+	// Map iteration order is randomized; closest-match suggestion order must not be.
+	sort.Strings(out)
+	return out
+}
+
+// GetQueryFieldAliases implements QueryFieldAliasSource.
+func (e *ElasticSource) GetQueryFieldAliases(discovered []string) []string {
+	return esQueryFieldAliases(discovered)
+}
+
+// GetQueryFieldAliases implements QueryFieldAliasSource.
+func (e *ElasticSaasSource) GetQueryFieldAliases(discovered []string) []string {
+	return esQueryFieldAliases(discovered)
 }

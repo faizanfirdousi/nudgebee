@@ -33,6 +33,7 @@ export default function AddAccountForm() {
           case 'slack':
             return (
               <MessagingIntegrationTile
+                key='slack'
                 provider='slack'
                 displayName='Slack'
                 installUrl='/api/integrations/slack/install'
@@ -45,6 +46,7 @@ export default function AddAccountForm() {
           case 'discord':
             return (
               <MessagingIntegrationTile
+                key='discord'
                 provider='discord'
                 displayName='Discord'
                 installUrl={null}
@@ -129,8 +131,9 @@ export default function AddAccountForm() {
           case 'msteams':
             return (
               <MessagingIntegrationTile
+                key='ms_teams'
                 provider='ms_teams'
-                displayName='Ms Teams'
+                displayName='Microsoft Teams'
                 installUrl='/api/integrations/ms-teams/install'
                 headers={['User Name', 'Installed At', 'Team Name', 'Channels', '', '']}
                 mappingMode='team-multi'
@@ -203,6 +206,10 @@ export default function AddAccountForm() {
             return <ListIntegrations integrationName={'openobserve'} />;
           case 'openobserve_webhook':
             return <ListIntegrations integrationName={'openobserve_webhook'} />;
+          case 'cubeapm':
+            return <ListIntegrations integrationName={'cubeapm'} />;
+          case 'cubeapm_webhook':
+            return <ListIntegrations integrationName={'cubeapm_webhook'} />;
           case 'azure_monitor_webhook':
             return <ListIntegrations integrationName={'azure_monitor_webhook'} />;
           case 'ssh':
@@ -223,6 +230,8 @@ export default function AddAccountForm() {
             return <ListIntegrations integrationName={'newrelic'} />;
           case 'splunk_observability_platform':
             return <ListIntegrations integrationName={'splunk_observability_platform'} />;
+          case 'splunk_enterprise':
+            return <ListIntegrations integrationName={'splunk_enterprise'} />;
           case 'splunk_webhook':
             return <ListIntegrations integrationName={'splunk_webhook'} />;
           case 'solarwinds':

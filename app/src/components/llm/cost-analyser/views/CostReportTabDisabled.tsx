@@ -42,14 +42,14 @@ function InfoRow({ icon, label, children }: { icon: React.ReactNode; label: stri
     <Box sx={{ minWidth: 0 }}>
       <Box sx={HEADING_ROW_SX}>
         <Box sx={{ color: ds.gray[400], display: 'flex' }}>{icon}</Box>
-        <Typography variant='caption' sx={{ fontWeight: 600, color: 'text.primary' }}>
+        <Typography variant='caption' sx={{ fontWeight: ds.weight.semibold, color: 'text.primary' }}>
           {label}
         </Typography>
       </Box>
       {/* Box, not Typography: the "Where it goes" row nests its own Typography/Chip
           (WhereItGoes) for the live channel-status line, and Typography-in-Typography
           renders a <p> inside a <p> — invalid HTML and a React DOM-nesting warning. */}
-      <Box sx={{ ...BODY_SX, mt: '4px' }}>{children}</Box>
+      <Box sx={{ ...BODY_SX, mt: ds.space[1] }}>{children}</Box>
     </Box>
   );
 }
@@ -139,7 +139,8 @@ export function CostReportTabDisabled() {
         <Card variant='outlined' size='sm' elevation='flat'>
           <Box sx={{ display: 'flex', flexDirection: 'column', gap: 'var(--ds-space-3)' }}>
             <InfoRow icon={<ScheduleOutlinedIcon sx={{ fontSize: 18 }} />} label='Delivery schedule'>
-              Posted daily at 6:00 AM UTC (~11:30 AM IST), once the previous day is fully complete.
+              Posted daily, once the previous day is fully complete, at a UTC hour you can configure once AI Cost Report is enabled (defaults to 6:00
+              AM UTC).
             </InfoRow>
             <InfoRow icon={<TagOutlinedIcon sx={{ fontSize: 18 }} />} label='Where it goes'>
               <WhereItGoes status={channelStatus} />
@@ -152,7 +153,7 @@ export function CostReportTabDisabled() {
             surface='section'
             tone='info'
             title='How to enable it'
-            message='Open your profile menu → Tenant Settings → Features, enable “AI/LLM cost report”, then Save. Make sure a default Slack channel is mapped under Admin → Integrations so the daily digest has somewhere to post.'
+            message='Open Admin → Tenant Settings → Features, enable “AI/LLM cost report”, then Save. Make sure a default Slack channel is mapped under Admin → Integrations so the daily digest has somewhere to post.'
           />
         ) : (
           <Banner

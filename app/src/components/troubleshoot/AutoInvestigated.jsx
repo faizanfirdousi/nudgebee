@@ -75,9 +75,16 @@ const AutoInvestigated = () => {
   }, [router.query.accountIds]);
 
   useEffect(() => {
+    let cancelled = false;
     apiHome.getCloudAccounts().then((res) => {
+      if (cancelled) {
+        return;
+      }
       setAccounts(res);
     });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const getAccountName = (id) => {
@@ -205,6 +212,9 @@ const AutoInvestigated = () => {
   );
 
   useEffect(() => {
+    // Filter/page changes overlap in flight; a superseded response must not
+    // overwrite the rows a newer one already rendered.
+    let cancelled = false;
     setLoading(true);
     setEmptyMessage('');
     const requestParams = {
@@ -219,6 +229,9 @@ const AutoInvestigated = () => {
     };
 
     apiAskNudgebee.llmConversationHistoryForInvestigation(requestParams).then((res) => {
+      if (cancelled) {
+        return;
+      }
       const response = res?.data?.data?.llm_conversations || [];
       setTotalCount(res?.data?.data?.llm_conversations_aggregate?.aggregate?.count || 0);
       if (response?.length > 0) {
@@ -227,7 +240,10 @@ const AutoInvestigated = () => {
           .filter(Boolean);
 
         if (eventIds.length < response.length) {
-          console.warn(`[AutoInvestigated] UUID extraction failed for ${response.length - eventIds.length} of ${response.length} conversation(s)`);
+          console.warn('[AutoInvestigated] UUID extraction failed for some conversations', {
+            failed: response.length - eventIds.length,
+            total: response.length,
+          });
         }
 
         if (eventIds.length === 0) {
@@ -244,10 +260,16 @@ const AutoInvestigated = () => {
             timeFilter: false,
           })
           .then((eventRes) => {
-            const events = eventRes?.data?.events || [];
-            setData(events);
+            if (cancelled) {
+              return;
+            }
+            const events = eventRes?.data?.events;
+            setData(Array.isArray(events) ? events : []);
           })
           .finally(() => {
+            if (cancelled) {
+              return;
+            }
             setLoading(false);
           });
       } else {
@@ -256,6 +278,9 @@ const AutoInvestigated = () => {
         setLoading(false);
       }
     });
+    return () => {
+      cancelled = true;
+    };
   }, [selectedAccountId, selectedStatus, rowsPerPage, currentPage, selectedDateRange]);
 
   const onPageChange = (page, limit) => {

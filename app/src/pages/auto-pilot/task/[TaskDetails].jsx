@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Box, Typography } from '@mui/material';
 import apiAutoPilot from '@api1/autoPilot';
 import { useRouter } from 'next/router';
@@ -29,7 +29,7 @@ const DRILL_DOWN_LISTING_HEADER = ['Name', 'Old Value', 'New Value'];
 import DateTime from '@shared/format/Datetime';
 import { titleCase } from '@lib/formatter';
 import PropTypes from 'prop-types';
-import WidgetCard from '@ui/WidgetCard';
+import { Card } from '@ui/Card';
 import Banner from '@ui/Banner';
 import { Stat } from '@ui/Stat';
 import k8sApi from '@api1/kubernetes';
@@ -50,6 +50,8 @@ import AutoOptimizeContinuousVerticalRightSizingSingleConfiguration from '@compo
 import { Modal } from '@ui/Modal';
 import apiAccount from '@api1/account';
 import apiRecommendations from '@api1/recommendation';
+import { useData } from '@context/DataContext';
+import { useUpdateAllClusterOption } from '@shared/layout/UpdateDataContext';
 import { ds } from 'src/utils/colors';
 
 const PRTicketLink = ({ prResolution, ticketLink }) => {
@@ -517,7 +519,7 @@ const AutoOptimizeSummary = ({ autoOptimizeData = {}, title, actions }) => {
       </ListingLayout.Toolbar>
       <ListingLayout.Body>
         <Box sx={{ display: 'flex', flexDirection: 'row', width: '100%', gap: ds.space[3], padding: `${ds.space[2]} 0` }}>
-          <WidgetCard sx={{ flex: 1, minWidth: 0, mt: 0, padding: `${ds.space[3]} ${ds.space[4]}` }}>
+          <Card size='sm' sx={{ flex: 1, minWidth: 0 }}>
             <Stat
               size='sm'
               label='Namespace'
@@ -530,8 +532,8 @@ const AutoOptimizeSummary = ({ autoOptimizeData = {}, title, actions }) => {
                 </Link>
               }
             />
-          </WidgetCard>
-          <WidgetCard sx={{ flex: 1, minWidth: 0, mt: 0, padding: `${ds.space[3]} ${ds.space[4]}` }}>
+          </Card>
+          <Card size='sm' sx={{ flex: 1, minWidth: 0 }}>
             <Stat
               size='sm'
               label={autoOptimizeData.category === 'pv_rightsize' ? 'Persistent Volume Claim' : 'Workload'}
@@ -550,16 +552,16 @@ const AutoOptimizeSummary = ({ autoOptimizeData = {}, title, actions }) => {
                 </Link>
               }
             />
-          </WidgetCard>
-          <WidgetCard sx={{ flex: 1, minWidth: 0, mt: 0, padding: `${ds.space[3]} ${ds.space[4]}` }}>
+          </Card>
+          <Card size='sm' sx={{ flex: 1, minWidth: 0 }}>
             <Stat size='sm' label='Kind' value={selectedWorkloadType || '-'} />
-          </WidgetCard>
-          <WidgetCard sx={{ flex: 1, minWidth: 0, mt: 0, padding: `${ds.space[3]} ${ds.space[4]}` }}>
+          </Card>
+          <Card size='sm' sx={{ flex: 1, minWidth: 0 }}>
             <Stat size='sm' label='Category' value={autoOptimizeData?.category || '-'} />
-          </WidgetCard>
-          <WidgetCard sx={{ flex: 1, minWidth: 0, mt: 0, padding: `${ds.space[3]} ${ds.space[4]}` }}>
+          </Card>
+          <Card size='sm' sx={{ flex: 1, minWidth: 0 }}>
             <Stat size='sm' label='Last Executed At' value={<DateTime value={autoOptimizeData?.last_executed_time} />} />
-          </WidgetCard>
+          </Card>
         </Box>
         <Box sx={{ mb: ds.space[4] }} />
         {autoOptimizeData.category == 'pv_rightsize' && (
@@ -633,6 +635,27 @@ const AutoOptimizeDetails = () => {
     ],
   };
   const router = useRouter();
+
+  const { allCluster } = useData();
+  const updateAllClusters = useUpdateAllClusterOption();
+
+  // allCluster is populated by the header cluster dropdown elsewhere; this page
+  // doesn't render it, so fetch it if missing. The edit modal needs the account
+  // list to resolve the config's account_id into the cluster/namespace fields —
+  // without it selectedCluster stays null and both render empty.
+  useEffect(() => {
+    if (allCluster == null) {
+      updateAllClusters();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allCluster]);
+
+  // Auto Optimize only targets Kubernetes workloads, so scope to K8s accounts
+  // (matches AutoOptimizeTabs, the other place this modal is opened from).
+  const accountOptions = useMemo(
+    () => (allCluster || []).filter((cluster) => cluster.cloud_provider === 'K8s').map((cluster) => ({ label: cluster.label, value: cluster.value })),
+    [allCluster]
+  );
 
   const [autoOptimizeTab, setAutoOptimizeTab] = useState(null);
 
@@ -887,6 +910,8 @@ const AutoOptimizeDetails = () => {
             isGoogleChannelsLoading={false}
             setIsLoading={setLoading}
             currentData={{}}
+            accountOptions={accountOptions}
+            defaultAccountId={autoOptimizeData?.account_id || router.query?.accountId || ''}
           />
         )}
         {openCreateAutoOptimizeType === 'horizontal_rightsize' && (
@@ -899,6 +924,8 @@ const AutoOptimizeDetails = () => {
             isGoogleChannelsLoading={false}
             setIsLoading={setLoading}
             currentData={{}}
+            accountOptions={accountOptions}
+            defaultAccountId={autoOptimizeData?.account_id || router.query?.accountId || ''}
           />
         )}
         {openCreateAutoOptimizeType === 'pvc_rightsize' && (
@@ -910,6 +937,8 @@ const AutoOptimizeDetails = () => {
             googleChannelList={googleChannelList}
             isGoogleChannelsLoading={false}
             setIsLoading={setLoading}
+            accountOptions={accountOptions}
+            defaultAccountId={autoOptimizeData?.account_id || router.query?.accountId || ''}
           />
         )}
         {openCreateAutoOptimizeType === 'continuous_rightsize' && (
@@ -921,6 +950,8 @@ const AutoOptimizeDetails = () => {
             googleChannelList={googleChannelList}
             isGoogleChannelsLoading={false}
             setIsLoading={setLoading}
+            accountOptions={accountOptions}
+            defaultAccountId={autoOptimizeData?.account_id || router.query?.accountId || ''}
           />
         )}
       </Modal>

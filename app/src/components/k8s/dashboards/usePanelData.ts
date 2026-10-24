@@ -1,23 +1,25 @@
 import { useEffect, useRef, useState } from 'react';
 import observability from '@api1/observability';
 import apiDashboards, { isCommandDatasource, type AccountOption, type Panel, type PanelQueryResult } from '@api1/dashboards';
-import { draftFromQuery, findTable, type EntityColumnFormat, type EntityQueryDraft } from './entityQuery';
+import { draftFromQuery, findTable, renderEntityQuery, type EntityColumnFormat, type EntityQueryDraft } from './entityQuery';
 import { runTracePanel } from './traceQuery';
 import { panelQueryAccounts, resolvePanelAccounts } from './panelAccounts';
-import { alignSeries, toRawSeries, type RawSeries } from './panelSeries';
+import { AWS_METRICS_PROVIDER, ES_PROVIDER, isAwsAccount } from './panelProviders';
+import { accountPrefixed, alignSeries, toRawSeries, type RawSeries } from './panelSeries';
 import { acquirePanelSlot } from './panelQueue';
+import { accountCappedWarning, capSeriesByAccount, MAX_CHART_SERIES, MAX_TABLE_SERIES, PANEL_TIMEOUT_MS, panelStep } from './panelBounds';
 import { convertNumberToTimestamp } from 'src/utils/common';
 import { renderTemplate, type VariableValues } from './templating';
+import { appliedViewerFilters, withViewerFilters, type ViewerFilter } from './panelViewerFilters';
 
 export interface PanelSeries {
   label: string;
   /** `null` where the series reported nothing — a gap, not a zero. */
   values: (number | null)[];
-}
-
-/** Whether an account's metrics come from CloudWatch. */
-function isAwsAccount(account: AccountOption): boolean {
-  return (account.cloud_provider || '').toLowerCase() === 'aws';
+  /** The account this series came from, on a panel that queried several. See RawSeries. */
+  accountLabel?: string;
+  /** True for the series that adds the accounts up — see consolidatedSeries. */
+  consolidated?: boolean;
 }
 
 /**
@@ -62,6 +64,18 @@ export interface PanelData {
    * series. Present only for those panels.
    */
   table?: PanelTable;
+  /**
+   * Accounts that were queried and could not answer. A stat adds up what it got,
+   * so the number is only checkable if the panel can also say who is missing
+   * from it — `warning` says so in prose, this says so in parts.
+   */
+  failedAccounts?: string[];
+  /**
+   * Accounts that answered with no series at all. Not a failure — the query ran —
+   * but a stat that left them out would read as if they had never been asked,
+   * and a cluster reporting nothing is often the one worth looking at.
+   */
+  emptyAccounts?: string[];
 }
 
 interface Options {
@@ -70,6 +84,8 @@ interface Options {
   accounts: AccountOption[];
   /** Viewer's narrowing selection. Empty = no filter applied. */
   accountFilter?: string[];
+  /** The viewer's column filters — traces and `nudgebee` panels only. See panelViewerFilters.ts. */
+  viewerFilters?: ViewerFilter[];
   variables: VariableValues;
   startTime: number;
   endTime: number;
@@ -91,6 +107,7 @@ export function usePanelData({
   panel,
   accounts,
   accountFilter,
+  viewerFilters,
   variables,
   startTime,
   endTime,
@@ -105,8 +122,9 @@ export function usePanelData({
 
   const scoped = resolvePanelAccounts(panel, accounts);
   // `nudgebee` panels reach the query engine, which takes every account in one
-  // call — so they query all of them rather than the first. See panelQueryAccounts.
-  const { accounts: resolved } = panelQueryAccounts(scoped, accountFilter, panel.datasource === 'nudgebee');
+  // call; `metrics` panels fan out and combine what comes back. Both answer for
+  // every account they were scoped to rather than the first. See panelQueryAccounts.
+  const { accounts: resolved } = panelQueryAccounts(scoped, accountFilter, panel.datasource === 'nudgebee' || panel.datasource === 'metrics');
   // Distinguishes "the filter hid everything" from "this panel has no accounts",
   // which need different messages.
   const filteredOut = scoped.length > 0 && resolved.length === 0;
@@ -115,7 +133,21 @@ export function usePanelData({
   const accountsKey = resolved.map((a) => a.value).join(',');
 
   // Serialised so a new object identity per render doesn't refetch forever.
-  const targetsKey = JSON.stringify((panel.targets || []).map((t) => [t.ref_id, renderTemplate(t.expr || '', variables), t.legend_format, t.hide]));
+  // The entity `query` is in here alongside `expr`: it is where an entity
+  // panel's filters live, so without it changing a variable those filters
+  // reference would substitute a new value that never gets fetched.
+  const targetsKey = JSON.stringify(
+    (panel.targets || []).map((t) => [
+      t.ref_id,
+      renderTemplate(t.expr || '', variables),
+      t.query ? renderEntityQuery(t.query, (v) => renderTemplate(v, variables)) : undefined,
+      t.legend_format,
+      t.hide,
+    ])
+  );
+  // Only the filters that narrow anything: adding a column with no value picked
+  // yet must not refetch an unchanged answer.
+  const viewerFiltersKey = JSON.stringify(appliedViewerFilters(viewerFilters || []));
 
   /**
    * Being on screen says the panel SHOULD load; the queue says when. Without it
@@ -209,63 +241,118 @@ export function usePanelData({
       setData({ labels: [], series: [] });
       return;
     }
+
+    /*
+     * One flag and one deadline for every path below. The flag is set by the
+     * effect's cleanup (scrolled away, range changed, unmounted) and by the
+     * deadline, and every callback checks it before touching state. The
+     * deadline aborts the request and leaves a retryable error: the relay
+     * allows 30s and the query engine 120s, and a panel that waited on either
+     * held its skeleton — and its load slot — for as long as they did.
+     */
+    let cancelled = false;
+    const controller = new AbortController();
+    const deadline = setTimeout(() => {
+      if (cancelled) return;
+      cancelled = true;
+      controller.abort();
+      setError(failure(`No answer after ${PANEL_TIMEOUT_MS / 1000}s. Retry, or narrow the query.`));
+      setData(null);
+      setLoading(false);
+    }, PANEL_TIMEOUT_MS);
+    /** The cleanup: stops the clock and whatever is still in flight. */
+    const stop = () => {
+      cancelled = true;
+      clearTimeout(deadline);
+      controller.abort();
+    };
+    /**
+     * A request has answered, well or badly: the deadline no longer applies.
+     * Without this the clock kept running past a successful answer and, 30s
+     * after the panel had drawn, replaced its data with the timeout error.
+     */
+    const settle = () => {
+      clearTimeout(deadline);
+      if (!cancelled) setLoading(false);
+    };
+
     // Traces are read through the TRACES SERVICE, not the query engine.
     if (panel.datasource === 'traces') {
       const stored = targets[0]?.query;
       if (!stored) {
         setError({ kind: 'config', message: 'This panel has no query' });
-        return;
+        // Nothing was sent, so nothing to wait for: stop the clock too.
+        return stop();
       }
-      let cancelledTraces = false;
       setLoading(true);
       setError(null);
 
       // One account: the traces API takes a single accountId, which is why a
-      // traces panel resolves to exactly one (auto-selected, or picked).
-      runTracePanel(draftFromQuery(stored), resolved[0].value, startTime, endTime)
+      // traces panel resolves to exactly one (auto-selected, or picked). The
+      // traces client takes no signal, so the deadline is the only bound here.
+      runTracePanel(
+        draftFromQuery(renderEntityQuery(stored, (v) => renderTemplate(v, variables))),
+        resolved[0].value,
+        startTime,
+        endTime,
+        viewerFilters
+      )
         .then((result) => {
-          if (cancelledTraces) return;
+          if (cancelled) return;
+          const notes: string[] = [];
           if (result.unsupported.length > 0) {
-            setWarning(`Ignored filters this trace store cannot apply: ${result.unsupported.join(', ')}.`);
+            notes.push(`Ignored filters this trace store cannot apply: ${result.unsupported.join(', ')}.`);
           }
+          if (result.overwritten.length > 0) {
+            notes.push(
+              `Only the last filter on ${result.overwritten.join(
+                ', '
+              )} ran: two filters with the same column and operator cannot both apply. Combine them into one — "is one of" for exact values, "matches regex" for patterns (a|b).`
+            );
+          }
+          if (notes.length > 0) setWarning(notes.join(' '));
           setData({ labels: [], series: [], table: result });
         })
         .catch((err) => {
-          if (cancelledTraces) return;
+          if (cancelled) return;
           setError(failure(err?.message || 'Could not load traces for this panel.'));
           setData(null);
         })
-        .finally(() => {
-          if (!cancelledTraces) setLoading(false);
-        });
+        .finally(settle);
 
-      return () => {
-        cancelledTraces = true;
-      };
+      return stop;
     }
 
     // `nudgebee` panels read the internal query engine.
     if (panel.datasource === 'nudgebee') {
-      const query = targets[0]?.query;
+      const stored = targets[0]?.query;
+      const query = stored
+        ? withViewerFilters(
+            renderEntityQuery(stored, (v) => renderTemplate(v, variables)),
+            viewerFilters || []
+          )
+        : undefined;
       if (!query) {
         setError({ kind: 'config', message: 'This panel has no query' });
-        return;
+        return stop();
       }
-      let cancelledEntity = false;
       setLoading(true);
       setError(null);
 
       apiDashboards
-        .executeEntityQuery({
-          account_ids: resolved.map((a) => a.value),
-          datasource: panel.datasource,
-          query,
-          time_column: targets[0]?.time_column,
-          start_time: startTime,
-          end_time: endTime,
-        })
+        .executeEntityQuery(
+          {
+            account_ids: resolved.map((a) => a.value),
+            datasource: panel.datasource,
+            query,
+            time_column: targets[0]?.time_column,
+            start_time: startTime,
+            end_time: endTime,
+          },
+          controller.signal
+        )
         .then((res) => {
-          if (cancelledEntity) return;
+          if (cancelled) return;
           if (res.errors || !res.data) {
             setError(failure(gatewayMessage(res.errors) || 'Could not run this panel’s query.'));
             setData(null);
@@ -275,18 +362,20 @@ export function usePanelData({
           // renderer can use the same Datetime component the listings do.
           setData({ labels: [], series: [], table: labelEntityColumns(res.data, draftFromQuery(query)) });
         })
-        .finally(() => {
-          if (!cancelledEntity) setLoading(false);
-        });
+        // An abort rejects rather than resolving with `errors`; after the
+        // deadline or a cleanup it is already accounted for.
+        .catch((err) => {
+          if (cancelled) return;
+          setError(failure(err?.message || 'Could not run this panel’s query.'));
+          setData(null);
+        })
+        .finally(settle);
 
-      return () => {
-        cancelledEntity = true;
-      };
+      return stop;
     }
 
     // Logs come back as lines, not series.
     if (panel.datasource === 'logs') {
-      let cancelledLogs = false;
       setLoading(true);
       setError(null);
       const query = renderTemplate(targets[0]?.expr || '', variables);
@@ -294,18 +383,32 @@ export function usePanelData({
 
       Promise.allSettled(
         resolved.map((account) =>
-          observability.fetchLogs({
-            account_id: account.value,
-            query,
-            start_time: startTime,
-            end_time: endTime,
-            limit: LOG_LINE_LIMIT,
-            offset: 0,
-          })
+          observability.fetchLogs(
+            {
+              account_id: account.value,
+              query,
+              start_time: startTime,
+              end_time: endTime,
+              limit: LOG_LINE_LIMIT,
+              offset: 0,
+              // A panel that names its provider queries THAT provider on every
+              // account, rather than each account's own default — the expression is
+              // written in one query language and only that provider can read it.
+              // The source is left for the server to resolve per account, since the
+              // same provider can be a user integration on one and agent-detected on
+              // another.
+              ...(panel.provider ? { log_provider: panel.provider } : {}),
+              // An ES query names no index, so the index is sent beside it. Omitted
+              // when the panel pins none, which leaves the backend on each account's
+              // own configured default — the pre-existing behaviour.
+              ...(panel.provider === ES_PROVIDER && panel.provider_index ? { request: { index: panel.provider_index } } : {}),
+            },
+            controller.signal
+          )
         )
       )
         .then((settled) => {
-          if (cancelledLogs) return;
+          if (cancelled) return;
           const failures: string[] = [];
           const rows: string[][] = [];
 
@@ -334,27 +437,24 @@ export function usePanelData({
           const kinds: ColumnKind[] = columns.map((c) => (c === 'Time' ? 'time' : 'text'));
           setData({ labels: [], series: [], table: { columns, rows, column_kinds: kinds } });
         })
-        .finally(() => {
-          if (!cancelledLogs) setLoading(false);
-        });
+        .finally(settle);
 
-      return () => {
-        cancelledLogs = true;
-      };
+      return stop;
     }
 
-    // redis / rabbitmq run a command through the relay instead of querying a provider.
+    // redis / rabbitmq / postgresql / kubectl run a command through the relay instead of querying a provider.
     if (isCommandDatasource(panel.datasource)) {
-      let cancelledCommand = false;
       setLoading(true);
       setError(null);
       const command = renderTemplate(targets[0]?.expr || '', variables);
 
       Promise.allSettled(
-        resolved.map((account) => apiDashboards.executePanelQuery({ account_id: account.value, datasource: panel.datasource, command }))
+        resolved.map((account) =>
+          apiDashboards.executePanelQuery({ account_id: account.value, datasource: panel.datasource, command }, controller.signal)
+        )
       )
         .then((settled) => {
-          if (cancelledCommand) return;
+          if (cancelled) return;
           const failures: string[] = [];
           const answers: { account: string; result: PanelQueryResult }[] = [];
 
@@ -381,16 +481,11 @@ export function usePanelData({
           }
           setData({ labels: [], series: [], table: mergeQueryResults(answers) });
         })
-        .finally(() => {
-          if (!cancelledCommand) setLoading(false);
-        });
+        .finally(settle);
 
-      return () => {
-        cancelledCommand = true;
-      };
+      return stop;
     }
 
-    let cancelled = false;
     setLoading(true);
     setError(null);
 
@@ -406,34 +501,56 @@ export function usePanelData({
     if (Object.keys(queries).length === 0) {
       setData({ labels: [], series: [] });
       setLoading(false);
-      return;
+      return stop();
     }
 
     // Only prefix when there is more than one account — on a single-account
     // panel the prefix is noise on every series.
     const prefixWithAccount = resolved.length > 1;
+    // A stat, gauge or table shows one value per series, so a single instant
+    // sample is the whole answer. A table used to run the range query and keep
+    // the last point — a 24h increase recomputed at every step, then thrown away.
+    const singleValue = panel.type === 'stat' || panel.type === 'gauge' || panel.type === 'table';
+    // Sized to the panel, not left to the provider: the agent's default is 60s
+    // whatever the range, which made Last 7 days 10k points per series.
+    const step = panelStep(startTime, endTime);
 
     Promise.allSettled(
       resolved.map((account) => {
-        const cloudwatch = isAwsAccount(account);
-        return observability.metricsQuery({
-          account_id: account.value,
-          queries,
-          start_time: startTime,
-          end_time: endTime,
-          // CloudWatch has no instant form — it always answers with a range.
-          instant: cloudwatch ? false : panel.type === 'stat',
-          // Named explicitly for AWS, because CloudWatch is never an account's DEFAULT metrics provider: it
-          // is not an integration that can carry that flag, so without this the query goes to whatever the
-          // account does default to (Datadog, typically) and comes back unparseable.
-          ...(cloudwatch ? { metric_provider: 'aws_cloudwatch', metric_provider_source: 'user' } : {}),
-        });
+        // A panel that names its provider queries THAT provider on every account.
+        // It supersedes the AWS default: an author who picked Prometheus for a
+        // panel meant it, and silently redirecting one account to CloudWatch would
+        // run PromQL against a backend that cannot read it.
+        const provider = panel.provider || (isAwsAccount(account) ? AWS_METRICS_PROVIDER : '');
+        const cloudwatch = provider === AWS_METRICS_PROVIDER;
+        // CloudWatch has no instant form — it always answers with a range.
+        const instant = !cloudwatch && singleValue;
+        return observability.metricsQuery(
+          {
+            account_id: account.value,
+            queries,
+            start_time: startTime,
+            end_time: endTime,
+            instant,
+            ...(instant ? {} : { step_interval: step }),
+            // CloudWatch is never an account's DEFAULT metrics provider: it is not an integration that can
+            // carry that flag, so it must be named — and named with its source, since it resolves only as
+            // `user` and the server would otherwise fall back to `agent` and reject the pair. Every other
+            // provider leaves the source for the server to resolve per account.
+            ...(provider ? { metric_provider: provider, ...(cloudwatch ? { metric_provider_source: 'user' } : {}) } : {}),
+            // The ES metrics path reads its index out of `metric_name` — the slot the
+            // request contract gives it, per resolveESMetricsIndex. Not a mistake here.
+            ...(provider === ES_PROVIDER && panel.provider_index ? { request: { metric_name: panel.provider_index } } : {}),
+          },
+          controller.signal
+        );
       })
     )
       .then((settled) => {
         if (cancelled) return;
         const raw: RawSeries[] = [];
         const failed: string[] = [];
+        const empty: string[] = [];
 
         settled.forEach((outcome, i) => {
           const account = resolved[i];
@@ -445,8 +562,10 @@ export function usePanelData({
             return;
           }
           const results = (outcome.value as any)?.data?.data?.metrics_list?.results || [];
-          for (const s of toRawSeries(results, legendByKey)) {
-            raw.push(prefixWithAccount ? { ...s, label: `${account.label} · ${s.label}` } : s);
+          const answered = toRawSeries(results, legendByKey);
+          if (answered.length === 0) empty.push(account.label);
+          for (const s of answered) {
+            raw.push(prefixWithAccount ? { ...s, label: accountPrefixed(account.label, s.label), accountLabel: account.label } : s);
           }
         });
 
@@ -455,27 +574,47 @@ export function usePanelData({
           setData(null);
           return;
         }
-        if (failed.length > 0) {
-          setWarning(`No data from ${failed.join(', ')} — showing the rest.`);
+        // Bounded before anything is aligned or drawn: Chart.js makes a dataset
+        // of every series and the legend a chip of each, and a per-pod query
+        // over a day of ephemeral pods answered with 4,798 of them. The viewer
+        // is told what was left out rather than shown a chart missing lines.
+        // Per account, not overall: one loud cluster would otherwise take every
+        // slot and the quiet ones would vanish with nothing saying they were asked.
+        const { kept, perAccount } = capSeriesByAccount(raw, panel.type === 'table' ? MAX_TABLE_SERIES : MAX_CHART_SERIES);
+        const notes: string[] = [];
+        // "No answer", not "no data": these accounts were asked and did not reply,
+        // which is a different fact from replying with nothing — and the one that
+        // matters when the panel adds the replies up.
+        // A stat or gauge carries this on the card — "2 of 3 accounts", with the
+        // account named on hover — so the banner would say it twice.
+        if (failed.length > 0 && panel.type !== 'stat' && panel.type !== 'gauge') {
+          notes.push(`No answer from ${failed.join(', ')} — showing the rest.`);
         }
+        const capped = accountCappedWarning(perAccount);
+        if (capped) notes.push(capped);
+        if (notes.length > 0) setWarning(notes.join(' '));
         // Aligned across ALL accounts at once, so a series that only one account
         // reports still sits at the right point on the shared axis.
-        setData(alignSeries(raw));
+        // The step the accounts were asked for is also what reconciles their
+        // answers — see snapToStep, which no-ops on a single-account panel.
+        setData({ ...alignSeries(kept, step), failedAccounts: failed, emptyAccounts: empty });
       })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
+      .finally(settle);
 
-    return () => {
-      cancelled = true;
-    };
+    return stop;
   }, [
     accountsKey,
     filteredOut,
     panel.account_type,
     panel.type,
     panel.datasource,
+    // The provider is sent on the request, so changing it in the editor has to
+    // refetch — without this the preview would keep showing the previous
+    // provider's answer under the new provider's name.
+    panel.provider,
+    panel.provider_index,
     targetsKey,
+    viewerFiltersKey,
     startTime,
     endTime,
     refreshKey,

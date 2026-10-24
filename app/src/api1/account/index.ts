@@ -24,6 +24,7 @@ query list_account {
       cloud_provider
       id
       account_name
+      created_at
     }
   }
   integrations: integrations_list(where: __WHERE_INTEGRATIONS__) {
@@ -31,6 +32,7 @@ query list_account {
       type
       status
       name
+      integrations_cloud_accounts
     }
   }
 }
@@ -58,6 +60,7 @@ mutation CreateAccount($object: cloud_accounts_insert_one_input!) {
       id
       access_key
       access_secret
+      warning
     }
   }
 `;
@@ -298,7 +301,7 @@ const apiAccount = {
         data: response?.data?.data?.messagingplatforms_list?.data || [],
       };
     } catch (err) {
-      console.log(`Failed to fetch ${platform_type}- `, err);
+      console.log('Failed to fetch platform', { platform_type, err });
       return err;
     }
   },
@@ -321,7 +324,7 @@ const apiAccount = {
       const res: any = await apiIntegrations.listIntegrations({ type: platform_type, limit: 50 });
       rows = res?.data?.data?.integrations_list?.rows || [];
     } catch (err) {
-      console.log(`Failed to fetch ${platform_type} integrations- `, err);
+      console.log('Failed to fetch platform integrations', { platform_type, err });
     }
     if (rows.length === 0) {
       return { data: legacy };
@@ -370,7 +373,7 @@ const apiAccount = {
         data: response?.data?.data?.messagingplatforms_update,
       };
     } catch (err) {
-      console.log(`Failed to update messaging platform for id ${id}- `, err);
+      console.log('Failed to update messaging platform', { id, err });
       return err;
     }
   },
@@ -490,13 +493,18 @@ const apiAccount = {
         'mssql',
         'oracle',
         'splunk_observability_platform',
+        'splunk_enterprise',
         'splunk_webhook',
+        'cubeapm',
+        'cubeapm_webhook',
         'dynatrace',
         'dynatrace_webhook',
         'gcp_monitoring_webhook',
         'solarwinds',
         'solarwinds_webhook',
         'elasticsearch_webhook',
+        'openobserve',
+        'openobserve_webhook',
         'workflow_webhook',
         'google_chat_space',
         'slack',
@@ -515,6 +523,19 @@ const apiAccount = {
           object: { platform: null },
         }),
       ]);
+
+      // Fail closed on the fetch so every caller can fail open on the decision.
+      // The envelope below is built unconditionally, so without this an errored
+      // query returns `all_accounts: []` — indistinguishable from a tenant that
+      // genuinely has none. The setup gate reads exactly that count, and locking
+      // an established tenant out of its own product because one query blipped is
+      // the worst outcome available. Same shape `getCloudAccounts` already uses
+      // in `api1/home`. The catch below *returns* the error rather than
+      // rethrowing, so callers see an Error value and must treat it as
+      // "unknown", never as "empty".
+      if (!accountsResponse?.data?.data || accountsResponse?.data?.errors?.length) {
+        throw new Error(accountsResponse?.data?.errors?.[0]?.message || 'Failed to fetch cloud accounts');
+      }
 
       const data = accountsResponse?.data?.data;
       const messagingData = messagingResponse?.data?.data?.messagingplatforms_list?.data || [];
@@ -645,6 +666,11 @@ const apiAccount = {
       if (update.data) {
         object.data = update.data;
       }
+      // Compared against undefined, not truthiness: an empty array clears the
+      // AWS region allowlist (back to auto-discovery) and must reach the server.
+      if (update.regions !== undefined) {
+        object.regions = update.regions;
+      }
       const response = await queryGraphQL(UPDATE_ACCOUNT, 'UpdateCloudAccount', { object });
       return response;
     } catch (err) {
@@ -681,6 +707,7 @@ const apiAccount = {
       query GetDefaultProvider {
         observability_get_default_provider(request: __WHERE__) {
           provider
+          integration_source
           default_index
           available_providers {
             provider
@@ -698,6 +725,8 @@ const apiAccount = {
             supports_trace_grouping
             supports_log_groups
             supports_service_map
+            supports_alert_rules
+            alert_rules_reason
             supported_operator_descriptors {
               token
               chip_label

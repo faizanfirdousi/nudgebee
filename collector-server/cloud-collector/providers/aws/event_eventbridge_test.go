@@ -27,12 +27,16 @@ type dummyAwsProvider struct {
 	queryLogsLastArgs               providers.QueryLogsRequest
 	queryMetricesCallCount          int
 	queryMetricesLastArgs           providers.QueryMetricsRequest
+	queryMetricesCalls              []providers.QueryMetricsRequest
 	lookupCloudTrailEventsCallCount int
 	lookupCloudTrailEventsLastArgs  struct {
 		input *cloudtrail.LookupEventsInput
 	}
 	getECSServiceDetailsCallCount int
 	getECSServiceDetailsLastArgs  struct {
+		region, clusterIdentifier, serviceIdentifier string
+	}
+	getECSServiceDetailsCalls []struct {
 		region, clusterIdentifier, serviceIdentifier string
 	}
 	getECSTaskDefinitionDetailsCallCount int
@@ -55,6 +59,7 @@ func (d *dummyAwsProvider) QueryLogs(ctx providers.CloudProviderContext, account
 func (d *dummyAwsProvider) QueryMetrices(ctx providers.CloudProviderContext, account providers.Account, filter providers.QueryMetricsRequest) (providers.QueryMetricsResponse, error) {
 	d.queryMetricesCallCount++
 	d.queryMetricesLastArgs = filter
+	d.queryMetricesCalls = append(d.queryMetricesCalls, filter)
 	ctx.GetLogger().Info("dummyAwsProvider: QueryMetrices called", "filter", fmt.Sprintf("%+v", filter))
 
 	// Ensure MetricNames and ResourceIds are not empty before accessing them
@@ -127,6 +132,9 @@ func (d *dummyAwsProvider) GetECSServiceDetails(ctx providers.CloudProviderConte
 	d.getECSServiceDetailsLastArgs.region = region
 	d.getECSServiceDetailsLastArgs.clusterIdentifier = clusterIdentifier
 	d.getECSServiceDetailsLastArgs.serviceIdentifier = serviceIdentifier
+	d.getECSServiceDetailsCalls = append(d.getECSServiceDetailsCalls, struct {
+		region, clusterIdentifier, serviceIdentifier string
+	}{region, clusterIdentifier, serviceIdentifier})
 	ctx.GetLogger().Info("dummyAwsProvider: GetECSServiceDetails called", "region", region, "cluster", clusterIdentifier, "service", serviceIdentifier)
 
 	return providers.Resource{
@@ -189,6 +197,7 @@ func (d *dummyProcessedEventHandler) GetAccountFromCloudProviderAccountId(pCtx p
 	d.getAccountFromCloudProviderIdCallCount++
 	pCtx.GetLogger().Info("dummyProcessedEventHandler: GetAccountFromCloudProviderAccountId called", "awsAccountNumber", awsAccountNumber)
 	return providers.Account{
+		ID:            testAccountId,
 		AccountNumber: awsAccountNumber,
 	}, nil
 }
@@ -196,32 +205,37 @@ func (d *dummyProcessedEventHandler) GetAccountFromCloudProviderAccountId(pCtx p
 func (d *dummyProcessedEventHandler) GetAccountFromExternalId(pCtx providers.CloudProviderContext, externalId string, accountNumber string) (providers.Account, error) {
 	pCtx.GetLogger().Info("dummyProcessedEventHandler: GetAccountFromExternalId called", "externalId", externalId, "accountNumber", accountNumber)
 	return providers.Account{
+		ID:            testAccountId,
 		AccountNumber: accountNumber,
 	}, nil
 }
 
-// seedAccountMetadataForTest populates the package-level account-metadata cache
-// so that update_cloud_resource actions can resolve the account UUID/tenant
-// without a live DB lookup. In production this cache is filled by
-// getAccountByExternalId; in tests we seed it directly. Registers a cleanup so
-// the global cache doesn't leak across tests.
-func seedAccountMetadataForTest(t *testing.T, accountNumber string) {
+// testAccountId and testTenantId are the account UUID the dummy handlers resolve
+// to and the tenant that owns it. The tenant cache is keyed by the account UUID
+// (an account number is not tenant-unique), so the handlers must return one just
+// as the real resolution path does.
+const (
+	testAccountId = "00000000-0000-0000-0000-000000000001"
+	testTenantId  = "00000000-0000-0000-0000-000000000002"
+)
+
+// seedAccountTenantForTest populates the package-level account-tenant cache so
+// that update_cloud_resource actions can resolve the tenant without a live DB
+// lookup. In production this cache is filled by getAccountByExternalId; in tests
+// we seed it directly. Registers a cleanup so the global cache doesn't leak
+// across tests.
+func seedAccountTenantForTest(t *testing.T) {
 	t.Helper()
-	accountMetadataCacheMutex.Lock()
-	accountMetadataCache[accountNumber] = AccountMetadata{
-		ID:       "00000000-0000-0000-0000-000000000001",
-		TenantID: "00000000-0000-0000-0000-000000000002",
-	}
-	accountMetadataCacheMutex.Unlock()
+	setAccountTenant(testAccountId, testTenantId)
 	t.Cleanup(func() {
-		accountMetadataCacheMutex.Lock()
-		delete(accountMetadataCache, accountNumber)
-		accountMetadataCacheMutex.Unlock()
+		accountTenantCacheMu.Lock()
+		delete(accountTenantCache, testAccountId)
+		accountTenantCacheMu.Unlock()
 	})
 }
 
 func TestAwsEvenBridge_Mock_ECS(t *testing.T) {
-	seedAccountMetadataForTest(t, "123456789012")
+	seedAccountTenantForTest(t)
 	sqsMessageBody := `{
 		"version": "0",
 		"id": "evt-id-ecs-stopped-unexpectedly",
@@ -248,7 +262,7 @@ func TestAwsEvenBridge_Mock_ECS(t *testing.T) {
 					"name": "my-app-container",
 					"image": "nginx:latest",
 					"exitCode": 137,
-					"reason": "OutOfMemoryError"
+					"reason": "Essential container exited with non-zero status"
 				}
 			],
 			"group": "service:my-ecs-service",
@@ -322,7 +336,7 @@ func TestAwsEvenBridge_Mock_ECS(t *testing.T) {
 	assert.Equal(t, []string{"arn:aws:ecs:us-east-1:123456789012:task/my-cluster/abcdef1234567890"}, dummyAPI.listResourcesLastArgs.resourceIds)
 }
 func TestAwsEvenBridge_Mock_ECR(t *testing.T) {
-	seedAccountMetadataForTest(t, "123456789012")
+	seedAccountTenantForTest(t)
 	sqsMessageBody := `{
     "version": "0",
     "id": "fcf0ea66-968f-3eda-ca24-40dcd217003b",
@@ -375,7 +389,7 @@ func TestAwsEvenBridge_Mock_ECR(t *testing.T) {
 }
 
 func TestAwsEventBridge_RDS_TagChange(t *testing.T) {
-	seedAccountMetadataForTest(t, "123456789012")
+	seedAccountTenantForTest(t)
 	sqsMessageBody := `{
 		"version": "0",
 		"id": "rds-tag-change-001",
@@ -422,7 +436,7 @@ func TestAwsEventBridge_RDS_TagChange(t *testing.T) {
 }
 
 func TestAwsEventBridge_EC2_TagChange(t *testing.T) {
-	seedAccountMetadataForTest(t, "123456789012")
+	seedAccountTenantForTest(t)
 	sqsMessageBody := `{
 		"version": "0",
 		"id": "ec2-tag-change-001",
@@ -527,7 +541,7 @@ func TestAwsEventBridge_EC2_TagChange_NonInstance_Skipped(t *testing.T) {
 }
 
 func TestAwsEventBridge_RDS_CloudTrail_Lifecycle(t *testing.T) {
-	seedAccountMetadataForTest(t, "123456789012")
+	seedAccountTenantForTest(t)
 	sqsMessageBody := `{
 		"version": "0",
 		"id": "rds-lifecycle-001",
@@ -573,7 +587,7 @@ func TestAwsEventBridge_RDS_CloudTrail_Lifecycle(t *testing.T) {
 }
 
 func TestAwsEventBridge_RDS_CloudTrail_DeleteCluster(t *testing.T) {
-	seedAccountMetadataForTest(t, "123456789012")
+	seedAccountTenantForTest(t)
 	sqsMessageBody := `{
 		"version": "0",
 		"id": "rds-delete-cluster-001",
@@ -616,7 +630,7 @@ func TestAwsEventBridge_RDS_CloudTrail_DeleteCluster(t *testing.T) {
 }
 
 func TestAwsEventBridge_ECS_CloudTrail_CreateCluster(t *testing.T) {
-	seedAccountMetadataForTest(t, "123456789012")
+	seedAccountTenantForTest(t)
 	sqsMessageBody := `{
 		"version": "0",
 		"id": "ecs-cluster-001",
@@ -659,7 +673,7 @@ func TestAwsEventBridge_ECS_CloudTrail_CreateCluster(t *testing.T) {
 }
 
 func TestAwsEventBridge_ECS_CloudTrail_DeleteService(t *testing.T) {
-	seedAccountMetadataForTest(t, "123456789012")
+	seedAccountTenantForTest(t)
 	sqsMessageBody := `{
 		"version": "0",
 		"id": "ecs-service-001",

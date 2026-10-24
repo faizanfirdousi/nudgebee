@@ -40,6 +40,10 @@ type ObservabilityTraceResponse struct {
 	// custom-projection queries render their real values instead of zeroed span structs. Nil means
 	// the services-server returned the legacy typed array (Traces).
 	Result *ObservabilityTraceRawTable `json:"result,omitempty"`
+	// Suggestion carries services-server's ValidateRequest empty-result diagnosis (unknown field
+	// name / unknown field value) when it fires. It arrives with an EMPTY Traces and a 200, so an
+	// empty trace result can say WHY it is empty instead of leaving the agent to guess and retry.
+	Suggestion string `json:"suggestion,omitempty"`
 }
 
 // ObservabilityTraceRawTable mirrors observability.RawTraceResult: an arbitrary ClickHouse result
@@ -107,7 +111,9 @@ type ObservabilityMetricsQueryRequest struct {
 	Queries        map[string]string `json:"queries"`
 	StartTime      int64             `json:"start_time"`
 	EndTime        int64             `json:"end_time"`
-	Request        map[string]any    `json:"request,omitempty"`
+	// StepInterval is the range step in seconds; zero lets the provider pick.
+	StepInterval int            `json:"step_interval,omitempty"`
+	Request      map[string]any `json:"request,omitempty"`
 }
 
 // ObservabilityMetricsQueryResponse mirrors api-server's OutputMetricQuery.
@@ -207,6 +213,16 @@ type ObservabilityTracesV3Request struct {
 	// array. Set only by the free-form ClickHouse agent tool so aggregation / custom-projection
 	// queries keep their real values. Mirrors observability.TracesV3Request.IncludeRawResult.
 	IncludeRawResult bool `json:"include_raw_result" mapstructure:"include_raw_result"`
+	// ValidateRequest opts the query into services-server's empty-result diagnosis: a query that
+	// matches nothing comes back naming the mistyped field or value instead of a silent empty
+	// list. Mirrors observability.TracesV3Request.ValidateRequest and the log path's
+	// LogQueryRequest.ValidateRequest.
+	ValidateRequest bool `json:"validate_request,omitempty" mapstructure:"validate_request"`
+	// IncludeExecutedQuery asks services-server to resolve the provider query it actually ran and
+	// return it on the envelope (query + provider), on the empty result as much as the successful
+	// one. Without it an answer of "no traces found" cannot say what was asked or which backend
+	// answered it. Mirrors observability.TracesV3Request.IncludeExecutedQuery.
+	IncludeExecutedQuery bool `json:"include_executed_query,omitempty" mapstructure:"include_executed_query"`
 }
 
 type SortField struct {

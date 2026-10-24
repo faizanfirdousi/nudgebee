@@ -1,7 +1,8 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Box, Stack, Typography } from '@mui/material';
 import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined';
-import DeleteOutlineIcon from '@mui/icons-material/DeleteOutline';
+import SafeIcon from '@shared/icons/SafeIcon';
+import { DeleteIconRed } from '@assets';
 import { Modal } from '@ui/Modal';
 import { Input } from '@ui/Input';
 import { Select } from '@ui/Select';
@@ -11,14 +12,48 @@ import Tooltip from '@ui/Tooltip';
 import LockOutlinedIcon from '@mui/icons-material/LockOutlined';
 import { Form } from '@shared/forms/Form';
 import { ds } from '@utils/colors';
-import { isCommandDatasource, type AccountOption, type Panel, type PanelColumn, type PanelDatasource, type PanelType } from '@api1/dashboards';
+import {
+  isCommandDatasource,
+  isKubernetesOnlyDatasource,
+  KUBERNETES_ACCOUNT_KIND,
+  type AccountOption,
+  type Panel,
+  type PanelCombine,
+  type PanelColumn,
+  type PanelDatasource,
+  type PanelTarget,
+  type PanelThresholdColor,
+  type PanelThresholdOp,
+  type PanelThresholdStep,
+  type PanelType,
+} from '@api1/dashboards';
 import EntityQueryBuilder from './EntityQueryBuilder';
 import PanelPreview, { PREVIEW_RAIL_WIDTH, usePreviewRange } from './PanelPreview';
 import { buildEntityQuery, defaultDraft, draftFromQuery, findTable, tablesFor, type EntityQueryDraft } from './entityQuery';
 import { grantTooltip, missingDatasourceGrant, queryableTables } from './panelAccess';
 import { isCompleteColumn, panelColumnsOf, referencedColumns, setHiddenColumns } from './panelColumns';
-import { accountsOfTypes, coversAllOfTypes, deriveAccountTypes, panelScopeFromTypes } from './panelAccounts';
+import { filterColumnsOf, savedFilterColumns } from './panelViewerFilters';
+import { accountPickerOptions, accountsOfTypes, deriveAccountTypes, panelScopeFromTypes, resolvePanelAccounts } from './panelAccounts';
+import { ES_PROVIDER, providerChoices, providerLabel, providerTypeOf, useEsIndexes, usePanelProviders } from './panelProviders';
+import FilterDropdown from '@ui/FilterDropdown';
+import CloudProviderIcon from '@shared/icons/CloudIcon';
+import PanelProviderRow from './PanelProviderRow';
+import {
+  appliesToOf,
+  hasThresholds,
+  isCompleteStep,
+  OP_PHRASE,
+  OP_SYMBOL,
+  opOf,
+  panelThresholdStepsOf,
+  THRESHOLD_COLORS,
+  THRESHOLD_OPS,
+  thresholdOverlaps,
+  thresholdTone,
+} from './panelThresholds';
+import { combineOf } from './panelSeries';
 import { referencedVariables, type VariableValues } from './templating';
+import { fillBrandTokens, useBrandingConfig } from '@hooks/useTenantBranding';
 
 interface Props {
   open: boolean;
@@ -40,9 +75,16 @@ interface Props {
   onSave: (panel: Panel) => unknown | Promise<unknown>;
 }
 
+/** How a stat or gauge folds its accounts into one number. */
+const COMBINE_OPTIONS: { label: string; value: PanelCombine }[] = [
+  { label: 'Sum', value: 'sum' },
+  { label: 'Average', value: 'avg' },
+];
+
 const PANEL_TYPES: { label: string; value: PanelType }[] = [
   { label: 'Time series', value: 'timeseries' },
   { label: 'Stat', value: 'stat' },
+  { label: 'Gauge', value: 'gauge' },
   { label: 'Table', value: 'table' },
   { label: 'Bar', value: 'bar' },
   { label: 'Text', value: 'text' },
@@ -55,7 +97,10 @@ const DATASOURCES: { label: string; value: PanelDatasource }[] = [
   { label: 'Redis', value: 'redis' },
   { label: 'RabbitMQ', value: 'rabbitmq' },
   { label: 'PostgreSQL', value: 'postgresql' },
-  { label: 'Nudgebee (events)', value: 'nudgebee' },
+  { label: 'kubectl', value: 'kubectl' },
+  // `{brand}` is filled at render (see fillBrandTokens) — DATASOURCES is a
+  // module-level constant, so a literal here would latch the house brand.
+  { label: '{brand} (events)', value: 'nudgebee' },
 ];
 
 /** What each command datasource accepts. */
@@ -77,7 +122,26 @@ const COMMAND_HELP: Record<string, { placeholder: string; allowed: string; examp
       'a single read-only statement starting with SELECT, WITH, SHOW, EXPLAIN, TABLE or VALUES. No writes anywhere in it (including data-modifying CTEs), no ";", no double quotes — single quotes for values are fine',
     example: "SELECT state, count(*) FROM pg_stat_activity WHERE state = 'active' GROUP BY state",
   },
+  kubectl: {
+    placeholder: 'get pods -n kube-system',
+    allowed:
+      'get, describe, logs, top, explain, api-resources, api-versions, version, cluster-info, with read flags only (-n, -A, -o, -l, --field-selector, --sort-by, -c, --tail, --since …). No secrets, no exec or port-forward, no file or template paths, and no quotes, pipes or redirects — `kubectl` itself is added by the server',
+    example: 'get pods -n kube-system -o wide',
+  },
 };
+
+/** What a threshold step paints the panel in. */
+const THRESHOLD_COLOR_OPTIONS = THRESHOLD_COLORS.map((color) => ({ label: `${color[0].toUpperCase()}${color.slice(1)}`, value: color }));
+
+/** How a threshold step compares — the symbol the badge shows, spelled out. */
+const THRESHOLD_OP_OPTIONS = THRESHOLD_OPS.map((op) => ({ label: `${OP_SYMBOL[op]} ${OP_PHRASE[op]}`, value: op }));
+
+/**
+ * The "Applies to" picker's value for one account. The picker is one flat list —
+ * the shown number, every account, then each account — so an account's option
+ * carries its id behind a prefix the two fixed choices cannot collide with.
+ */
+const ACCOUNT_SUBJECT = 'account:';
 
 /**
  * The link picker's stand-in for "attach to nothing, add a column of my own".
@@ -86,6 +150,61 @@ const COMMAND_HELP: Record<string, { placeholder: string; allowed: string; examp
  * it is mapped back to an absent `column` before the panel is stored.
  */
 const NEW_COLUMN = '__new_column__';
+
+/** A threshold's number as typed. Empty reads as NaN — a step the author has not finished. */
+const parseThreshold = (text: string): number => (text.trim() === '' ? Number.NaN : Number(text));
+
+/** NaN never equals itself, and "still empty" has to count as unchanged. */
+const sameThreshold = (a: number, b: number): boolean => (Number.isNaN(a) && Number.isNaN(b)) || a === b;
+
+/**
+ * The threshold's value field.
+ *
+ * It holds the TEXT the author typed and reports the number that text parses to,
+ * rather than re-deriving the text from the number on every keystroke. That
+ * round trip — `String(Number(text))` — is what made `1.05` land as `15` and
+ * `-0.5` as `0.5`: it rewrites the field mid-entry, and a `type='number'` input
+ * discards whatever partial value it was still holding when it is rewritten.
+ * Verified in Chromium, not jsdom, which does not sanitise a number input.
+ *
+ * Re-seeds only when the step's value stops agreeing with the text, so removing
+ * the row above this one refreshes it while typing never does.
+ */
+const ThresholdValue: React.FC<{ value: number; index: number; onChange: (next: number) => void }> = ({ value, index, onChange }) => {
+  const [text, setText] = useState(() => (Number.isFinite(value) ? String(value) : ''));
+
+  useEffect(() => {
+    setText((current) => (sameThreshold(parseThreshold(current), value) ? current : Number.isFinite(value) ? String(value) : ''));
+  }, [value]);
+
+  return (
+    <Input
+      type='number'
+      value={text}
+      onChange={(next: string) => {
+        setText(next);
+        onChange(parseThreshold(next));
+      }}
+      placeholder='80'
+      data-testid={`threshold-value-${index}`}
+    />
+  );
+};
+
+/**
+ * A ref id no other query on the panel holds. The metrics request is keyed by
+ * ref id, so two queries sharing one would come back as a single series.
+ */
+const nextRefId = (targets: PanelTarget[]): string => {
+  const used = new Set(targets.map((t) => t.ref_id));
+  for (let code = 65; code <= 90; code++) {
+    const id = String.fromCharCode(code);
+    if (!used.has(id)) return id;
+  }
+  let n = targets.length + 1;
+  while (used.has(`Q${n}`)) n++;
+  return `Q${n}`;
+};
 
 /** A card's heading: what the group is, and why its fields are together. */
 const GroupHeader: React.FC<{ title: string; description: string }> = ({ title, description }) => (
@@ -102,11 +221,15 @@ const GroupHeader: React.FC<{ title: string; description: string }> = ({ title, 
     >
       {title}
     </Typography>
-    <Typography variant='caption' sx={{ display: 'block', mt: '2px', color: ds.gray[500], fontWeight: 400 }}>
+    <Typography variant='caption' sx={{ display: 'block', mt: ds.space[0], color: ds.gray[500], fontWeight: ds.weight.regular }}>
       {description}
     </Typography>
   </Box>
 );
+
+// The Accounts picker's section headers carry the provider's own mark, same as
+// the automations listing's account groups.
+const renderProviderGroupIcon = (provider: string) => <CloudProviderIcon cloud_provider={provider} width='14px' height='14px' />;
 
 const PanelEditorModal: React.FC<Props> = ({ open, panel, isEdit, accountOptions, variables, startTime, endTime, onClose, onSave }) => {
   const [draft, setDraft] = useState<Panel | null>(panel);
@@ -127,9 +250,12 @@ const PanelEditorModal: React.FC<Props> = ({ open, panel, isEdit, accountOptions
   React.useEffect(() => {
     setDraft(panel);
     setAccountTypes(panel ? deriveAccountTypes(panel, accountOptions) : []);
-    // A panel naming every account of its providers IS "all of those providers", which the types control
-    // already says.
-    setAccountIds(panel && coversAllOfTypes(panel, accountOptions) ? [] : panel?.account_ids || []);
+    // Exactly what is stored, even when the ids happen to be every account of the providers above. Those
+    // two are the same bytes on disk but not the same panel: an id list is PINNED and will not pick up an
+    // account connected tomorrow, so showing it as an empty "all of these providers" field claimed a
+    // behaviour the panel does not have — and re-saving it silently widened the scope to whatever had been
+    // connected since.
+    setAccountIds(panel?.account_ids || []);
     setEntityDraft(draftFromQuery(panel?.targets?.[0]?.query));
   }, [panel, accountOptions]);
 
@@ -140,9 +266,16 @@ const PanelEditorModal: React.FC<Props> = ({ open, panel, isEdit, accountOptions
    * one names the grant to ask for. Nothing is gated for a tenant admin or any
    * account user — see panelAccess.ts.
    */
+  // Subscribed for the re-render, not the value: fillBrandTokens reads the
+  // branding cache imperatively, and this memo is otherwise dep-free — it would
+  // bake in whatever the brand was on first paint and never recompute, which is
+  // the latch this placeholder work exists to remove. `title` in the deps is
+  // what makes the option list repaint once /api/public/app_config lands.
+  const { title: brandTitle } = useBrandingConfig();
   const datasourceOptions = useMemo(
     () =>
-      DATASOURCES.map((option) => {
+      DATASOURCES.map((template) => {
+        const option = { ...template, label: fillBrandTokens(template.label) };
         const missing = missingDatasourceGrant(option.value);
         if (!missing) return option;
         return {
@@ -161,46 +294,96 @@ const PanelEditorModal: React.FC<Props> = ({ open, panel, isEdit, accountOptions
           ),
         };
       }),
-    []
+    [brandTitle]
+  );
+
+  /**
+   * The accounts this panel's datasource can actually be served by.
+   *
+   * kubectl runs against an account's own agent, so a cloud account has nothing
+   * to answer with — offering one would save a scope that can only fail at
+   * render. Scoped by `kind` (what the account MANAGES) rather than
+   * `cloud_provider`: a `vm` fleet reaches an agent too, and that agent has no
+   * kubectl.
+   */
+  const draftDatasource = draft?.datasource;
+  const scopedAccountOptions = useMemo(
+    () =>
+      draftDatasource && isKubernetesOnlyDatasource(draftDatasource)
+        ? accountOptions.filter((o) => o.kind === KUBERNETES_ACCOUNT_KIND)
+        : accountOptions,
+    [accountOptions, draftDatasource]
   );
 
   const accountTypeOptions = useMemo(() => {
     const seen = new Set<string>();
-    for (const o of accountOptions) {
+    for (const o of scopedAccountOptions) {
       if (o.cloud_provider) seen.add(o.cloud_provider);
     }
     return [...seen].sort().map((t) => ({ label: t, value: t }));
-  }, [accountOptions]);
+  }, [scopedAccountOptions]);
 
   // The account picker lists only the chosen providers' accounts — an unfiltered list mixes clusters with
-  // cloud accounts and is unreadable past a handful.
-  const accountsForTypes = useMemo(
-    () =>
-      accountsOfTypes(accountTypes, accountOptions).map((o) => ({
-        label: accountTypes.length > 1 && o.cloud_provider ? `${o.label} (${o.cloud_provider})` : o.label,
-        value: o.value,
-      })),
-    [accountOptions, accountTypes]
+  // cloud accounts and is unreadable past a handful — sectioned by provider when it spans more than one.
+  const accountsForTypes = useMemo(() => accountPickerOptions(accountTypes, scopedAccountOptions), [scopedAccountOptions, accountTypes]);
+
+  // The accounts this panel will actually query, resolved exactly as the panel
+  // itself resolves them at render — the provider row must not be able to
+  // disagree with the requests usePanelData goes on to make.
+  const providerAccounts = useMemo(
+    () => resolvePanelAccounts(panelScopeFromTypes(accountTypes, accountIds, scopedAccountOptions), scopedAccountOptions),
+    [accountTypes, accountIds, scopedAccountOptions]
+  );
+  // A text panel queries nothing, and the Source card it would sit in is hidden.
+  const providerType = draft && draft.type !== 'text' ? providerTypeOf(draft.datasource) : undefined;
+  const { loading: providersLoading, entries: providerEntries, total: providerTotal } = usePanelProviders(providerAccounts, providerType);
+  /**
+   * Every provider the panel could be written for.
+   *
+   * Naming none is a real state, not an unmade choice — it is how every panel
+   * written before this control behaves, and it stays correct for the common
+   * single-provider tenant. So it lives in the placeholder and the clear button,
+   * exactly as the Accounts field already spells "all accounts of this type".
+   */
+  // Only ES needs an index named beside the query; every other provider carries
+  // it in the expression or does not have the concept.
+  const needsIndex = draft?.provider === ES_PROVIDER;
+  // Listed from the panel's first account. The picker is free-solo, so an author
+  // whose accounts hold different index sets can still type the pattern they want
+  // — which is also the answer for a wildcard spanning several.
+  const { loading: indexesLoading, indexes } = useEsIndexes(providerAccounts[0]?.value || '', needsIndex);
+
+  const providerOptions = useMemo(
+    () => providerChoices(providerEntries, draft?.provider || '').map((p) => ({ label: providerLabel(p), value: p })),
+    [providerEntries, draft?.provider]
   );
 
-  const expr = draft?.targets?.[0]?.expr || '';
-  const templateVars = useMemo(() => referencedVariables(expr), [expr]);
+  const targets = draft?.targets || [];
+  const expr = targets[0]?.expr || '';
+  // Every query, not just the first: a variable in query B is filled in (or
+  // refused) exactly like one in query A.
+  const allExprs = targets.map((t) => t.expr || '').join('\n');
+  const templateVars = useMemo(() => referencedVariables(allExprs), [allExprs]);
 
   if (!draft) return null;
 
   const patch = (next: Partial<Panel>) => setDraft((prev) => (prev ? { ...prev, ...next } : prev));
 
-  // Every edit rewrites target A in place, preserving the fields it does not
-  // touch (legend_format, hide, …).
-  const patchTarget = (next: Partial<NonNullable<Panel['targets']>[number]>) =>
-    setDraft((prev) =>
-      prev
-        ? {
-            ...prev,
-            targets: [{ ref_id: prev.targets?.[0]?.ref_id || 'A', ...(prev.targets?.[0] || {}), ...next }],
-          }
-        : prev
-    );
+  // Rewrites one query in place, preserving the fields it does not touch
+  // (legend_format, hide, …) and every other query on the panel.
+  const patchTarget = (next: Partial<PanelTarget>, index = 0) =>
+    setDraft((prev) => {
+      if (!prev) return prev;
+      const nextTargets = [...(prev.targets || [])];
+      nextTargets[index] = { ...nextTargets[index], ...next, ref_id: nextTargets[index]?.ref_id || 'A' };
+      return { ...prev, targets: nextTargets };
+    });
+
+  const addTarget = () =>
+    setDraft((prev) => (prev ? { ...prev, targets: [...(prev.targets || []), { ref_id: nextRefId(prev.targets || []), expr: '' }] } : prev));
+
+  const removeTarget = (index: number) =>
+    setDraft((prev) => (prev ? { ...prev, targets: (prev.targets || []).filter((_, i) => i !== index) } : prev));
 
   /**
    * Column settings live in one list on `options`, and an empty one is dropped
@@ -219,15 +402,71 @@ const PanelEditorModal: React.FC<Props> = ({ open, panel, isEdit, accountOptions
       return { ...prev, options };
     });
 
+  /**
+   * The columns a viewer's "Filter by column" menu offers, under the same rule:
+   * none chosen is saved as no list, which offers every column.
+   */
+  const patchFilterColumns = (next: string[]) =>
+    setDraft((prev) => {
+      if (!prev) return prev;
+      const options: Record<string, unknown> = { ...(prev.options || {}), filter_columns: next };
+      if (next.length === 0) delete options.filter_columns;
+      return { ...prev, options };
+    });
+
+  /** Threshold steps, under the same "an empty list is no list" rule as the columns above. */
+  const patchThresholds = (next: PanelThresholdStep[]) =>
+    setDraft((prev) => {
+      if (!prev) return prev;
+      const options: Record<string, unknown> = { ...(prev.options || {}), thresholds: next };
+      if (next.length === 0) delete options.thresholds;
+      return { ...prev, options };
+    });
+
+  /**
+   * Only a stat or a gauge evaluates thresholds, or combines its accounts into
+   * one number, so switching to any other visualisation drops both. Carrying
+   * them would leave the panel storing config nothing renders — and silently
+   * colouring itself, or summing where it would average, if it were ever
+   * switched back, long after whoever set them had forgotten.
+   */
+  const changeType = (next: PanelType) =>
+    setDraft((prev) => {
+      if (!prev) return prev;
+      if (hasThresholds(next) || (!prev.options?.thresholds && prev.options?.combine === undefined)) return { ...prev, type: next };
+      const options = { ...prev.options };
+      delete options.thresholds;
+      delete options.combine;
+      return { ...prev, type: next, options };
+    });
+
   const changeAccountTypes = (next: string[]) => {
     setAccountTypes(next);
     // Selections from a provider that is no longer chosen would be invisible in
     // the filtered list yet still scope the panel, so drop them.
-    const kept = new Set(accountsOfTypes(next, accountOptions).map((o) => o.value));
+    const kept = new Set(accountsOfTypes(next, scopedAccountOptions).map((o) => o.value));
     setAccountIds((prev) => prev.filter((id) => kept.has(id)));
+    // The provider was chosen from what the OLD accounts had configured, and a
+    // different account type resolves an entirely different set — an AWS panel
+    // holding a Kubernetes cluster's `prometheus` would name a provider none of
+    // its accounts can serve. Back to the account default, which is always valid.
+    patch({ provider: undefined, provider_index: undefined });
   };
 
-  /** Changing the data source clears the query. */
+  /**
+   * Naming a provider does not touch the query: an author switching from
+   * "Account default" to the provider those accounts already resolve to is
+   * pinning what they had, not starting over. The row below names any account the
+   * choice leaves behind.
+   */
+  const changeProvider = (next: string) =>
+    // The index belongs to the provider that was named. Carrying it onto another
+    // one would pin a Prometheus panel to an Elasticsearch index, which the
+    // backend has nowhere to put — and ValidateDefinition rejects an index with
+    // no provider at all.
+    patch({ provider: next || undefined, provider_index: next === ES_PROVIDER ? draft?.provider_index : undefined });
+
+  /** Changing the data source clears the query — all of them, back to a single empty one. */
   const changeDatasource = (next: string) => {
     const datasource = next as PanelDatasource;
     const datasourceTables = tablesFor(datasource);
@@ -240,10 +479,24 @@ const PanelEditorModal: React.FC<Props> = ({ open, panel, isEdit, accountOptions
     // grant. Falls back to it when none are readable, which is the honest state.
     const entityStart = defaultDraft(entity ? (queryableTables(datasourceTables)[0] || datasourceTables[0]).value : datasource);
     if (entity) setEntityDraft(entityStart);
-    // Only `nudgebee` reads across providers, so leaving a second one selected
-    // on the way out would save a scope the single control cannot show — the
-    // field would read "AWS" while the panel quietly queried AWS and GCP.
-    if (datasource !== 'nudgebee') changeAccountTypes(accountTypes.slice(0, 1));
+    // A kubectl panel can only be scoped to clusters, so a scope the new
+    // datasource cannot serve is dropped here rather than saved and failed at
+    // render. Where the panel was already on clusters the scope is kept; where
+    // it was on AWS it falls back to the one provider clusters have.
+    if (isKubernetesOnlyDatasource(datasource)) {
+      const clusters = accountOptions.filter((o) => o.kind === KUBERNETES_ACCOUNT_KIND);
+      const providers = [...new Set(clusters.map((o) => o.cloud_provider).filter(Boolean))];
+      const kept = accountTypes.filter((t) => providers.includes(t));
+      setAccountTypes((kept.length > 0 ? kept : providers).slice(0, 1));
+      const keptIds = new Set(clusters.map((o) => o.value));
+      setAccountIds((prev) => prev.filter((id) => keptIds.has(id)));
+      patch({ provider: undefined, provider_index: undefined });
+    } else if (datasource !== 'nudgebee') {
+      // Only `nudgebee` reads across providers, so leaving a second one selected
+      // on the way out would save a scope the single control cannot show — the
+      // field would read "AWS" while the panel quietly queried AWS and GCP.
+      changeAccountTypes(accountTypes.slice(0, 1));
+    }
     setDraft((prev) =>
       prev
         ? {
@@ -253,6 +506,13 @@ const PanelEditorModal: React.FC<Props> = ({ open, panel, isEdit, accountOptions
             // Link and hidden columns name the previous table's columns, and the
             // query they came from has just been thrown away with them.
             options: undefined,
+            // The provider named the query language of the expression that has
+            // just been cleared, and the new datasource resolves a different set
+            // of providers entirely. Keeping it would pin the panel to a provider
+            // that cannot serve it — which ValidateDefinition rejects outright on
+            // the entity and command datasources.
+            provider: undefined,
+            provider_index: undefined,
             // A nudgebee panel is authored as a structured query, so it starts
             // from a working default rather than an empty one.
             targets: entity
@@ -292,11 +552,49 @@ const PanelEditorModal: React.FC<Props> = ({ open, panel, isEdit, accountOptions
   // The editor reads the list RAW: an author typing a path has an incomplete
   // entry, and the render-time filter would delete the row out from under them.
   const columns = panelColumnsOf(draft);
+  const filterColumnOptions = isEntity ? filterColumnsOf(findTable(entityDraft.table)).map((c) => ({ label: c.label, value: c.name })) : [];
+  // Only names the table offers: an imported panel can carry ones it does not,
+  // which the menu ignores anyway — shown here they would read as choices.
+  const filterColumns = savedFilterColumns(draft).filter((name) => filterColumnOptions.some((o) => o.value === name));
   const hiddenColumns = columns.filter((c) => c.visibility === 'hidden' && c.name).map((c) => c.name as string);
   // Links are the only column setting the editor authors today. A column's other
   // settings — a title override, a format override — are honoured by the
   // renderer and set by import or by hand until this grows fields for them.
   const links = columns.filter((c) => Boolean(c.link));
+  /**
+   * Read RAW, exactly as the links are: a step being typed is momentarily
+   * incomplete, and the render-time filter in panelThresholdsOf would delete the
+   * row out from under the author mid-keystroke.
+   */
+  const thresholds = panelThresholdStepsOf(draft);
+  /** A step that could not be drawn. Blocks Save, and says so rather than greying the button out. */
+  const unfinishedThresholds = thresholds.filter((step) => !isCompleteStep(step));
+  /**
+   * A step naming an account the panel no longer covers — the account was
+   * removed from the scope, deleted, or the panel was imported from another
+   * tenant. It never fires, which is safe, so it does not block Save; it is
+   * flagged so the author can re-point it rather than keep a rule that is dead.
+   */
+  const coveredAccountIds = new Set(providerAccounts.map((a) => a.value));
+  const danglingThresholds = thresholds.filter((step) => appliesToOf(step) === 'account' && !coveredAccountIds.has(step.account_id || ''));
+  /**
+   * On a single-account panel every subject is the same number, so the picker
+   * would be a choice with no consequence — unless a step already names one,
+   * which has to stay fixable.
+   */
+  const showAppliesTo = providerAccounts.length > 1 || thresholds.some((step) => appliesToOf(step) !== 'shown');
+  /** Steps that apply to the same value with an outcome worth spelling out — a hint, never a Save blocker. */
+  const thresholdConflicts = thresholdOverlaps(thresholds, providerAccounts);
+  const appliesToOptions = [
+    { label: 'Shown number', value: 'shown' },
+    { label: 'Every account', value: 'every' },
+    ...providerAccounts.map((a) => ({ label: a.label, value: `${ACCOUNT_SUBJECT}${a.value}` })),
+    // One option per missing account, however many steps still name it.
+    ...[...new Set(danglingThresholds.map((step) => step.account_id || ''))].map((id) => ({
+      label: 'Account not available',
+      value: `${ACCOUNT_SUBJECT}${id}`,
+    })),
+  ];
   /**
    * What a link can be attached to: an existing column, whose own values become
    * the links, or a new column of its own.
@@ -328,13 +626,23 @@ const PanelEditorModal: React.FC<Props> = ({ open, panel, isEdit, accountOptions
   const hasScope = accountTypes.length > 0 || accountIds.length > 0;
   const canSave =
     draft.title.trim().length > 0 &&
-    (isText || (hasScope && (isEntity ? Boolean(draft.targets?.[0]?.query) : expr.trim().length > 0))) &&
+    // The server refuses a panel if any one of its queries is empty, not only the first.
+    (isText ||
+      (hasScope && (isEntity ? Boolean(targets[0]?.query) : targets.length > 0 && targets.every((t) => (t.expr || '').trim().length > 0)))) &&
     // The server refuses these too; catching them here saves a round trip that
     // comes back as a message about a panel the author can no longer see.
-    columns.every(isCompleteColumn);
+    columns.every(isCompleteColumn) &&
+    // Not a server rule — `options` is opaque to it — but a step with no number
+    // is a row the author is still filling in, and it would save as inert config.
+    unfinishedThresholds.length === 0;
 
   /** The draft as it would be stored — the preview runs this and the save sends it. */
-  const resolvedDraft: Panel = { ...draft, ...panelScopeFromTypes(accountTypes, accountIds, accountOptions) };
+  const resolvedDraft: Panel = {
+    ...draft,
+    ...panelScopeFromTypes(accountTypes, accountIds, accountOptions),
+    // Trimmed here, not as it is typed, so a unit like "req / s" can still be typed.
+    ...(typeof draft.unit === 'string' ? { unit: draft.unit.trim() } : {}),
+  };
 
   const handleSave = async () => {
     setSaving(true);
@@ -411,7 +719,7 @@ const PanelEditorModal: React.FC<Props> = ({ open, panel, isEdit, accountOptions
                 >
                   <Form.Section>
                     <Form.Field label='Data source'>
-                      <Select value={draft.datasource} options={datasourceOptions} onChange={changeDatasource} />
+                      <Select value={draft.datasource} options={datasourceOptions} onChange={changeDatasource} id='panel-datasource-select' />
                     </Form.Field>
                     <Form.Row ratio={[1, 1]}>
                       <Form.Field label={multiType ? 'Account types' : 'Account type'} required>
@@ -436,7 +744,7 @@ const PanelEditorModal: React.FC<Props> = ({ open, panel, isEdit, accountOptions
                       </Form.Field>
                       <Form.Field
                         label={
-                          <Box component='span' sx={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
+                          <Box component='span' sx={{ display: 'inline-flex', alignItems: 'center', gap: ds.space[1] }}>
                             Accounts
                             <Tooltip
                               title={multiType ? 'Leave empty for all accounts of the chosen providers' : 'Leave empty for all accounts of this type'}
@@ -450,6 +758,9 @@ const PanelEditorModal: React.FC<Props> = ({ open, panel, isEdit, accountOptions
                       >
                         <Select
                           multiple
+                          grouped
+                          defaultGroupsOpen
+                          groupIcon={renderProviderGroupIcon}
                           value={accountIds}
                           options={accountsForTypes}
                           onChange={setAccountIds}
@@ -459,6 +770,60 @@ const PanelEditorModal: React.FC<Props> = ({ open, panel, isEdit, accountOptions
                         />
                       </Form.Field>
                     </Form.Row>
+                    {providerType && (
+                      <Form.Field
+                        label={
+                          <Box component='span' sx={{ display: 'inline-flex', alignItems: 'center', gap: ds.space[1] }}>
+                            Provider
+                            <Tooltip title='The backend this panel’s query is written for. One panel speaks one query language — for a second provider, add a second panel.'>
+                              <Box component='span' sx={{ display: 'inline-flex', alignItems: 'center', color: ds.gray[400], cursor: 'help' }}>
+                                <InfoOutlinedIcon sx={{ fontSize: 13 }} />
+                              </Box>
+                            </Tooltip>
+                          </Box>
+                        }
+                      >
+                        <Stack gap={1}>
+                          <Select
+                            value={draft.provider || ''}
+                            options={providerOptions}
+                            onChange={changeProvider}
+                            // Nothing to choose from until the panel has accounts: the options ARE
+                            // what those accounts have configured. Disabled rather than hidden so
+                            // the field keeps its place and the form does not jump as it fills in.
+                            disabled={providerAccounts.length === 0}
+                            placeholder={providerAccounts.length > 0 ? 'Account default' : 'Select accounts first'}
+                            id='panel-provider-select'
+                          />
+                          <PanelProviderRow
+                            providerType={providerType}
+                            loading={providersLoading}
+                            entries={providerEntries}
+                            total={providerTotal}
+                            declared={draft.provider || ''}
+                          />
+                        </Stack>
+                      </Form.Field>
+                    )}
+                    {providerType && needsIndex && (
+                      <Form.Field
+                        label='Index'
+                        helperText='Leave empty to use each account’s configured index. Wildcards are accepted — type a pattern if it is not listed.'
+                      >
+                        <FilterDropdown
+                          id='panel-es-index-select'
+                          label='Select an Index'
+                          value={draft.provider_index || null}
+                          options={indexes}
+                          freeSolo
+                          // Same affordance as the log query builder's picker: free-solo alone is
+                          // invisible, so the hint is what tells the author a pattern is accepted.
+                          searchPlaceholder='Search or type pattern (use * for wildcard)...'
+                          isOptionsLoading={indexesLoading}
+                          onSelect={(_event: any, value: any) => patch({ provider_index: value || undefined })}
+                        />
+                      </Form.Field>
+                    )}
                   </Form.Section>
                 </Card>
               )}
@@ -476,32 +841,56 @@ const PanelEditorModal: React.FC<Props> = ({ open, panel, isEdit, accountOptions
                   {!isText && (
                     <>
                       {isEntity ? (
-                        <EntityQueryBuilder
-                          draft={entityDraft}
-                          tables={entityTables}
-                          onChange={(next, query, timeColumn) => {
-                            setEntityDraft(next);
-                            patchTarget({ query: query as any, time_column: timeColumn, expr: undefined });
-                            // Settings for a column the query no longer selects would come back
-                            // to life the moment the author selects it again — drop them, but
-                            // keep the added columns, which name no query column at all.
-                            const kept = columns.filter((c) => !c.name || next.columns.includes(c.name));
-                            if (kept.length !== columns.length) patchColumns(kept);
-                          }}
-                        />
+                        <>
+                          <EntityQueryBuilder
+                            draft={entityDraft}
+                            tables={entityTables}
+                            onChange={(next, query, timeColumn) => {
+                              setEntityDraft(next);
+                              patchTarget({ query: query as any, time_column: timeColumn, expr: undefined });
+                              // Settings for a column the query no longer selects would come back
+                              // to life the moment the author selects it again — drop them, but
+                              // keep the added columns, which name no query column at all.
+                              const kept = columns.filter((c) => !c.name || next.columns.includes(c.name));
+                              if (kept.length !== columns.length) patchColumns(kept);
+                              // A filter column belongs to the table, not to what it selects: only a
+                              // switch to another table can leave one behind.
+                              const offered = new Set(filterColumnsOf(findTable(next.table)).map((c) => c.name));
+                              const keptFilters = filterColumns.filter((name) => offered.has(name));
+                              if (keptFilters.length !== filterColumns.length) patchFilterColumns(keptFilters);
+                            }}
+                          />
+                          <Form.Field
+                            label='Columns viewers can filter by'
+                            description='What the panel’s Filter by column menu lists. Leave empty to offer every column.'
+                          >
+                            <Select
+                              multiple
+                              value={filterColumns}
+                              options={filterColumnOptions}
+                              onChange={(next: string[]) => patchFilterColumns(next)}
+                              placeholder='Every column'
+                              id='panel-filter-columns'
+                            />
+                          </Form.Field>
+                        </>
                       ) : commandHelp ? (
                         <>
                           <Form.Field
                             label={draft.datasource === 'postgresql' ? 'Query' : 'Command'}
                             required
-                            description={`Runs against this account's ${draft.datasource} integration. Read-only only — the credentials and connection flags are added by the server.`}
+                            description={
+                              draft.datasource === 'kubectl'
+                                ? "Runs in this account's cluster through its agent. Read-only only — `kubectl` itself is added by the server."
+                                : `Runs against this account's ${draft.datasource} integration. Read-only only — the credentials and connection flags are added by the server.`
+                            }
                           >
                             <Input value={expr} onChange={(v) => patchTarget({ expr: v })} placeholder={commandHelp.placeholder} />
                           </Form.Field>
-                          <Box sx={{ p: 1.5, border: `1px solid ${ds.gray[300]}`, background: ds.background[200], borderRadius: '6px' }}>
+                          <Box sx={{ p: 1.5, border: `1px solid ${ds.gray[300]}`, background: ds.background[200], borderRadius: ds.radius.md }}>
                             <Typography variant='body2' sx={{ color: ds.gray[700] }}>
                               Allowed: {commandHelp.allowed}. The result is a snapshot — this panel ignores the dashboard&apos;s time range. Example:{' '}
-                              <Box component='code' sx={{ fontFamily: 'monospace' }}>
+                              <Box component='code' sx={{ fontFamily: ds.font.mono }}>
                                 {commandHelp.example}
                               </Box>
                             </Typography>
@@ -516,16 +905,64 @@ const PanelEditorModal: React.FC<Props> = ({ open, panel, isEdit, accountOptions
                           <Input value={expr} onChange={(v) => patchTarget({ expr: v })} placeholder='{namespace="$namespace"} |= "error"' />
                         </Form.Field>
                       ) : (
-                        <Form.Field label='Query' required>
-                          <Input
-                            value={expr}
-                            onChange={(v) => patchTarget({ expr: v })}
-                            placeholder='sum(rate(http_requests_total{namespace="$namespace"}[5m]))'
-                          />
-                        </Form.Field>
+                        // Metrics is the one datasource that runs every query on the panel, each
+                        // drawing its own series — so every one is shown here. The others read
+                        // only the first. A lone query stays the plain field it always was; the
+                        // legend only earns its place once there are lines to tell apart. Rows are
+                        // numbered by position: a ref id is an internal key (an import's own names,
+                        // or the next free letter), and the legend is what names the line.
+                        <>
+                          {(targets.length > 0 ? targets : [{ ref_id: 'A', expr: '' }]).map((target, i) => (
+                            <Stack
+                              key={i}
+                              direction={{ xs: 'column', sm: 'row' }}
+                              gap={1}
+                              alignItems={{ xs: 'stretch', sm: 'flex-end' }}
+                              data-testid='panel-query-row'
+                            >
+                              <Box sx={{ flex: 3, minWidth: 0 }}>
+                                <Form.Field label={targets.length > 1 ? `Query ${i + 1}` : 'Query'} required id={`panel-query-${i}`}>
+                                  <Input
+                                    value={target.expr || ''}
+                                    onChange={(v) => patchTarget({ expr: v }, i)}
+                                    placeholder='sum(rate(http_requests_total{namespace="$namespace"}[5m]))'
+                                  />
+                                </Form.Field>
+                              </Box>
+                              {targets.length > 1 && (
+                                <>
+                                  <Box sx={{ flex: 1, minWidth: 0 }}>
+                                    <Form.Field label='Legend' id={`panel-query-legend-${i}`}>
+                                      <Input
+                                        value={target.legend_format || ''}
+                                        onChange={(v) => patchTarget({ legend_format: v || undefined }, i)}
+                                        placeholder='Series name or {{label}}'
+                                      />
+                                    </Form.Field>
+                                  </Box>
+                                  <Box sx={{ alignSelf: { xs: 'flex-end', sm: 'auto' } }}>
+                                    <Button
+                                      tone='ghost'
+                                      composition='icon-only'
+                                      aria-label={`Remove query ${i + 1}`}
+                                      icon={<SafeIcon src={DeleteIconRed} alt='delete' width={16} height={16} />}
+                                      onClick={() => removeTarget(i)}
+                                      id={`panel-remove-query-${i}`}
+                                    />
+                                  </Box>
+                                </>
+                              )}
+                            </Stack>
+                          ))}
+                          <Box>
+                            <Button tone='secondary' size='sm' onClick={addTarget} id='panel-add-query-btn'>
+                              Add query
+                            </Button>
+                          </Box>
+                        </>
                       )}
                       {templateVars.length > 0 && (
-                        <Box sx={{ p: 1.5, border: `1px solid ${ds.amber[300]}`, background: ds.amber[100], borderRadius: '6px' }}>
+                        <Box sx={{ p: 1.5, border: `1px solid ${ds.amber[300]}`, background: ds.amber[100], borderRadius: ds.radius.md }}>
                           <Typography variant='body2' sx={{ color: ds.gray[700] }}>
                             {commandHelp ? (
                               <>
@@ -552,15 +989,221 @@ const PanelEditorModal: React.FC<Props> = ({ open, panel, isEdit, accountOptions
                     </Form.Field>
                   )}
 
-                  <Form.Field label='Visualisation'>
+                  <Form.Field
+                    label='Visualisation'
+                    description={draft.type === 'gauge' ? 'The dial runs 0 to 100 — write the query to return a percentage.' : undefined}
+                  >
                     <Select
                       value={draft.type}
                       options={commandHelp || isEntity || isLogs ? PANEL_TYPES.filter((t) => t.value === 'table') : PANEL_TYPES}
-                      onChange={(v: string) => patch({ type: v as PanelType })}
+                      onChange={(v: string) => changeType(v as PanelType)}
                     />
                   </Form.Field>
+
+                  {/* The unit was only reachable through a template, an import or the JSON,
+                      so a number on the card could carry a suffix nobody could find to
+                      change. Offered where something reads it: a metrics stat, gauge, table
+                      or time series. A bar chart, a text panel — which keeps its datasource —
+                      and every other datasource's table do not. */}
+                  {draft.datasource === 'metrics' && draft.type !== 'bar' && !isText && (
+                    <Form.Field label='Unit' description='Shown after the numbers this panel draws — e.g. %, ms, req/s, pods. Leave empty for none.'>
+                      <Input value={draft.unit || ''} onChange={(v) => patch({ unit: v })} placeholder='None' id='panel-unit-input' />
+                    </Form.Field>
+                  )}
+
+                  {/* Whether the one number is the accounts' sum or their mean is a fact
+                      the card cannot show — 100 and 33 are both plausible readings of
+                      90, 0 and 10. A gauge averages by default, since its dial reads as
+                      a percentage; a stat adds up. Offered where there are accounts to
+                      combine, or where a saved choice has to stay changeable. */}
+                  {draft.datasource === 'metrics' &&
+                    hasThresholds(draft.type) &&
+                    (providerAccounts.length > 1 || draft.options?.combine !== undefined) && (
+                      <Form.Field
+                        label='Across accounts'
+                        description='How the accounts’ figures become the one number shown: added up, or averaged. A gauge averages unless told otherwise; a stat adds up.'
+                      >
+                        <Select
+                          value={combineOf(draft)}
+                          options={COMBINE_OPTIONS}
+                          onChange={(v: string) => patch({ options: { ...(draft.options || {}), combine: v as PanelCombine } })}
+                          id='panel-combine-select'
+                        />
+                      </Form.Field>
+                    )}
                 </Form.Section>
               </Card>
+
+              {hasThresholds(draft.type) && (
+                <Card
+                  variant='tinted'
+                  header={
+                    <GroupHeader
+                      title='Thresholds'
+                      description='Colour the panel when a number crosses a line — the border and the title band take the step’s colour, and the header names the threshold that was crossed, and the account when it was one account’s.'
+                    />
+                  }
+                >
+                  <Form.Section>
+                    <Box>
+                      <Stack direction='row' alignItems='center' gap={ds.space[2]} sx={{ mb: ds.space[2] }}>
+                        <Typography sx={{ fontFamily: ds.font.display, fontSize: 13, fontWeight: ds.weight.semibold, color: ds.gray[700] }}>
+                          Steps
+                        </Typography>
+                        <Box sx={{ flex: 1 }} />
+                        <Button
+                          tone='secondary'
+                          size='sm'
+                          // Red first: the first threshold anyone writes is the one
+                          // that means trouble, and a value of its own would be a
+                          // guess at the panel's scale.
+                          onClick={() => patchThresholds([...thresholds, { value: Number.NaN, color: 'red' }])}
+                          id='add-threshold'
+                        >
+                          Add threshold
+                        </Button>
+                      </Stack>
+
+                      {thresholds.length === 0 ? (
+                        <Typography variant='caption' sx={{ color: ds.gray[500] }}>
+                          No thresholds — the panel always draws plain.
+                        </Typography>
+                      ) : (
+                        <Stack gap={ds.space[2]}>
+                          {thresholds.map((step, i) => {
+                            const patchStep = (next: Partial<PanelThresholdStep>) =>
+                              patchThresholds(thresholds.map((other, j) => (j === i ? { ...other, ...next } : other)));
+                            return (
+                              // Indexed: two steps can hold the same value while one
+                              // is being typed, so neither value nor colour is a key.
+                              <Stack key={i} direction='row' gap={ds.space[2]} alignItems='center'>
+                                <Box
+                                  sx={{
+                                    width: 14,
+                                    height: 14,
+                                    flexShrink: 0,
+                                    borderRadius: ds.radius.sm,
+                                    background: thresholdTone(step.color).border,
+                                  }}
+                                />
+                                {/* Read left to right as the rule: "Every account ≥ 80 → Red". */}
+                                {showAppliesTo && (
+                                  <Box sx={{ flex: 1.4, minWidth: 0 }}>
+                                    <Select
+                                      value={appliesToOf(step) === 'account' ? `${ACCOUNT_SUBJECT}${step.account_id || ''}` : appliesToOf(step)}
+                                      options={appliesToOptions}
+                                      onChange={(v: string) =>
+                                        v.startsWith(ACCOUNT_SUBJECT)
+                                          ? patchStep({ applies_to: 'account', account_id: v.slice(ACCOUNT_SUBJECT.length) })
+                                          : // "Shown number" is what an absent field means, so it is stored as one:
+                                            // the panel JSON stays what every step before this looked like.
+                                            patchStep({ applies_to: v === 'every' ? 'every' : undefined, account_id: undefined })
+                                      }
+                                      id={`threshold-applies-${i}`}
+                                    />
+                                  </Box>
+                                )}
+                                <Box sx={{ flex: 1 }}>
+                                  <Select
+                                    value={opOf(step)}
+                                    options={THRESHOLD_OP_OPTIONS}
+                                    // `gte` is what an absent field means; stored as absent for the same reason.
+                                    onChange={(v: string) => patchStep({ op: v === 'gte' ? undefined : (v as PanelThresholdOp) })}
+                                    id={`threshold-op-${i}`}
+                                  />
+                                </Box>
+                                <Box sx={{ flex: 1 }}>
+                                  <ThresholdValue value={step.value} index={i} onChange={(next) => patchStep({ value: next })} />
+                                </Box>
+                                <Box sx={{ flex: 1 }}>
+                                  <Select
+                                    value={step.color}
+                                    options={THRESHOLD_COLOR_OPTIONS}
+                                    onChange={(v: string) => patchStep({ color: v as PanelThresholdColor })}
+                                    id={`threshold-color-${i}`}
+                                  />
+                                </Box>
+                                <Button
+                                  tone='ghost'
+                                  composition='icon-only'
+                                  aria-label={`Remove threshold ${i + 1}`}
+                                  icon={<SafeIcon src={DeleteIconRed} alt='delete' width={16} height={16} />}
+                                  onClick={() => patchThresholds(thresholds.filter((_, j) => j !== i))}
+                                  id={`remove-threshold-${i}`}
+                                />
+                              </Stack>
+                            );
+                          })}
+                        </Stack>
+                      )}
+
+                      {thresholds.length > 0 && (
+                        <Typography variant='caption' sx={{ display: 'block', mt: ds.space[2], color: ds.gray[500] }}>
+                          A value past a step’s line takes its colour. Past several, the furthest wins — the highest of the ≥ and &gt; steps, the
+                          lowest of the ≤ and &lt; steps — and when one of each applies, the more severe colour. Past none, the panel draws plain.
+                          {showAppliesTo &&
+                            ' “Shown number” compares the number on the panel: the accounts’ sum or average, or one account’s when the view is narrowed to it. “Every account” checks each account on its own, and names the one that crossed.'}
+                        </Typography>
+                      )}
+
+                      {unfinishedThresholds.length > 0 && (
+                        <Box
+                          sx={{
+                            mt: ds.space[2],
+                            p: ds.space[3],
+                            border: `1px solid ${ds.amber[300]}`,
+                            background: ds.amber[100],
+                            borderRadius: ds.radius.md,
+                          }}
+                        >
+                          <Typography variant='body2' sx={{ color: ds.gray[700] }}>
+                            Every threshold needs a number to compare against. Fill it in, or remove the step.
+                          </Typography>
+                        </Box>
+                      )}
+
+                      {thresholdConflicts.length > 0 && (
+                        <Box
+                          data-testid='threshold-overlaps'
+                          sx={{
+                            mt: ds.space[2],
+                            p: ds.space[3],
+                            border: `1px solid ${ds.blue[300]}`,
+                            background: ds.blue[100],
+                            borderRadius: ds.radius.md,
+                            display: 'grid',
+                            gap: ds.space[1],
+                          }}
+                        >
+                          {thresholdConflicts.map((overlap) => (
+                            <Typography key={overlap.steps.join(':')} variant='body2' sx={{ color: ds.gray[700] }}>
+                              {overlap.message}
+                            </Typography>
+                          ))}
+                        </Box>
+                      )}
+
+                      {danglingThresholds.length > 0 && (
+                        <Box
+                          data-testid='threshold-dangling'
+                          sx={{
+                            mt: ds.space[2],
+                            p: ds.space[3],
+                            border: `1px solid ${ds.amber[300]}`,
+                            background: ds.amber[100],
+                            borderRadius: ds.radius.md,
+                          }}
+                        >
+                          <Typography variant='body2' sx={{ color: ds.gray[700] }}>
+                            {danglingThresholds.length === 1 ? 'A threshold names' : `${danglingThresholds.length} thresholds name`} an account this
+                            panel no longer covers, so it never fires. Pick one of the panel’s accounts, or remove the step.
+                          </Typography>
+                        </Box>
+                      )}
+                    </Box>
+                  </Form.Section>
+                </Card>
+              )}
 
               {isNudgebee && (
                 <Card
@@ -594,7 +1237,7 @@ const PanelEditorModal: React.FC<Props> = ({ open, panel, isEdit, accountOptions
 
                     <Box>
                       <Stack direction='row' alignItems='center' gap={1} sx={{ mb: 1 }}>
-                        <Typography sx={{ fontFamily: 'var(--ds-font-display)', fontSize: 13, fontWeight: 600, color: ds.gray[700] }}>
+                        <Typography sx={{ fontFamily: 'var(--ds-font-display)', fontSize: 13, fontWeight: ds.weight.semibold, color: ds.gray[700] }}>
                           Links
                         </Typography>
                         <Box sx={{ flex: 1 }} />
@@ -653,7 +1296,7 @@ const PanelEditorModal: React.FC<Props> = ({ open, panel, isEdit, accountOptions
                                   tone='ghost'
                                   composition='icon-only'
                                   aria-label='Remove link'
-                                  icon={<DeleteOutlineIcon sx={{ fontSize: 18 }} />}
+                                  icon={<SafeIcon src={DeleteIconRed} alt='delete' width={16} height={16} />}
                                   // A link on an existing column keeps that column's other settings;
                                   // an added column has nothing left once its link is gone.
                                   onClick={() => patchColumns(columns.flatMap((c) => (c !== link ? [c] : c.name ? [{ ...c, link: undefined }] : [])))}
@@ -669,7 +1312,7 @@ const PanelEditorModal: React.FC<Props> = ({ open, panel, isEdit, accountOptions
                         <Typography variant='caption' sx={{ display: 'block', mt: 1, color: ds.gray[500] }}>
                           Attach the link to a column and its own values become the links; choose New column for a plain action column instead. Write
                           an in-app path and fill it from the row with{' '}
-                          <Box component='code' sx={{ fontFamily: 'monospace' }}>
+                          <Box component='code' sx={{ fontFamily: ds.font.mono }}>
                             {'{{column}}'}
                           </Box>
                           . Available here: {entityDraft.columns.map((c) => `{{${c}}}`).join(', ')}.
@@ -677,7 +1320,7 @@ const PanelEditorModal: React.FC<Props> = ({ open, panel, isEdit, accountOptions
                       )}
 
                       {unfinishedLinks.length > 0 && (
-                        <Box sx={{ mt: 1, p: 1.5, border: `1px solid ${ds.amber[300]}`, background: ds.amber[100], borderRadius: '6px' }}>
+                        <Box sx={{ mt: 1, p: 1.5, border: `1px solid ${ds.amber[300]}`, background: ds.amber[100], borderRadius: ds.radius.md }}>
                           <Typography variant='body2' sx={{ color: ds.gray[700] }}>
                             Every link needs a header (or a column to attach to) and a path inside the product — starting with a single <code>/</code>
                             , as in <code>/investigate?id={'{{id}}'}</code>. Anyone who can see this dashboard follows these links, which is why an
@@ -687,7 +1330,7 @@ const PanelEditorModal: React.FC<Props> = ({ open, panel, isEdit, accountOptions
                       )}
 
                       {unknownPlaceholders.length > 0 && (
-                        <Box sx={{ mt: 1, p: 1.5, border: `1px solid ${ds.amber[300]}`, background: ds.amber[100], borderRadius: '6px' }}>
+                        <Box sx={{ mt: 1, p: 1.5, border: `1px solid ${ds.amber[300]}`, background: ds.amber[100], borderRadius: ds.radius.md }}>
                           <Typography variant='body2' sx={{ color: ds.gray[700] }}>
                             {unknownPlaceholders.map((c) => `{{${c}}}`).join(', ')} {unknownPlaceholders.length === 1 ? 'is' : 'are'} not selected in
                             Columns above, so {unknownPlaceholders.length === 1 ? 'it' : 'they'} cannot be filled in — those cells will be blank. Add

@@ -10,6 +10,10 @@
 // `resolveServerBranding()` synchronously, so the provider must be sync —
 // the EE side resolves its async license check once at boot before
 // registering (see `app/src/ee/branding/serverInit.ts`).
+//
+// Branding resolves PER REQUEST HOST: one deployment can front several partner
+// hostnames, each with its own brand kit. Callers holding the request pass its
+// host; callers without one get the deployment-wide default.
 
 export interface ServerBrandingData {
   logoUrl?: string;
@@ -40,7 +44,21 @@ export interface ServerBrandingData {
   fontRemap?: Array<{ family: string; src: string; weight?: string; style?: string }> | null;
 }
 
-type ServerBrandingProvider = () => ServerBrandingData | null;
+type ServerBrandingProvider = (host?: string | null) => ServerBrandingData | null;
+
+/**
+ * Optional async preparation step. The provider itself must stay synchronous
+ * (SSR calls it during render), but a provider backed by anything other than
+ * the local filesystem needs a way to say "I am not ready yet".
+ *
+ * Only callers that CAN await should use it — in practice `/api/public/app_config`,
+ * which is an API route and is also the client's single source of branding. If
+ * it answers before the provider is ready, the browser caches un-branded values
+ * for the whole page load and the partner sees the house brand until the next
+ * reload. SSR paths keep calling the provider directly and may be one beat
+ * behind; the client repaints from app_config regardless.
+ */
+type ServerBrandingPreload = () => Promise<void>;
 
 // The provider lives on globalThis so it survives Next.js's dual module graph
 // between the Node-runtime (`instrumentation.ts` → `@ee/init-server` →
@@ -52,11 +70,11 @@ type ServerBrandingProvider = () => ServerBrandingData | null;
 // in every built image. Same pattern (and same root cause) as
 // `globalThis.__nbAuthHooks` in `authHooks.ts` and
 // `globalThis.__nbBypassGraphQLAsServer` in `instrumentation.ts`.
-type ServerBrandingRegistry = { provider: ServerBrandingProvider | null };
+type ServerBrandingRegistry = { provider: ServerBrandingProvider | null; preload: ServerBrandingPreload | null };
 
 const _g = globalThis as unknown as { __nbServerBranding?: ServerBrandingRegistry };
 if (!_g.__nbServerBranding) {
-  _g.__nbServerBranding = { provider: null };
+  _g.__nbServerBranding = { provider: null, preload: null };
 }
 const _registry = _g.__nbServerBranding!;
 
@@ -69,16 +87,93 @@ export function registerServerBranding(provider: ServerBrandingProvider): void {
 }
 
 /**
- * Resolve branding data for the current request, or `null` when no provider
- * is registered (the OSS case — always neutral).
+ * Register the optional async readiness step. Called once at server boot
+ * alongside registerServerBranding. OSS registers nothing, so
+ * `awaitServerBrandingReady()` resolves immediately there.
  */
-export function resolveServerBranding(): ServerBrandingData | null {
+export function registerServerBrandingPreload(preload: ServerBrandingPreload): void {
+  _registry.preload = preload;
+}
+
+/**
+ * Resolve once the branding provider can answer completely. A no-op when no
+ * preload is registered.
+ *
+ * Never rejects and never blocks indefinitely: the registered implementation
+ * owns its own timeout, and a failure here must degrade to "answer with what we
+ * have", exactly like a failed refresh does.
+ */
+export async function awaitServerBrandingReady(): Promise<void> {
+  const preload = _registry.preload;
+  if (!preload) return;
+  try {
+    await preload();
+  } catch (err) {
+    console.warn('[branding] readiness step failed; answering with current values:', err);
+  }
+}
+
+/**
+ * Normalize a `Host` / `X-Forwarded-Host` header into a brand-map lookup key:
+ * first entry of a comma-joined list, lower-cased, port and trailing dot
+ * stripped. Exported so the EE side normalizes the configured map with exactly
+ * the same rules the lookup uses — a map key that normalizes differently from
+ * the header would silently never match.
+ *
+ * IPv6 literals (`[::1]:3000`) keep their brackets: stripping the port must not
+ * eat the address.
+ */
+export function normalizeBrandHost(host?: string | null): string {
+  if (!host) return '';
+  const first = host.split(',')[0].trim().toLowerCase();
+  if (!first) return '';
+  const hostname = first.startsWith('[') ? first.slice(0, first.indexOf(']') + 1) : first.split(':')[0];
+  return hostname.replace(/\.$/, '');
+}
+
+type HeaderBag = Record<string, string | string[] | undefined> | undefined;
+
+/**
+ * Pick the brand-selecting hostname out of a request's headers.
+ *
+ * `X-Forwarded-Host` is checked FIRST, and the order is not cosmetic: the app
+ * runs behind an nginx sidecar whose `location /` proxies to `127.0.0.1:3000`
+ * and sets only `X-Forwarded-Host $host`. It does not set `Host`, so nginx's
+ * default (`Host: $proxy_host`) applies and `req.headers.host` arrives as
+ * `127.0.0.1:3000` in every deployed pod — reading it would resolve every
+ * request to the same brand. `Host` remains the fallback for `next dev` and any
+ * deployment that talks to Next directly.
+ *
+ * The sidecar overwrites a client-supplied `X-Forwarded-Host` with its own
+ * `$host`, so the value is not spoofable past the proxy. `$host` itself derives
+ * from the request's `Host`, which is also what the ingress routed on.
+ */
+export function brandHostFromHeaders(headers: HeaderBag): string | null {
+  if (!headers) return null;
+  const first = (v: string | string[] | undefined): string | undefined => (Array.isArray(v) ? v[0] : v);
+  return first(headers['x-forwarded-host']) || first(headers.host) || null;
+}
+
+/**
+ * Resolve branding data for `host`, or `null` when no provider is registered
+ * (the OSS case — always neutral).
+ *
+ * `host` is the raw header value; it is normalized by the provider. Omitting it
+ * resolves the deployment-wide default brand, which is the right answer for
+ * callers with no request in hand: build-time prerendering, and the marketplace
+ * callback pages, which are only ever reached at BASE_URL.
+ */
+export function resolveServerBranding(host?: string | null): ServerBrandingData | null {
   const provider = _registry.provider;
   if (!provider) return null;
   try {
-    return provider();
-  } catch {
-    // A misbehaving provider must never break SSR / the config endpoint.
+    return provider(host);
+  } catch (err) {
+    // A misbehaving provider must never break SSR / the config endpoint, but it
+    // must not fail silently either: returning null here is indistinguishable
+    // from "no branding configured", so a partner deployment would quietly
+    // render as Nudgebee with nothing anywhere saying why.
+    console.error('[branding] server branding provider threw; falling back to neutral defaults:', err);
     return null;
   }
 }

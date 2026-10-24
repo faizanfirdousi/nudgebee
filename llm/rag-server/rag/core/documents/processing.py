@@ -5,17 +5,18 @@ Handles batch processing, embedding generation, and document lifecycle managemen
 """
 
 import asyncio
+import copy
 import gc
 import hashlib
 import logging
 import os
 import time
+import uuid
 from typing import List, Optional
 
 from botocore.exceptions import ClientError
 from rag.core.types import Document
 
-from rag.core.documents.loaders.base import trim_text
 from rag.core.embeddings.tracker import EmbeddingTracker
 from rag.exceptions import is_not_found_error
 from rag.qdrant.client import get_qdrant_client
@@ -29,6 +30,10 @@ logger = logging.getLogger(__name__)
 
 # Module-level engine for connection pooling — avoid creating per-call.
 _kb_engine = None
+
+# Ids per existence-probe request. Qdrant carries the id list in the request body,
+# so a whole embedding batch is chunked rather than sent as one oversized call.
+_EXISTENCE_PROBE_CHUNK = 256
 
 
 def _get_kb_engine():
@@ -45,6 +50,7 @@ def update_kb_load_result(
     status: str,
     document_count: Optional[int] = None,
     error_message: Optional[str] = None,
+    warning: Optional[str] = None,
 ) -> None:
     """Record a load's outcome on a single llm_knowledgebases row (by id).
 
@@ -58,13 +64,22 @@ def update_kb_load_result(
         with engine.connect() as connection:
             with connection.begin():
                 if document_count is not None:
+                    # The warning rides in the same statement as the status flip.
+                    # Written separately afterwards it would be erased by this
+                    # very UPDATE, and a gap nobody is shown is a silently
+                    # partial index.
                     connection.execute(
                         sql_text(
                             "UPDATE llm_knowledgebases SET status = :status, "
                             "document_count = :doc_count, last_loaded_at = NOW(), "
-                            "error_message = NULL, updated_at = NOW() WHERE id = :kb_id"
+                            "error_message = :warning, updated_at = NOW() WHERE id = :kb_id"
                         ),
-                        {"status": status, "doc_count": document_count, "kb_id": knowledgebase_id},
+                        {
+                            "status": status,
+                            "doc_count": document_count,
+                            "warning": warning or None,
+                            "kb_id": knowledgebase_id,
+                        },
                     )
                 else:
                     connection.execute(
@@ -90,7 +105,9 @@ def update_integration_kb_load_result(
     An integration can have one KB row per cloud account in its tenant, all
     backed by the same vector collection — so the update keys on integration_id
     rather than a single KB id. On failure error_message holds the reason; on
-    success it is cleared.
+    success it holds any shortfall worth reporting — a load that indexed the text
+    but dropped the pictures is active, not failed, and must still say so — and is
+    cleared when there is nothing to report.
     """
     try:
         engine = _get_kb_engine()
@@ -101,10 +118,15 @@ def update_integration_kb_load_result(
                         sql_text(
                             "UPDATE llm_knowledgebases SET status = :status, "
                             "document_count = :doc_count, last_loaded_at = NOW(), "
-                            "error_message = NULL, updated_at = NOW() "
+                            "error_message = :error_message, updated_at = NOW() "
                             "WHERE integration_id = :iid AND kb_type = 'integration'"
                         ),
-                        {"status": status, "doc_count": document_count, "iid": integration_id},
+                        {
+                            "status": status,
+                            "doc_count": document_count,
+                            "iid": integration_id,
+                            "error_message": error_message or None,
+                        },
                     )
                 else:
                     connection.execute(
@@ -132,10 +154,42 @@ def _get_document_id(doc):
     return hashlib.md5(doc.page_content.encode()).hexdigest()
 
 
-# NOTE: _check_document_exists() function removed - it was causing major performance issues
-# Old implementation checked existence of each document individually (N HTTP requests per batch)
-# Qdrant's upsert operation handles duplicates automatically and atomically
-# If you need the old function for reference, check git history
+# NOTE: the original _check_document_exists() did one HTTP round-trip per document
+# (N per batch) and was removed for that reason. Upsert does dedupe *storage* — point
+# ids are content hashes, so an unchanged page overwrites itself — but the vector is
+# computed before Qdrant is ever contacted, so unchanged pages were still being
+# re-embedded on every sync. This is the batched form: one retrieve per batch instead
+# of N, ids only, no payload or vectors.
+def _normalize_point_id(point_id):
+    """Hyphen-stripped form of a point id, for comparison only.
+
+    Qdrant accepts a bare 32-char hex id on write but stores and returns it in
+    canonical hyphenated UUID form, so `_generate_document_ids`' plain hex never
+    equals a returned `point.id` by string compare. Same normalisation as
+    `_get_missing_doc_ids`.
+    """
+    return str(point_id).replace("-", "")
+
+
+def _existing_point_ids(collection_name, ids):
+    """Return the normalised subset of `ids` already present in the collection.
+
+    Chunked because Qdrant takes the id list in the request body and a whole
+    embedding batch can be large. Ids only — no payload, no vectors — so this
+    stays a cheap existence probe rather than a read.
+    """
+    existing = set()
+    client = get_qdrant_client()
+    for start in range(0, len(ids), _EXISTENCE_PROBE_CHUNK):
+        chunk = ids[start : start + _EXISTENCE_PROBE_CHUNK]
+        found = client.retrieve(
+            collection_name=collection_name,
+            ids=chunk,
+            with_payload=False,
+            with_vectors=False,
+        )
+        existing.update(_normalize_point_id(point.id) for point in found)
+    return existing
 
 
 def _create_embeddings_batch(
@@ -186,6 +240,9 @@ def _create_embeddings_batch(
                 text=doc.page_content,
                 embedding_model=embeddings,
                 usage_metadata=usage_metadata,
+                # Chunks of one document share a parent_id; an unchunked document
+                # is its own key.
+                document_key=(doc.metadata or {}).get("parent_id") or doc_id,
             )
 
 
@@ -210,11 +267,12 @@ async def generate_embeddings_batch(
         collection_name: Target collection name
         collection_metadata: Collection metadata
         tracker: Embedding tracker for metrics
-        verify_doc: Whether to verify document existence before processing (deprecated - ignored)
+        verify_doc: Skip documents already present in the collection (set by _setup_collection)
         vector_store: Optional pre-created vector store for reuse across batches
 
-    NOTE: verify_doc parameter is deprecated and ignored. Qdrant's upsert operation
-    automatically handles duplicates, so existence checks are unnecessary and slow.
+    NOTE: verify_doc gates the batched existence probe. Upsert dedupes storage, but
+    the embedding is computed before Qdrant is contacted, so skipping unchanged
+    documents is what avoids the redundant embedding work.
     """
     if not documents:
         return
@@ -223,11 +281,29 @@ async def generate_embeddings_batch(
     wait_time = int(os.environ.get("INITIAL_WAIT_TIME", 1))
     max_retry_duration = int(os.environ.get("MAX_RETRY_DURATION", 600))
 
-    # NOTE: Removed existence check - Qdrant's upsert automatically handles duplicates
-    # Old code: if verify_doc: for doc in documents: if not _check_document_exists()...
-    # This was causing N individual HTTP requests for each document in the batch
-    # Upsert is atomic and much faster - it updates existing docs or inserts new ones
+    # Skip documents already embedded in this collection. `verify_doc` is only set
+    # when the collection exists AND carries embeddings_generated_at (see
+    # _setup_collection), i.e. exactly the re-sync case — on a first build there is
+    # nothing to find, so the probe is skipped entirely. Fails open: any error here
+    # embeds the full batch rather than blocking ingestion.
     docs_to_process = documents
+    if verify_doc and documents:
+        try:
+            batch_ids = [_get_document_id(d) for d in documents]
+            existing = _existing_point_ids(collection_name, batch_ids)
+            if existing:
+                docs_to_process = [
+                    d for d, doc_id in zip(documents, batch_ids) if _normalize_point_id(doc_id) not in existing
+                ]
+                logger.info(
+                    f"Skipping {len(documents) - len(docs_to_process)} already-embedded "
+                    f"documents of {len(documents)} in batch"
+                )
+            if not docs_to_process:
+                return
+        except Exception as e:
+            logger.warning(f"Existence probe failed, embedding full batch: {e}")
+            docs_to_process = documents
 
     # Main retry loop for entire batch
     while time.time() - start_time < max_retry_duration:
@@ -253,6 +329,12 @@ async def generate_embeddings_batch(
 
                 if token_limit_error:
                     logger.info("Too many input tokens in batch. Retrying by reducing document sizes...")
+                    # Imported locally: `loaders` imports this module back, so a
+                    # module-scope import here is a cycle that decides which test
+                    # files are collectable. The dependency only matters on the
+                    # oversize-batch retry path.
+                    from rag.core.documents.loaders.base import trim_text
+
                     # Trim all documents in batch
                     for doc in docs_to_process:
                         doc.page_content = trim_text(doc.page_content)
@@ -340,9 +422,104 @@ def _build_collection_meta(account_id, module, tenant_id=None, source=None):
     return meta
 
 
+# The reranker hard-slices each document to Config.reranker_max_doc_chars
+# characters BEFORE tokenizing it (local_reranker.py:rerank, applied ahead of
+# the separate Config.reranker_max_length combined-token-budget truncation),
+# so any chunk longer than that has its tail permanently invisible to
+# scoring regardless of tokenizer behavior. The worst-case stored chunk is
+# _CHUNK_CHAR_LIMIT + _CHUNK_OVERLAP_CHARS (see _split_on_paragraphs's final
+# flush), so the overlap must come out of the same budget, not sit on top of
+# it. An earlier fixed 700-char limit was sized against an assumed reranker
+# config, not the one main was running (500 chars / 128 tokens since
+# 604d28a76c), and live-testing showed content past char 500 of such a chunk
+# is never scored. Deriving the limit from the live config instead of a
+# disconnected guess keeps it from drifting out of sync again.
+_CHUNK_OVERLAP_CHARS = 100
+_CHUNK_CHAR_LIMIT = max(200, Config.reranker_max_doc_chars - _CHUNK_OVERLAP_CHARS)
+
+
+def _chunk_long_documents(documents):
+    """Split any document longer than _CHUNK_CHAR_LIMIT into smaller chunks
+    that fit the reranker's effective budget, on paragraph boundaries where
+    possible. Metadata already set on the document (provenance, any classifier
+    output a caller has already run) is copied onto every chunk unchanged —
+    it describes the whole document, not an arbitrary slice of it.
+
+    Documents at or under the limit pass through as a single chunk,
+    unmodified, so this is a no-op for the common case.
+    """
+    chunked = []
+    for doc in documents:
+        content = doc.page_content or ""
+        if len(content) <= _CHUNK_CHAR_LIMIT:
+            chunked.append(doc)
+            continue
+
+        pieces = _split_on_paragraphs(content, _CHUNK_CHAR_LIMIT, _CHUNK_OVERLAP_CHARS)
+        # parent_id + chunk_index is the contract collection._is_listed_point
+        # (lists chunk_index 0 only) and llm/ranking.py (groups chunks by
+        # parent) already read; without parent_id every chunk lists as its own
+        # document and none of them group.
+        parent_id = getattr(doc, "id", None) or hashlib.md5(content.encode()).hexdigest()
+        for i, piece in enumerate(pieces):
+            # Deep copy, not dict(): a shallow copy shares mutable values
+            # (e.g. the `capabilities` list) across every chunk of this
+            # document, so mutating one chunk's metadata would silently
+            # mutate all the others.
+            metadata = copy.deepcopy(doc.metadata) if doc.metadata else {}
+            metadata.setdefault("parent_id", parent_id)
+            metadata["chunk_index"] = i
+            metadata["chunk_count"] = len(pieces)
+            chunked.append(Document(page_content=piece, metadata=metadata))
+    return chunked
+
+
+def _split_on_paragraphs(text, limit, overlap):
+    """Greedily pack paragraphs (blank-line-separated) into chunks up to
+    `limit` chars, carrying the last `overlap` chars of each chunk into the
+    next so a boundary doesn't strand a sentence with no context. A single
+    paragraph longer than `limit` is hard-sliced rather than left oversized,
+    since an oversized chunk defeats the whole point of chunking.
+    """
+    paragraphs = [p for p in text.split("\n\n") if p.strip()]
+    chunks = []
+    current = ""
+    for para in paragraphs:
+        candidate = f"{current}\n\n{para}" if current else para
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            # A flush shorter than the overlap window is fully re-carried
+            # into the next chunk's prefix below (current[-overlap:] is then
+            # the whole string), so appending it here too would emit a
+            # redundant near-duplicate chunk with nothing lost by skipping it.
+            if len(current) > overlap:
+                chunks.append(current)
+            current = current[-overlap:] + "\n\n" + para if overlap else para
+        else:
+            current = para
+        while len(current) > limit:
+            chunks.append(current[:limit])
+            # max(1, ...) rather than max(0, ...): guarantees forward
+            # progress even if a future caller passes overlap >= limit,
+            # where limit - overlap <= 0 would otherwise re-slice from 0
+            # every time and loop forever.
+            current = current[max(1, limit - overlap) :]
+    if current:
+        chunks.append(current)
+    return chunks or [text[:limit]]
+
+
 def _stamp_provenance(documents, source=None, tenant_id=None):
     """Stamp provenance tags onto each document's metadata so per-source and
-    per-tenant filters work at query time. Respects caller overrides."""
+    per-tenant filters work at query time. Respects caller overrides.
+
+    Deliberately no run id: an unchanged document is skipped before upsert, so the marker
+    would only ever land on documents that changed — present on some points, absent on
+    others, for reasons a reader cannot see. Which documents a load captured is answered
+    from the source store, which writes every document it was given.
+    """
     if not (source or tenant_id):
         return
     for doc in documents:
@@ -443,6 +620,9 @@ def process_documents(
     trigger_type="system_sync",
     source=None,
     tenant_id=None,
+    warning=None,
+    run_id=None,
+    source_document_count=None,
 ):
     """
     Process multiple documents asynchronously with batch embedding.
@@ -490,7 +670,25 @@ def process_documents(
             return None, None
         collection_name, collection_meta, verify_doc = result
 
+    run_id = run_id or str(uuid.uuid4())
     _stamp_provenance(documents, source=source, tenant_id=tenant_id)
+    # Counted before chunking: a KB's document_count is what the list column
+    # shows and what the documents drilldown enumerates (one row per parent,
+    # collection._is_listed_point), so it stays in source-document units. The
+    # chunks below are embedding and retrieval units, and the tracker's own
+    # counts stay in those.
+    # How many documents a person would say this load covered. Usually one per item
+    # handed in, but a caller that has already split one thing into several — a PDF
+    # broken into passages, a note split per line — passes the real figure, so the
+    # knowledge base does not report a six-page file as eight documents.
+    if source_document_count is None:
+        source_document_count = len(documents)
+    # The load ledger is a separate unit and has to stay one. Its own document_count
+    # counts what was embedded, so the figure it is compared against must count what
+    # was submitted for embedding — mixing a source count into that pair makes the
+    # history render "8 / 1" and claim a completed load dropped seven documents.
+    submitted_document_count = len(documents)
+    documents = _chunk_long_documents(documents)
 
     # Initialize tracker with load metadata
     tracker = EmbeddingTracker(
@@ -500,7 +698,8 @@ def process_documents(
         triggered_by=triggered_by,
         trigger_type=trigger_type,
         module=module,
-        expected_document_count=len(documents),
+        expected_document_count=submitted_document_count,
+        run_id=run_id,
     )
     tracker.start_timer()
 
@@ -552,7 +751,12 @@ def process_documents(
     # knowledgebase_id here; integration scrapes pass none and update every
     # integration KB row by integration_id at scrape completion instead.
     if knowledgebase_id:
-        update_kb_load_result(knowledgebase_id, "active", tracker.expected_document_count or total_documents)
+        update_kb_load_result(
+            knowledgebase_id,
+            "active",
+            source_document_count,
+            warning=warning,
+        )
 
     logger.info(
         f"Embeddings generated for account id {account_id}, module {module}, "
@@ -684,10 +888,15 @@ def _delete_document(client, doc_id, collection_name):
 
 
 def _get_missing_doc_ids(client, collection_name, documents_id):
-    """Helper function to identify documents that need to be deleted using direct Qdrant client."""
+    """Helper function to identify documents that need to be deleted using direct Qdrant client.
+
+    Returns point ids exactly as Qdrant returned them. Legacy points carry
+    integer ids; stringifying one makes Qdrant reject the later delete with a
+    400, so those points were never pruned.
+    """
     try:
         # Scroll through all points to get existing IDs
-        all_ids = []
+        existing_ids = set()
         offset = None
         while True:
             points, next_offset = client.scroll(
@@ -699,19 +908,15 @@ def _get_missing_doc_ids(client, collection_name, documents_id):
             )
             if not points:
                 break
-            all_ids.extend([str(point.id) for point in points])
+            existing_ids.update(point.id for point in points)
             if next_offset is None:
                 break
             offset = next_offset
 
         logger.info(f"Length of documents processed: {len(documents_id)}")
-        existing_ids = set(all_ids)
         logger.info(f"Length of existing documents: {len(existing_ids)}")
-        # Normalize IDs by removing hyphens for comparison.
-        # Qdrant stores UUIDs with hyphens (e.g. "3c73415d-dce9-..."),
-        # but _generate_document_ids returns plain hex (e.g. "3c73415ddce9...").
-        normalized_doc_ids = {doc_id.replace("-", "") for doc_id in documents_id}
-        missing_ids = {eid for eid in existing_ids if eid.replace("-", "") not in normalized_doc_ids}
+        normalized_doc_ids = {_normalize_point_id(doc_id) for doc_id in documents_id}
+        missing_ids = {eid for eid in existing_ids if _normalize_point_id(eid) not in normalized_doc_ids}
         logger.info(f"Missing ids: {len(missing_ids)}")
         return missing_ids
     except Exception as e:

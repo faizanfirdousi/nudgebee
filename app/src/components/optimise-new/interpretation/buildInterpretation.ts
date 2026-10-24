@@ -11,7 +11,14 @@
  * lighter title/insight re-frame and degrades gracefully.
  */
 import type { InterpretationData } from './InterpretationPanel';
-import { summarizeRightSizing, summarizeCloudRightSizing, formatCloudTargetSpec, type RightSizingSummary } from '../rightSizingData';
+import {
+  summarizeRightSizing,
+  summarizeCloudRightSizing,
+  formatCloudTargetSpec,
+  splitSavings,
+  type RightSizingSummary,
+  type SavingsSplit,
+} from '../rightSizingData';
 import { summarizeConfigIssues } from '../evidence/configIssues';
 
 interface BuildArgs {
@@ -31,17 +38,44 @@ interface BuildArgs {
   recData?: any;
   /** Catalog recommendation steps — the richest "why" text when present. */
   recommendations?: string[];
+  /** The live workload facts behind a k8s recommendation, for restart risk. */
+  workload?: WorkloadFacts;
+}
+
+export interface WorkloadFacts {
+  /** Controller kind from discovery meta (Deployment, StatefulSet, ...). */
+  kind?: string;
+  /** Live pod count from discovery meta — not spec.replicas: 0 mid-rollout. */
+  pods?: number | null;
 }
 
 // Rule-family caveats. Kept deliberately small for v1 — only rules where the
 // operational consequence is well-defined and worth surfacing up-front.
 const RISK_BY_RULE: Record<string, string> = {
-  pod_right_sizing: "Applying updates the workload's resource requests and triggers a rolling restart. Reversible by reverting the change.",
+  pod_right_sizing:
+    "Applying updates the workload's resource requests; unless the no-restart (in-place) apply is used, that triggers a rolling restart. Reversible by reverting the change.",
   replica_right_sizing: 'Reducing replicas lowers spare capacity for traffic spikes and failures — confirm there is enough headroom before applying.',
   pv_rightsize: "Persistent volumes can't be shrunk in place — this requires creating a new PVC and migrating data, with downtime.",
   unused_pvc: "Deleting a PVC can be irreversible if the volume isn't retained. Confirm nothing depends on it first.",
   abandoned_resource: "Scaling the workload to zero is reversible, but verify it's genuinely unused before applying.",
 };
+
+// singleReplicaOutage: a rolling restart is an outage only when the workload
+// cannot keep a pod serving while its one pod is replaced — a StatefulSet
+// replaces pods in place. A single-pod Deployment surges a new pod before
+// terminating the old one under the default strategy, so it earns no outage
+// claim. A live pod count of 0 (mid-rollout, scaled to zero) or an unknown
+// count is "unknown", never "single".
+export const singleReplicaOutage = (workload?: WorkloadFacts): boolean => workload?.kind === 'StatefulSet' && workload?.pods === 1;
+
+// The single-pod case is a variant of the same caveat, not an addition to it:
+// concatenating the two made one paragraph name the in-place apply twice.
+const SINGLE_REPLICA_RISK =
+  "Applying updates the workload's resource requests. This StatefulSet runs a single pod, so the restart is a brief outage for its callers — prefer the no-restart (in-place) apply where the cluster supports it, or a maintenance window. Reversible by reverting the change.";
+
+// podRightSizingRisk picks the restart caveat that fits the workload.
+export const podRightSizingRisk = (workload?: WorkloadFacts): string =>
+  singleReplicaOutage(workload) ? SINGLE_REPLICA_RISK : RISK_BY_RULE.pod_right_sizing;
 
 // Action-oriented verdicts for the K8s-native RightSizing rules, which have no
 // catalog title (it degrades to the prettified rule name, e.g. "Pod Right
@@ -84,6 +118,12 @@ function deriveImpact(category: string, savings: number): { impact: string; impa
   if (savings && savings > 0) {
     return { impact: `~$${Math.round(savings)}/mo estimated savings.`, impactIsCost: true };
   }
+  // A negative saving is a real cost impact — applying the recommendation raises
+  // the bill. impactIsCost stays false: it renders green, which would read as
+  // money saved.
+  if (Math.round(-savings) >= 1) {
+    return { impact: `Costs ~$${Math.round(-savings)}/mo more to apply.`, impactIsCost: false };
+  }
   switch (category) {
     case 'Security':
       return { impact: 'Security — reduces attack surface. No direct cost.', impactIsCost: false };
@@ -106,20 +146,75 @@ const DIRECTION_VERB: Record<RightSizingSummary['direction'], string> = {
   none: 'Right-size',
 };
 
+// " at an average of 3.2 replicas over 14 days (2–10)"; the range is dropped
+// when the count never moved.
+export function formatReplicaWindow(r: RightSizingSummary['replicas']): string {
+  if (!r) return '';
+  const avg = Number.isInteger(r.avg) ? String(r.avg) : r.avg.toFixed(1);
+  const noun = r.avg === 1 ? 'replica' : 'replicas';
+  const days = r.windowHours != null ? r.windowHours / 24 : null;
+  const over = days != null ? ` over ${Number.isInteger(days) ? days : days.toFixed(1)} days` : '';
+  const range = r.min !== r.max ? ` (${r.min}–${r.max})` : '';
+  return ` at an average of ${avg} ${noun}${over}${range}`;
+}
+
+// resourceNames says which requests move, in the order the table lists them.
+const resourceNames = (changed: RightSizingSummary['changedResources']): string => {
+  if (changed.length === 2) return 'CPU and memory requests';
+  if (changed[0] === 'cpu') return 'CPU requests';
+  if (changed[0] === 'memory') return 'memory requests';
+  return 'resource requests';
+};
+
 function podRightSizing(
   summary: RightSizingSummary,
-  savings: number
+  savings: number,
+  split: SavingsSplit | null = null
 ): Pick<InterpretationData, 'verdict' | 'impact' | 'impactIsCost' | 'evidence' | 'confidence' | 'observedWindow'> {
-  const containerLabel = summary.containerCount > 1 ? `${summary.primary} (+${summary.containerCount - 1} more)` : summary.primary;
+  // The verdict names the action; the current → recommended figures live in the
+  // "Recommended Resource Changes" table right below it, which also carries the
+  // percentages, so spelling them here made the reader parse the same four
+  // numbers twice. The container is named only when there is more than one —
+  // with a single container the table's one row already names it.
+  const containerLabel = summary.containerCount > 1 ? ` on ${summary.primary} (+${summary.containerCount - 1} more)` : '';
   const verdict = summary.changeText
-    ? `${DIRECTION_VERB[summary.direction]} ${containerLabel}: ${summary.changeText}`
+    ? `${DIRECTION_VERB[summary.direction]} ${resourceNames(summary.changedResources)}${containerLabel}`
     : 'Right-size resource requests to match observed usage';
 
   let impact: string;
   let impactIsCost = false;
-  if (Math.round(savings) >= 1) {
-    impact = `~$${Math.round(savings)}/mo savings${summary.reclaimText ? ` · reclaims ${summary.reclaimText}` : ''}.`;
-    impactIsCost = true;
+  const monthlyIncrease = Math.round(savings < 0 ? -savings : 0);
+  // The dollar figure is per pod times replicas; say which replica count it
+  // assumed so a swing on an autoscaled workload reads as a range, not a bug.
+  const atReplicas = formatReplicaWindow(summary.replicas);
+  // The replica window qualifies the dollar figure, which now lives only in the
+  // panel header, so it is stated as the assumption behind it rather than
+  // trailing a number this line no longer prints. formatReplicaWindow leads
+  // with " at" for the cost line below; here the verb already carries it.
+  const assumption = atReplicas ? `; the figure assumes${atReplicas.replace(/^ at /, ' ')}` : '';
+  if (split && Math.round(split.gross) >= 1 && Math.round(split.cost) >= 1) {
+    // Name containers by the side they contributed to, not by their own net: a
+    // container whose cpu saving and memory cost cancel still belongs on both.
+    const saver = split.containers.filter((c) => (c.cpu ?? 0) > 0 || (c.memory ?? 0) > 0).map((c) => c.name);
+    const payer = split.containers.filter((c) => (c.cpu ?? 0) < 0 || (c.memory ?? 0) < 0).map((c) => c.name);
+    const sameContainers = saver.join(', ') === payer.join(', ');
+    // The panel header already carries the gross, the cost and the net. What it
+    // cannot show is which container is on which side of that split, so that is
+    // all this line adds — and with one container there is no side to name, so
+    // the slot is dropped rather than restating the header. It is no longer a
+    // money statement either way, so it never renders in the savings tone.
+    if (summary.containerCount === 1) impact = '';
+    else if (sameContainers) impact = `Saves and costs more on the same container, ${saver.join(', ')}${assumption}.`;
+    else impact = `Saves on ${saver.join(', ')} · costs more on ${payer.join(', ')}${assumption}.`;
+  } else if (Math.round(savings) >= 1) {
+    // The header states the saving. Reclaimed capacity is the part it cannot.
+    impact = summary.reclaimText ? `Reclaims ${summary.reclaimText}${assumption}.` : '';
+  } else if (monthlyIncrease >= 1) {
+    // Raising requests buys reliability at a monthly price, and that price is
+    // the whole basis for the trade-off, so name it rather than reporting
+    // "no direct cost change" for a workload whose bill goes up.
+    const reason = summary.direction === 'increase' ? 'prevents CPU throttling and OOM kills' : 'matches requests to observed usage';
+    impact = `Costs ~$${monthlyIncrease}/mo more${atReplicas} · ${reason}.`;
   } else if (summary.reclaimText) {
     impact = `Reclaims ~${summary.reclaimText} of guaranteed allocation. No direct cost change.`;
   } else if (summary.direction === 'increase') {
@@ -210,11 +305,12 @@ export function buildInterpretation({
   savings,
   recData,
   recommendations,
+  workload,
 }: BuildArgs): InterpretationData {
   // "Why" source priority: catalog recommendation step (richest) → catalog/JSONB
   // description → computed insight (best for K8s-native rules with no catalog).
   const whyNow = recommendations?.[0]?.trim() || (description?.trim() ? description : insight) || undefined;
-  const sharedRisk = RISK_BY_RULE[ruleName] || undefined;
+  const sharedRisk = ruleName === 'pod_right_sizing' ? podRightSizingRisk(workload) : RISK_BY_RULE[ruleName] || undefined;
 
   // Rich treatment for K8s misconfiguration "array of findings" recs — the
   // findings are the recommendation, so lead with their breakdown.
@@ -233,14 +329,14 @@ export function buildInterpretation({
   if (ruleName === 'pod_right_sizing') {
     const summary = recData ? summarizeRightSizing(recData) : null;
     if (summary) {
-      const r = podRightSizing(summary, savings || 0);
+      const r = podRightSizing(summary, savings || 0, splitSavings(recData));
       return {
         verdict: r.verdict,
         serviceName: serviceName || undefined,
         confidence: r.confidence,
         observedWindow: r.observedWindow,
         whyNow,
-        impact: r.impact,
+        impact: r.impact || undefined,
         impactIsCost: r.impactIsCost,
         risk: sharedRisk,
         evidence: r.evidence,

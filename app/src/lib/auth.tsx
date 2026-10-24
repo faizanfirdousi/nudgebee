@@ -322,8 +322,11 @@ export function missingPermissionMessage(permission: string): string {
 }
 
 // Modules backing the sections of the Admin page (/user-management): Users,
-// Groups, Audits, Notifications, Integrations, Ownership, and the EE Roles &
-// Permissions tab. Kept in sync with baseFilters in
+// Groups, Audits, Notifications, Integrations, Ownership, the EE Roles &
+// Permissions tab, Tenant Settings, and AI & Tools (Agents/Tools & MCP/
+// Functions/Budgets & Limits/Memory Policy/RCA Format share `ai`; Providers
+// reuses `integrations`; Gateway reuses `llm`; Egress Filter is
+// `egressfilter`). Kept in sync with baseFilters in
 // app/src/pages/user-management/index.jsx.
 // Cross-tenant super admin (full, not the read-only flavor). Kept distinct from
 // isTenantWideRole() because destructive / write gates must not accept
@@ -344,30 +347,39 @@ export function canManage(module: string, permissionClass: 'Read' | 'Write' | 'E
   return isTenantAdmin() || isSuperAdmin() || hasPermission(module, permissionClass);
 }
 
-// Tenant Settings (the avatar-menu modal) splits into two questions, because
-// seeing the tenant's configuration and changing it are different privileges.
-//
-// VIEW — any tenant-wide role (including the read-only flavors) or a
-// `tenants:Read` grant. The reads behind the modal (tenant_attributes_v2,
-// featureflags_list, features_list) are all classified `tenants:Read` and
-// actions.yaml already grants them to the read-only roles, so this mirrors the
-// backend rather than being stricter than it.
-export function canViewTenantSettings(): boolean {
-  return isTenantWideRole() || hasPermission('tenants', 'Read') || canEditTenantSettings();
-}
-
-// EDIT — mirrors CanManage("tenants","Write") in
-// api-server/services/tenant/service.go, which gates all four writes the modal
+// EDIT gate for the Tenant Settings Admin tab — mirrors CanManage("tenants","Write") in
+// api-server/services/tenant/service.go, which gates all four writes the tab
 // makes (tenant_attribute_upsert / _delete, tenant_update_name,
 // featureflag_upsert). Note a `tenants:Write` grant still cannot flip the
 // privileged keys carved out in tenant/privileged_config.go (entitlement_bypass,
 // RBAC_K8S, …) — those stay tenant-admin/super-admin only, and the backend
 // rejects them per-key rather than per-request.
+//
+// There's no separate canViewTenantSettings(): reachability is decided by
+// hasAdminSurfaceAccess() now that this is a page tab, not an avatar-menu
+// modal with its own independent view/edit split.
 export function canEditTenantSettings(): boolean {
   return canManage('tenants', 'Write');
 }
 
-const ADMIN_SURFACE_MODULES = ['users', 'usergroups', 'audits', 'notifications', 'integrations', 'ownership', 'customroles', 'roles'];
+// 'ai', 'llm' and 'egressfilter' cover Admin → AI & Tools (docs/ia-consolidation-plan.md,
+// PR 3) — the dynamic-RBAC modules its own sub-tabs gate on (see baseFilters
+// in pages/user-management/index.jsx). Keep this list in sync with those
+// `module` fields, same rule as every other Admin-page module here.
+const ADMIN_SURFACE_MODULES = [
+  'users',
+  'usergroups',
+  'audits',
+  'notifications',
+  'integrations',
+  'ownership',
+  'customroles',
+  'roles',
+  'tenants',
+  'ai',
+  'llm',
+  'egressfilter',
+];
 
 // Should the Admin sidebar tab / route be reachable for the current user?
 // True for tenant-wide admins (hasReadAccess) and for any custom-role holder
@@ -426,17 +438,45 @@ const LIST_ACCOUNT_FEATURE_FLAGS = `
     }
   }`;
 
+// Tenant-flag requests still in flight. featureData fills only once a fetch lands, so callers
+// firing together on mount (each `hasFeatureAccess`) would otherwise each send their own request.
+const tenantFlagsInFlight: Record<string, Promise<any[]>> = Object.create(null);
+
+function loadTenantFeatureFlags(tenantKey: string, fresh: boolean = false): Promise<any[]> {
+  // queryGraphQL resolves (it does not reject) on network and GraphQL errors, so a failed request
+  // has to be recognised here and thrown. Returning [] would be cached as "no flags enabled" for
+  // the session, and every caller sharing this request would read it.
+  const request = () =>
+    queryGraphQL(LIST_TENANT_FEATURE_FLAGS, 'GetTenantFeatureFlags', {}).then((response) => {
+      const list = response?.data?.data?.featureflags_list;
+      if (!list || response?.data?.errors?.length) {
+        throw new Error(response?.data?.errors?.[0]?.message || 'Failed to fetch tenant feature flags');
+      }
+      return list.rows || [];
+    });
+  // A refresh must reach the network, not join a request started before it.
+  if (fresh) {
+    return request();
+  }
+  if (!tenantFlagsInFlight[tenantKey]) {
+    tenantFlagsInFlight[tenantKey] = request().finally(() => {
+      delete tenantFlagsInFlight[tenantKey];
+    });
+  }
+  return tenantFlagsInFlight[tenantKey];
+}
+
 export async function hasFeatureAccess(featureName: string): Promise<boolean> {
   const tenantKey = getTenantKey();
   if (!Object.hasOwn(featureData, tenantKey)) {
     try {
-      const response = await queryGraphQL(LIST_TENANT_FEATURE_FLAGS, 'GetTenantFeatureFlags', {});
-      featureData[tenantKey] = response?.data?.data?.featureflags_list?.rows || [];
+      featureData[tenantKey] = await loadTenantFeatureFlags(tenantKey);
     } catch (error) {
       console.log('failed to fetch feature flags-', error);
     }
   }
-  const tenantFeatures: any[] = featureData[tenantKey];
+  // Unset when the fetch failed: answer "not enabled" now, and let the next call retry.
+  const tenantFeatures: any[] = featureData[tenantKey] ?? [];
   for (const f of tenantFeatures) {
     if (f['feature_id'] === featureName && f['status'] === 'enabled') {
       return true;
@@ -474,11 +514,12 @@ export async function fetchFeatureFlagsForTenant(refresh = false): Promise<any[]
   }
 
   try {
-    const response = await queryGraphQL(LIST_TENANT_FEATURE_FLAGS, 'GetTenantFeatureFlags', {});
-    featureData[tenantKey] = response?.data?.data?.featureflags_list?.rows || [];
+    featureData[tenantKey] = await loadTenantFeatureFlags(tenantKey, refresh);
   } catch (error) {
+    // Not cached: a failure must not read as "no flags", and a failed refresh must not wipe
+    // flags already loaded. Callers get what is known (or []), and the next call retries.
     console.log('Failed to fetch feature flags -', error);
-    featureData[tenantKey] = [];
+    return featureData[tenantKey] ?? [];
   }
 
   return featureData[tenantKey];

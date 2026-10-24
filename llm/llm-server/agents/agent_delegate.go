@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"nudgebee/llm/agents/core"
-	"nudgebee/llm/config"
 	"nudgebee/llm/security"
 	toolcore "nudgebee/llm/tools/core"
 )
@@ -68,9 +67,10 @@ func (t *delegateAgentTool) GetType() toolcore.NBToolType { return toolcore.NBTo
 func (t *delegateAgentTool) Description() string {
 	return `Spawn a scoped specialist sub-investigator with its own prompt, tool list, and iteration budget.
 Input: {"prompt": <brief>, "tools": [<tool names>], "max_iterations": <int>} — "tools" is required; omitting it leaves the sub-agent LLM-only, which is almost always misuse. max_iterations defaults to 5, minimum 2, maximum 15.
+When the work names a cluster or cloud account, preserve that exact target in the delegated prompt so the specialist can pass it through the targetable tool's existing per-call argument.
 USE when a specific sub-question needs 3+ tool calls to answer and would otherwise pollute your own scratchpad with serial discovery (e.g. "investigate DNS for service X", "check egress firewall for namespace Y").
 DO NOT use when 1-2 tool calls suffice — call the tool directly.
-DO NOT use to record findings — write to your own notebook with <update_notebook>. Prompts that start with "update the notebook" / "updating the notebook" are rejected at the tool boundary with an error pointing here.
+DO NOT use to record findings — the parent agent owns investigation state. Prompts that start with "update the notebook" / "updating the notebook" are rejected at the tool boundary with an error pointing here.
 DO NOT use to format, summarize, or rewrite text — call the LLM tool directly.
 DO NOT use as a final-answer preamble.`
 }
@@ -85,6 +85,7 @@ func (t *delegateAgentTool) InputSchema() toolcore.ToolSchema {
 			},
 			"tools": {
 				Type:        toolcore.ToolSchemaTypeArray,
+				Items:       map[string]any{"type": "string"},
 				Description: "List of tool names the sub-agent should use (e.g., [\"mysql_query\", \"prometheus\"]). Must be tools available in the current account.",
 			},
 			"max_iterations": {
@@ -178,6 +179,7 @@ func (t *delegateAgentTool) Call(ctx toolcore.NbToolContext, input toolcore.NBTo
 		Context: input.Context,
 	}
 	resp, err := core.ExecuteAgentToolCall(ctx, dynamicAgent, subInput)
+	parentTerminal := core.ResolveAgentParentTerminal(dynamicAgent, resp.IsTerminal)
 
 	// Build additionalDetails ONCE, upfront, so every return path below (including
 	// the early err != nil path) carries agent_id. Without agent_id, the parent's
@@ -237,7 +239,7 @@ func (t *delegateAgentTool) Call(ctx toolcore.NbToolContext, input toolcore.NBTo
 		return toolcore.NBToolResponse{
 			Status:            toolcore.NBToolResponseStatusError,
 			Data:              fmt.Sprintf("Sub-agent execution failed: %s", err.Error()),
-			IsTerminal:        resp.IsTerminal,
+			IsTerminal:        parentTerminal,
 			AdditionalDetails: additionalDetails,
 			SubAgentEvidence:  subAgentEvidence,
 		}, nil
@@ -265,7 +267,7 @@ func (t *delegateAgentTool) Call(ctx toolcore.NbToolContext, input toolcore.NBTo
 			Data:              data,
 			Status:            toolcore.NBToolResponseStatusWaiting,
 			Type:              toolcore.NBToolResponseTypeText,
-			IsTerminal:        resp.IsTerminal,
+			IsTerminal:        parentTerminal,
 			AdditionalDetails: additionalDetails,
 			SubAgentEvidence:  subAgentEvidence,
 		}, nil
@@ -280,7 +282,7 @@ func (t *delegateAgentTool) Call(ctx toolcore.NbToolContext, input toolcore.NBTo
 			Data:              responseData,
 			Status:            toolcore.NBToolResponseStatusError,
 			Type:              toolcore.NBToolResponseTypeText,
-			IsTerminal:        resp.IsTerminal,
+			IsTerminal:        parentTerminal,
 			AdditionalDetails: additionalDetails,
 			SubAgentEvidence:  subAgentEvidence,
 		}, nil
@@ -291,7 +293,7 @@ func (t *delegateAgentTool) Call(ctx toolcore.NbToolContext, input toolcore.NBTo
 			Data:              resp.Response[0],
 			Status:            toolcore.NBToolResponseStatusSuccess,
 			Type:              toolcore.NBToolResponseTypeText,
-			IsTerminal:        resp.IsTerminal,
+			IsTerminal:        parentTerminal,
 			AdditionalDetails: additionalDetails,
 			SubAgentEvidence:  subAgentEvidence,
 		}, nil
@@ -304,7 +306,7 @@ func (t *delegateAgentTool) Call(ctx toolcore.NbToolContext, input toolcore.NBTo
 				Data:              resp.AgentStepResponse[i].Response.Content,
 				Status:            toolcore.NBToolResponseStatusSuccess,
 				Type:              toolcore.NBToolResponseTypeText,
-				IsTerminal:        resp.IsTerminal,
+				IsTerminal:        parentTerminal,
 				AdditionalDetails: additionalDetails,
 				SubAgentEvidence:  subAgentEvidence,
 			}, nil
@@ -315,7 +317,7 @@ func (t *delegateAgentTool) Call(ctx toolcore.NbToolContext, input toolcore.NBTo
 		Data:              "Sub-agent completed but produced no output.",
 		Status:            toolcore.NBToolResponseStatusError,
 		Type:              toolcore.NBToolResponseTypeText,
-		IsTerminal:        resp.IsTerminal,
+		IsTerminal:        parentTerminal,
 		AdditionalDetails: additionalDetails,
 	}, nil
 }
@@ -381,7 +383,7 @@ func parseDelegateInput(input toolcore.NBToolCallRequest) (prompt string, toolNa
 	// Reject notebook-update misuse at the tool boundary. See
 	// notebookMisusePromptRe for the why and the rejection rationale.
 	if notebookMisusePromptRe.MatchString(prompt) {
-		return "", nil, 0, fmt.Errorf("delegate_agent rejected: prompt starts with 'update the notebook' — the sub-agent's job is to investigate a focused sub-question, not to record findings on your behalf. Write to your own notebook with the <update_notebook> XML tag in your next thought; do not delegate the notebook update")
+		return "", nil, 0, fmt.Errorf("delegate_agent rejected: prompt starts with 'update the notebook' — the sub-agent's job is to investigate a focused sub-question, not to record findings on your behalf. Update the parent agent's notebook directly; do not delegate the notebook update")
 	}
 
 	// Reject degenerate single-iteration delegations when no tools are provided.
@@ -663,46 +665,17 @@ func (a *dynamicReActAgent) GetSystemPrompt(ctx *security.RequestContext, _ core
 		)
 	}
 
-	instructions := []string{a.prompt}
-	if menu := a.accountSkillListsMenu(ctx); menu != "" {
-		instructions = append(instructions, menu)
-	}
-
 	return core.NBAgentPrompt{
 		Role:         "a specialist investigator dynamically composed by a parent agent",
-		Instructions: instructions,
+		Instructions: []string{a.prompt},
 		Constraints: []string{
 			"Focus exclusively on the task described in your instructions. Do not expand scope.",
 			"Use only the tools provided to you. Do not attempt to call tools not in your tool list.",
+			"When invoking a provided agent tool, copy every explicit execution scope from your instructions into that agent tool's request, including account, cluster, project or subscription, region, namespace, time window, and resource identity. Never omit a named scope or silently replace it with a default.",
 			budgetConstraint,
 			"Report your findings with specific evidence: timestamps, metric values, log lines, or query results. Never make claims without supporting data.",
 		},
 	}
-}
-
-// accountSkillListsMenu renders a `<skill-lists>` discovery block from all active
-// KBs mapped in the delegate's account. Returns "" when the feature flag is off,
-// the account has no accessible KBs, or the KB list call fails (fail-open — the
-// menu is discovery-only and the delegate stays functional without it).
-//
-// This is the delegate's only path to skills: the parent agent opts the whole
-// sub-agent out of default-tool injection to keep the curated toolset honest,
-// so unlike other agents the delegate can't rely on the executor's kb_prestep
-// path to attach a menu. Load_skills itself re-injects via
-// DefaultSkillsInjectOverride once this menu marker is present.
-func (a *dynamicReActAgent) accountSkillListsMenu(ctx *security.RequestContext) string {
-	if !config.Config.LlmServerDelegateAccountKBsEnabled {
-		return ""
-	}
-	if a.accountId == "" {
-		return ""
-	}
-	kbs, err := toolcore.ListKnowledgebases(ctx, a.accountId)
-	if err != nil {
-		ctx.GetLogger().Warn("delegate: unable to list account KBs for skill menu", "error", err, "account_id", a.accountId)
-		return ""
-	}
-	return core.BuildSkillListsMenu(kbs, false)
 }
 
 func (a *dynamicReActAgent) GetPlannerType() core.AgentPlannerType {
@@ -718,6 +691,14 @@ func (a *dynamicReActAgent) GetPlannerType() core.AgentPlannerType {
 // trimmed orchestrators' on-demand reach-back) cost-competitive with a direct tool call.
 func (a *dynamicReActAgent) GetModelCategory() core.ModelTier {
 	return core.ModelTierRetrieval
+}
+
+// GetNotebookEnabled keeps delegated specialists focused on their bounded brief.
+// The parent orchestrator owns investigation state and receives the delegate's
+// evidence when it completes, so a separate child notebook only consumes the
+// delegate's limited iteration budget.
+func (a *dynamicReActAgent) GetNotebookEnabled() bool {
+	return false
 }
 
 // GetMaxIterations implements core.NBAgentIterationProvider to cap the sub-agent's
@@ -742,9 +723,8 @@ func (a *dynamicReActAgent) OptOutDefaultTools() bool {
 
 // InjectDefaultSkills implements core.DefaultSkillsInjectOverride: even though
 // the delegate opts out of default-tool injection wholesale, load_skills must
-// still land when the delegate's synthesized system prompt advertises a
-// `<skill-lists>` menu (see accountSkillListsMenu). Without this override the
-// menu is visible but unreachable — the LLM sees named runbooks it cannot open.
+// still land when account-wide discovery can advertise candidates. Without
+// this override those candidates would be visible but unreachable.
 func (a *dynamicReActAgent) InjectDefaultSkills() bool {
 	return true
 }

@@ -6,6 +6,7 @@ import (
 	"nudgebee/llm/tools/core"
 	"nudgebee/llm/utils"
 	"nudgebee/llm/workspace"
+	"os"
 	"strings"
 )
 
@@ -28,6 +29,12 @@ func (m GithubCliTool) Name() string {
 func (m GithubCliTool) GetType() core.NBToolType {
 	return core.NBToolTypeTool
 }
+
+// ShellCommandPrefixes returns the shell command prefixes that map to this
+// tool. Implements core.ShellWrappable so shell_execute's classifier can
+// delegate confirmation-gate decisions to this tool when the LLM invokes
+// the CLI via `shell_execute("gh ...")` instead of `github_execute`.
+func (m GithubCliTool) ShellCommandPrefixes() []string { return []string{"gh"} }
 
 func (m GithubCliTool) Description() string {
 	return `Executes Github CLI ('gh') commands based on natural language queries. This tool allows you to interact with GitHub resources like repositories, issues, pull requests, actions, etc.
@@ -96,17 +103,27 @@ func (m GithubCliTool) Call(nbRequestContext core.NbToolContext, input core.NBTo
 	// For GitHub App authentication, get installation token
 	githubToken := password
 	if authType == "application" {
-		installationID := int64(0)
-		if _, err := fmt.Sscanf(password, "%d", &installationID); err != nil {
-			return core.NBToolResponse{}, fmt.Errorf("invalid installation_id in password field: %w", err)
-		}
+		// Local-dev escape hatch: a local llm-server has no GitHub App
+		// credentials (GITHUB_APP_ID/GITHUB_PRIVATE_KEY) provisioned, so the
+		// installation-token exchange below always fails there even though
+		// the tenant's DB config is otherwise correct. GITHUB_TOKEN matches
+		// the existing local-testing fallback in agent_code2.go's
+		// resolveGitToken — reuse the same var instead of adding a new one.
+		if localToken := strings.TrimSpace(os.Getenv("GITHUB_TOKEN")); localToken != "" {
+			githubToken = localToken
+		} else {
+			installationID := int64(0)
+			if _, err := fmt.Sscanf(password, "%d", &installationID); err != nil {
+				return core.NBToolResponse{}, fmt.Errorf("invalid installation_id in password field: %w", err)
+			}
 
-		token, err := utils.GetGithubAppInstallationToken(nbRequestContext.Ctx.GetContext(), apiUrl, installationID)
-		if err != nil {
-			nbRequestContext.Ctx.GetLogger().Error("github: unable to get installation token", "error", err.Error())
-			return core.NBToolResponse{}, fmt.Errorf("failed to get GitHub App installation token: %w", err)
+			token, err := utils.GetGithubAppInstallationToken(nbRequestContext.Ctx.GetContext(), apiUrl, installationID)
+			if err != nil {
+				nbRequestContext.Ctx.GetLogger().Error("github: unable to get installation token", "error", err.Error())
+				return core.NBToolResponse{}, fmt.Errorf("failed to get GitHub App installation token: %w", err)
+			}
+			githubToken = token
 		}
-		githubToken = token
 	}
 
 	command = strings.ReplaceAll(command, "\\n", "\n")
@@ -235,4 +252,12 @@ func (m GithubCliTool) InferToolRequestTypePrompt(ctx *security.RequestContext, 
 	answer: delete
 	`
 	return prompt, nil
+}
+
+func (m GithubCliTool) InferToolRequestType(ctx *security.RequestContext, toolName, input string) (core.ToolRequestType, error) {
+	requestType := inferNestedCLIRequestType(input, "gh", githubReadActions, githubCreateActions, githubUpdateActions, githubDeleteActions)
+	if requestType == "" {
+		ctx.GetLogger().Warn("github: action not recognized by heuristic, falling through to LLM classification", "input", input)
+	}
+	return requestType, nil
 }

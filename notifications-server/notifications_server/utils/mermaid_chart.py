@@ -4,15 +4,27 @@ primitives, instead of dumping raw Mermaid syntax as text.
 Chart-shaped diagrams (``xychart``/``xychart-beta``, ``pie``) map onto Slack's
 native ``data_visualization`` block (see
 https://docs.slack.dev/reference/block-kit/blocks/data-visualization-block/),
-so those render as real bar/line/pie charts. Structural diagrams (flowchart,
-sequenceDiagram, classDiagram, stateDiagram, gantt, timeline, ...) have no
-such equivalent in Slack, so they fall back to a clearly labeled code block,
-optionally with a link back to the full diagram in the web app.
+so those render as real bar/line/pie charts. Graph-shaped diagrams
+(``flowchart``/``graph``) fall to an Image tier - rendered locally with
+Graphviz via mermaid_graph.py, no browser/third-party service involved -
+when the caller supplies an ``upload_image`` callback and the diagram parses
+cleanly. That callback uploads the PNG to Slack *without posting it anywhere*
+(files_upload_v2 with no channel) and returns the file's id, which gets
+embedded as a native Slack ``image`` block via its ``slack_file`` field - the
+image then renders inline in whatever message includes that block, at
+whatever position it's placed, rather than as a separate follow-up message
+(see https://docs.slack.dev/reference/block-kit/blocks/image-block/ and the
+"Leveraging Private Files for Image Blocks" Slack blog post). Everything else
+(sequenceDiagram, classDiagram, stateDiagram, gantt, timeline, ...), and any
+graph/flowchart that fails to parse, render, or upload, falls back to a
+clearly labeled code block, optionally with a link back to the full diagram
+in the web app.
 """
 
+import logging
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from notifications_server.message_templates.blocks import (
     BLOCK_SIZE_LIMIT,
@@ -22,7 +34,16 @@ from notifications_server.message_templates.blocks import (
     LinkProp,
     LinksBlock,
     MarkdownBlock,
+    SlackFileImageBlock,
 )
+from notifications_server.utils.mermaid_graph import SUPPORTED_GRAPH_TYPES, render_flowchart_image
+
+LOG = logging.getLogger(__name__)
+
+# Uploads `contents` (PNG bytes) as `filename` without posting it anywhere,
+# returning the resulting Slack file id - or None/raises on failure, either
+# of which _render_flowchart treats as "couldn't embed, fall back".
+ImageUploader = Callable[[str, bytes], Optional[str]]
 
 MERMAID_FENCE_RE = re.compile(r"```([^\s`]*)[ \t]*\r?\n(.*?)```", re.DOTALL)
 
@@ -71,6 +92,23 @@ class MermaidSegment:
     text: str
 
 
+def _meaningful_lines(code: str) -> List[str]:
+    """``code``'s lines with blanks and ``%%`` comments removed, and a leading
+    YAML frontmatter block (``---`` / ... / ``---``, which real Mermaid allows
+    ahead of the diagram type) dropped - so the first element is the actual
+    diagram-type line. Mirrors mermaid_graph._strip_yaml_frontmatter; kept
+    here too since this module classifies diagrams without going through that
+    parser."""
+    lines = [ln.strip() for ln in code.splitlines()]
+    lines = [ln for ln in lines if ln and not ln.startswith("%%")]
+    if lines and lines[0] == "---":
+        try:
+            lines = lines[lines.index("---", 1) + 1 :]
+        except ValueError:
+            pass  # no closing fence - leave as-is, downstream just won't match a diagram type
+    return lines
+
+
 def _is_mermaid_fence(lang: str, content: str) -> bool:
     """Whether a ``` fence is a Mermaid diagram: either explicitly tagged
     ```mermaid, or untagged with a body that starts with a recognized
@@ -79,10 +117,7 @@ def _is_mermaid_fence(lang: str, content: str) -> bool:
         return True
     if lang:
         return False  # an explicit non-mermaid tag, e.g. ```python, ```bash
-    for line in content.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("%%"):
-            continue
+    for stripped in _meaningful_lines(content):
         first_word = stripped.split()[0].lower()
         return first_word.startswith("xychart") or first_word in _MERMAID_DIAGRAM_KEYWORDS
     return False
@@ -105,12 +140,28 @@ def split_mermaid_segments(text: str) -> List[MermaidSegment]:
     return segments
 
 
-def render_mermaid_code(code: str, view_url: Optional[str] = None) -> List[BaseBlock]:
+def render_mermaid_code(
+    code: str,
+    view_url: Optional[str] = None,
+    upload_image: Optional[ImageUploader] = None,
+    diagram_number: Optional[int] = None,
+) -> List[BaseBlock]:
     """Render one Mermaid code fence's body as native Slack blocks.
 
     Falls back to a labeled raw code block (with an optional link to view the
     rendered diagram in the web app) for anything that isn't a chart, or that
-    fails to parse as one.
+    fails to parse as one. Passing ``upload_image`` additionally attempts to
+    render flowchart/graph diagrams as an actual inline picture (see
+    mermaid_graph.py and ImageUploader above) before falling back - the
+    caller must be able to make a Slack upload call to use this; see
+    rich_text_blocks.py's render_rich_segments.
+
+    ``diagram_number``, when given, numbers the filename and alt text (e.g.
+    "diagram-2.png") - used when a single message has more than one
+    flowchart image, so each is distinguishable. render_rich_segments
+    decides whether to pass one, since only it knows how many
+    flowchart-shaped segments are in the whole message; this function
+    renders one diagram at a time and has no visibility into that.
     """
     diagram_type = _diagram_type(code)
 
@@ -119,17 +170,41 @@ def render_mermaid_code(code: str, view_url: Optional[str] = None) -> List[BaseB
         blocks = _render_xychart(code, view_url)
     elif diagram_type == "pie":
         blocks = _render_pie(code, view_url)
+    elif upload_image is not None and diagram_type in SUPPORTED_GRAPH_TYPES:
+        blocks = _render_flowchart(code, upload_image, diagram_number)
 
     if blocks:
         return blocks
     return _render_fallback(code, diagram_type, view_url)
 
 
+def is_graph_diagram(code: str) -> bool:
+    """Whether ``code`` is a flowchart/graph diagram (render_mermaid_code's
+    Image tier target). Used by rich_text_blocks.py to cheaply pre-count
+    candidates for diagram numbering, without actually parsing/rendering
+    anything."""
+    return _diagram_type(code) in SUPPORTED_GRAPH_TYPES
+
+
+def _render_flowchart(code: str, upload_image: ImageUploader, diagram_number: Optional[int] = None) -> List[BaseBlock]:
+    png = render_flowchart_image(code)
+    if not png:
+        return []
+    filename = f"diagram-{diagram_number}.png" if diagram_number is not None else "diagram.png"
+    try:
+        file_id = upload_image(filename, png)
+    except Exception:
+        LOG.warning("mermaid_chart: diagram image upload failed, falling back to the code block", exc_info=True)
+        file_id = None
+    if not file_id:
+        return []
+    alt_text = f"Diagram {diagram_number}" if diagram_number is not None else "Diagram"
+    # No "view exact diagram" link here
+    return [SlackFileImageBlock(slack_file_id=file_id, alt_text=alt_text, title=filename)]
+
+
 def _diagram_type(code: str) -> str:
-    for line in code.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("%%"):
-            continue
+    for stripped in _meaningful_lines(code):
         first_word = stripped.split()[0].lower()
         if first_word.startswith("xychart"):
             return "xychart"

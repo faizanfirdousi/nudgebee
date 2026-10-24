@@ -10,6 +10,15 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+// wantsTracesEnvelope reports whether a traces_query/traces_list caller needs the TracesResult
+// object rather than the bare span array. Both flags require it and neither can be served without
+// it: a bare array carries neither the empty-result diagnosis (ValidateRequest) nor the executed
+// query and provider (IncludeExecutedQuery). Keeping IncludeExecutedQuery off this test would make
+// it silently useless over HTTP whenever validation is disabled.
+func wantsTracesEnvelope(request observability.TracesV3Request) bool {
+	return request.ValidateRequest || request.IncludeExecutedQuery
+}
+
 func handleTracesAction(actionPayload *ActionRequest, c *gin.Context, tracer *trace.Tracer, meter *metric.Meter, logger *slog.Logger) {
 	ctx, err := buildContextFromPayload(c, actionPayload, tracer, meter, logger)
 	if err != nil {
@@ -62,7 +71,23 @@ func handleTracesAction(actionPayload *ActionRequest, c *gin.Context, tracer *tr
 			return
 		}
 
-		c.JSON(200, resp)
+		// Callers that asked for the envelope get it, so an empty result can carry the diagnosis
+		// of WHY it is empty and the query/provider that produced it. Everyone else — notably the
+		// traces UI on traces_list — keeps the bare []OpenTelemetryTrace array, the same way the
+		// IncludeRawResult path above varies its shape by request flag rather than changing it
+		// for every caller.
+		if wantsTracesEnvelope(request) {
+			c.JSON(200, resp)
+			return
+		}
+
+		// Never hand the UI a bare null: a provider that returns a nil slice would serialize
+		// as `null` rather than `[]`, and the traces screen maps over the response.
+		if resp.Traces == nil {
+			c.JSON(200, []common.OpenTelemetryTrace{})
+			return
+		}
+		c.JSON(200, resp.Traces)
 		return
 	case "traces_counts":
 		var request observability.TracesV3Request

@@ -36,7 +36,7 @@ import SectionHeader from '../components/Section';
 import CostTreemap from '../components/CostTreemap';
 import ToolReliabilityBars from '../components/ToolReliabilityBars';
 import ToolDurationBars from '../components/ToolDurationBars';
-import ToolCallsModal from '../components/ToolCallsModal';
+import ToolCallsModal, { type ToolCallCounts } from '../components/ToolCallsModal';
 import { makeSeverity, SeverityCell, type Severity } from '../components/severity';
 import { listToolUsage, TOOL_TYPE_LABEL, type ToolUsageRow, type ToolSortBy, type ToolStatusGroup } from '@api1/ai-cost';
 import type { CostFilters } from '../types';
@@ -53,6 +53,8 @@ interface ToolDrill {
   tool: string;
   type: string;
   status: ToolStatusGroup;
+  /** The row's true aggregate counts, so the modal's captions don't rely on its own truncated row fetch. */
+  counts: ToolCallCounts;
 }
 
 const SORT_OPTIONS: { value: ToolSortBy; label: string; icon: React.ReactNode }[] = [
@@ -67,13 +69,24 @@ const numCell = { fontSize: 'var(--ds-text-body)', color: 'var(--ds-gray-700)', 
 
 const H = {
   tool: <HeaderLabel label='Tool' info='The tool name and its type. Aggregated across every conversation in range.' />,
-  calls: <HeaderLabel label='Calls' info='Total invocations of this tool in range.' />,
-  errors: <HeaderLabel label='Errors' secondary='(rate)' info='Settled failures (status fail / error / terminated) and the share of all calls.' />,
-  avgDur: <HeaderLabel label='Avg dur' info='Average wall-clock duration per call (execution_duration_ms, else updated−created).' />,
-  p90Dur: <HeaderLabel label='Duration' secondary='(p90 / max)' info='90th-percentile and slowest single call duration.' />,
-  reach: <HeaderLabel label='Reach' secondary='(agents / convs)' info='Distinct agents and conversations that used this tool.' />,
+  calls: <HeaderLabel label='Calls' info='Total invocations of this tool in range.' alignRight />,
+  errors: (
+    <HeaderLabel
+      label='Errors'
+      secondary='(rate)'
+      info='Settled failures (status fail / error / terminated) and the share of all calls.'
+      alignRight
+    />
+  ),
+  avgDur: <HeaderLabel label='Avg dur' info='Average wall-clock duration per call (execution_duration_ms, else updated−created).' alignRight />,
+  p90Dur: <HeaderLabel label='Duration' secondary='(p90 / max)' info='90th-percentile and slowest single call duration.' alignRight />,
+  reach: <HeaderLabel label='Reach' secondary='(agents / convs)' info='Distinct agents and conversations that used this tool.' alignRight />,
   cost: (
-    <HeaderLabel label='Downstream $' info='LLM cost of sub-agents this tool spawned (child_agent_id). Blank for tools that make no LLM calls.' />
+    <HeaderLabel
+      label='Downstream $'
+      info='LLM cost of sub-agents this tool spawned (child_agent_id). Blank for tools that make no LLM calls.'
+      alignRight
+    />
   ),
 };
 
@@ -273,7 +286,16 @@ export function ToolsView({ accountId, filters, onSelectRun }: ToolsViewProps) {
   const errSev = React.useMemo(() => makeSeverity(sortedRows.map((r) => r.error_rate_pct)), [sortedRows]);
   const durSev = React.useMemo(() => makeSeverity(sortedRows.map((r) => r.p90_duration_seconds)), [sortedRows]);
   const costSev = React.useMemo(() => makeSeverity(sortedRows.map((r) => r.downstream_cost_usd)), [sortedRows]);
-  const openDrill = React.useCallback((r: ToolUsageRow, status: ToolStatusGroup) => setDrill({ tool: r.tool_name, type: r.tool_type, status }), []);
+  const openDrill = React.useCallback(
+    (r: ToolUsageRow, status: ToolStatusGroup) =>
+      setDrill({
+        tool: r.tool_name,
+        type: r.tool_type,
+        status,
+        counts: { calls: r.calls, successCount: r.success_count, errorCount: r.error_count, inProgressCount: r.in_progress_count },
+      }),
+    []
+  );
   const tableData = React.useMemo(
     () => sortedRows.map((r) => toRow(r, errSev, durSev, costSev, openDrill)),
     [sortedRows, errSev, durSev, costSev, openDrill]
@@ -383,6 +405,7 @@ export function ToolsView({ accountId, filters, onSelectRun }: ToolsViewProps) {
         accountId={accountId}
         filters={filters}
         initialStatus={drill?.status ?? 'all'}
+        counts={drill?.counts}
         onClose={() => setDrill(null)}
         onSelectRun={onSelectRun}
       />

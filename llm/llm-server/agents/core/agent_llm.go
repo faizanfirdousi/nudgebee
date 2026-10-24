@@ -13,9 +13,21 @@ import (
 	"github.com/tmc/langchaingo/llms"
 )
 
+// groundedSummarySystemPrompt is the system prompt for Summary-tier LLM tool
+// calls. Planners call the LLM tool as if it could fetch data ("get the triage
+// status and cache metrics for event X"), often with an empty context; a bare
+// "summarize the provided context" prompt then invents plausible metrics,
+// statuses and versions that flow into the investigation report. Environment
+// facts must come from the context; general concepts may still be explained.
+const groundedSummarySystemPrompt = "You are a technical systems expert. Answer the user's question concisely from the provided context. Use Markdown format.\n" +
+	"First report the relevant data the context contains, preserving its technical details exactly. " +
+	"Facts about this environment (metrics, statuses, priorities, IDs, versions, configuration, deployments, log lines, or what this system's code does) must come from the context: " +
+	"for anything asked that the context lacks (including when it is empty), state that it is not in the context and which kind of tool (logs, metrics, events, code) would fetch it; never estimate or invent those values.\n" +
+	"General concepts (what an exit code means, how a public tool behaves) may be explained from knowledge, marked as general knowledge rather than findings about this environment."
+
 func init() {
 
-	llmToolDescription := `A general-purpose LLM tool for answering conceptual questions, summarizing text, or performing general reasoning and analysis on provided data. Input should be a clear question or instruction.`
+	llmToolDescription := `A general-purpose LLM tool for answering conceptual questions, summarizing text, or performing general reasoning and analysis on provided data. It cannot fetch live data (events, metrics, logs, configuration, code); use a data tool for that. Input should be a clear question or instruction.`
 	llmToolInput := "User Question"
 	llmToolOutput := "The tool will return the output of the LLM query"
 
@@ -40,7 +52,7 @@ func (p LLMAgent) GetName() string {
 }
 
 func (a LLMAgent) GetNameAliases() []string {
-	return []string{"LLM"}
+	return []string{"Answer Composer", "LLM"}
 }
 
 func (p LLMAgent) GetDescription() string {
@@ -79,8 +91,8 @@ func (l LLMAgent) Execute(ctx *security.RequestContext, request NBAgentRequest) 
 	}
 
 	accountInstructions := ""
-	if request.AccountPrompt != "" {
-		accountInstructions = fmt.Sprintf("\nAccount Instructions:\n%s\n", common.SanitizePromptInput(request.AccountPrompt))
+	if accountPrompt := CombinedAccountPrompt(request); accountPrompt != "" {
+		accountInstructions = fmt.Sprintf("\nAccount Instructions:\n%s\n", common.SanitizePromptInput(accountPrompt))
 	}
 
 	sourceInfo := ""
@@ -103,7 +115,7 @@ func (l LLMAgent) Execute(ctx *security.RequestContext, request NBAgentRequest) 
 	// "summarize the context" task) and the condensed prompt would mis-shape
 	// the response.
 	if modelTierFromContext(ctx) == ModelTierSummary {
-		systemPrompt = "You are a technical systems expert. Provide a concise and accurate summary of the provided context to answer the user's question. Preserve all technical details and data. Use Markdown format."
+		systemPrompt = groundedSummarySystemPrompt
 	}
 
 	messageContent := []llms.MessageContent{
@@ -138,7 +150,7 @@ func (p ClarificationAgent) GetName() string {
 }
 
 func (a ClarificationAgent) GetNameAliases() []string {
-	return []string{"Followup", "Clarification"}
+	return []string{"Clarifying Question Asker", "Followup", "Clarification"}
 }
 
 func (p ClarificationAgent) GetDescription() string {

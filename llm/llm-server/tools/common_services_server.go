@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"nudgebee/llm/common"
 	"nudgebee/llm/config"
+	"nudgebee/llm/relay"
 	"nudgebee/llm/security"
 	"nudgebee/llm/services_server"
 	"nudgebee/llm/tools/core"
@@ -201,6 +202,14 @@ func executeFetchLogs(ctx core.NbToolContext, logProvider services_server.Observ
 	return logs, nil
 }
 
+// ExecuteNativeLogQuery sends an already-authored provider query to
+// services-server without translating it through the canonical where-clause
+// path. The caller resolves the account's provider; services-server validates
+// the provider-native syntax during execution.
+func ExecuteNativeLogQuery(ctx core.NbToolContext, logProvider services_server.ObservabilityProvider, query string, configs map[string]any) (core.ObservabilityLogResponse, error) {
+	return executeFetchLogs(ctx, logProvider, query, configs)
+}
+
 // executeFetchLogsCanonical sends a provider-independent canonical `where` clause
 // to services-server with an EMPTY Query, so FetchLogs resolves canonical→provider
 // labels and builds the native query server-side (the same path the UI query
@@ -211,7 +220,7 @@ func executeFetchLogs(ctx core.NbToolContext, logProvider services_server.Observ
 // LogProvider/LogProviderSource ARE forwarded from the caller's already-resolved
 // logProvider (mirroring the legacy path) — services-server falls back to its own
 // account-default lookup when they're empty, so this is a no-op for the common
-// case FetchLogsAgentV2 relies on (a well-formed account with exactly one default
+// case FetchLogsAgent relies on (a well-formed account with exactly one default
 // log provider: services-server would resolve the same provider either way). It
 // stops being a no-op for a per-request provider override (e.g.
 // ai_generate_log_query honoring the user's "Log Provider:" dropdown selection on
@@ -298,6 +307,17 @@ func GetLogsQueryPreview(ctx *security.RequestContext, accountId string, logProv
 	}
 	setRequestIndex(&logRequest, p.index)
 
+	// The index has to ride in `request`, not just the top-level field:
+	// services-server's FetchLogRequest — the struct logs_get_query decodes
+	// into — has no top-level index at all, and reads it only out of the
+	// free-form request bag (labelDiscoveryRequest). Without this, an ES index
+	// selection is silently dropped and logs_get_query type-checks the where
+	// clause against whichever index label discovery falls back to, since
+	// Elasticsearch field types are per-index.
+	if p.index != "" {
+		logRequest.Request = map[string]any{"index": p.index}
+	}
+
 	output, err := services_server.GetLogsQuery(*ctx, logRequest)
 	if err != nil {
 		return "", err
@@ -367,6 +387,28 @@ func getProvider(accountId, providerType, requestedProvider string) (services_se
 		return services_server.ObservabilityProvider{}, err
 	}
 	return provider, nil
+}
+
+// tracePayloadForResponse shapes what a trace tool hands back to the agent: the spans plus the
+// metadata naming the query services-server actually ran and the provider that answered it. The
+// metadata travels on every path, empty results included — that is the point (#37406). A bare span
+// array (what this used to return on success and on a clean empty result) leaves an answer of "no
+// traces found" unable to say what was asked or which backend answered, the same defect the logs
+// path fixed in tool_logs_v2.go. Suggestion and Result stay omitempty, so the payload only grows by
+// the metadata object.
+func tracePayloadForResponse(resp core.ObservabilityTraceResponse) core.ObservabilityTraceResponse {
+	if resp.Traces == nil {
+		// Explicit empty array: a nil slice marshals to `null`, and "null" reads to the agent
+		// as a broken tool rather than a window with no spans in it.
+		resp.Traces = []core.ObservabilityTrace{}
+	}
+	return resp
+}
+
+// traceValidateRequestEnabled reads the trace-validation flag from package scope.
+// executeFetchTrace takes a parameter named `config`, which shadows the config package inside it.
+func traceValidateRequestEnabled() bool {
+	return config.Config.LlmServerTraceValidateRequestEnabled
 }
 
 func executeFetchTrace(ctx core.NbToolContext, traceProvider string, traceProviderSource string, query string, queryBuilder core.TraceQueryBuilder, config map[string]any) (core.ObservabilityTraceResponse, error) {
@@ -445,6 +487,17 @@ func executeFetchTrace(ctx core.NbToolContext, traceProvider string, traceProvid
 		// being zeroed by the fixed span-schema mapping. Other providers and the structured
 		// query-builder path keep the typed span array.
 		IncludeRawResult: traceProvider == "otel_clickhouse" && query != "",
+		// On an empty or failed result, name the mistyped field or value so the agent can
+		// self-correct instead of re-issuing the same query. Only meaningful on the
+		// where-clause path — the raw-SQL and Datadog facet paths carry no canonical where
+		// clause, so services-server finds nothing to validate and the flag is a no-op there.
+		ValidateRequest: traceValidateRequestEnabled(),
+		// Always ask for the executed query and resolved provider so an empty result can still
+		// name what ran and where (#37406). Unconditional, mirroring the log path where
+		// FetchLogs resolves them for every caller: the canonical path sends an empty Query and
+		// ProviderType, so without this the metadata reaching the agent is blank. Free on the
+		// raw-SQL and Datadog paths, where a non-empty Query short-circuits the resolution.
+		IncludeExecutedQuery: true,
 	}
 	traces, err := services_server.QueryTraces(*ctx.Ctx, traceRequest)
 	if err != nil {
@@ -507,7 +560,10 @@ func GetMetricsProvider(accountId string) (services_server.ObservabilityProvider
 	providerFromServicesServer, err := getProvider(accountId, "metrics", "")
 	if err == nil {
 		if providerFromServicesServer.Provider != "" {
-			return providerFromServicesServer, nil
+			if !isCloudObservabilityProvider(providerFromServicesServer.Provider) || hasActiveCloudProvider(accountId, providerFromServicesServer.Provider) {
+				return providerFromServicesServer, nil
+			}
+			slog.Warn("metrics: ignoring cloud provider for inactive account", "provider", providerFromServicesServer.Provider, "accountId", accountId)
 		}
 	}
 
@@ -516,11 +572,10 @@ func GetMetricsProvider(accountId string) (services_server.ObservabilityProvider
 	}
 
 	// No first-class metrics provider (Prometheus / Datadog / Elasticsearch) is
-	// configured. For a cloud-ONLY GCP/Azure account (no connected k8s agent) the
+	// configured. For a cloud-only account (no connected k8s agent) the
 	// in-cluster Prometheus default can't answer, so fall back to the account's
-	// cloud CLI (Cloud Monitoring / Azure Monitor). The hasConnectedK8sAgent guard
-	// keeps a GKE/AKS account that merely also has cloud creds on its cluster's
-	// Prometheus. AWS and unknown providers keep the prometheus default.
+	// cloud CLI. The hasConnectedK8sAgent guard keeps an account that merely also
+	// has cloud creds on its cluster's Prometheus.
 	if cloud := cloudFallbackProvider(accountId); cloud != "" && !hasConnectedK8sAgent(accountId) {
 		return services_server.ObservabilityProvider{
 			Provider:          cloud,
@@ -534,30 +589,66 @@ func GetMetricsProvider(accountId string) (services_server.ObservabilityProvider
 	}, nil
 }
 
-// cloudFallbackProvider returns "gcp" or "azure" when the account is a GCP/Azure
-// cloud account, else "". It is the shared "decide the fallback observability
-// backend from the account's cloud type" hook used by the Get*Provider resolvers
-// when no first-class observability provider (Loki/Prometheus/Datadog/…) is
-// configured. AWS is intentionally excluded — it has no CLI-based observability
-// fallback wired here and keeps the existing k8s/prometheus/clickhouse defaults.
-// A lookup failure degrades to "" (no fallback) so provider resolution never
-// blocks on a missing cloud_accounts row.
+// cloudFallbackProvider returns the CLI observability provider for an active
+// AWS/GCP/Azure cloud account, else "". A lookup failure degrades to "" (no
+// fallback) so provider resolution never enables a cloud capability on doubt.
 func cloudFallbackProvider(accountId string) string {
 	if _, err := uuid.Parse(accountId); err != nil {
 		return ""
 	}
-	creds, err := GetCloudAccountCredentials(accountId)
+	cloudProvider, err := getActiveCloudProvider(accountId)
 	if err != nil {
 		slog.Warn("observability: could not resolve cloud type for CLI fallback", "error", err, "accountId", accountId)
 		return ""
 	}
-	return cloudProviderToObservabilityFallback(creds.CloudProvider)
+	return cloudProviderToObservabilityFallback(cloudProvider)
+}
+
+// getActiveCloudProvider deliberately reads only the provider field and only
+// from an active account. GetCloudAccountCredentials also returns disabled
+// rows, which is appropriate for some lifecycle operations but unsafe for
+// deciding whether an integration-backed runtime capability may execute.
+func getActiveCloudProvider(accountId string) (string, error) {
+	dbms, err := common.GetDatabaseManager(common.Metastore)
+	if err != nil {
+		return "", fmt.Errorf("get database manager: %w", err)
+	}
+
+	var cloudProviders []string
+	if err := dbms.Db.Select(&cloudProviders, `
+		SELECT cloud_provider
+		FROM cloud_accounts
+		WHERE id = $1 AND status = 'active'
+	`, accountId); err != nil {
+		return "", fmt.Errorf("get active cloud provider: %w", err)
+	}
+	if len(cloudProviders) == 0 {
+		return "", nil
+	}
+	return cloudProviders[0], nil
+}
+
+func isCloudObservabilityProvider(provider string) bool {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "aws", "gcp", "azure":
+		return true
+	default:
+		return false
+	}
+}
+
+func hasActiveCloudProvider(accountId, requestedProvider string) bool {
+	activeProvider, err := getActiveCloudProvider(accountId)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(activeProvider), strings.TrimSpace(requestedProvider))
 }
 
 // cloudProviderToObservabilityFallback maps a cloud_accounts.cloud_provider value
 // to the observability fallback provider name, or "" when the cloud has no
 // fallback provider wired here. Pure (no DB) so the mapping — including the
-// case/whitespace normalization — is unit-testable in isolation from GetCloudAccountCredentials.
+// case/whitespace normalization — is unit-testable without a database.
 func cloudProviderToObservabilityFallback(cloudProvider string) string {
 	switch strings.ToLower(strings.TrimSpace(cloudProvider)) {
 	case "aws":
@@ -580,21 +671,20 @@ func cloudProviderToObservabilityFallback(cloudProvider string) string {
 // connected-agent probe in tools/core/tool_config.go. Fails closed (treats a DB
 // error as "agent present") so a transient error never silently enables the
 // hijack this guard exists to prevent.
+//
+// Delegates to relay.AgentConnected for the lookup rather than running its own
+// query: that is the same lookup gating relay calls, so two copies could drift
+// into answering differently about the same account. It also adds the per-account
+// cache this had none of — every call used to hit the metastore.
 func hasConnectedK8sAgent(accountId string) bool {
+	// This caller's own precondition, not the relay gate's: an account id that
+	// is not a uuid cannot name a cloud account, and for the hijack guard the
+	// safe answer is "no k8s agent". relay.AgentConnected deliberately lets a
+	// malformed id fall through and fail open, which is the wrong default here.
 	if _, err := uuid.Parse(accountId); err != nil {
 		return false
 	}
-	dbms, err := common.GetDatabaseManager(common.Metastore)
-	if err != nil {
-		slog.Warn("observability: could not check k8s agent presence; assuming present", "error", err, "accountId", accountId)
-		return true
-	}
-	var connectedCount int
-	if err := dbms.Db.Get(&connectedCount, "select count(*) from agent where status = 'CONNECTED' and cloud_account_id = $1", accountId); err != nil {
-		slog.Warn("observability: k8s agent presence query failed; assuming present", "error", err, "accountId", accountId)
-		return true
-	}
-	return connectedCount > 0
+	return relay.AgentConnected(accountId)
 }
 
 // logProviderCacheNS caches the resolved observability log provider per account.
@@ -711,9 +801,9 @@ func getLogProviderUncached(accountId string) (services_server.ObservabilityProv
 		slog.Error("logs: unable to fetch dbms", "error", err)
 		return services_server.ObservabilityProvider{}, err
 	}
-	rows, err := dbms.Db.Queryx("select connection_status::text, status from agent where cloud_account_id = $1", accountId)
+	rows, err := dbms.Db.Queryx("select connection_status::text, status, coalesce(type, '') from agent where cloud_account_id = $1", accountId)
 	if err != nil {
-		slog.Error("logs: unable to fetch dbms", "error", err)
+		slog.Error("logs: unable to query agents", "error", err)
 		return services_server.ObservabilityProvider{}, err
 	}
 	defer func() {
@@ -723,17 +813,18 @@ func getLogProviderUncached(accountId string) (services_server.ObservabilityProv
 	}()
 
 	explicitlySet := false
-	hasConnectedAgent := false
+	hasConnectedK8s := false
 	for rows.Next() {
 		var connectionStatusString *string
 		var agentStatus string
-		err := rows.Scan(&connectionStatusString, &agentStatus)
+		var agentType string
+		err := rows.Scan(&connectionStatusString, &agentStatus, &agentType)
 		if err != nil {
 			slog.Error("logs: unable to scan rows", "error", err)
-			break
+			return services_server.ObservabilityProvider{}, err
 		}
-		if agentStatus == "CONNECTED" {
-			hasConnectedAgent = true
+		if agentStatus == "CONNECTED" && strings.EqualFold(strings.TrimSpace(agentType), "k8s") {
+			hasConnectedK8s = true
 		}
 		connectionStatus := map[string]any{}
 		if connectionStatusString != nil {
@@ -751,17 +842,17 @@ func getLogProviderUncached(accountId string) (services_server.ObservabilityProv
 			slog.Info("logs: unable to find log connection provider, will be using default")
 		}
 	}
+	if err := rows.Err(); err != nil {
+		slog.Error("logs: error iterating rows", "error", err)
+		return services_server.ObservabilityProvider{}, err
+	}
 
 	// No log provider was explicitly configured (neither services-server nor the
-	// agent connection_status named one). For a cloud-ONLY GCP/Azure account (no
+	// agent connection_status named one). For a cloud-only account (no
 	// connected k8s agent) the bare "k8s" default can't read logs, so fall back to
-	// the account's cloud CLI (Cloud Logging / Log Analytics). Both gates matter: an
-	// explicit provider (even "k8s" from a GKE/AKS agent that streams logs) is
-	// respected via explicitlySet, and the hasConnectedAgent check additionally
-	// covers a connected agent whose status omitted logsConnectionProvider.
-	// AWS/unknown keep the k8s default.
+	// the account's cloud CLI (Cloud Logging / Log Analytics / CloudWatch Logs).
 	if !explicitlySet {
-		if cloud := cloudFallbackProvider(accountId); cloud != "" && !hasConnectedAgent {
+		if cloud := cloudFallbackProvider(accountId); cloud != "" && !hasConnectedK8s {
 			return services_server.ObservabilityProvider{Provider: cloud, IntegrationSource: "agent"}, nil
 		}
 	}

@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -31,6 +32,12 @@ type fakeStore struct {
 	fallback              string
 	prometheuClusterLabel string
 	err                   error
+	touched               atomic.Int64
+	metadataNotFound      []string
+	metadataChanged       bool
+	datasourceOwners      map[string]string // datasource key → owning agent id
+	ownerErr              error
+	upsertAgentID         string
 }
 
 func (f *fakeStore) IsWSEnabled(ctx context.Context, acct, agentType string) (bool, string, error) {
@@ -44,8 +51,8 @@ func (f *fakeStore) IsAgentConnected(ctx context.Context, acct, agentType string
 func (f *fakeStore) ValidateAgent(
 	ctx context.Context,
 	accessKey, secret string,
-) (bool, string, string, error) {
-	return f.allowed, f.fallback, "k8s", f.err
+) (bool, string, string, string, error) {
+	return f.allowed, f.fallback, "k8s", "", f.err
 }
 
 func (f *fakeStore) GetAgentStatus(ctx context.Context, accountID, agentType string) (connected bool, wsEnabled bool, fallbackURL string, prometheusClusterLabel string, err error) {
@@ -56,6 +63,11 @@ func (f *fakeStore) UpdateRelayConnectionStatus(ctx context.Context, accountID, 
 	return false, "", f.err
 }
 
+func (f *fakeStore) TouchRelaySession(ctx context.Context, accountID, agentType string) error {
+	f.touched.Add(1)
+	return f.err
+}
+
 func (f *fakeStore) UpdateAgentVersion(ctx context.Context, accountID, agentType, version, commit, buildTime, protocolVersion string) error {
 	return f.err
 }
@@ -64,16 +76,21 @@ func (f *fakeStore) UpdateDatasourceHealth(ctx context.Context, accountID, agent
 	return f.err
 }
 
-func (f *fakeStore) UpsertAgentDatasources(ctx context.Context, accountID, agentType string, datasources []db.AgentDatasource) error {
+func (f *fakeStore) UpsertAgentDatasources(ctx context.Context, accountID, agentType, agentID string, datasources []db.AgentDatasource) error {
+	f.upsertAgentID = agentID
 	return f.err
+}
+
+func (f *fakeStore) GetDatasourceAgentID(ctx context.Context, accountID, datasourceKey string) (string, error) {
+	return f.datasourceOwners[datasourceKey], f.ownerErr
 }
 
 func (f *fakeStore) GetWorkspaceToolConfig(ctx context.Context, accountID, integrationType, configName string) ([]db.WorkspaceConfigValue, error) {
 	return nil, f.err
 }
 
-func (f *fakeStore) UpdateDatasourceMetadata(ctx context.Context, accountID, agentType string, metadata map[string]map[string]any) error {
-	return f.err
+func (f *fakeStore) UpdateDatasourceMetadata(ctx context.Context, accountID, agentType string, metadata map[string]map[string]any) ([]string, bool, error) {
+	return f.metadataNotFound, f.metadataChanged, f.err
 }
 
 func (f *fakeStore) QueryProxyDatasources(ctx context.Context, accountID string) ([]db.ProxyDatasource, error) {
@@ -82,9 +99,10 @@ func (f *fakeStore) QueryProxyDatasources(ctx context.Context, accountID string)
 
 // fakeRPCClient implements the minimal Call signature.
 type fakeRPCClient struct {
-	resp  []byte
-	err   error
-	calls []rpcCall
+	resp         []byte
+	err          error
+	calls        []rpcCall
+	deliverLocal bool
 }
 
 type rpcCall struct {
@@ -103,6 +121,14 @@ func (f fakeRPCClient) Call(
 	f.calls = append(f.calls, rpcCall{exchange, routingKey, payload, requestID}) //nolint:staticcheck
 	return f.resp, f.err
 }
+
+func (f fakeRPCClient) InstanceID() string { return "fake-instance" }
+
+func (f fakeRPCClient) DeliverLocal(corrID string, body []byte) bool {
+	return f.deliverLocal
+}
+
+func (f fakeRPCClient) AbandonCh(corrID string) <-chan struct{} { return nil }
 
 func (f fakeRPCClient) Close() {
 }
@@ -131,7 +157,7 @@ func setupRouter(store db.AgentStore, rpcClient fakeRPCClient) *gin.Engine {
 	if err := metrics.Init(meter); err != nil {
 		logger.Error("metrics init failed", "error", err)
 	}
-	r.POST("/request", NewRequestHandler(store, rpcClient, fakeTopo, cfg, nil, &tracer, &meter, logger))
+	r.POST("/request", NewRequestHandler(store, rpcClient, fakeTopo, nil, cfg, nil, &tracer, &meter, logger))
 	return r
 }
 
@@ -196,6 +222,27 @@ func TestRequestHandler_StoreError(t *testing.T) {
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
 	require.Equal(t, float64(500), body["errors"][0]["code"])
 	require.Equal(t, "internal server error", body["errors"][0]["message"])
+}
+
+func TestRequestHandler_AgentNotConnected(t *testing.T) {
+	store := &fakeStore{allowed: false}
+	rpc := fakeRPCClient{}
+	router := setupRouter(store, rpc)
+
+	input := models.ExternalActionRequest{
+		Body: models.ActionRequestBody{AccountID: "acct1"},
+	}
+	b, _ := json.Marshal(input)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/request", bytes.NewBuffer(b))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	require.Equal(t, 503, w.Code)
+	var body map[string][]map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	require.Equal(t, float64(503), body["errors"][0]["code"])
+	require.Equal(t, "agent not connected", body["errors"][0]["message"])
 }
 
 func TestRequestHandler_RPCError(t *testing.T) {

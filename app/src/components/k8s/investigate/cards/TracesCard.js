@@ -3,7 +3,14 @@ import KubernetesTracesListing from '@components/k8s/details/KubernetesTracesLis
 import { formatDateForPlusMinusDuration } from 'src/utils/common';
 import TracesBlueIcon from '@assets/ask-nudgebee/traces-blue-icon.svg';
 import { KubernetesTraceServiceOperation } from '@components/k8s/common/KubernetesTraceServiceOperation';
+import ExecutedQueryInfo from '@shared/ExecutedQueryInfo';
 import { Box } from '@mui/material';
+
+// A traces card is created per evidence slot, so its id carries that index. Anything
+// deciding "did a traces card render?" has to ask through here rather than compare the
+// id to a bare name — that comparison silently never matched. Match on the separator
+// too, so a future TracesCardSummary is not mistaken for one.
+export const isTracesCardId = (id) => typeof id === 'string' && id.startsWith('TracesCard_');
 
 class TracesCard {
   constructor(evidenceData, event, index) {
@@ -226,7 +233,19 @@ class TracesCard {
     });
   };
 
+  // Wraps every branch below so the query row is present whichever one renders, including
+  // the live-fetch fallback. ExecutedQueryInfo returns null when there is no recorded query,
+  // so that branch and evidence predating the backend stamp degrade quietly.
   renderTraceData = () => {
+    return (
+      <>
+        <ExecutedQueryInfo query={this.evidenceData?.additional_info?.executed_query} provider={this.evidenceData?.additional_info?.provider} />
+        {this.renderTraceContent()}
+      </>
+    );
+  };
+
+  renderTraceContent = () => {
     if (this.traceDataFromEvidence.length > 0) {
       if (this.isTraceIdDifferent(this.traceDataFromEvidence)) {
         const traceTableData = this.mapDataToTraceTableData(this.traceDataFromEvidence);

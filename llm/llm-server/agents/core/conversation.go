@@ -44,6 +44,17 @@ const finalizeOnPanicDBBudget = 5 * time.Second
 
 var conversationAsyncTaskWorkerPool *common.WorkerPool
 
+// QueuedMessageDispatcherFunc defines the function signature for dispatching queued messages
+// to an asynchronous execution pool.
+type QueuedMessageDispatcherFunc func(ctx *security.RequestContext, agent NBAgent, conversation Conversation, msg ConversationMessage)
+
+var queuedMessageDispatcher QueuedMessageDispatcherFunc
+
+// SetQueuedMessageDispatcher configures the dispatcher used to execute queued conversation messages.
+func SetQueuedMessageDispatcher(d QueuedMessageDispatcherFunc) {
+	queuedMessageDispatcher = d
+}
+
 func init() {
 	conversationAsyncTaskWorkerPool = common.NewWorkerPool("conversation_async_tasks", config.Config.ConversationTaskWorkerCount, 100)
 }
@@ -92,9 +103,16 @@ func generateConversationTitleAsync(ctx *security.RequestContext, conversationId
 	wordCount := common.GetWordCount(query)
 	title := ""
 	if wordCount > 0 && wordCount <= common.ShortQueryWordCountThreshold {
-		title = query
-		if len(title) > 100 {
-			title = title[:97] + "..."
+		// A short query can still be a JSON alert payload — unwrap it to a readable
+		// field rather than using the raw `{"description":...` envelope as the title.
+		if derived, ok := common.DeriveTitleFromJSONQuery(query); ok {
+			title = derived
+		} else {
+			title = query
+			if len(title) > 100 {
+				// Byte-boundary safe: never split a multi-byte rune (raw title[:97] could).
+				title = common.TruncateHead(title, 97) + "..."
+			}
 		}
 	}
 
@@ -122,11 +140,11 @@ func generateConversationTitleAsync(ctx *security.RequestContext, conversationId
 	err := conversationAsyncTaskWorkerPool.Submit(submissionCtx, func() {
 		title, err := generateConversationTitle(bgCtx, accountId, conversationId, messageId, query, userId)
 		if err != nil {
-			bgCtx.GetLogger().Warn("conversation: unable to generate title via LLM in background task", "conversation_id", conversationId, "query", query, "error", err)
+			bgCtx.GetLogger().Warn("conversation: unable to generate title via LLM in background task", "conversation_id", conversationId, "error", err)
 			bgCtx.GetLogger().Info("conversation: title generation task completed with error")
 			return
 		}
-		bgCtx.GetLogger().Info("conversation: generated title via LLM in background task", "conversation_id", conversationId, "query", query, "title", title)
+		bgCtx.GetLogger().Info("conversation: generated title via LLM in background task", "conversation_id", conversationId, "title", title)
 		err = GetConversationDao().UpdateConversationTitle(conversationId, title)
 		if err != nil {
 			bgCtx.GetLogger().Error("conversation: unable to update conversation title in background task", "conversation_id", conversationId, "error", err)
@@ -270,7 +288,17 @@ func generateCompactResponse(ctx *security.RequestContext, accountId, conversati
 		llms.TextParts(llms.ChatMessageTypeHuman, userPrompt),
 	}
 
-	completion, err := GenerateAndTrackLLMContent(ctx, userId, accountId, conversationId, messageId, "compact_response_agent", true, messageContent, false)
+	// Reformatting a finished answer for Slack — no tools, no reasoning — so it
+	// resolves on the summary tier instead of the conversation's main model.
+	compactCtx := security.NewRequestContext(
+		context.WithValue(ctx.GetContext(), ContextKeyModelTier, ModelTierSummary),
+		ctx.GetSecurityContext(),
+		ctx.GetLogger(),
+		ctx.GetTracer(),
+		ctx.GetMeter(),
+	)
+
+	completion, err := GenerateAndTrackLLMContent(compactCtx, userId, accountId, conversationId, messageId, "compact_response_agent", true, messageContent, false)
 	if err != nil {
 		return "", fmt.Errorf("llm call for compact response generation failed: %w", err)
 	}
@@ -326,9 +354,12 @@ type additionalConversationSessionRequestConfig struct {
 	previousState         string
 	isNewConversation     bool
 	isResume              bool
+	isQueuedDispatch      bool
 	images                []ImageAttachment
 	channelContext        string
 	channelContextRefs    map[string]any
+	replyRef              string
+	skipHistory           bool
 }
 
 type ConversationSessionRequestConfig interface {
@@ -557,6 +588,19 @@ func ConversationSessionRequestWithIsResume(isResume bool) ConversationSessionRe
 	}
 }
 
+type sessionRequestWithQueuedDispatch struct{}
+
+func (sessionRequestWithQueuedDispatch) apply(c *additionalConversationSessionRequestConfig) {
+	c.isResume = true
+	c.isQueuedDispatch = true
+}
+
+// ConversationSessionRequestWithQueuedDispatch is only for an atomically claimed
+// queue row. It bypasses the competing-turn guard without recovery cleanup.
+func ConversationSessionRequestWithQueuedDispatch() ConversationSessionRequestConfig {
+	return sessionRequestWithQueuedDispatch{}
+}
+
 type sessionRequestWithImages struct {
 	images []ImageAttachment
 }
@@ -605,8 +649,43 @@ func ConversationSessionRequestWithChannelContextRefs(refs map[string]any) Conve
 	}
 }
 
-func HandleConversationSessionRequest(ctx *security.RequestContext, agent NBAgent, userId string, accountId string, sessionId string, query string, configs ...ConversationSessionRequestConfig) (NBAgentResponse, error) {
+type sessionRequestWithReplyRef struct {
+	replyRef string
+}
 
+func (h sessionRequestWithReplyRef) apply(c *additionalConversationSessionRequestConfig) {
+	c.replyRef = h.replyRef
+}
+
+// ConversationSessionRequestWithReplyRef carries an opaque per-question
+// correlator through to NBAgentRequest.ReplyRef — see its doc comment on
+// ConversationApiRequest.ReplyRef for why SessionId alone isn't enough.
+func ConversationSessionRequestWithReplyRef(replyRef string) ConversationSessionRequestConfig {
+	return sessionRequestWithReplyRef{
+		replyRef: replyRef,
+	}
+}
+
+type sessionRequestWithoutConversationHistory struct{}
+
+func (h sessionRequestWithoutConversationHistory) apply(c *additionalConversationSessionRequestConfig) {
+	c.skipHistory = true
+}
+
+// ConversationSessionRequestWithoutConversationHistory runs the turn without the
+// conversation's earlier messages or distilled conversation memory, while still
+// saving the turn into that conversation. For automated pipelines that reuse one
+// conversation across independent runs (event analysis per fingerprint), where
+// prior answers must not stand in for fresh investigation.
+func ConversationSessionRequestWithoutConversationHistory() ConversationSessionRequestConfig {
+	return sessionRequestWithoutConversationHistory{}
+}
+
+// resolveSessionRequestConfigs applies the options, then folds the fields that
+// live inside NBQueryConfig into it. The fold runs after every option so
+// WithConfig, which replaces config wholesale, cannot drop them whatever the
+// option order.
+func resolveSessionRequestConfigs(configs ...ConversationSessionRequestConfig) additionalConversationSessionRequestConfig {
 	defaultConfig := additionalConversationSessionRequestConfig{
 		source: ConversationSourceUserInvestigation,
 	}
@@ -620,6 +699,15 @@ func HandleConversationSessionRequest(ctx *security.RequestContext, agent NBAgen
 	if !defaultConfig.capabilities.IsEmpty() {
 		defaultConfig.config.Capabilities = defaultConfig.capabilities
 	}
+	if defaultConfig.skipHistory {
+		defaultConfig.config.SkipConversationHistory = true
+	}
+	return defaultConfig
+}
+
+func HandleConversationSessionRequest(ctx *security.RequestContext, agent NBAgent, userId string, accountId string, sessionId string, query string, configs ...ConversationSessionRequestConfig) (NBAgentResponse, error) {
+
+	defaultConfig := resolveSessionRequestConfigs(configs...)
 
 	if defaultConfig.enableQueryRefinement == nil {
 		defaultConfig.enableQueryRefinement = lo.ToPtr(true)
@@ -641,13 +729,11 @@ func HandleConversationSessionRequest(ctx *security.RequestContext, agent NBAgen
 		defaultConfig.enableCritique = lo.ToPtr(false)
 	}
 
-	// Compose AccountPrompt from per-request additional system prompt (e.g.
-	// event-analysis additional_instructions, memory bridge writes) and the
-	// account-wide GlobalContext. Both surfaces feed the same <global_preferences>
-	// block in the planner human-message; see renderGlobalPreferencesBlock.
-	// GC loader is soft-failing — DB issues never block a chat turn.
+	// Keep the stable account-wide GlobalContext separate from request-specific
+	// additional guidance. ReAct planners cache AccountContext in their system
+	// prefix while AccountPrompt stays in the dynamic human turn. The GC loader
+	// is soft-failing — DB issues never block a chat turn.
 	gcPrompt := toolcore.LoadActiveGlobalContext(ctx, accountId)
-	composedAccountPrompt := mergeAccountPrompts(defaultConfig.systemPrompt, gcPrompt)
 
 	agentRequest := NBAgentRequest{
 		Query:                 query,
@@ -659,7 +745,8 @@ func HandleConversationSessionRequest(ctx *security.RequestContext, agent NBAgen
 		AgentId:               lo.Ternary(defaultConfig.agentId.Valid, defaultConfig.agentId.UUID.String(), ""),
 		QueryContext:          defaultConfig.queryContext,
 		EnableQueryRefinement: *defaultConfig.enableQueryRefinement,
-		AccountPrompt:         composedAccountPrompt,
+		AccountContext:        gcPrompt,
+		AccountPrompt:         strings.TrimSpace(defaultConfig.systemPrompt),
 		SessionId:             sessionId,
 		ConversationSource:    defaultConfig.source,
 		EnableCritique:        *defaultConfig.enableCritique,
@@ -667,9 +754,11 @@ func HandleConversationSessionRequest(ctx *security.RequestContext, agent NBAgen
 		Capabilities:          defaultConfig.capabilities,
 		PreviousState:         defaultConfig.previousState,
 		IsResume:              defaultConfig.isResume,
+		IsQueuedDispatch:      defaultConfig.isQueuedDispatch,
 		Images:                defaultConfig.images,
 		ChannelContext:        defaultConfig.channelContext,
 		ChannelContextRefs:    defaultConfig.channelContextRefs,
+		ReplyRef:              defaultConfig.replyRef,
 	}
 
 	response, err := handleConversationRequest(ctx, agentRequest, agent, sessionId, defaultConfig.source)
@@ -679,6 +768,16 @@ func HandleConversationSessionRequest(ctx *security.RequestContext, agent NBAgen
 	}
 
 	return response, err
+}
+
+func shouldSkipQueuedDispatch(conversationStatus, messageStatus ConversationStatus) bool {
+	return conversationStatus != ConversationStatusInProgress || messageStatus != ConversationStatusInProgress
+}
+
+func shouldCleanupExistingMessage(queuedDispatch bool, status ConversationStatus, messageType MessageType) bool {
+	// A claimed queue row is fresh. Recovery cleanup would reset its status and
+	// could resurrect it if cancellation committed after the worker read it.
+	return !queuedDispatch && status != ConversationStatusWaiting && status != ConversationStatusWaitingForClientTool && messageType != MessageTypeFollowup
 }
 
 // shouldSkipResumeForTerminalConversation returns true when a recovery / resume
@@ -800,6 +899,40 @@ func applyConversationModelConfig(ctx *security.RequestContext, dao IConversatio
 	}
 }
 
+// droppedTierPick records a per-tier pick that could not be used, so the caller
+// can log it. Silent discards are what let a benchmark run report the filters a
+// user chose while executing something else entirely.
+type droppedTierPick struct {
+	Tier     string
+	Provider string
+	Model    string
+}
+
+// tierOverridesFromPicks converts the wire shape into the resolver's, keeping a
+// pick that names a config source OR a complete provider+model pair.
+//
+// A source alone is sufficient: resolveFromPinnedSource reads provider, model,
+// endpoint and key off the slot, and tierPinFor tolerates an empty model. That
+// is exactly how "use this config's own model" is encoded — requiring
+// provider AND model discarded it, so those tiers silently fell back to account
+// defaults. Guessing a provider from the config's first model is not a fix: on a
+// mixed config that row can belong to a different provider than the base slot.
+func tierOverridesFromPicks(picks map[string]toolcore.TierModelPick) (ConversationTierOverrides, []droppedTierPick) {
+	var overrides ConversationTierOverrides
+	var dropped []droppedTierPick
+	for tier, p := range picks {
+		if p.ConfigSource == "" && (p.Provider == "" || p.Model == "") {
+			dropped = append(dropped, droppedTierPick{Tier: tier, Provider: p.Provider, Model: p.Model})
+			continue
+		}
+		if overrides.Picks == nil {
+			overrides.Picks = make(map[string]TierModelPick)
+		}
+		overrides.Picks[tier] = TierModelPick{Provider: p.Provider, Model: p.Model, ConfigSource: p.ConfigSource}
+	}
+	return overrides, dropped
+}
+
 func handleConversationRequest(ctx *security.RequestContext, request NBAgentRequest, agent NBAgent, sessionId string, source ConversationSource) (NBAgentResponse, error) {
 	err := common.ValidateStruct(request)
 	if err != nil {
@@ -898,9 +1031,12 @@ func handleConversationRequest(ctx *security.RequestContext, request NBAgentRequ
 	// of many calls that reference the same email would otherwise show
 	// e.g. "95 PII scrubbed" for what is really 1-few distinct values.
 	//
-	// Values live only in the accumulator's in-memory map for the duration
-	// of this turn — never serialized or persisted. Same risk profile as
-	// the per-call mapping the wrapper already holds for rehydration.
+	// Raw values live only in the accumulator's in-memory map for the
+	// duration of this turn. The consolidated event persists a per-value
+	// breakdown (category, source, tool, KB origin, length, character-class
+	// shape) but NOT the values themselves — unless the testing-only
+	// EGRESSFILTER_REVEAL_VALUES feature flag is enabled for the tenant, which writes them
+	// verbatim and must never be enabled in production.
 	// At message-end we call Consolidated() to build ONE PIIScrubEvent
 	// with the true-distinct hit_count + union of categories + agent list.
 	piiAccumulator := egressfilter.NewPIIValueAccumulator()
@@ -922,16 +1058,10 @@ func handleConversationRequest(ctx *security.RequestContext, request NBAgentRequ
 		llmModel = request.QueryConfig.LlmModelName
 	}
 
-	// Drop half-set entries; convert wire shape → DAO/resolver struct.
-	var llmTierOverrides ConversationTierOverrides
-	for tier, p := range request.QueryConfig.LlmTierModels {
-		if p.Provider == "" || p.Model == "" {
-			continue
-		}
-		if llmTierOverrides.Picks == nil {
-			llmTierOverrides.Picks = make(map[string]TierModelPick)
-		}
-		llmTierOverrides.Picks[tier] = TierModelPick{Provider: p.Provider, Model: p.Model, ConfigSource: p.ConfigSource}
+	llmTierOverrides, droppedTiers := tierOverridesFromPicks(request.QueryConfig.LlmTierModels)
+	for _, d := range droppedTiers {
+		ctx.GetLogger().Warn("conversation: ignoring incomplete per-tier LLM pick — needs a config source, or both provider and model",
+			"tier", d.Tier, "provider", d.Provider, "model", d.Model)
 	}
 	if llmTierOverrides.HasAny() {
 		ctx.GetLogger().Info("conversation: overriding per-tier models from request config", "tier_count", len(llmTierOverrides.Picks))
@@ -953,6 +1083,17 @@ func handleConversationRequest(ctx *security.RequestContext, request NBAgentRequ
 
 			if sessionId != "" && sessionId != conversation.SessionID {
 				return NBAgentResponse{}, errors.New("conversation: sessionId doesnt match with existing conversation")
+			}
+
+			if request.IsQueuedDispatch {
+				// Reject a superseded claim before writing sticky model settings.
+				claimed, loadErr := GetConversationDao().GetConversationMessage(request.MessageId, request.AccountId, request.ConversationId)
+				if loadErr != nil {
+					return NBAgentResponse{}, loadErr
+				}
+				if shouldSkipQueuedDispatch(conversation.Status, claimed.Status) {
+					return NBAgentResponse{Status: claimed.Status, ConversationId: request.ConversationId, MessageId: request.MessageId}, nil
+				}
 			}
 
 			// Followup resume v2: when the feature flag is on and the request is a
@@ -1037,7 +1178,14 @@ func handleConversationRequest(ctx *security.RequestContext, request NBAgentRequ
 			// async title-generation task finishes).
 			var title string
 			initialTitleSource := common.StripLeadingAgentMention(request.Query)
-			if initialTitleSource != "" {
+			if derived, ok := common.DeriveTitleFromJSONQuery(initialTitleSource); ok {
+				// Webhook/alert triggers send a JSON payload as the query; unwrap it to
+				// a readable field so the placeholder isn't the raw `{"description":...`
+				// envelope. Matters most for single-shot classifiers (e.g.
+				// webhook_subject_name_extractor), which skip async title generation and
+				// keep this placeholder as their final, user-facing title.
+				title = derived
+			} else if initialTitleSource != "" {
 				words := strings.Fields(initialTitleSource)
 				if len(words) > 5 {
 					title = strings.Join(words[:5], " ") + "..."
@@ -1140,6 +1288,35 @@ func handleConversationRequest(ctx *security.RequestContext, request NBAgentRequ
 		ctx.GetMeter(),
 	)
 
+	// Establish reporting attribution before saving/activating a message, so a
+	// history-read failure cannot strand newly accepted work in IN_PROGRESS.
+	// This also precedes contextualization and agent execution.
+	// The executor's context copies and child agents inherit this same scope.
+	// Include stored context because refinement can resend it independently of
+	// the recent-message window. Security still scans every outbound payload.
+	reportBaseline := ""
+	if !newConversation {
+		reportHistory, err := getExistingHistory(request, ctx)
+		if err != nil {
+			return NBAgentResponse{}, fmt.Errorf("conversation: load history for egress reporting baseline: %w", err)
+		}
+		reportBaseline = messageFormatterToString(reportHistory)
+	}
+	if len(conversation.Context) > 0 && !request.QueryConfig.SkipConversationHistory {
+		contextJSON, err := common.MarshalJson(conversation.Context)
+		if err != nil {
+			return NBAgentResponse{}, fmt.Errorf("conversation: encode egress reporting baseline: %w", err)
+		}
+		reportBaseline += "\n" + string(contextJSON)
+		// Match the executor's human-readable memory too: JSON escapes
+		// multiline values that appear literally in the outbound prompt.
+		var unified LlmUnifiedExtraction
+		if err := common.UnmarshalJson(contextJSON, &unified); err == nil {
+			reportBaseline += "\n" + unified.String()
+		}
+	}
+	ctx.SetContext(egressfilter.WithReportBaseline(ctx.GetContext(), reportBaseline, request.Query))
+
 	historyType := MessageTypeGeneration
 	status := ConversationStatusCompleted
 	if agent.GetName() == RouterAgentName {
@@ -1167,7 +1344,7 @@ func handleConversationRequest(ctx *security.RequestContext, request NBAgentRequ
 			}
 			if len(previousConversations) > 0 {
 				for _, v := range slices.Backward(previousConversations) {
-					if v.MessageType != string(MessageTypeGeneration) {
+					if v.Status == ConversationStatusQueued || v.MessageType != string(MessageTypeGeneration) {
 						continue
 					}
 					if v.MessageConfig != nil && *v.MessageConfig != "" {
@@ -1176,6 +1353,9 @@ func handleConversationRequest(ctx *security.RequestContext, request NBAgentRequ
 						if err != nil {
 							ctx.GetLogger().Error("conversation: unable to unmarshal message config from previous message", "error", err, "data", *v.MessageConfig, "id", v.ID)
 						}
+						// Skipping history is a property of the turn that asked for it; a
+						// user's follow-up after an automated re-analysis needs the history.
+						prevConfig.SkipConversationHistory = false
 						request.QueryConfig.MergeFrom(prevConfig)
 						break
 					}
@@ -1252,6 +1432,11 @@ func handleConversationRequest(ctx *security.RequestContext, request NBAgentRequ
 		messageStatus = message.Status
 		messageType = MessageType(message.MessageType)
 
+		if request.IsQueuedDispatch && shouldSkipQueuedDispatch(conversation.Status, message.Status) {
+			// Stop/force may have superseded this claim while the worker waited.
+			return NBAgentResponse{Status: message.Status, ConversationId: request.ConversationId, MessageId: request.MessageId}, nil
+		}
+
 		// Defense-in-depth: don't cleanup or re-process messages for conversations
 		// that already reached a terminal state. This prevents dead worker recovery
 		// from destroying completed execution data.
@@ -1274,7 +1459,7 @@ func handleConversationRequest(ctx *security.RequestContext, request NBAgentRequ
 		markConversationActive(ctx, conversation.ID.String(), conversation.Status, "resumed/followup turn", false)
 
 		// Only cleanup if it's not a waiting message or a followup response
-		if message.Status != ConversationStatusWaiting && message.Status != ConversationStatusWaitingForClientTool && messageType != MessageTypeFollowup {
+		if shouldCleanupExistingMessage(request.IsQueuedDispatch, message.Status, messageType) {
 			err = GetConversationDao().CleanupConversationMessage(request.MessageId, request.AccountId)
 			if err != nil {
 				if errors.Is(err, ErrCleanupRefusedActiveFollowup) {
@@ -1345,7 +1530,7 @@ func handleConversationRequest(ctx *security.RequestContext, request NBAgentRequ
 	// When ConversationContextEnabled is true, skip query rewriting — the agent LLM resolves
 	// references naturally from the increased history window + summary context.
 	// Also skip if we are resuming an agent (request.AgentId is set) to prevent feedback turns from being rewritten.
-	if !config.Config.ConversationContextEnabled && (conversation.Context != nil) && request.EnableQueryRefinement && messageStatus != ConversationStatusWaiting && request.Query != "" && messageType != MessageTypeFollowup && agent.GetName() != RouterAgentName && agent.GetPlannerType() != AgentPlannerTypeCustom && request.AgentId == "" {
+	if !config.Config.ConversationContextEnabled && (conversation.Context != nil) && !request.QueryConfig.SkipConversationHistory && request.EnableQueryRefinement && messageStatus != ConversationStatusWaiting && request.Query != "" && messageType != MessageTypeFollowup && agent.GetName() != RouterAgentName && agent.GetPlannerType() != AgentPlannerTypeCustom && request.AgentId == "" {
 		contextualizedQuery, err := GetContextManager().ContextualizeQuery(ctx, request, conversation.Context)
 		if err == nil && contextualizedQuery != "" && contextualizedQuery != request.Query {
 			ctx.GetLogger().Info("conversation: query contextualized", "original", request.Query, "contextualized", contextualizedQuery)
@@ -1354,7 +1539,7 @@ func handleConversationRequest(ctx *security.RequestContext, request NBAgentRequ
 	}
 
 	// Set the conversation context in the request
-	if len(conversation.Context) > 0 {
+	if len(conversation.Context) > 0 && !request.QueryConfig.SkipConversationHistory {
 		contextJSON, err := common.MarshalJson(conversation.Context)
 		if err != nil {
 			ctx.GetLogger().Warn("conversation: unable to marshal conversation context", "error", err)
@@ -1417,14 +1602,32 @@ func handleConversationRequest(ctx *security.RequestContext, request NBAgentRequ
 		status = ConversationStatusFailed
 	}
 	if executeErr != nil {
-		agentResponseContent = executeErr.Error()
+		// This string becomes the assistant's persisted reply, so it is the last
+		// place a raw internal error can reach the user. executor.go sanitizes the
+		// planner-construction path, but an error raised once the planner is
+		// running (config resolved lazily at the first LLM call, provider refusals)
+		// arrives here instead and was previously stored verbatim — account UUIDs
+		// and internal agent names included.
+		agentResponseContent = sanitizeErrorForUser(executeErr)
 		status = ConversationStatusFailed
 	}
 
 	// After getting the agent response, update the context asynchronously.
 	// Single-shot internal classifiers use a throwaway conversation per call, so
 	// there is nothing to carry forward — skip context_memories_extractions.
-	if len(agentResponse.Response) > 0 && agentResponse.AgentName != RouterAgentName && agentResponse.AgentName != ToolLlm && !isSingleShotClassifier(agent) {
+	// Headless automated pipelines (alert investigations, PR lifecycle bots, workflow
+	// automations, and recommendation generators) also never reuse conversational context.
+	effectiveSource := source
+	if conversation.Source != nil && *conversation.Source != "" {
+		effectiveSource = *conversation.Source
+	} else if effectiveSource == "" {
+		effectiveSource = request.ConversationSource
+	}
+	if len(agentResponse.Response) > 0 &&
+		agentResponse.AgentName != RouterAgentName &&
+		agentResponse.AgentName != ToolLlm &&
+		!isSingleShotClassifier(agent) &&
+		isContextExtractionApplicable(effectiveSource) {
 		updateConversationContextAsync(ctx, request, agentResponseContent, conversation.ID.String(), conversation.Context, agentResponse.AgentName)
 	}
 	conversation, err = GetConversationDao().GetConversation(conversation.ID.String())
@@ -1447,7 +1650,15 @@ func handleConversationRequest(ctx *security.RequestContext, request NBAgentRequ
 
 	if !skipSaveBack {
 		// Saving AI Response to DB
-		err = GetConversationDao().UpdateConversationMessage(request.MessageId, agentResponseContent, status)
+		if config.Config.QueuedMessagesEnabled {
+			var applied bool
+			applied, err = GetConversationDao().FinalizeConversationMessage(request.ConversationId, request.MessageId, agentResponseContent, status)
+			if err == nil && !applied {
+				return NBAgentResponse{ConversationId: request.ConversationId, MessageId: request.MessageId, Status: ConversationStatusTerminated}, nil
+			}
+		} else {
+			err = GetConversationDao().UpdateConversationMessage(request.MessageId, agentResponseContent, status)
+		}
 		if err != nil {
 			ctx.GetLogger().Error("conversation: unable to save AI response to DB at router", "error", err)
 			return NBAgentResponse{}, err
@@ -1491,7 +1702,9 @@ func handleConversationRequest(ctx *security.RequestContext, request NBAgentRequ
 			}
 		}
 
-		err = GetConversationDao().UpdateConversationStatus(request.ConversationId, status)
+		if !config.Config.QueuedMessagesEnabled {
+			err = GetConversationDao().UpdateConversationStatus(request.ConversationId, status)
+		}
 		if err != nil {
 			ctx.GetLogger().Error("conversation: unable to save conversation to DB", "error", err)
 			return NBAgentResponse{}, err
@@ -1511,6 +1724,21 @@ func handleConversationRequest(ctx *security.RequestContext, request NBAgentRequ
 
 		if status == ConversationStatusCompleted && agentResponse.AgentName != ToolLlm {
 			computeProductivityMetricsAsync(ctx, request.UserId, request.AccountId, request.ConversationId, request.MessageId)
+			// Post-hoc answer grading. Runs only after the answer row is
+			// committed above, so the grader reads the same text the user sees,
+			// and is fire-and-forget — the turn is already complete and its
+			// status does not depend on the outcome. Self-gates on the feature
+			// flag and on the turn being an investigation.
+			ScoreAnswerConfidenceAsync(ctx, request, agentResponseContent)
+		}
+
+		if status == ConversationStatusCompleted && queuedMessageDispatcher != nil {
+			if nextMsg, claimErr := GetConversationDao().ClaimNextQueuedMessage(ctx.GetContext(), request.ConversationId); claimErr == nil && nextMsg != nil {
+				ctx.GetLogger().Info("conversation: auto-dispatching next queued message", "conversation_id", request.ConversationId, "message_id", nextMsg.ID.String())
+				queuedMessageDispatcher(ctx, agent, conversation, *nextMsg)
+			} else if claimErr != nil {
+				ctx.GetLogger().Warn("conversation: error checking for queued messages", "error", claimErr, "conversation_id", request.ConversationId)
+			}
 		}
 	} else {
 		ctx.GetLogger().Info("conversation: skipping save-back", "reason", skipReason, "message_id", request.MessageId)
@@ -1538,7 +1766,7 @@ func handleConversationRequest(ctx *security.RequestContext, request NBAgentRequ
 	}
 
 	// Generate compact response for InstantNotification source (Slack) and Investigation
-	if config.Config.SlackCompactResponse && (source == ConversationSourceInstantNotification || source == ConversationSourceInvestigation) && status == ConversationStatusCompleted && len(agentResponse.Response) > 0 && agentResponse.Response[0] != "" && agentResponse.AgentName != ToolLlm {
+	if config.Config.SlackCompactResponse && (effectiveSource == ConversationSourceInstantNotification || effectiveSource == ConversationSourceInvestigation) && status == ConversationStatusCompleted && len(agentResponse.Response) > 0 && agentResponse.Response[0] != "" && agentResponse.AgentName != ToolLlm {
 		compactResponse, compactErr := generateCompactResponse(ctx, request.AccountId, request.ConversationId, request.MessageId, request.UserId, request.Query, agentResponse.Response[0])
 
 		if compactErr != nil {
@@ -1547,7 +1775,7 @@ func handleConversationRequest(ctx *security.RequestContext, request NBAgentRequ
 			// For Investigation source, preserve the original structured response (used by event_analyzer
 			// for structured field parsing like git_diff, pr_list, etc.) and only save compact to DB.
 			// For Slack/InstantNotification, replace the response with compact version for display.
-			if source != ConversationSourceInvestigation {
+			if effectiveSource != ConversationSourceInvestigation {
 				agentResponse.Response = []string{compactResponse}
 			}
 			// Save compact response to DB asynchronously

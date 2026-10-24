@@ -8,7 +8,9 @@ export const generateQuery = (logProvider, chips, operations, metricName = '', a
     (logProvider === 'newrelic' && providerType === 'logs') ||
     (logProvider === 'dynatrace' && providerType === 'logs') ||
     logProvider === 'ES' ||
-    (logProvider === 'solarwinds' && providerType === 'logs');
+    (logProvider === 'solarwinds' && providerType === 'logs') ||
+    (logProvider === 'openobserve' && providerType === 'logs') ||
+    (logProvider === 'cubeapm' && providerType === 'logs');
 
   const hasValidOperations = isLogsProvider && operations?.some((op) => op.value && op.value.trim() !== '');
 
@@ -55,8 +57,10 @@ export const generateQuery = (logProvider, chips, operations, metricName = '', a
     let dql = `timeseries val = ${aggregator}(${metricKey})`;
     if (chips.length > 0) {
       const filterExprs = chips.map((chip) => {
-        const escapedLabel = chip.label.replace(/`/g, '\\`');
-        const escapedValue = chip.value.replace(/"/g, '\\"');
+        // Escape backslashes first: otherwise a value ending in "\" escapes the
+        // closing quote and the rest of the DQL is read as part of the string.
+        const escapedLabel = chip.label.replace(/\\/g, '\\\\').replace(/`/g, '\\`');
+        const escapedValue = chip.value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
         switch (chip.operator) {
           case '!=':
           case '_neq':
@@ -148,6 +152,8 @@ export const generateQuery = (logProvider, chips, operations, metricName = '', a
     logProvider == 'prometheus' ||
     logProvider == 'chronosphere' ||
     logProvider == 'victoria-metrics' ||
+    (logProvider === 'openobserve' && providerType === 'metrics') ||
+    (logProvider === 'cubeapm' && providerType === 'metrics') ||
     (logProvider === 'newrelic' && providerType === 'traces')
   ) {
     const promFilters = chips.map((chip) => {
@@ -217,7 +223,9 @@ export const generateQuery = (logProvider, chips, operations, metricName = '', a
     (logProvider === 'newrelic' && providerType == 'logs') ||
     (logProvider === 'dynatrace' && providerType == 'logs') ||
     logProvider === 'ES' ||
-    (logProvider === 'solarwinds' && providerType == 'logs')
+    (logProvider === 'solarwinds' && providerType == 'logs') ||
+    (logProvider === 'openobserve' && providerType == 'logs') ||
+    (logProvider === 'cubeapm' && providerType == 'logs')
   ) {
     const operatorMap = {
       // Legacy UI values (kept for persisted state + providers still emitting them)
@@ -271,7 +279,7 @@ export const generateQuery = (logProvider, chips, operations, metricName = '', a
       const { label, operator, value } = filter;
       const apiOperator = operatorMap[operator];
       if (!apiOperator) {
-        console.warn(`Unsupported operator: ${operator}`);
+        console.warn('Unsupported operator', { operator });
         return null; // or throw new Error(...)
       }
       return {
@@ -321,7 +329,7 @@ export const generateQuery = (logProvider, chips, operations, metricName = '', a
               },
             });
           } else {
-            console.warn(`Unsupported line operation operator: ${op.op}`);
+            console.warn('Unsupported line operation operator', { operator: op.op });
           }
         });
     }

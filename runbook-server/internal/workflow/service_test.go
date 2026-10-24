@@ -39,6 +39,13 @@ import (
 type MockTemporalClient struct {
 	client.Client
 	mock.Mock
+	// Run IDs passed to CancelWorkflow / TerminateWorkflow. Recorded on the
+	// struct rather than through mock expectations so tests that never look at
+	// them keep working without registering a call.
+	canceled   []string
+	terminated []string
+	// Error TerminateWorkflow returns, for the paths that have to survive one.
+	terminateErr error
 }
 
 // ScheduleClient returns a mock ScheduleClient.
@@ -47,6 +54,11 @@ func (m *MockTemporalClient) ScheduleClient() client.ScheduleClient {
 }
 
 func (m *MockTemporalClient) ListWorkflow(ctx context.Context, request *workflowservice.ListWorkflowExecutionsRequest) (*workflowservice.ListWorkflowExecutionsResponse, error) {
+	// A real gRPC call fails on a canceled context; the mock has to, or a test
+	// cannot tell detached work from work that merely looked detached.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	args := m.Called(ctx, request)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
@@ -55,6 +67,9 @@ func (m *MockTemporalClient) ListWorkflow(ctx context.Context, request *workflow
 }
 
 func (m *MockTemporalClient) DescribeWorkflowExecution(ctx context.Context, workflowID, runID string) (*workflowservice.DescribeWorkflowExecutionResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	args := m.Called(ctx, workflowID, runID)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
@@ -68,6 +83,18 @@ func (m *MockTemporalClient) GetWorkflowHistory(ctx context.Context, workflowID,
 }
 
 func (m *MockTemporalClient) TerminateWorkflow(ctx context.Context, workflowID string, runID string, reason string, details ...interface{}) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.terminated = append(m.terminated, runID)
+	return m.terminateErr
+}
+
+func (m *MockTemporalClient) CancelWorkflow(ctx context.Context, workflowID string, runID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.canceled = append(m.canceled, runID)
 	return nil
 }
 
@@ -461,6 +488,8 @@ func TestGetDetailedWorkflowExecutionInputs(t *testing.T) {
 	mockStore := new(MockWorkflowStore)
 	mockTaskRegistry := tasks.NewInitializedTaskRegistry()
 	mockConfigService := new(MockConfigService)
+	// Error text is scrubbed of the account's secret values, which are read here.
+	mockConfigService.On("ListConfigsDecrypted", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return([]model.Config{}, nil).Maybe()
 	workflowExector := &WorkflowExecutor{
 		temporalClient: mockTemporalClient,
 		workflowStore:  mockStore,
@@ -708,6 +737,9 @@ func (m *MockWorkflowStore) DeleteExpiredState(ctx context.Context, limit int) (
 }
 
 func (m *MockWorkflowStore) SetLastExecutionStatus(ctx context.Context, tenantID, accountID, id string, status model.WorkflowExecutionStatus, executionTime time.Time, statusMessage string, version *int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	args := m.Called(ctx, tenantID, accountID, id, status, executionTime, statusMessage, version)
 	if args.Get(0) == nil {
 		return nil
@@ -1956,6 +1988,65 @@ func TestAIOriginatedWritesCannotMoveTheOptIn(t *testing.T) {
 		})
 		require.NoError(t, err)
 		assert.False(t, saved.AIInvocable)
+	})
+
+	// ai_auto_approve is the same kind of human grant and moves with ai_invocable
+	// through every one of the paths above.
+	t.Run("an AI edit keeps auto-approve but cannot grant it", func(t *testing.T) {
+		service, store := newService()
+		existing := optedInWorkflow("wf-ai-auto")
+		existing.AIAutoApprove = true
+		store.On("Find", mock.Anything, "test-tenant", "test-account", "wf-ai-auto").Return(existing, nil)
+
+		var saved model.Workflow
+		store.On("Update", mock.Anything, "test-tenant", "test-account", "wf-ai-auto", mock.Anything).
+			Return(nil).Run(func(args mock.Arguments) { saved = args.Get(4).(model.Workflow) })
+
+		_, err := service.UpdateWorkflow(aiRequestContext(true), "test-account", "wf-ai-auto", model.Workflow{
+			Name:       existing.Name,
+			Definition: aiDefinition(),
+		})
+		require.NoError(t, err)
+		assert.True(t, saved.AIAutoApprove, "AI edit must not revoke the human's auto-approve grant")
+
+		serviceGrant, storeGrant := newService()
+		notAuto := optedInWorkflow("wf-ai-auto-grant")
+		storeGrant.On("Find", mock.Anything, "test-tenant", "test-account", "wf-ai-auto-grant").Return(notAuto, nil)
+		var grantSaved model.Workflow
+		storeGrant.On("Update", mock.Anything, "test-tenant", "test-account", "wf-ai-auto-grant", mock.Anything).
+			Return(nil).Run(func(args mock.Arguments) { grantSaved = args.Get(4).(model.Workflow) })
+
+		_, err = serviceGrant.UpdateWorkflow(aiRequestContext(true), "test-account", "wf-ai-auto-grant", model.Workflow{
+			Name:          notAuto.Name,
+			AIAutoApprove: true, // the AI asking to skip its own confirmation
+			Definition:    aiDefinition(),
+		})
+		require.NoError(t, err)
+		assert.False(t, grantSaved.AIAutoApprove, "only a human may allow unattended runs")
+	})
+
+	// Losing the invocation grant must take auto-approve with it, or the row
+	// keeps an unattended-run opt-in waiting for the next time someone ticks
+	// ai_invocable.
+	t.Run("an AI edit that drops the opt-in drops auto-approve too", func(t *testing.T) {
+		service, store := newService()
+		existing := optedInWorkflow("wf-ai-auto-strip")
+		existing.AIAutoApprove = true
+		store.On("Find", mock.Anything, "test-tenant", "test-account", "wf-ai-auto-strip").Return(existing, nil)
+
+		var saved model.Workflow
+		store.On("Update", mock.Anything, "test-tenant", "test-account", "wf-ai-auto-strip", mock.Anything).
+			Return(nil).Run(func(args mock.Arguments) { saved = args.Get(4).(model.Workflow) })
+
+		stripped := aiDefinition()
+		stripped.LLMDescription = ""
+		_, err := service.UpdateWorkflow(aiRequestContext(true), "test-account", "wf-ai-auto-strip", model.Workflow{
+			Name:       existing.Name,
+			Definition: stripped,
+		})
+		require.NoError(t, err)
+		assert.False(t, saved.AIInvocable)
+		assert.False(t, saved.AIAutoApprove)
 	})
 
 	// The UI sends ai_invocable on every save including false — that is how the

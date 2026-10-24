@@ -10,6 +10,7 @@ import (
 	"nudgebee/services/internal/database"
 	"nudgebee/services/security"
 	"nudgebee/services/tenant"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -68,6 +69,15 @@ type ColumnDefinition struct {
 	IsAggregated bool
 	DefGenerator func(ctx *security.RequestContext, accountId string, request QueryRequest) (string, QueryRequest, error)
 	WhereDef     string
+	// NumericCompareDef opts a string-typed column into ordered comparison (< <= > >=)
+	// by supplying an explicit numeric projection of itself, e.g.
+	// "toInt32OrZero(http_status_code)". Ordered operators on a string column are
+	// otherwise rejected on purpose: comparing lexicographically against a value the
+	// caller means numerically returns plausible wrong rows instead of an error. Set
+	// this only where the column genuinely holds a number stored as text, and only the
+	// ordered operators use it -- _eq/_like/label-values keep the string Def, so the
+	// column's existing behaviour (and the UI built on it) is unchanged.
+	NumericCompareDef string
 }
 
 type TableDefinition struct {
@@ -104,6 +114,12 @@ type TableDefinition struct {
 	// clause still bounds the result. Leave false for tables whose NULL-account
 	// rows are sensitive or global-only.
 	TenantWideReadable bool
+	// AccountScope, when set, replaces the account-id restriction applied to
+	// account-scoped readers with a table-specific SQL predicate. It must build
+	// SQL only from the quoted ids it is given. The result goes to the SQL
+	// builder as a separate argument and never through QueryRequest, which
+	// callers control.
+	AccountScope func(accountIds []string, quote func(any) string) string
 }
 
 var AzureTraceTableDefinition = map[string]ColumnDefinition{
@@ -294,6 +310,15 @@ func GetTracesProviderAndUrl(ctx *security.RequestContext, accountId string) (st
 		}
 	}
 	return traceProvider, traceProviderConfig, hasMaterializedColumn
+}
+
+func TracesConfigured(accountId string) bool {
+	agentDetails, err := account.GetAgentConnectionDetails(accountId)
+	if err != nil {
+		return false
+	}
+	f := agentDetails.Features
+	return f.TracesEnabled != nil && *f.TracesEnabled && f.TracesUrl != nil && *f.TracesUrl != ""
 }
 
 func getSource(tableName string) database.DatabaseManagerType {
@@ -646,10 +671,31 @@ var fingerprintDependentColumns = map[string]bool{
 	"count_new_issue_events":    true,
 }
 
+// Columns that depend on the analysed-events JOIN on event_groupings_v2.
+//
+// Kept separate from prDependentColumns (which serves a different table's
+// pr_url/pr_title) because this one joins a PRE-AGGREGATED subquery:
+// event_log_analysis holds one row per analysis_type per event, so joining it
+// raw would multiply every event row by its stage count and silently inflate
+// event_count, count_new_issues and every other aggregate in the same query.
+// The subquery collapses to one row per (event, account) before the join.
+var analysisDependentColumns = map[string]bool{
+	"count_analysed_issues":     true,
+	"first_analysed_at":         true,
+	"minutes_to_first_analysis": true,
+}
+
 // Columns that depend on the event_log_analysis JOIN
 var prDependentColumns = map[string]bool{
 	"pr_url":   true,
 	"pr_title": true,
+}
+
+// Columns that add the investigation-status join, keyed on the (fingerprint,
+// account, aggregation_key) triple rather than event_id: analysis is cached per
+// fingerprint, so a sibling event's run is what /investigate serves.
+var investigationStatusDependentColumns = map[string]bool{
+	"is_investigated": true,
 }
 
 // Columns that depend on the event_correlations same_incident JOINs
@@ -657,6 +703,10 @@ var prDependentColumns = map[string]bool{
 var incidentDependentColumns = map[string]bool{
 	"incident_leader_id":    true,
 	"incident_member_count": true,
+	// Aggregate forms for grouped (inbox) rows.
+	"incident_group_size":      true,
+	"is_incident_child":        true,
+	"incident_group_leader_id": true,
 }
 
 func whereReferencesColumns(where QueryWhereClause, cols map[string]bool) bool {
@@ -781,6 +831,86 @@ func extractFilterSQL(request *QueryRequest, filterName string, sqlColumn string
 	return sql
 }
 
+// cleanEmptyAndClauses recursively prunes empty QueryWhereClause nodes from where.And.
+func cleanEmptyAndClauses(where *QueryWhereClause) {
+	if where == nil || len(where.And) == 0 {
+		return
+	}
+	active := make([]QueryWhereClause, 0, len(where.And))
+	for i := range where.And {
+		cleanEmptyAndClauses(&where.And[i])
+		if len(where.And[i].Binary) > 0 || len(where.And[i].And) > 0 || len(where.And[i].Or) > 0 || where.And[i].Not != nil {
+			active = append(active, where.And[i])
+		}
+	}
+	where.And = active
+}
+
+// extractCategoryFilterSQL extracts equality/IN filter(s) for "category" from request.Where,
+// generates the SQL fragment (e.g. " AND LOWER(it_filter.category) = 'database'"), and
+// removes the filter from its owning Binary map, including inside _and clauses.
+//
+// Unlike extractFilterSQL (which leaves filters inside _and in place for outer WHERE
+// enforcement because some DefGenerators push into loosely-scoped subqueries), category
+// is NOT a declared column on the outer integrations relation and is fully constrained
+// by the EXISTS subquery pushdown against integration_types. Leaving it in _and causes
+// generateWhereClause to fail with "column category defined in where clause not found".
+func extractCategoryFilterSQL(request *QueryRequest, sqlColumn string) string {
+	if request == nil {
+		return ""
+	}
+	dialect := &postgresDialect{}
+	var parts []string
+	for {
+		filter, holder := locateBinaryFilter(&request.Where, "category")
+		if holder == nil {
+			break
+		}
+		if eqVal, ok := filter[Eq]; ok {
+			parts = append(parts, " AND "+sqlColumn+" = "+dialect.QuoteLiteral(eqVal))
+		} else if inVal, ok := filter[In]; ok {
+			if vals, ok := inVal.([]any); ok && len(vals) > 0 {
+				quoted := make([]string, len(vals))
+				for i, v := range vals {
+					quoted[i] = dialect.QuoteLiteral(v)
+				}
+				parts = append(parts, " AND "+sqlColumn+" IN ("+strings.Join(quoted, ",")+")")
+			}
+		}
+		delete(holder, "category")
+	}
+	cleanEmptyAndClauses(&request.Where)
+	return strings.Join(parts, "")
+}
+
+// renderFilterSQLForColumn is extractFilterSQL without the delete: it renders the
+// eq/IN fragment against an arbitrary sqlColumn and leaves request.Where untouched.
+// Must run before extractFilterSQL, which deletes the top-level filter this then
+// can't locate.
+func renderFilterSQLForColumn(request *QueryRequest, filterName string, sqlColumn string) string {
+	if request == nil {
+		return ""
+	}
+	dialect := &postgresDialect{}
+	filter, holder := locateBinaryFilter(&request.Where, filterName)
+	if holder == nil {
+		return ""
+	}
+	if eqVal, ok := filter[Eq]; ok {
+		return " AND " + sqlColumn + " = " + dialect.QuoteLiteral(eqVal)
+	}
+	if inVal, ok := filter[In]; ok {
+		if vals, ok := inVal.([]any); ok && len(vals) > 0 {
+			quoted := make([]string, len(vals))
+			for i, v := range vals {
+				quoted[i] = dialect.QuoteLiteral(v)
+			}
+			return " AND " + sqlColumn + " IN (" + strings.Join(quoted, ",") + ")"
+		}
+	}
+	return ""
+}
+
 // VulnerabilityRecommendationSQL reconstructs the legacy recommendation.recommendation
 // JSON shape (the one every consumer — frontend, LLM security tool, PR-prompt
 // generator — was written against) from the deduplicated vulnerabilities row,
@@ -878,6 +1008,12 @@ func VulnerabilityRecommendationSQL(recAlias, vulnAccessor string) string {
 		END`
 }
 
+// imageScanOnlyRuleNameFilter matches renderFilterSQLForColumn's rendering of
+// an exact rule_name='image_scan' filter (Eq or single-value In), tolerant of
+// whitespace so it doesn't silently stop matching if that helper's formatting
+// changes -- see recommendation_groupings_v2's DefGenerator below.
+var imageScanOnlyRuleNameFilter = regexp.MustCompile(`^\s*AND\s+r\.rule_name\s*(?:=\s*'image_scan'|IN\s*\(\s*'image_scan'\s*\))\s*$`)
+
 var table_metadata = map[string]TableDefinition{
 	"k8s_cluster_groupings_v2": {
 		Type:   Normal,
@@ -952,6 +1088,11 @@ var table_metadata = map[string]TableDefinition{
 			) AS ksw
 			USING (cloud_account_id, tenant_id)
 			JOIN (
+				-- Pods bucketed the way the pods table names them: the container
+				-- reason where there is one, the phase otherwise. Counting the raw
+				-- phase instead -- which this did until #36593 -- files every
+				-- CrashLoopBackOff pod under "Running" and every ImagePullBackOff
+				-- one under "Pending", so a cluster with broken pods reads healthy.
 				SELECT
 					ksp.cloud_account_id,
 					ksp.tenant_id,
@@ -960,7 +1101,7 @@ var table_metadata = map[string]TableDefinition{
 					SELECT
 						ksp.cloud_account_id,
 						ksp.tenant_id,
-						ksp.status,
+						COALESCE(ksp.container_status, ksp.status) AS status,
 						COUNT(*) AS status_count
 					FROM
 						k8s_pods ksp
@@ -969,7 +1110,7 @@ var table_metadata = map[string]TableDefinition{
 					GROUP BY
 						ksp.cloud_account_id,
 						ksp.tenant_id,
-						ksp.status
+						COALESCE(ksp.container_status, ksp.status)
 				) AS ksp
 				GROUP BY
 					ksp.cloud_account_id,
@@ -1288,10 +1429,71 @@ var table_metadata = map[string]TableDefinition{
 		Type:             Aggregate,
 		Source:           getSource("event_groupings_v2"),
 		DefGenerator: func(ctx *security.RequestContext, accountId string, request QueryRequest) (string, QueryRequest, error) {
+			from := "events"
 			if requestReferencesColumns(request, fingerprintDependentColumns) {
-				return "events LEFT JOIN event_duplicates ed ON ed.event_id = events.id AND ed.cloud_account_id = events.cloud_account_id", request, nil
+				from += " LEFT JOIN event_duplicates ed ON ed.event_id = events.id AND ed.cloud_account_id = events.cloud_account_id"
 			}
-			return "events", request, nil
+			if requestReferencesColumns(request, incidentDependentColumns) {
+				// Same-subject incident grouping (#34655): mirrors the events_v2
+				// joins so grouped counts can filter/aggregate on the same
+				// incident columns the list filters on (children folded by
+				// default must fold in the counts too).
+				from += ` LEFT JOIN (SELECT DISTINCT ON (event_id, cloud_account_id) event_id, cloud_account_id, related_event_id
+					FROM event_correlations WHERE correlation_type = 'same_incident'
+					ORDER BY event_id, cloud_account_id, related_event_id) ecl
+					ON ecl.event_id = events.id AND ecl.cloud_account_id = events.cloud_account_id`
+				// Distinct ALERTS, not links. Group links join firings, so one alert firing repeatedly inside an incident contributes several rows
+				// counting them would report an incident with two alerts in it
+				// as having six members.
+				from += ` LEFT JOIN (SELECT ec.related_event_id, ec.cloud_account_id,
+					       count(DISTINCT me.fingerprint) AS incident_member_count
+					FROM event_correlations ec
+					JOIN events me ON me.id = ec.event_id AND me.cloud_account_id = ec.cloud_account_id
+					WHERE ec.correlation_type = 'same_incident'
+					GROUP BY ec.related_event_id, ec.cloud_account_id) ecc
+					ON ecc.related_event_id = events.id AND ecc.cloud_account_id = events.cloud_account_id`
+			}
+			// One row per analysed event, not per analysis stage. event_log_analysis
+			// carries a row per analysis_type (summary / log_analysis /
+			// investigation / detailed_response), so a raw join would return up to
+			// four rows per event and multiply every other aggregate selected
+			// alongside these columns.
+			//
+			// min(recorded_at) is the clock: time to FIRST completed stage is when a
+			// reader could first see an explanation, which is what "time to
+			// understand" means. Waiting for all four would measure pipeline depth
+			// instead.
+			if requestReferencesColumns(request, analysisDependentColumns) {
+				from += ` LEFT JOIN (
+					SELECT event_id, cloud_account_id, min(recorded_at) AS first_analysed_at
+					FROM event_log_analysis
+					WHERE status = 'COMPLETED'
+					GROUP BY event_id, cloud_account_id
+				) ela ON ela.event_id = events.id AND ela.cloud_account_id = events.cloud_account_id`
+			}
+			// One row per triple (not per analysis stage), so it can't fan out
+			// event rows. The inner DISTINCT ON picks the newest row per stage —
+			// V850 keeps history rows. completion_ts is that newest stage's
+			// timestamp; the is_investigated column compares it to created_at.
+			if requestReferencesColumns(request, investigationStatusDependentColumns) {
+				from += ` LEFT JOIN (
+					SELECT event_fingerprint, cloud_account_id, event_aggregation_key,
+					       count(*) FILTER (WHERE status = 'COMPLETED') = 4 AS is_complete,
+					       max(ts) FILTER (WHERE status = 'COMPLETED') AS completion_ts
+					FROM (
+						SELECT DISTINCT ON (event_fingerprint, cloud_account_id, event_aggregation_key, analysis_type)
+						       event_fingerprint, cloud_account_id, event_aggregation_key,
+						       status, coalesce(updated_at, recorded_at) AS ts
+						FROM event_log_analysis
+						WHERE analysis_type IN ('summary', 'investigation', 'log_analysis', 'detailed_response')
+						ORDER BY event_fingerprint, cloud_account_id, event_aggregation_key, analysis_type, coalesce(updated_at, recorded_at) DESC
+					) latest
+					GROUP BY event_fingerprint, cloud_account_id, event_aggregation_key
+				) eia ON eia.event_fingerprint = events.fingerprint
+					AND eia.cloud_account_id = events.cloud_account_id
+					AND eia.event_aggregation_key = events.aggregation_key`
+			}
+			return from, request, nil
 		},
 		Name:                "event_groupings_v2",
 		TenantIdColumnName:  "tenant_id",
@@ -1337,7 +1539,12 @@ var table_metadata = map[string]TableDefinition{
 			},
 			"subject_owner": {
 				Type: ColumnDefinitionTypeString,
-				Def:  "COALESCE(subject_owner, subject_name, '')",
+				// NULLIF before COALESCE: events.subject_owner is never NULL —
+				// producers write '' when the subject has no owning workload
+				// (nodes, cloud resources, alerts whose labels resolved no
+				// owner), so a plain COALESCE returns '' and never reaches the
+				// subject_name fallback the grouped-events view depends on.
+				Def: "COALESCE(NULLIF(subject_owner, ''), subject_name, '')",
 			},
 			"priority": {
 				Type: ColumnDefinitionTypeString,
@@ -1583,6 +1790,33 @@ var table_metadata = map[string]TableDefinition{
 				Def:          "min(ed.absolute_first_seen_at)",
 				IsAggregated: true,
 			},
+			// Coverage numerator. DISTINCT fingerprint so it shares the issue unit
+			// with event_count's distinct transformation — dividing a per-event
+			// numerator by a per-chain denominator is the exact mistake this
+			// column exists to stop callers making.
+			"count_analysed_issues": {
+				Type:         ColumnDefinitionTypeInt,
+				Def:          "count(DISTINCT CASE WHEN ela.first_analysed_at IS NOT NULL THEN events.fingerprint END)",
+				IsAggregated: true,
+			},
+			"first_analysed_at": {
+				Type:         ColumnDefinitionTypeDatetime,
+				Def:          "min(ela.first_analysed_at)",
+				IsAggregated: true,
+			},
+			// Median, not mean: analysis latency has a long tail (a stuck chain
+			// sitting for hours drags an average far past anything a reader would
+			// recognise). Rows where the analysis predates the event are excluded
+			// rather than clamped — a negative interval means the analysis came
+			// from an earlier occurrence being reused, which is not this event's
+			// time to understand.
+			"minutes_to_first_analysis": {
+				Type: ColumnDefinitionTypeFloat,
+				Def: "percentile_cont(0.5) WITHIN GROUP (ORDER BY " +
+					"CASE WHEN ela.first_analysed_at >= events.created_at " +
+					"THEN EXTRACT(EPOCH FROM (ela.first_analysed_at - events.created_at)) / 60 END)",
+				IsAggregated: true,
+			},
 			"fingerprint_event_count": {
 				Type:         ColumnDefinitionTypeInt,
 				Def:          "max(ed.occurrence_number)",
@@ -1591,6 +1825,53 @@ var table_metadata = map[string]TableDefinition{
 			"is_new_issue": {
 				Type: ColumnDefinitionTypeBoolean,
 				Def:  "CASE WHEN ed.absolute_first_seen_at > NOW() - INTERVAL '7 days' THEN true ELSE false END",
+			},
+			"incident_leader_id": {
+				Type: ColumnDefinitionTypeString,
+				Def:  "ecl.related_event_id",
+			},
+			"incident_member_count": {
+				Type: ColumnDefinitionTypeInt,
+				Def:  "coalesce(ecc.incident_member_count, 0)",
+			},
+			// Row-level group signals for the Triage Inbox (#34655): a
+			// fingerprint row LEADS a group when any of its events has
+			// members; it is a CHILD when any of its events links to a
+			// leader. Aggregated because inbox rows span many events.
+			"incident_group_size": {
+				Type:         ColumnDefinitionTypeInt,
+				Def:          "max(coalesce(ecc.incident_member_count, 0))",
+				IsAggregated: true,
+			},
+			"is_incident_child": {
+				Type:         ColumnDefinitionTypeBoolean,
+				Def:          "bool_or(ecl.related_event_id IS NOT NULL)",
+				IsAggregated: true,
+			},
+			// eia.* (see the join in DefGenerator) is constant within a
+			// fingerprint group; the >= reuses the analysis for events that
+			// fired up to 24h after it, or any time before.
+			"is_investigated": {
+				Type:         ColumnDefinitionTypeBoolean,
+				Def:          "bool_and(coalesce(eia.is_complete, false)) AND max(eia.completion_ts) >= max(events.created_at) - INTERVAL '24 hours'",
+				IsAggregated: true,
+			},
+			// The event id the Grouped Alerts drill-down resolves the row's
+			// group from. A row's newest event is usually neither a leader nor
+			// a member — the leader is the OLDEST event of a recurring
+			// fingerprint — so anchoring on latest_event_id left rows that
+			// visibly carry a GROUPED badge showing "no related alerts".
+			// Leading rows anchor on their own largest leader (a row can hold
+			// more than one; incident_group_size is that same max); child rows
+			// anchor on the leader their newest linked event points at.
+			"incident_group_leader_id": {
+				Type: ColumnDefinitionTypeString,
+				Def: "coalesce(" +
+					"(array_agg(events.id::text ORDER BY ecc.incident_member_count DESC, events.created_at DESC) " +
+					"FILTER (WHERE ecc.incident_member_count > 0))[1], " +
+					"(array_agg(ecl.related_event_id::text ORDER BY events.created_at DESC) " +
+					"FILTER (WHERE ecl.related_event_id IS NOT NULL))[1])",
+				IsAggregated: true,
 			},
 		},
 	},
@@ -1631,12 +1912,41 @@ var table_metadata = map[string]TableDefinition{
 					`coalesce(ecc.incident_member_count, 0) as incident_member_count`)
 				joins = append(joins,
 					`LEFT JOIN (SELECT DISTINCT ON (event_id, cloud_account_id) event_id, cloud_account_id, related_event_id
-						FROM event_correlations WHERE correlation_type = 'same_incident') ecl
-						ON ecl.event_id = e.id AND ecl.cloud_account_id = e.cloud_account_id`,
-					`LEFT JOIN (SELECT related_event_id, cloud_account_id, count(*) AS incident_member_count
 						FROM event_correlations WHERE correlation_type = 'same_incident'
-						GROUP BY related_event_id, cloud_account_id) ecc
+						ORDER BY event_id, cloud_account_id, related_event_id) ecl
+						ON ecl.event_id = e.id AND ecl.cloud_account_id = e.cloud_account_id`,
+					// Distinct alerts, not links — see the matching join above.
+					`LEFT JOIN (SELECT ec.related_event_id, ec.cloud_account_id,
+						       count(DISTINCT me.fingerprint) AS incident_member_count
+						FROM event_correlations ec
+						JOIN events me ON me.id = ec.event_id AND me.cloud_account_id = ec.cloud_account_id
+						WHERE ec.correlation_type = 'same_incident'
+						GROUP BY ec.related_event_id, ec.cloud_account_id) ecc
 						ON ecc.related_event_id = e.id AND ecc.cloud_account_id = e.cloud_account_id`)
+			}
+			if requestReferencesColumns(request, investigationStatusDependentColumns) {
+				// LATERAL rather than a whole-table grouped subquery: per list
+				// row this is an index range scan on
+				// idx_event_log_analysis_fingerprint_account_agg_type (V850),
+				// Memoized across repeated fingerprints, so cost stays flat as
+				// event_log_analysis grows. DISTINCT ON picks the newest row per
+				// stage — V850 keeps history rows.
+				selects = append(selects, `coalesce(eia.is_investigated, false) as is_investigated`)
+				joins = append(joins, `LEFT JOIN LATERAL (
+						SELECT count(*) FILTER (WHERE latest.status = 'COMPLETED') = 4
+							AND max(latest.ts) FILTER (WHERE latest.status = 'COMPLETED') >= e.created_at - INTERVAL '24 hours'
+							AS is_investigated
+						FROM (
+							SELECT DISTINCT ON (ela.analysis_type)
+							       ela.status, coalesce(ela.updated_at, ela.recorded_at) AS ts
+							FROM event_log_analysis ela
+							WHERE ela.event_fingerprint = e.fingerprint
+								AND ela.cloud_account_id = e.cloud_account_id
+								AND ela.event_aggregation_key = e.aggregation_key
+								AND ela.analysis_type IN ('summary', 'investigation', 'log_analysis', 'detailed_response')
+							ORDER BY ela.analysis_type, coalesce(ela.updated_at, ela.recorded_at) DESC
+						) latest
+					) eia ON true`)
 			}
 			if len(joins) == 0 {
 				return "events", request, nil
@@ -1698,6 +2008,9 @@ var table_metadata = map[string]TableDefinition{
 				Type: ColumnDefinitionTypeString,
 			},
 			"subject_owner": {
+				Type: ColumnDefinitionTypeString,
+			},
+			"subject_owner_kind": {
 				Type: ColumnDefinitionTypeString,
 			},
 			"service_key": {
@@ -1771,6 +2084,10 @@ var table_metadata = map[string]TableDefinition{
 			},
 			"pr_title": {
 				Type: ColumnDefinitionTypeString,
+			},
+			// No Def: the LATERAL join in DefGenerator emits the aliased boolean.
+			"is_investigated": {
+				Type: ColumnDefinitionTypeBoolean,
 			},
 			"fingerprint_first_seen_at": {
 				Type: ColumnDefinitionTypeDatetime,
@@ -2330,6 +2647,123 @@ var table_metadata = map[string]TableDefinition{
 			},
 		},
 	},
+	// The account / EC2 cost-summary cards need this-month, last-month and
+	// year-to-date spend, each split into net / gross / credits. The frontend
+	// used to ask for that as 8 near-identical spend_groupings_v2 calls per page
+	// (CloudAccountSummary, CloudAccEC2Summary and ~3 sibling blocks) -- 8 round
+	// trips, 8 connection holds and 8 scans of the same account's spend rows. On
+	// a busy page those queue behind each other and the whole summary stalls.
+	//
+	// This is one query: a short (this-month + last-month) scan CROSS JOINed to
+	// the year scan, each figure a sum(amount) FILTER (WHERE <kind>). Splitting
+	// recent from the year keeps the small windows on the (cloud_account, date,
+	// exclude_aggregate) index instead of dragging every figure through the
+	// full-year scan. Windows come from now() server-side: spend is
+	// daily-granularity and the callers already compute these boundaries in UTC,
+	// so month-to-now and month-to-month-end sum identically. net = not-excluded;
+	// gross = not-excluded and amount >= 0; credits = excluded and amount < 0 --
+	// the exact predicates the old *SpendsWhere variables carried. A 1-row
+	// anchor + LEFT JOINs keep exactly one row even when an account has spend in
+	// only one of the two ranges. resource_service_name (EC2 summary) optional.
+	"spend_summary_windows_v2": {
+		PermissionModule:    "spend",
+		Type:                Derived,
+		Source:              database.Metastore,
+		Name:                "spend_summary_windows_v2",
+		TenantIdColumnName:  "tenant_id",
+		AccountIdColumnName: "account_id",
+		DefGenerator: func(ctx *security.RequestContext, accountId string, request QueryRequest) (string, QueryRequest, error) {
+			// pushed into both inner scans and removed from request.Where so the
+			// outer query never re-applies them against columns that only exist
+			// on spends.
+			scope := extractFilterSQL(&request, "account_id", "cloud_account") +
+				extractFilterSQL(&request, "resource_service_name", "(tags -> 'nb_service_name' ->> 0)")
+
+			const (
+				net     = "exclude_aggregate = false"
+				gross   = "exclude_aggregate = false AND amount >= 0"
+				credits = "exclude_aggregate = true AND amount < 0"
+				cm      = "date >= date_trunc('month', now()) AND date < date_trunc('month', now()) + interval '1 month'"
+				lm      = "date >= date_trunc('month', now()) - interval '1 month' AND date < date_trunc('month', now())"
+			)
+			f := func(window, kind string) string {
+				if window == "" {
+					return fmt.Sprintf("COALESCE(sum(amount) FILTER (WHERE %s), 0)::float", kind)
+				}
+				return fmt.Sprintf("COALESCE(sum(amount) FILTER (WHERE %s AND %s), 0)::float", window, kind)
+			}
+
+			q := fmt.Sprintf(`(
+				SELECT
+					joined.tenant_id, joined.account_id, joined.currency_type,
+					COALESCE(joined.cm_net, 0)     AS cm_net,
+					COALESCE(joined.cm_gross, 0)   AS cm_gross,
+					COALESCE(joined.cm_credits, 0) AS cm_credits,
+					COALESCE(joined.lm_net, 0)     AS lm_net,
+					COALESCE(joined.lm_gross, 0)   AS lm_gross,
+					COALESCE(joined.lm_credits, 0) AS lm_credits,
+					COALESCE(joined.yr_net, 0)     AS yr_net,
+					COALESCE(joined.yr_gross, 0)   AS yr_gross,
+					COALESCE(joined.yr_credits, 0) AS yr_credits
+				FROM (SELECT 1) anchor
+				LEFT JOIN (
+					-- one row per currency (recent + year figures side by side),
+					-- then the dominant currency. The join is ON currency_type so
+					-- a multi-currency account can't get this-month figures in one
+					-- currency next to yearly figures in another.
+					SELECT
+						COALESCE(rec.tenant_id, yr.tenant_id)         AS tenant_id,
+						COALESCE(rec.account_id, yr.account_id)       AS account_id,
+						COALESCE(rec.currency_type, yr.currency_type) AS currency_type,
+						rec.cm_net, rec.cm_gross, rec.cm_credits,
+						rec.lm_net, rec.lm_gross, rec.lm_credits,
+						yr.yr_net, yr.yr_gross, yr.yr_credits
+					FROM (
+						SELECT cast(tenant as text) AS tenant_id, cast(cloud_account as text) AS account_id, unit AS currency_type,
+							%s AS cm_net, %s AS cm_gross, %s AS cm_credits,
+							%s AS lm_net, %s AS lm_gross, %s AS lm_credits
+						FROM spends
+						WHERE 1 = 1%s
+							AND date >= date_trunc('month', now()) - interval '1 month'
+							AND date < date_trunc('month', now()) + interval '1 month'
+						GROUP BY tenant, cloud_account, unit
+					) rec
+					FULL OUTER JOIN (
+						SELECT cast(tenant as text) AS tenant_id, cast(cloud_account as text) AS account_id, unit AS currency_type,
+							%s AS yr_net, %s AS yr_gross, %s AS yr_credits
+						FROM spends
+						WHERE 1 = 1%s
+							AND date >= date_trunc('year', now())
+							AND date < date_trunc('year', now()) + interval '1 year'
+						GROUP BY tenant, cloud_account, unit
+					) yr ON rec.tenant_id = yr.tenant_id AND rec.account_id = yr.account_id AND rec.currency_type = yr.currency_type
+					ORDER BY COALESCE(rec.cm_net, yr.yr_net) DESC NULLS LAST
+					LIMIT 1
+				) joined ON true
+			) AS spend_summary_windows_v2`,
+				f(cm, net), f(cm, gross), f(cm, credits),
+				f(lm, net), f(lm, gross), f(lm, credits), scope,
+				f("", net), f("", gross), f("", credits), scope)
+			return q, request, nil
+		},
+		Columns: map[string]ColumnDefinition{
+			"tenant_id":     {Type: ColumnDefinitionTypeString},
+			"account_id":    {Type: ColumnDefinitionTypeString},
+			"currency_type": {Type: ColumnDefinitionTypeString},
+			// accepted in the where clause only; the DefGenerator pushes it into
+			// the aggregate and strips it before the outer query runs.
+			"resource_service_name": {Type: ColumnDefinitionTypeString, Def: "tags -> 'nb_service_name' ->> 0"},
+			"cm_net":                {Type: ColumnDefinitionTypeFloat},
+			"cm_gross":              {Type: ColumnDefinitionTypeFloat},
+			"cm_credits":            {Type: ColumnDefinitionTypeFloat},
+			"lm_net":                {Type: ColumnDefinitionTypeFloat},
+			"lm_gross":              {Type: ColumnDefinitionTypeFloat},
+			"lm_credits":            {Type: ColumnDefinitionTypeFloat},
+			"yr_net":                {Type: ColumnDefinitionTypeFloat},
+			"yr_gross":              {Type: ColumnDefinitionTypeFloat},
+			"yr_credits":            {Type: ColumnDefinitionTypeFloat},
+		},
+	},
 	"audits_v2": {
 		Type:                Normal,
 		Source:              getSource("audits_v2"),
@@ -2741,7 +3175,7 @@ var table_metadata = map[string]TableDefinition{
 			traceProvider, traceProviderUrl, hasMaterializedColumn := GetTracesProviderAndUrl(ctx, accountId)
 			baseQuery := fmt.Sprintf(`(SELECT workload_zone, destination_workload_zone, TraceId AS trace_id, SpanId AS span_id, ParentSpanId AS parent_span_id, cloud_availability_zone, workload_namespace,workload_name, Timestamp AS timestamp, StatusCode AS status_code, SpanName AS span_name, resource, Duration AS duration_ns, destination_workload_name, destination_workload_namespace, destination_name, headers, http_status_code, request_payload, http_response, trace_source FROM %s) AS traces_grouping_v2`, tableName)
 			if !hasMaterializedColumn {
-				baseQuery = fmt.Sprintf(`(SELECT ResourceAttributes['cloud.availability_zone'] AS workload_zone, SpanAttributes['destination.cloud.availablity_zone'] AS destination_workload_zone, TraceId AS trace_id, SpanId AS span_id, ParentSpanId AS parent_span_id, ResourceAttributes['cloud.availability_zone'] AS cloud_availability_zone, CASE WHEN mapContains(SpanAttributes, 'source.workload_namespace') THEN SpanAttributes['source.workload_namespace'] WHEN mapContains(ResourceAttributes, 'k8s.namespace.name') THEN ResourceAttributes['k8s.namespace.name'] ELSE ResourceAttributes['service.namespace'] END AS workload_namespace, CASE WHEN mapContains(SpanAttributes, 'source.workload_name') THEN SpanAttributes['source.workload_name'] WHEN mapContains(ResourceAttributes, 'k8s.deployment.name') THEN ResourceAttributes['k8s.deployment.name'] ELSE ResourceAttributes['service.name'] END AS workload_name, Timestamp AS timestamp, StatusCode AS status_code, SpanName AS span_name, CASE WHEN mapContains(SpanAttributes, 'db.statement') THEN SpanAttributes['db.statement'] ELSE SpanAttributes['http.url'] END AS resource, Duration AS duration_ns, CASE WHEN mapContains(SpanAttributes, 'destination.workload_name') THEN SpanAttributes['destination.workload_name'] WHEN mapContains(ResourceAttributes, 'k8s.deployment.name') THEN ResourceAttributes['k8s.deployment.name'] WHEN mapContains(ResourceAttributes, 'service.name') THEN ResourceAttributes['service.name'] ELSE ResourceAttributes['net.peer.name'] END AS destination_workload_name, CASE WHEN mapContains(SpanAttributes, 'destination.workload_namespace') THEN SpanAttributes['destination.workload_namespace'] WHEN mapContains(ResourceAttributes, 'k8s.namespace.name') THEN ResourceAttributes['k8s.namespace.name'] ELSE ResourceAttributes['service.namespace'] END AS destination_workload_namespace, CASE WHEN mapContains(SpanAttributes, 'destination.name') THEN SpanAttributes['destination.name'] WHEN mapContains(ResourceAttributes, 'service.name') THEN ResourceAttributes['service.name'] ELSE ResourceAttributes['net.peer.name'] END AS destination_name, SpanAttributes['http.headers'] AS headers, SpanAttributes['http.status_code'] AS http_status_code, SpanAttributes['http.request_payload'] AS request_payload, SpanAttributes['http.response'] AS http_response, %s AS trace_source FROM %s) AS traces_grouping_v2`, traceSourceExpr(tableName), tableName)
+				baseQuery = fmt.Sprintf(`(SELECT ResourceAttributes['cloud.availability_zone'] AS workload_zone, SpanAttributes['destination.cloud.availability_zone'] AS destination_workload_zone, TraceId AS trace_id, SpanId AS span_id, ParentSpanId AS parent_span_id, ResourceAttributes['cloud.availability_zone'] AS cloud_availability_zone, CASE WHEN mapContains(SpanAttributes, 'source.workload_namespace') THEN SpanAttributes['source.workload_namespace'] WHEN mapContains(ResourceAttributes, 'k8s.namespace.name') THEN ResourceAttributes['k8s.namespace.name'] ELSE ResourceAttributes['service.namespace'] END AS workload_namespace, CASE WHEN mapContains(SpanAttributes, 'source.workload_name') THEN SpanAttributes['source.workload_name'] WHEN mapContains(ResourceAttributes, 'k8s.deployment.name') THEN ResourceAttributes['k8s.deployment.name'] ELSE ResourceAttributes['service.name'] END AS workload_name, Timestamp AS timestamp, StatusCode AS status_code, SpanName AS span_name, CASE WHEN mapContains(SpanAttributes, 'db.statement') THEN SpanAttributes['db.statement'] ELSE SpanAttributes['http.url'] END AS resource, Duration AS duration_ns, CASE WHEN mapContains(SpanAttributes, 'destination.workload_name') THEN SpanAttributes['destination.workload_name'] WHEN mapContains(ResourceAttributes, 'k8s.deployment.name') THEN ResourceAttributes['k8s.deployment.name'] WHEN mapContains(ResourceAttributes, 'service.name') THEN ResourceAttributes['service.name'] ELSE ResourceAttributes['net.peer.name'] END AS destination_workload_name, CASE WHEN mapContains(SpanAttributes, 'destination.workload_namespace') THEN SpanAttributes['destination.workload_namespace'] WHEN mapContains(ResourceAttributes, 'k8s.namespace.name') THEN ResourceAttributes['k8s.namespace.name'] ELSE ResourceAttributes['service.namespace'] END AS destination_workload_namespace, CASE WHEN mapContains(SpanAttributes, 'destination.name') THEN SpanAttributes['destination.name'] WHEN mapContains(ResourceAttributes, 'service.name') THEN ResourceAttributes['service.name'] ELSE ResourceAttributes['net.peer.name'] END AS destination_name, SpanAttributes['http.headers'] AS headers, SpanAttributes['http.status_code'] AS http_status_code, SpanAttributes['http.request_payload'] AS request_payload, SpanAttributes['http.response'] AS http_response, %s AS trace_source FROM %s) AS traces_grouping_v2`, traceSourceExpr(tableName), tableName)
 			}
 			if traceProvider == "bigquery" {
 				baseQuery = fmt.Sprintf(`(SELECT span.attributes.attributeMap.source_workload_namespace AS workload_namespace, span.attributes.attributeMap.source_workload_name AS workload_name, span.startTime AS timestamp, span.displayName.value AS span_name, CASE WHEN SAFE_CAST(span.attributes.attributeMap._http_status_code AS INT64) >= 400 OR SAFE_CAST(span.attributes.attributeMap._http_status_code AS INT64) < 200 OR SAFE_CAST(span.attributes.attributeMap._http_status_code AS INT64) IS NULL THEN 'STATUS_CODE_ERROR' ELSE 'STATUS_CODE_UNSET' END AS status_code, span.attributes.attributeMap._http_status_code as http_status_code, TIMESTAMP_DIFF(span.endTime, span.startTime, MICROSECOND) * 1000 AS duration_ns, CASE WHEN span.attributes.attributeMap.http_url IS NOT NULL THEN span.attributes.attributeMap.http_url ELSE span.attributes.attributeMap._http_path END AS resource, CASE WHEN span.attributes.attributeMap.destination_workload_name IS NOT NULL THEN span.attributes.attributeMap.destination_workload_name ELSE span.attributes.attributeMap.net_peer_name END AS destination_workload_name, CASE WHEN span.attributes.attributeMap.destination_workload_namespace IS NOT NULL THEN span.attributes.attributeMap.destination_workload_namespace ELSE span.attributes.attributeMap.destination_namespace END AS destination_workload_namespace FROM %s) AS traces_grouping_v2`, traceProviderUrl)
@@ -2939,36 +3373,6 @@ var table_metadata = map[string]TableDefinition{
 		Source:           database.Metastore,
 		Name:             "recommendation_groupings_v2",
 		DefGenerator: func(ctx *security.RequestContext, accountId string, request QueryRequest) (string, QueryRequest, error) {
-			// Push down these filters into the subquery so the planner can use
-			// idx_recommendation_tenant_account_status(tenant_id, cloud_account_id, status, category, rule_name)
-			pushdownFilters := extractFilterSQL(&request, "account_id", "r.cloud_account_id")
-			pushdownFilters += extractFilterSQL(&request, "status", "r.status")
-			pushdownFilters += extractFilterSQL(&request, "category", "r.category")
-			pushdownFilters += extractFilterSQL(&request, "rule_name", "r.rule_name")
-			// Push tenant_id into the CTE for the same reason the sibling recommendations_v2
-			// generator does (see its comment): the ROW_NUMBER() window's PARTITION BY does
-			// not include tenant_id, so the planner cannot push an outer tenant filter through
-			// the window fence. Without it the CTE windows every tenant's recommendations
-			// (joined to cloud_resourses, detoasting the meta jsonb) before the outer query
-			// narrows to one tenant. It also completes the leading column of the composite
-			// idx_recommendation_tenant_account_status index. tenant_id is injected by the
-			// security layer as an _and clause, not into _binary, so it is not extracted by
-			// the calls above — take it straight from the security context.
-			sc := ctx.GetSecurityContext()
-			tenantId := sc.GetTenantId()
-			if tenantId == "" && !sc.IsSuperAdmin() {
-				// Fail closed: a non-super-admin must always be tenant-scoped.
-				return "", request, fmt.Errorf("tenant_id is required")
-			}
-			if tenantId != "" {
-				pushdownFilters += " AND r.tenant_id = " + (&postgresDialect{}).QuoteLiteral(tenantId)
-			}
-
-			// Fast path: when no column requiring a JOIN or the dedup window function is
-			// needed (e.g. pure count queries like count_recommendations), skip the CTE
-			// entirely and scan recommendation directly. This avoids the LEFT JOINs to
-			// cloud_resourses / cloud_accounts and the ROW_NUMBER() window function.
-			//
 			// joinRequiringCols is only the columns projected out of the cloud_resourses /
 			// cloud_accounts joins. The two dedup columns are tracked separately in
 			// windowRequiringCols: they need the ROW_NUMBER() window but not the
@@ -3030,6 +3434,43 @@ var table_metadata = map[string]TableDefinition{
 			needsJoin := references(joinRequiringCols)
 			needsWindow := references(windowRequiringCols)
 
+			isFastPath := !needsJoin && !needsWindow
+
+			// status/rule_name pre-window can crown the wrong row primary; only
+			// safe fast-path or rule_name='image_scan' (resource_id always NULL).
+			pushdownFilters := extractFilterSQL(&request, "account_id", "r.cloud_account_id")
+			pushdownFilters += extractFilterSQL(&request, "category", "r.category")
+			ruleNameFilterSQL := renderFilterSQLForColumn(&request, "rule_name", "r.rule_name")
+			isImageScanOnly := imageScanOnlyRuleNameFilter.MatchString(ruleNameFilterSQL)
+			switch {
+			case isFastPath:
+				pushdownFilters += extractFilterSQL(&request, "status", "r.status")
+				pushdownFilters += extractFilterSQL(&request, "rule_name", "r.rule_name")
+				pushdownFilters += extractFilterSQL(&request, "severity", "r.severity")
+			case isImageScanOnly:
+				pushdownFilters += extractFilterSQL(&request, "rule_name", "r.rule_name")
+				pushdownFilters += extractFilterSQL(&request, "severity", "r.severity")
+			}
+
+			// Push tenant_id into the CTE for the same reason the sibling recommendations_v2
+			// generator does (see its comment): the ROW_NUMBER() window's PARTITION BY does
+			// not include tenant_id, so the planner cannot push an outer tenant filter through
+			// the window fence. Without it the CTE windows every tenant's recommendations
+			// (joined to cloud_resourses, detoasting the meta jsonb) before the outer query
+			// narrows to one tenant. It also completes the leading column of the composite
+			// idx_recommendation_tenant_account_status index. tenant_id is injected by the
+			// security layer as an _and clause, not into _binary, so it is not extracted by
+			// the calls above — take it straight from the security context.
+			sc := ctx.GetSecurityContext()
+			tenantId := sc.GetTenantId()
+			if tenantId == "" && !sc.IsSuperAdmin() {
+				// Fail closed: a non-super-admin must always be tenant-scoped.
+				return "", request, fmt.Errorf("tenant_id is required")
+			}
+			if tenantId != "" {
+				pushdownFilters += " AND r.tenant_id = " + (&postgresDialect{}).QuoteLiteral(tenantId)
+			}
+
 			// The vulnerabilities join is its own opt-in, separate from needsJoin
 			// above: unlike cloud_resourses/cloud_accounts (needed by many common
 			// columns), it's only relevant to the 3 columns that actually read
@@ -3054,7 +3495,7 @@ var table_metadata = map[string]TableDefinition{
 				v.data_source AS v_data_source, v.details AS v_details`
 			}
 
-			if !needsJoin && !needsWindow {
+			if isFastPath {
 				def := `(
 		SELECT
 			r.*` + vulnCols + `,
@@ -3097,7 +3538,11 @@ var table_metadata = map[string]TableDefinition{
 							ELSE r.id::text
 						END,
 						r.category
-					ORDER BY r.estimated_savings DESC, r.updated_at DESC, r.id
+					ORDER BY
+						-- Terminal rows sort last; must match
+						-- tools.PrimaryRecommendationRank in llm-server.
+						CASE WHEN r.status IN ('Archive', 'Closed') THEN 1 ELSE 0 END,
+						r.estimated_savings DESC, r.updated_at DESC, r.id
 				) AS resource_rank` + vulnCols + `
 			FROM recommendation r
 			LEFT JOIN cloud_accounts ca ON ca.id = r.cloud_account_id
@@ -3148,6 +3593,10 @@ var table_metadata = map[string]TableDefinition{
 							-- Per-resource recommendations: one primary per (resource, category) wins.
 							WHEN r.resource_id IS NOT NULL THEN r.resource_id::text
 							-- Azure-shaped fallback (kept while Azure ingestion still relies on it).
+							-- NOTE: llm-server mirrors this whole partition in
+							-- tools.PrimaryRecommendationRank so chat and this page report the
+							-- same savings (#36673). Change both together, or Azure/AWS totals
+							-- diverge across surfaces again.
 							-- Gated on cloud_provider FIRST so the jsonb tests are only reached for
 							-- Azure rows. Without the gate every non-Azure row that falls through the
 							-- branches above detoasts the recommendation jsonb up to four times just
@@ -3168,7 +3617,11 @@ var table_metadata = map[string]TableDefinition{
 							ELSE r.id::text
 						END,
 						r.category
-					ORDER BY r.estimated_savings DESC, r.updated_at DESC, r.id
+					ORDER BY
+						-- Terminal rows sort last; must match
+						-- tools.PrimaryRecommendationRank in llm-server.
+						CASE WHEN r.status IN ('Archive', 'Closed') THEN 1 ELSE 0 END,
+						r.estimated_savings DESC, r.updated_at DESC, r.id
 				) AS resource_rank` + vulnCols + `
 			FROM recommendation r
 			LEFT JOIN cloud_resourses cr ON cr.id = r.resource_id
@@ -3190,6 +3643,10 @@ var table_metadata = map[string]TableDefinition{
 		TenantIdColumnName:  "tenant_id",
 		AccountIdColumnName: "cloud_account_id",
 		Columns: map[string]ColumnDefinition{
+			"id": {
+				Type: ColumnDefinitionTypeString,
+				Def:  "id",
+			},
 			"tenant_id": {
 				Type: ColumnDefinitionTypeString,
 				Def:  "tenant_id",
@@ -3283,9 +3740,14 @@ var table_metadata = map[string]TableDefinition{
 				Def:          "count(*)",
 				IsAggregated: true,
 			},
+			// GREATEST clamps at the roll-up, not in the stored row: a negative
+			// estimated_savings is a real cost impact (an under-provisioned
+			// right-sizing costs more to apply) that the Optimise table and the
+			// "Cost increase (< $0)" filter both render, so the row keeps its
+			// sign and only the savings headline drops it.
 			"sum_estimated_savings": {
 				Type:         ColumnDefinitionTypeFloat,
-				Def:          "sum(CASE WHEN is_primary_recommendation THEN estimated_savings ELSE 0 END)",
+				Def:          "sum(CASE WHEN is_primary_recommendation THEN GREATEST(estimated_savings, 0) ELSE 0 END)",
 				IsAggregated: true,
 			},
 			// VM package-scan findings (rule_name = 'vm_package_vulnerability') keep
@@ -3426,10 +3888,12 @@ var table_metadata = map[string]TableDefinition{
 		Type:             Normal,
 		Source:           database.Metastore,
 		DefGenerator: func(ctx *security.RequestContext, accountId string, request QueryRequest) (string, QueryRequest, error) {
-			// Drive from recommendation using idx_recommendation_security_status_weight
-			// (cloud_account_id, status, severity_weight DESC) so the planner can seek to
-			// (account, status='Open') and scan in severity order, stopping at LIMIT without
-			// sorting all 400K+ rows.
+			// Drive from recommendation using idx_recommendation_severity_weight
+			// (cloud_account_id, status, severity_weight DESC) — shared with
+			// recommendations_v2 and the CIS/misconfig groupings, not image_scan-
+			// specific — so the planner can seek to (account, status='Open') and
+			// scan in severity order, stopping at LIMIT without sorting all
+			// matching rows.
 			// pod_container is an inline subquery (NOT a CTE) so PostgreSQL can pull the entire
 			// def up into the outer query — a CTE barrier would prevent the planner from seeing
 			// the recommendation table and applying the index for the outer ORDER BY + LIMIT.
@@ -3442,6 +3906,13 @@ var table_metadata = map[string]TableDefinition{
 			// choose a more efficient join strategy.
 			podAccountFilter := extractFilterSQL(&request, "account_id", "pc.cloud_account_id")
 			recAccountFilter := strings.Replace(podAccountFilter, "pc.cloud_account_id", "rec.cloud_account_id", 1)
+			// Tenant filter arrives as an _and clause from the security layer, so
+			// extractFilterSQL leaves it enforced in the outer WHERE and the copies
+			// pushed here act purely as planner hints — without them a cross-account
+			// request (no account filter) scans every tenant's pods and findings
+			// inside the subqueries before the outer tenant filter applies.
+			podTenantFilter := extractFilterSQL(&request, "tenant_id", "pc.tenant_id")
+			recTenantFilter := strings.Replace(podTenantFilter, "pc.tenant_id", "rec.tenant_id", 1)
 			recStatusFilter := extractFilterSQL(&request, "status", "rec.status")
 			recSeverityFilter := extractFilterSQL(&request, "severity", "rec.severity")
 			podNamespaceFilter := extractFilterSQL(&request, "namespace", "pc.\"namespace\"")
@@ -3486,13 +3957,13 @@ var table_metadata = map[string]TableDefinition{
 					container->>'image' AS image
 				FROM k8s_pods pc,
 					LATERAL jsonb_array_elements(pc.meta->'config'->'containers') AS container
-				WHERE pc.is_active IS NOT FALSE` + podAccountFilter + podNamespaceFilter + `
+				WHERE pc.is_active IS NOT FALSE` + podAccountFilter + podTenantFilter + podNamespaceFilter + `
 			) cr ON cr.cloud_account_id = rec.cloud_account_id
 				AND cr.tenant_id        = rec.tenant_id
 				AND cr.image            = rec.recommendation->>'image_name'
 			WHERE rec.category            = 'Security'
 				AND rec.rule_name         = 'image_scan'
-				AND rec.account_object_id IS NOT NULL` + recAccountFilter + recStatusFilter + recSeverityFilter + `
+				AND rec.account_object_id IS NOT NULL` + recAccountFilter + recTenantFilter + recStatusFilter + recSeverityFilter + `
 		) AS t
 		`
 			return def, request, nil
@@ -3570,6 +4041,11 @@ var table_metadata = map[string]TableDefinition{
 			// instead of all pods for the account.
 			podAccountFilter := extractFilterSQL(&request, "account_id", "cr.cloud_account_id")
 			outerAccountFilter := strings.Replace(podAccountFilter, "cr.cloud_account_id", "pc.cloud_account_id", 1)
+			// Planner hint for cross-account requests — the tenant filter stays
+			// enforced in the outer WHERE (it arrives as an _and clause; see
+			// recommendation_security_v2 above). Both CTE paths alias k8s_pods as
+			// cr; the recommendation sides already bind tenant via the pod rows.
+			podTenantFilter := extractFilterSQL(&request, "tenant_id", "cr.tenant_id")
 			podNamespaceFilter := extractFilterSQL(&request, "namespace", "cr.\"namespace\"")
 			// rec2 alias is used in the heavy-path LATERAL; r alias is used in the light-path EXISTS.
 			recStatusFilter := extractFilterSQL(&request, "status", "rec2.status")
@@ -3605,7 +4081,7 @@ var table_metadata = map[string]TableDefinition{
 					cr.tenant_id                   AS tenant_id
 				FROM k8s_pods cr,
 					lateral jsonb_array_elements(cr.meta->'config'->'containers') AS container
-				WHERE cr.is_active IS NOT FALSE` + podAccountFilter + podNamespaceFilter + `
+				WHERE cr.is_active IS NOT FALSE` + podAccountFilter + podTenantFilter + podNamespaceFilter + `
 			)
 			SELECT DISTINCT
 				pi.namespace      AS namespace,
@@ -3750,7 +4226,7 @@ var table_metadata = map[string]TableDefinition{
 					cr.tenant_id         AS tenant_id
 				FROM k8s_pods cr,
 					lateral jsonb_array_elements(cr.meta->'config'->'containers') AS container
-				WHERE cr.is_active IS NOT FALSE` + podAccountFilter + podNamespaceFilter + `
+				WHERE cr.is_active IS NOT FALSE` + podAccountFilter + podTenantFilter + podNamespaceFilter + `
 			)
 			SELECT
 				pc.tenant_id         AS tenant_id,
@@ -4242,6 +4718,34 @@ var table_metadata = map[string]TableDefinition{
 				Type: ColumnDefinitionTypeString,
 				Def:  "status",
 			},
+			// The status a human recognises, mirroring what kubectl prints. `status`
+			// above is only the pod PHASE, which is "Running" for a pod stuck in
+			// CrashLoopBackOff and "Pending" for one stuck in ImagePullBackOff -- so
+			// on its own it cannot distinguish a broken pod from a healthy one. The
+			// reason kubectl shows lives in the container statuses, which the agent
+			// ships in meta.status_info.
+			//
+			// Precedence follows kubectl: an init container that is not done blocks
+			// the pod, so its reason wins; then the app containers; falling back to
+			// NULL so callers can use `status` when there is nothing more specific.
+			// Computed rather than stored: it changes with every container
+			// transition, and a column would need a migration plus a writer.
+			"container_status": {
+				Type: ColumnDefinitionTypeString,
+				Def:  `COALESCE(container_status, ` + podContainerStatusExpr("meta") + `)`,
+			},
+			// What the Status filter and the Summary counts are keyed on: the
+			// container reason when there is one, the phase otherwise -- the same
+			// value the table renders, so filtering for CrashLoopBackOff returns
+			// exactly the rows that read CrashLoopBackOff.
+			//
+			// The stored column only, with no jsonb fallback: unlike
+			// container_status above this one lands in WHERE and GROUP BY, where it
+			// is evaluated for every row scanned rather than the 25 on screen.
+			"display_status": {
+				Type: ColumnDefinitionTypeString,
+				Def:  "COALESCE(container_status, status)",
+			},
 			"node_name": {
 				Type: ColumnDefinitionTypeString,
 				Def:  "node_name",
@@ -4337,7 +4841,7 @@ var table_metadata = map[string]TableDefinition{
 			},
 			"workload_count": {
 				Type: ColumnDefinitionTypeInt,
-				Def:  "workload_count",
+				Def:  "(SELECT COUNT(*) FROM k8s_workloads WHERE k8s_workloads.cloud_account_id = k8s_namespaces.cloud_account_id::uuid AND k8s_workloads.tenant_id = k8s_namespaces.tenant_id::uuid AND k8s_workloads.namespace = k8s_namespaces.name AND k8s_workloads.is_active = true)",
 			},
 			"pod_count": {
 				Type: ColumnDefinitionTypeInt,
@@ -4556,6 +5060,24 @@ var table_metadata = map[string]TableDefinition{
 			"pod_fqdn": {
 				Type: ColumnDefinitionTypeString,
 				Def:  "concat(namespace, '/', name)",
+			},
+			// The pods list sends one where to both tables -- rows from
+			// k8s_pods_v2, the result count from here -- so a column missing on
+			// this side fails the count with "column not found in table" the
+			// moment the user picks a status.
+			//
+			// container_status is the stored column alone here, without the jsonb
+			// fallback k8s_pods_v2 adds for display: this table only ever groups
+			// and filters, and a jsonb read in a WHERE runs for every row scanned
+			// (minutes over the 333k historical pods one account holds), not for
+			// the page being shown.
+			"container_status": {
+				Type: ColumnDefinitionTypeString,
+				Def:  "container_status",
+			},
+			"display_status": {
+				Type: ColumnDefinitionTypeString,
+				Def:  "COALESCE(container_status, status)",
 			},
 			"creation_time": {
 				Type: ColumnDefinitionTypeDatetime,
@@ -5007,15 +5529,18 @@ var table_metadata = map[string]TableDefinition{
 		Source:           database.Metastore,
 		DefGenerator: func(ctx *security.RequestContext, accountId string, request QueryRequest) (string, QueryRequest, error) {
 			pushdownFilters := extractFilterSQL(&request, "account_id", "r.cloud_account_id")
-			pushdownFilters += extractFilterSQL(&request, "status", "r.status")
-			// id is not part of PARTITION BY, so pushing it pre-window would narrow
-			// the sibling set is_primary_recommendation is ranked against — a caller
-			// that filters by id AND reads that column would see rank computed only
-			// among the requested ids, not the full history. Only take the shortcut
-			// when the request provably doesn't touch that column (mirrors the
-			// joinRequiringCols guard in recommendation_groupings_v2 above); otherwise
-			// fall back to the correct-but-slower outer-filter path.
-			if !requestReferencesColumns(request, map[string]bool{"is_primary_recommendation": true}) {
+			// needsWindow: is_primary_recommendation is a ROW_NUMBER() OVER (...) window,
+			// which Postgres cannot compute until it has materialized every row in the
+			// partition — that defeats the ORDER BY .. LIMIT top-N pushdown every paginated
+			// caller relies on. The two real production callers (the main recommendations
+			// table, the vulnerabilities list) never reference this column; only the
+			// dashboard-panel "Is primary" filter/column does. Gated the same way as the
+			// sibling recommendation_groupings_v2 generator above (windowRequiringCols).
+			needsWindow := requestReferencesColumns(request, map[string]bool{"is_primary_recommendation": true})
+			// status/id/rule_name/account_object_id pre-window can crown the wrong
+			// row primary (same bug class as recommendation_groupings_v2 above).
+			if !needsWindow {
+				pushdownFilters += extractFilterSQL(&request, "status", "r.status")
 				pushdownFilters += extractFilterSQL(&request, "id", "r.id")
 				pushdownFilters += extractFilterSQL(&request, "rule_name", "r.rule_name")
 				pushdownFilters += extractFilterSQL(&request, "account_object_id", "r.account_object_id")
@@ -5059,10 +5584,9 @@ var table_metadata = map[string]TableDefinition{
 							v.cvss_score AS v_cvss_score, v.cvss_vector AS v_cvss_vector, v.description AS v_description,
 							v.data_source AS v_data_source, v.details AS v_details`
 			}
-			def := `(
-					WITH all_recommendations AS (
-						SELECT
-							r.*,
+			// resourceCols is shared verbatim by both shapes below — the join and its
+			// display projection are unaffected by needsWindow, only the ranking is.
+			resourceCols := `
 							COALESCE(
 								cr.meta ->> 'namespace',
 								cr.meta -> 'config' ->> 'namespace',
@@ -5084,7 +5608,30 @@ var table_metadata = map[string]TableDefinition{
 							cr.cloud_provider as resource_cloud_provider,
 							cr.arn as resource_arn,
 							cr.region as resource_region,
-							cr.status as resource_status,
+							cr.status as resource_status`
+
+			if !needsWindow {
+				// Lean path: no CTE, no ROW_NUMBER(). Same join and display columns (the
+				// main recommendations table and the vulnerabilities list both need
+				// resource_name/resource_type), but skipping the window lets Postgres push
+				// ORDER BY .. LIMIT through as a top-N heapsort straight off the join
+				// instead of first materializing and ranking every matching row.
+				def := `(
+					SELECT
+						r.*,` + resourceCols + vulnCols + `
+					FROM recommendation r
+					LEFT JOIN cloud_resourses cr ON cr.id = r.resource_id
+					LEFT JOIN cloud_accounts ca ON ca.id = r.cloud_account_id
+					` + vulnJoin + `
+					WHERE ca.status = 'active'` + pushdownFilters + `
+				) as r1`
+				return def, request, nil
+			}
+
+			def := `(
+					WITH all_recommendations AS (
+						SELECT
+							r.*,` + resourceCols + `,
 							ROW_NUMBER() OVER (
 								PARTITION BY
 									CASE
@@ -5101,7 +5648,11 @@ var table_metadata = map[string]TableDefinition{
 										ELSE r.id::text
 									END,
 									r.category
-								ORDER BY r.estimated_savings DESC, r.updated_at DESC, r.id
+								ORDER BY
+						-- Terminal rows sort last; must match
+						-- tools.PrimaryRecommendationRank in llm-server.
+						CASE WHEN r.status IN ('Archive', 'Closed') THEN 1 ELSE 0 END,
+						r.estimated_savings DESC, r.updated_at DESC, r.id
 							) AS resource_rank` + vulnCols + `
 						FROM recommendation r
 						LEFT JOIN cloud_resourses cr ON cr.id = r.resource_id
@@ -5362,7 +5913,7 @@ var table_metadata = map[string]TableDefinition{
 			},
 			"sum_estimated_savings": {
 				Type:         ColumnDefinitionTypeFloat,
-				Def:          "sum(estimated_savings)",
+				Def:          "sum(GREATEST(estimated_savings, 0))",
 				IsAggregated: true,
 			},
 		},
@@ -5959,6 +6510,13 @@ var table_metadata = map[string]TableDefinition{
 				resourceWhereStrNoStatus = "1 = 1"
 			}
 
+			// Scope the spend/recommendation sub-aggregations to the account too;
+			// without it the planner rolls those tables up across every account before
+			// the join discards all but one (full seq scan of spends). Their columns
+			// are named differently, and this must precede the extractFilterSQL below.
+			spendAcctTenantWhereSQL := renderFilterSQLForColumn(&request, "account_id", "cloud_account") + renderFilterSQLForColumn(&request, "tenant_id", "tenant")
+			recAcctTenantWhereSQL := renderFilterSQLForColumn(&request, "account_id", "cloud_account_id") + renderFilterSQLForColumn(&request, "tenant_id", "tenant_id")
+
 			// Push account_id and tenant_id into the CTE so the planner can use
 			// the account/tenant index before the full status+type scan.
 			// extractFilterSQL also removes them from request.Where to avoid
@@ -5996,10 +6554,10 @@ var table_metadata = map[string]TableDefinition{
 					// cost includes spend on now-Deleted resources. resource_count below still
 					// comes from the status-filtered resource_base.
 					spendResourceBaseCTE = `, spend_resource_base as (select tenant, account, id, service_name from cloud_resourses where __resources_nostatus__where__)`
-					spendJoin = `left join (select sum(spends1.spend_amount) as spend_amount, cr2.tenant, cr2.service_name, spends1.cloud_account from (select amount as spend_amount, "date" as spend_date, cloud_resource_id, cloud_account from spends) spends1 join spend_resource_base cr2 on cr2.id = spends1.cloud_resource_id and cr2.account = spends1.cloud_account where __spends__where__ group by cr2.tenant, cr2.service_name, spends1.cloud_account) s on s.tenant = cr.tenant and s.service_name = cr.service_name and s.cloud_account = cr.account`
+					spendJoin = `left join (select sum(spends1.spend_amount) as spend_amount, cr2.tenant, cr2.service_name, spends1.cloud_account from (select amount as spend_amount, "date" as spend_date, cloud_resource_id, cloud_account from spends where __spends_acct__where__) spends1 join spend_resource_base cr2 on cr2.id = spends1.cloud_resource_id and cr2.account = spends1.cloud_account where __spends__where__ group by cr2.tenant, cr2.service_name, spends1.cloud_account) s on s.tenant = cr.tenant and s.service_name = cr.service_name and s.cloud_account = cr.account`
 				}
 				if needsRec {
-					recJoin = `left join (select count(*) as recommendation_count, sum(r1.recommendation_estimated_savings) as recommendation_estimated_savings, r1.cloud_account_id, cr3.tenant, cr3.service_name from (select id as recommendation_id, rule_name as recommendation_rule_name, category as recommendation_category, status as recommendation_status, severity as recommendation_severity, estimated_savings as recommendation_estimated_savings, resource_id, cloud_account_id from recommendation) r1 join resource_base cr3 on cr3.id = r1.resource_id and cr3.account = r1.cloud_account_id where __recommendations__where__ group by cr3.tenant, cr3.service_name, r1.cloud_account_id) r on r.tenant = cr.tenant and r.service_name = cr.service_name and r.cloud_account_id = cr.account`
+					recJoin = `left join (select count(*) as recommendation_count, sum(r1.recommendation_estimated_savings) as recommendation_estimated_savings, r1.cloud_account_id, cr3.tenant, cr3.service_name from (select id as recommendation_id, rule_name as recommendation_rule_name, category as recommendation_category, status as recommendation_status, severity as recommendation_severity, estimated_savings as recommendation_estimated_savings, resource_id, cloud_account_id from recommendation where __recommendations_acct__where__) r1 join resource_base cr3 on cr3.id = r1.resource_id and cr3.account = r1.cloud_account_id where __recommendations__where__ group by cr3.tenant, cr3.service_name, r1.cloud_account_id) r on r.tenant = cr.tenant and r.service_name = cr.service_name and r.cloud_account_id = cr.account`
 				}
 				baseQuery = fmt.Sprintf(`(
 					with resource_base as (
@@ -6015,10 +6573,10 @@ var table_metadata = map[string]TableDefinition{
 				) as resource_group`, spendResourceBaseCTE, spendSelect, recSelect, spendJoin, recJoin)
 			} else {
 				if needsSpend {
-					spendJoin = `left join (select sum(spend_amount) as spend_amount, cloud_resource_id, cloud_account from (select amount as spend_amount, "date" as spend_date, cloud_resource_id, cloud_account from spends) spends1 where __spends__where__ group by cloud_resource_id, cloud_account) s on s.cloud_resource_id = cr.id and s.cloud_account = cr.account`
+					spendJoin = `left join (select sum(spend_amount) as spend_amount, cloud_resource_id, cloud_account from (select amount as spend_amount, "date" as spend_date, cloud_resource_id, cloud_account from spends where __spends_acct__where__) spends1 where __spends__where__ group by cloud_resource_id, cloud_account) s on s.cloud_resource_id = cr.id and s.cloud_account = cr.account`
 				}
 				if needsRec {
-					recJoin = `left join (select count(*) as recommendation_count, sum(recommendation_estimated_savings) as recommendation_estimated_savings, resource_id, cloud_account_id from (select id as recommendation_id, rule_name as recommendation_rule_name, category as recommendation_category, status as recommendation_status, severity as recommendation_severity, estimated_savings as recommendation_estimated_savings, resource_id, cloud_account_id from recommendation ) r1 where __recommendations__where__ group by resource_id, cloud_account_id ) r on r.resource_id = cr.id and r.cloud_account_id = cr.account`
+					recJoin = `left join (select count(*) as recommendation_count, sum(recommendation_estimated_savings) as recommendation_estimated_savings, resource_id, cloud_account_id from (select id as recommendation_id, rule_name as recommendation_rule_name, category as recommendation_category, status as recommendation_status, severity as recommendation_severity, estimated_savings as recommendation_estimated_savings, resource_id, cloud_account_id from recommendation where __recommendations_acct__where__ ) r1 where __recommendations__where__ group by resource_id, cloud_account_id ) r on r.resource_id = cr.id and r.cloud_account_id = cr.account`
 				}
 				baseQuery = fmt.Sprintf(`(
 					select cr.tenant as tenant_id, cr.account as account_id, cr.id, cr.name, cr.service_name, cr.status, cr."type", cr.region, cr.arn, cr.tags
@@ -6035,6 +6593,8 @@ var table_metadata = map[string]TableDefinition{
 			baseQuery = strings.ReplaceAll(baseQuery, "__resources__where__", resourceWhereStr)
 			baseQuery = strings.ReplaceAll(baseQuery, "__spends__where__", spendsWhereStr)
 			baseQuery = strings.ReplaceAll(baseQuery, "__recommendations__where__", recommendationWhereStr)
+			baseQuery = strings.ReplaceAll(baseQuery, "__spends_acct__where__", "1 = 1"+spendAcctTenantWhereSQL)
+			baseQuery = strings.ReplaceAll(baseQuery, "__recommendations_acct__where__", "1 = 1"+recAcctTenantWhereSQL)
 
 			return baseQuery, request, nil
 		},
@@ -6565,11 +7125,23 @@ var table_metadata = map[string]TableDefinition{
 					nr.severity,
 					nr.delivery_mode,
 					nr.frequency,
+					nr.event_types,
+					nr.scope_mode,
+					COALESCE(nra.account_ids, '[]'::jsonb) as account_ids,
+					nr.exceptions,
+					nr.source_mode,
+					COALESCE(to_jsonb(nr.sources), jsonb_build_array(nr.source)) as sources,
+					COALESCE(nr.is_active, true) as is_active,
 					nr.tenant_id::text as tenant_id,
 					u.display_name as created_by_display_name,
 					COALESCE(nrm.mappings, '[]'::json) as notification_rule_mappings
 			FROM notification_rules nr
 			LEFT JOIN users u ON u.id = nr.created_by
+			LEFT JOIN (
+					SELECT rule_id, jsonb_agg(account_id::text ORDER BY account_id) as account_ids
+					FROM notification_rule_accounts
+					GROUP BY rule_id
+			) nra ON nra.rule_id = nr.id
 			LEFT JOIN (
 					SELECT
 							rule_id,
@@ -6582,6 +7154,7 @@ var table_metadata = map[string]TableDefinition{
 					GROUP BY rule_id
 			) nrm ON nrm.rule_id = nr.id
 	) as notification_rules_v2`,
+		AccountScope: notificationRuleAccountScope("notification_rules_v2"),
 		Columns: map[string]ColumnDefinition{
 			"id": {
 				Type: ColumnDefinitionTypeString,
@@ -6647,6 +7220,34 @@ var table_metadata = map[string]TableDefinition{
 				Type: ColumnDefinitionTypeString,
 				Def:  "frequency",
 			},
+			"event_types": {
+				Type: ColumnDefinitionTypeJson,
+				Def:  "event_types",
+			},
+			"scope_mode": {
+				Type: ColumnDefinitionTypeString,
+				Def:  "scope_mode",
+			},
+			"account_ids": {
+				Type: ColumnDefinitionTypeJson,
+				Def:  "account_ids",
+			},
+			"exceptions": {
+				Type: ColumnDefinitionTypeJson,
+				Def:  "exceptions",
+			},
+			"source_mode": {
+				Type: ColumnDefinitionTypeString,
+				Def:  "source_mode",
+			},
+			"sources": {
+				Type: ColumnDefinitionTypeJson,
+				Def:  "sources",
+			},
+			"is_active": {
+				Type: ColumnDefinitionTypeBoolean,
+				Def:  "is_active",
+			},
 			"tenant_id": {
 				Type: ColumnDefinitionTypeString,
 				Def:  "tenant_id",
@@ -6680,10 +7281,26 @@ var table_metadata = map[string]TableDefinition{
 				nr.is_suppressed,
 				nr.severity,
 				nr.delivery_mode,
+				nr.scope_mode,
+				COALESCE(nra.account_ids, '[]'::jsonb) as account_ids,
 				nr.tenant_id::text as tenant_id
 			FROM notification_rules nr
+			LEFT JOIN (
+				SELECT rule_id, jsonb_agg(account_id::text ORDER BY account_id) as account_ids
+				FROM notification_rule_accounts
+				GROUP BY rule_id
+			) nra ON nra.rule_id = nr.id
 		) as notification_rules_grouping`,
+		AccountScope: notificationRuleAccountScope("notification_rules_grouping"),
 		Columns: map[string]ColumnDefinition{
+			"scope_mode": {
+				Type: ColumnDefinitionTypeString,
+				Def:  "scope_mode",
+			},
+			"account_ids": {
+				Type: ColumnDefinitionTypeJson,
+				Def:  "account_ids",
+			},
 			"id": {
 				Type: ColumnDefinitionTypeString,
 				Def:  "id",
@@ -6767,6 +7384,14 @@ var table_metadata = map[string]TableDefinition{
 				accountClause = " AND EXISTS (SELECT 1 FROM integrations_cloud_accounts ica_filter WHERE ica_filter.integration_id = i.id" + accountIdFilter + ")"
 			}
 
+			// Optional category filter — restricts the returned list to integrations
+			// whose type belongs to the specified category in integration_types.
+			categoryFilter := extractCategoryFilterSQL(&request, "LOWER(it_filter.category)")
+			categoryClause := ""
+			if categoryFilter != "" {
+				categoryClause = " AND EXISTS (SELECT 1 FROM integration_types it_filter WHERE it_filter.name = i.type" + categoryFilter + ")"
+			}
+
 			def := `(
 			SELECT
 				i.id::text as id,
@@ -6848,7 +7473,7 @@ var table_metadata = map[string]TableDefinition{
 				JOIN integrations ii ON ii.id = icv.integration_id
 				GROUP BY icv.integration_id
 			) icv_agg ON icv_agg.integration_id = i.id
-			WHERE 1=1` + existsClause + accountClause + `
+			WHERE 1=1` + existsClause + accountClause + categoryClause + `
 		) as integrations_v2`
 			return def, request, nil
 		},
@@ -6922,13 +7547,21 @@ var table_metadata = map[string]TableDefinition{
 		PermissionModule:   "integrations",
 		Name:               "admin_get_integrations_grouping_v2",
 		DefGenerator: func(ctx *security.RequestContext, accountId string, request QueryRequest) (string, QueryRequest, error) {
-			// Mirror the cloud_account_id pushdown from admin_get_integrations_v2
+			// Mirror the cloud_account_id and category pushdown from admin_get_integrations_v2
 			// so the row count stays in sync with the filtered row set when the
-			// caller passes a cloud_account_id predicate.
+			// caller passes a cloud_account_id or category predicate.
 			accountIdFilter := extractFilterSQL(&request, "cloud_account_id", "ica_filter.cloud_account_id")
-			accountClause := ""
+			categoryFilter := extractCategoryFilterSQL(&request, "LOWER(it_filter.category)")
+			var whereClauses []string
 			if accountIdFilter != "" {
-				accountClause = " WHERE EXISTS (SELECT 1 FROM integrations_cloud_accounts ica_filter WHERE ica_filter.integration_id = i.id" + accountIdFilter + ")"
+				whereClauses = append(whereClauses, "EXISTS (SELECT 1 FROM integrations_cloud_accounts ica_filter WHERE ica_filter.integration_id = i.id"+accountIdFilter+")")
+			}
+			if categoryFilter != "" {
+				whereClauses = append(whereClauses, "EXISTS (SELECT 1 FROM integration_types it_filter WHERE it_filter.name = i.type"+categoryFilter+")")
+			}
+			whereClause := ""
+			if len(whereClauses) > 0 {
+				whereClause = " WHERE " + strings.Join(whereClauses, " AND ")
 			}
 			def := `(
 			SELECT
@@ -6939,7 +7572,7 @@ var table_metadata = map[string]TableDefinition{
 				i.status,
 				i.created_at,
 				i.tenant_id::text as tenant_id
-			FROM integrations i` + accountClause + `
+			FROM integrations i` + whereClause + `
 		) as integrations_grouping`
 			return def, request, nil
 		},
@@ -6972,6 +7605,64 @@ var table_metadata = map[string]TableDefinition{
 				Type: ColumnDefinitionTypeString,
 				Def:  "tenant_id",
 			},
+			"count": {
+				Type:         ColumnDefinitionTypeInt,
+				Def:          "count(*)",
+				IsAggregated: true,
+			},
+		},
+	},
+	// Incoming webhook events for the per-integration Activity Log (Admin ->
+	// Integrations -> <webhook> -> Activity Log). This is the raw ingestion log,
+	// not the processed `events` surface. Tenant-scoped and gated on integrations
+	// like the integrations catalog itself (admin_get_integrations_v2); the caller
+	// always filters by integration_id, which is the real per-integration scope.
+	// Deliberately no AccountIdColumnName: a webhook routes to many accounts and
+	// unrouted events carry account_id IS NULL (V697), so an account filter would
+	// hide part of the integration's activity — and setting it would flip the
+	// integrations module into the account-scopable set (see AccountScopableModules).
+	"event_incoming_webhooks_v2": {
+		Type:               Normal,
+		Source:             database.Metastore,
+		TenantIdColumnName: "tenant_id",
+		PermissionModule:   "integrations",
+		Name:               "event_incoming_webhooks_v2",
+		DefGenerator: func(ctx *security.RequestContext, accountId string, request QueryRequest) (string, QueryRequest, error) {
+			return "event_incoming_webhooks", request, nil
+		},
+		Columns: map[string]ColumnDefinition{
+			"id":                {Type: ColumnDefinitionTypeString},
+			"integration_id":    {Type: ColumnDefinitionTypeString},
+			"account_id":        {Type: ColumnDefinitionTypeString},
+			"event_title":       {Type: ColumnDefinitionTypeString},
+			"event_type":        {Type: ColumnDefinitionTypeString},
+			"event_status":      {Type: ColumnDefinitionTypeString},
+			"event_priority":    {Type: ColumnDefinitionTypeString},
+			"event_url":         {Type: ColumnDefinitionTypeString},
+			"event_description": {Type: ColumnDefinitionTypeString},
+			"event_created_at":  {Type: ColumnDefinitionTypeDatetime},
+			"processing_status": {Type: ColumnDefinitionTypeString},
+			"raw":               {Type: ColumnDefinitionTypeString},
+			"tenant_id":         {Type: ColumnDefinitionTypeString},
+		},
+	},
+	// Count companion for the two Activity Log widgets: total events (filter on
+	// integration_id) and processed events (integration_id + processing_status).
+	"event_incoming_webhooks_grouping_v2": {
+		Type:               Aggregate,
+		Source:             database.Metastore,
+		TenantIdColumnName: "tenant_id",
+		PermissionModule:   "integrations",
+		Name:               "event_incoming_webhooks_grouping_v2",
+		DefGenerator: func(ctx *security.RequestContext, accountId string, request QueryRequest) (string, QueryRequest, error) {
+			return "event_incoming_webhooks", request, nil
+		},
+		Columns: map[string]ColumnDefinition{
+			"integration_id":    {Type: ColumnDefinitionTypeString},
+			"processing_status": {Type: ColumnDefinitionTypeString},
+			"account_id":        {Type: ColumnDefinitionTypeString},
+			"event_created_at":  {Type: ColumnDefinitionTypeDatetime},
+			"tenant_id":         {Type: ColumnDefinitionTypeString},
 			"count": {
 				Type:         ColumnDefinitionTypeInt,
 				Def:          "count(*)",
@@ -7437,6 +8128,7 @@ var table_metadata = map[string]TableDefinition{
 				status_message,
 				status,
 				last_connected_at,
+				last_synced_at,
 				created_at,
 				k8s_version,
 				k8s_provider,
@@ -7475,6 +8167,10 @@ var table_metadata = map[string]TableDefinition{
 			"last_connected_at": {
 				Type: ColumnDefinitionTypeDatetime,
 				Def:  "last_connected_at",
+			},
+			"last_synced_at": {
+				Type: ColumnDefinitionTypeDatetime,
+				Def:  "last_synced_at",
 			},
 			"k8s_version": {
 				Type: ColumnDefinitionTypeString,
@@ -8227,7 +8923,19 @@ var table_metadata = map[string]TableDefinition{
 		Name:             "cloud_resources_list_v2",
 		PermissionModule: "cloud",
 		DefGenerator: func(ctx *security.RequestContext, accountId string, request QueryRequest) (string, QueryRequest, error) {
+			// cr_base is the request's filtered resource set (this module is always
+			// account-scoped). It is referenced twice, so Postgres materialises it
+			// once and the spend roll-up joins against those rows instead of
+			// SUM-ing the account's entire all-time spend history under a nested
+			// loop driven by a rows=1 misestimate -- the shape that made this a
+			// 60s+ query. __cr__where__ moves into the CTE for the same reason.
 			baseQuery := `(
+				WITH cr_base AS (
+					SELECT cr.region, cr.resourse_id, cr.service_name, cr.status, cr.name, cr.id,
+						cr.meta, cr.account, cr.tags, cr.created_at, cr.resourse_created_on, cr.type, cr.tenant
+					FROM cloud_resourses cr
+					__cr__where__
+				)
 				SELECT cr.region, cr.resourse_id, cr.service_name, cr.status, cr.name, cr.id,
 					cr.meta, cr.account, cr.tags, cr.created_at, cr.resourse_created_on, cr.type, cr.tenant,
 					cr.meta ->> 'namespace' as namespace,
@@ -8236,12 +8944,13 @@ var table_metadata = map[string]TableDefinition{
 					m.value::float as latest_metric_value,
 					m.timestamp as latest_metric_timestamp,
 					COUNT(*) OVER() as total_count
-				FROM cloud_resourses cr
+				FROM cr_base cr
 				LEFT JOIN (
-					SELECT cloud_resource_id, cloud_account, SUM(amount) as spend_amount
+					SELECT spends.cloud_resource_id, spends.cloud_account, SUM(spends.amount) as spend_amount
 					FROM spends
+					JOIN cr_base ON cr_base.id = spends.cloud_resource_id AND cr_base.account = spends.cloud_account
 					__spends__where__
-					GROUP BY cloud_resource_id, cloud_account
+					GROUP BY spends.cloud_resource_id, spends.cloud_account
 				) s ON s.cloud_resource_id = cr.id AND s.cloud_account = cr.account
 				LEFT JOIN LATERAL (
 					SELECT metric, value, timestamp
@@ -8251,7 +8960,6 @@ var table_metadata = map[string]TableDefinition{
 					ORDER BY timestamp DESC
 					LIMIT 1
 				) m ON true
-				__cr__where__
 			) as cloud_resources_list_v2`
 
 			metricColumns := []string{"metric"}
@@ -8502,6 +9210,50 @@ var table_metadata = map[string]TableDefinition{
 				Def:          "max(last_seen_at)",
 				IsAggregated: true,
 			},
+		},
+	},
+	// Credential-free view of the integrations wired to a cloud account, one
+	// row per (integration, account). Backs cloud_list_account_integrations so
+	// the VM fleet page can list its vm_agent / discovery integrations for
+	// account-scoped roles. integrations_list (admin_get_integrations_v2) stays
+	// tenant-admin-only because its rows carry integration_config_values, and
+	// it has no account column, so it cannot be account-scoped (#39858).
+	"cloud_account_integrations_v2": {
+		Type:               Normal,
+		Source:             database.Metastore,
+		Name:               "cloud_account_integrations_v2",
+		TenantIdColumnName: "tenant_id",
+		// Columns KEY, not the physical column (see cloud_vm_packages_v2).
+		AccountIdColumnName: "account_id",
+		// Filed under `cloud`, not `integrations`: this is per-account operational
+		// data (which agents serve this account), the same grant that reads the
+		// account's VMs and packages. Keep in sync with the action's classified
+		// module (cloud_list_account_integrations -> cloud:Read).
+		PermissionModule: "cloud",
+		Def: `(
+			SELECT
+				i.id::text as id,
+				i.name,
+				i.type,
+				i.source,
+				i.status,
+				i.created_at,
+				i.updated_at,
+				i.tenant_id::text as tenant_id,
+				ica.cloud_account_id::text as cloud_account_id
+			FROM integrations i
+			JOIN integrations_cloud_accounts ica ON ica.integration_id = i.id
+			) as cloud_account_integrations_v2`,
+		Columns: map[string]ColumnDefinition{
+			"id":         {Type: ColumnDefinitionTypeString},
+			"name":       {Type: ColumnDefinitionTypeString},
+			"type":       {Type: ColumnDefinitionTypeString},
+			"source":     {Type: ColumnDefinitionTypeString},
+			"status":     {Type: ColumnDefinitionTypeString},
+			"created_at": {Type: ColumnDefinitionTypeDatetime},
+			"updated_at": {Type: ColumnDefinitionTypeDatetime},
+			"tenant_id":  {Type: ColumnDefinitionTypeString},
+			"account_id": {Type: ColumnDefinitionTypeString, Def: "cloud_account_id"},
 		},
 	},
 	"resource_spend_trend_v2": {
@@ -8884,7 +9636,17 @@ var table_metadata = map[string]TableDefinition{
 			rr.created_at,
 			rr.updated_at,
 			rr.status_message,
-			CASE WHEN rr.data IS NOT NULL THEN jsonb_build_object('data', rr.data->'data', 'provider_config', rr.data->'provider_config') END as data,
+			-- ticket_id/ticket_key are stored at the TOP level of data by
+			-- services/recommendation/ticket_resolution.go, so a projection naming
+			-- only 'data' and 'provider_config' dropped both, and every ticket
+			-- resolution read out as {"data": null, "provider_config": null} — the
+			-- key was written on creation and then visible to nothing.
+			CASE WHEN rr.data IS NOT NULL THEN jsonb_build_object(
+				'data', rr.data->'data',
+				'provider_config', rr.data->'provider_config',
+				'ticket_id', rr.data->'ticket_id',
+				'ticket_key', rr.data->'ticket_key'
+			) END as data,
 			r.tenant_id as tenant_id,
 			r.cloud_account_id as account_id,
 			CASE WHEN r.recommendation IS NOT NULL THEN jsonb_build_object('spec', r.recommendation->'spec', 'metadata', r.recommendation->'metadata', 'namespace', r.recommendation->'namespace') END as rec_recommendation,
@@ -8931,9 +9693,13 @@ var table_metadata = map[string]TableDefinition{
 		},
 	},
 	"recommendation_resolution_groupings_v2": {
-		Type:                Aggregate,
-		Source:              database.Metastore,
-		Def:                 "(SELECT rr.*, r.tenant_id, r.cloud_account_id as account_id FROM recommendation_resolution rr LEFT JOIN recommendation r ON r.id = rr.recommendation_id) as rr_agg",
+		Type:   Aggregate,
+		Source: database.Metastore,
+		// rec_severity is joined in so a severity-filtered listing can be COUNTED
+		// as well as listed: the frontend sends one where clause to the listing and
+		// another to this aggregate, and a column missing here would leave
+		// pagination reporting totals for a filter it never applied.
+		Def:                 "(SELECT rr.*, r.tenant_id, r.cloud_account_id as account_id, r.severity as rec_severity FROM recommendation_resolution rr LEFT JOIN recommendation r ON r.id = rr.recommendation_id) as rr_agg",
 		Name:                "recommendation_resolution_groupings_v2",
 		TenantIdColumnName:  "tenant_id",
 		AccountIdColumnName: "account_id",
@@ -8949,6 +9715,7 @@ var table_metadata = map[string]TableDefinition{
 			"recommendation_id": {Type: ColumnDefinitionTypeString},
 			"tenant_id":         {Type: ColumnDefinitionTypeString},
 			"account_id":        {Type: ColumnDefinitionTypeString},
+			"rec_severity":      {Type: ColumnDefinitionTypeString},
 		},
 	},
 	"event_resolution_v2": {
@@ -9848,14 +10615,36 @@ var table_metadata = map[string]TableDefinition{
 			"updated_at": {Type: ColumnDefinitionTypeDatetime, Def: "updated_at"},
 		},
 	},
+	// Joined to feature_category so the settings screen gets a readable group
+	// label and a stable order without hard-coding either in the frontend.
+	// feature.category is NOT NULL with an FK to feature_category, so the inner
+	// join cannot drop a row.
 	"feature_v2": {
-		Type:   Normal,
+		Type:   Derived,
 		Source: database.Metastore,
 		Name:   "feature_v2",
-		Def:    "feature",
+		Def: `(
+			SELECT
+				f.value as value,
+				f.description as description,
+				f.display_name as display_name,
+				f.category as category,
+				c.label as category_label,
+				c.sort_order as category_sort_order,
+				f.polarity as polarity,
+				f.stored_value_inverted as stored_value_inverted
+			FROM feature f
+			INNER JOIN feature_category c ON c.id = f.category
+		) as feature_v2`,
 		Columns: map[string]ColumnDefinition{
-			"value":       {Type: ColumnDefinitionTypeString, Def: "value"},
-			"description": {Type: ColumnDefinitionTypeString, Def: "description"},
+			"value":                 {Type: ColumnDefinitionTypeString, Def: "value"},
+			"description":           {Type: ColumnDefinitionTypeString, Def: "description"},
+			"display_name":          {Type: ColumnDefinitionTypeString, Def: "display_name"},
+			"category":              {Type: ColumnDefinitionTypeString, Def: "category"},
+			"category_label":        {Type: ColumnDefinitionTypeString, Def: "category_label"},
+			"category_sort_order":   {Type: ColumnDefinitionTypeInt, Def: "category_sort_order"},
+			"polarity":              {Type: ColumnDefinitionTypeString, Def: "polarity"},
+			"stored_value_inverted": {Type: ColumnDefinitionTypeBoolean, Def: "stored_value_inverted"},
 		},
 	},
 	"tenant_by_user_v2": {
@@ -9995,6 +10784,8 @@ var table_metadata = map[string]TableDefinition{
 				ua.credential as credential,
 				ua.tenant_id::text as auth_tenant_id,
 				ua.expires_at as expires_at,
+				ua.kind::text as kind,
+				to_jsonb(ua.scopes) as scopes,
 				ua.status::text as auth_status,
 				ua.provider::text as provider,
 				ua."user"::text as user_id,
@@ -10056,6 +10847,8 @@ var table_metadata = map[string]TableDefinition{
 			"credential":     {Type: ColumnDefinitionTypeString, Def: "credential"},
 			"auth_tenant_id": {Type: ColumnDefinitionTypeString, Def: "auth_tenant_id"},
 			"expires_at":     {Type: ColumnDefinitionTypeDatetime, Def: "expires_at"},
+			"kind":           {Type: ColumnDefinitionTypeString, Def: "kind"},
+			"scopes":         {Type: ColumnDefinitionTypeJson, Def: "scopes"},
 			"auth_status":    {Type: ColumnDefinitionTypeString, Def: "auth_status"},
 			"provider":       {Type: ColumnDefinitionTypeString, Def: "provider"},
 			"user_id":        {Type: ColumnDefinitionTypeString, Def: "user_id"},
@@ -10167,12 +10960,14 @@ var tableAliases = map[string]string{
 	"events_list":           "events_v2",
 	"agents_list_playbooks": "agent_playbook_v2",
 	// Tier 2: admin_get_*_v2 → <entity>_<verb>_*
-	"integrations_list":             "admin_get_integrations_v2",
-	"integrations_aggregate":        "admin_get_integrations_grouping_v2",
-	"notifications_list_rules":      "admin_get_notification_rules_v2",
-	"notifications_aggregate_rules": "admin_get_notification_rules_grouping_v2",
-	"usergroups_aggregate":          "admin_get_user_groups_grouping_v2",
-	"users_aggregate_by_tenant":     "admin_get_users_grouping_by_tenant_v2",
+	"integrations_list":                     "admin_get_integrations_v2",
+	"integrations_aggregate":                "admin_get_integrations_grouping_v2",
+	"integrations_list_webhook_events":      "event_incoming_webhooks_v2",
+	"integrations_aggregate_webhook_events": "event_incoming_webhooks_grouping_v2",
+	"notifications_list_rules":              "admin_get_notification_rules_v2",
+	"notifications_aggregate_rules":         "admin_get_notification_rules_grouping_v2",
+	"usergroups_aggregate":                  "admin_get_user_groups_grouping_v2",
+	"users_aggregate_by_tenant":             "admin_get_users_grouping_by_tenant_v2",
 	// Tier 3: user_*_v2 / usergroup_*_v2 → users_* / usergroups_*
 	"users_get_details":                "user_details_v2",
 	"users_get_by_provider_account":    "user_by_provider_account_v2",
@@ -10181,6 +10976,8 @@ var tableAliases = map[string]string{
 	"users_get_super_admin_role":       "user_super_admin_role_v2",
 	"usergroups_list_users":            "usergroup_users_v2",
 	"usergroups_aggregate_users":       "usergroup_users_grouping_v2",
+	// Verb-named read over a credential-free per-account integrations view.
+	"cloud_list_account_integrations": "cloud_account_integrations_v2",
 }
 
 func GetTableMetadata(name string) (TableDefinition, bool) {
@@ -10296,4 +11093,87 @@ func init() {
 			table_metadata[k] = tableDef
 		}()
 	}
+}
+
+// podContainerStatusExpr renders the pod status a human recognises -- the one
+// kubectl prints in its STATUS column -- from the container statuses the agent
+// ships in meta.status_info.
+//
+// It is now the FALLBACK, not the source: the collector writes the same value to
+// k8s_pods.container_status, which is what filters and counts read (a jsonb read
+// in a WHERE or GROUP BY runs for every row scanned, and is minutes over one
+// account's history). This expression stays for the pods table, where it runs for
+// the page on screen and covers rows last written before that collector shipped.
+//
+// It exists because k8s_pods.status holds the pod PHASE, and the phase cannot
+// express "running but broken": a pod in CrashLoopBackOff has phase Running and
+// one in ImagePullBackOff has phase Pending. Measured on a dev cluster, 402
+// active pods carried just two distinct phases, so the phase alone tells a
+// reader nothing about health.
+//
+// Init containers take precedence over app containers, matching kubectl: while
+// an init container is stuck the app containers have not started, and their
+// generic "PodInitializing" would mask the real reason. Within each group a
+// waiting reason wins over a terminated one, since waiting is the current state
+// and terminated is the last one. That is what the ORDER BY spells out: grp
+// (init before app), then waiting before terminated, then position in the array.
+// NULL when nothing is waiting or terminated -- i.e. a healthy pod -- so callers
+// fall back to the phase.
+//
+// One pass, and meta is read once. The obvious shape -- a COALESCE of four
+// scalar subqueries, one per (group, state) combination -- is what this was
+// until the Summary counts started using it, and each of those four subqueries
+// detoasts meta again. Measured on dev, that cost 3.2s over the 1810 pods the
+// Summary has to classify and 9.9s over a single 87k-pod account; folding it
+// into one subquery over a UNION ALL of both arrays took the same work to 277ms.
+// The two forms were verified to agree on all 94,591 active pods on dev.
+//
+// A container that exited 0 is not a problem and is skipped in BOTH groups. A
+// long-running pod alongside a completed sidecar or helper would otherwise read
+// "Completed" while its main container is happily running. The consequence is
+// that a finished Job pod reports its phase, "Succeeded", where kubectl says
+// "Completed" -- the same fact in the vocabulary the rest of this table uses.
+//
+// exitCode is compared as text rather than cast to int. Every value Go writes
+// here comes from an int32 field so it is always numeric, but meta is free-form
+// jsonb and a cast raises on anything else, which would fail the whole query
+// rather than one row. This is the same reasoning as the jsonb_typeof guards.
+//
+// jsonb_typeof guards every array: status_info is null for pods last reported by
+// an agent that predates it being sent, and jsonb_array_elements errors on a
+// non-array rather than returning no rows.
+//
+// WITH ORDINALITY + ORDER BY ord makes the pick deterministic. jsonb_array_elements
+// emits in array order in practice, but nothing guarantees it, and a pod whose
+// containers are broken in two different ways (one CrashLoopBackOff, one
+// ImagePullBackOff) would otherwise report whichever the executor happened to
+// return first, and could report a different one on the next refresh. Ordering by
+// position means it always reports the first such container, matching the order the
+// pod spec lists them in.
+//
+// metaColumn is the meta column to read, qualified when the caller's FROM has an
+// alias (the cluster-summary subquery says ksp.meta).
+func podContainerStatusExpr(metaColumn string) string {
+	return `(SELECT cs.reason
+	   FROM (SELECT ` + metaColumn + `->'status_info' AS si) src
+	   CROSS JOIN LATERAL (
+	     SELECT COALESCE(c.value->'state'->'waiting'->>'reason',
+	                     c.value->'state'->'terminated'->>'reason') AS reason
+	       FROM (
+	         SELECT value, ord, 0 AS grp
+	           FROM jsonb_array_elements(CASE WHEN jsonb_typeof(src.si->'initContainerStatuses') = 'array'
+	                                          THEN src.si->'initContainerStatuses' ELSE '[]'::jsonb END)
+	                WITH ORDINALITY AS t(value, ord)
+	         UNION ALL
+	         SELECT value, ord, 1 AS grp
+	           FROM jsonb_array_elements(CASE WHEN jsonb_typeof(src.si->'containerStatuses') = 'array'
+	                                          THEN src.si->'containerStatuses' ELSE '[]'::jsonb END)
+	                WITH ORDINALITY AS t(value, ord)
+	       ) c
+	      WHERE c.value->'state'->'waiting'->>'reason' IS NOT NULL
+	         OR (c.value->'state'->'terminated'->>'reason' IS NOT NULL
+	             AND COALESCE(c.value->'state'->'terminated'->>'exitCode', '') <> '0')
+	      ORDER BY c.grp, (c.value->'state'->'waiting'->>'reason') IS NULL, c.ord
+	      LIMIT 1
+	   ) cs)`
 }

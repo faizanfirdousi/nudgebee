@@ -3,10 +3,12 @@
  * Spec: design-system/primitives/layout/card.html
  * Original proposal: design-system/proposals/card-consolidation.html
  *
- * Consolidates WidgetCard + CustomBorderCard into a single primitive with
- * three independent axes: `variant`, `size`, `elevation`. Visual baseline
- * (size="md" + elevation="raised") matches @common/WidgetCard exactly —
- * same border, radius, padding tokens, and shadow value.
+ * Consolidates the removed WidgetCard and CustomBorderCard into a single primitive
+ * with three independent axes: `variant`, `size`, `elevation`.
+ *
+ * Some call sites keep WidgetCard's old 16px 24px padding (and its 24px top margin)
+ * in `sx`. That was a deliberate migration-only exception to the Don't below, so
+ * moving them to Card didn't shift their layout — new code picks a size.
  *
  * Distinct from:
  *   - CollapsableCard  — disclosure behavior; composes Card for the surface.
@@ -26,11 +28,14 @@
  *                             (e.g. modal bodies). `tone='neutral'` is the
  *                             canonical "light-gray panel" look.
  *   size         = 'sm' | 'md' | 'lg'
- *                  Drives padding AND default shadow. md is today's WidgetCard.
- *   elevation    = 'raised' | 'flat'
+ *                  Drives padding AND default shadow.
+ *   elevation    = 'raised' | 'flat' | 'floating'
  *                  Default 'raised' (all sizes ship with a shadow).
  *                  Use 'flat' when nested inside Modal / Inspector / Drawer
  *                  where stacking shadows would compound visual weight.
+ *                  Use 'floating' for a `position: sticky`/fixed surface that
+ *                  needs to visually separate itself from content scrolling
+ *                  underneath it — a noticeably darker shadow than 'raised'.
  *                  Tinted variant is always flat (shadow on tinted bg looks heavy).
  *   tone         = 'neutral' | 'info' | 'success' | 'warning' | 'danger'
  *                  Meaningful when variant='accent' (left-border colour) OR
@@ -47,6 +52,21 @@
  *   selected     = boolean
  *                  2px brand border for picker-row use. Interaction state,
  *                  not semantic colour.
+ *   disabled     = boolean  (with interactive)
+ *                  A button that is unavailable right now: keeps role="button"
+ *                  (so it is still announced, as dimmed), adds aria-disabled,
+ *                  leaves the tab order, ignores clicks and keys, and drops the
+ *                  hover, focus ring and pointer. A card that is simply not a
+ *                  button should drop `interactive` instead. Cursor is 'default',
+ *                  as on ds/Button — Stat/Chip content pins its own cursor, so
+ *                  'not-allowed' would only show over the padding.
+ *   pressed      = boolean  (with interactive)
+ *                  Toggle state for a card that switches a filter on and off;
+ *                  emits aria-pressed. It sets no visual — style the pressed
+ *                  look with `selected` or the consumer's own sx.
+ *
+ * Hover: an `sx['&:hover']` replaces Card's interactive hover entirely (sx is
+ * spread over it, not merged), which is how a card opts out of the lift.
  *
  * Slots (props):
  *   header   — ReactNode rendered above body with a 1px divider when children
@@ -66,13 +86,16 @@
  *   - Don't use sx for padding/shadow overrides. Use size and elevation instead.
  *   - Don't pass tone without variant="accent" or variant="tinted".
  *   - Don't pass onClick without interactive=true (dev-warns; keyboard would be broken).
+ *   - Don't pass disabled or pressed without interactive=true (dev-warns; ignored).
+ *   - Don't hand-roll role / tabIndex / onKeyDown / aria-pressed / aria-disabled —
+ *     use interactive, pressed and disabled.
  */
 import * as React from 'react';
 import { Box, SxProps, Theme } from '@mui/material';
 
 export type CardVariant = 'elevated' | 'outlined' | 'accent' | 'tinted';
 export type CardSize = 'sm' | 'md' | 'lg';
-export type CardElevation = 'raised' | 'flat';
+export type CardElevation = 'raised' | 'flat' | 'floating';
 export type CardTone = 'neutral' | 'info' | 'success' | 'warning' | 'danger';
 
 export interface CardProps {
@@ -82,6 +105,10 @@ export interface CardProps {
   tone?: CardTone;
   interactive?: boolean;
   selected?: boolean;
+  /** With `interactive`: announced as a dimmed button, but inert. */
+  disabled?: boolean;
+  /** With `interactive`: toggle state, emitted as aria-pressed. */
+  pressed?: boolean;
 
   header?: React.ReactNode;
   footer?: React.ReactNode;
@@ -99,7 +126,7 @@ export interface CardProps {
 }
 
 /**
- * Padding scale anchored on the production WidgetCard (20px 24px) as `md`.
+ * Padding scale with `md` at 20px 24px.
  * Each size keeps the vertical-narrower-than-horizontal rhythm.
  * 20px / 28px are literal (no matching --ds-space-* token).
  */
@@ -109,13 +136,22 @@ const SIZE_TOKENS: Record<CardSize, { padding: string; shadow: string }> = {
     shadow: '0 1px 6px rgba(0, 0, 0, 0.06)',
   },
   md: {
-    padding: '20px var(--ds-space-5)', // 20px 24px — matches WidgetCard
+    padding: '20px var(--ds-space-5)', // 20px 24px
     shadow: '0 1px 10px rgba(0, 0, 0, 0.08)',
   },
   lg: {
     padding: '28px var(--ds-space-6)', // 28px 32px
     shadow: '0 2px 16px rgba(0, 0, 0, 0.10)',
   },
+};
+
+// elevation='floating' shadow, keyed by size — same offset/blur ramp as the
+// 'raised' shadows above, roughly 2x the spread and opacity so a sticky/fixed
+// surface reads as clearly lifted above whatever scrolls beneath it.
+const FLOATING_SHADOW: Record<CardSize, string> = {
+  sm: '0 4px 14px rgba(0, 0, 0, 0.1)',
+  md: '0 6px 20px rgba(0, 0, 0, 0.12)',
+  lg: '0 8px 28px rgba(0, 0, 0, 0.14)',
 };
 
 const ACCENT_TONE_COLOR: Record<CardTone, string> = {
@@ -154,6 +190,8 @@ export const Card: React.FC<CardProps> = ({
   tone = 'neutral',
   interactive = false,
   selected = false,
+  disabled = false,
+  pressed,
   header,
   footer,
   children,
@@ -166,28 +204,36 @@ export const Card: React.FC<CardProps> = ({
   if (process.env.NODE_ENV !== 'production') {
     if (tone !== 'neutral' && variant !== 'accent' && variant !== 'tinted') {
       // eslint-disable-next-line no-console
-      console.warn(`[Card] tone="${tone}" is only meaningful when variant="accent" or variant="tinted" (got variant="${variant}"). Ignoring tone.`);
+      console.warn('[Card] tone is only meaningful when variant="accent" or variant="tinted". Ignoring tone.', { tone, variant });
     }
     if (onClick && !interactive) {
       // eslint-disable-next-line no-console
       console.warn('[Card] onClick provided without interactive=true. Set interactive to add role="button" and keyboard support.');
     }
+    if ((disabled || pressed !== undefined) && !interactive) {
+      // eslint-disable-next-line no-console
+      console.warn('[Card] disabled / pressed only apply with interactive=true — a non-button card has no pressed or disabled state. Ignoring.');
+    }
   }
 
-  const { padding, shadow } = SIZE_TOKENS[size];
+  const { padding, shadow: raisedShadow } = SIZE_TOKENS[size];
+  const shadow = elevation === 'floating' ? FLOATING_SHADOW[size] : raisedShadow;
 
   const isOutlined = variant === 'outlined';
   const isAccent = variant === 'accent';
   const isTinted = variant === 'tinted';
 
-  const showShadow = elevation === 'raised' && !isTinted;
+  const showShadow = (elevation === 'raised' || elevation === 'floating') && !isTinted;
 
   const borderWidth = selected ? 2 : isOutlined ? 1 : 1;
   const defaultBorderColor = selected ? 'var(--ds-blue-500)' : isTinted ? TINTED_BORDER[tone] : 'var(--ds-gray-200)';
   const borderColor = defaultBorderColor;
 
+  // A disabled interactive card is still a button (role, aria-disabled) but takes no input.
+  const actionable = interactive && !disabled;
+
   const handleKeyDown =
-    interactive && onClick
+    actionable && onClick
       ? (e: React.KeyboardEvent<HTMLDivElement>) => {
           if (e.key === 'Enter' || e.key === ' ') {
             e.preventDefault();
@@ -200,10 +246,12 @@ export const Card: React.FC<CardProps> = ({
     <Box
       id={id}
       className={className}
-      onClick={interactive ? onClick : undefined}
+      onClick={actionable ? onClick : undefined}
       onKeyDown={handleKeyDown}
       role={interactive ? 'button' : undefined}
-      tabIndex={interactive ? 0 : undefined}
+      tabIndex={interactive ? (disabled ? -1 : 0) : undefined}
+      aria-disabled={interactive && disabled ? true : undefined}
+      aria-pressed={interactive ? pressed : undefined}
       sx={{
         backgroundColor: isTinted ? TINTED_BG[tone] : 'var(--ds-background-100)',
         border: `${borderWidth}px solid ${borderColor}`,
@@ -216,7 +264,7 @@ export const Card: React.FC<CardProps> = ({
         ...(isOutlined && {
           borderColor: selected ? 'var(--ds-blue-500)' : 'var(--ds-gray-300)',
         }),
-        ...(interactive && {
+        ...(actionable && {
           cursor: 'pointer',
           transition: 'box-shadow 120ms ease, transform 120ms ease, border-color 120ms ease',
           '&:hover': {
@@ -229,6 +277,11 @@ export const Card: React.FC<CardProps> = ({
             outlineOffset: 2,
           },
         }),
+        ...(interactive &&
+          disabled && {
+            cursor: 'default',
+            opacity: 0.5,
+          }),
         ...sx,
       }}
       {...rest}

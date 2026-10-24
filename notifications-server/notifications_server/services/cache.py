@@ -9,6 +9,11 @@ from notifications_server.models.models import MessagingPlatform
 
 LOG = logging.getLogger(__name__)
 
+# Bounds the WATCH/retry loop in update_event_entry against another writer
+# repeatedly touching the same key — a handful of attempts is enough to ride
+# out real contention without risking a busy-retry loop under sustained load.
+_UPDATE_EVENT_ENTRY_MAX_RETRIES = 5
+
 
 class Cache:
     _redis_client = None
@@ -63,7 +68,10 @@ class Cache:
             try:
                 installations_dict = [installation.to_dict() for installation in installations]
                 pipe.set(key, json.dumps(installations_dict, default=self._json_serializable))
-                pipe.expire(key, settings.redis.cache_expiration_minutes * 30)
+                # redis EXPIRE takes SECONDS, so a minutes setting converts with * 60 —
+                # as every other expire in this file does. This one used * 30, giving
+                # installations half the configured lifetime.
+                pipe.expire(key, settings.redis.cache_expiration_minutes * 60)
                 pipe.execute()
             except TypeError as e:
                 LOG.exception(f"Error serializing installations: {e}")
@@ -98,7 +106,7 @@ class Cache:
         self._ensure_connection()
         if not self.redis_client:
             return
-        key = f"notification_rules:{tenant_id}"
+        key = f"notification_rules:v5:{tenant_id}"
         with self.redis_client.pipeline() as pipe:
             try:
                 rules_dict = [rule.to_dict() if hasattr(rule, "to_dict") else rule for rule in rules]
@@ -114,7 +122,7 @@ class Cache:
         self._ensure_connection()
         if not self.redis_client:
             return None
-        key = f"notification_rules:{tenant_id}"
+        key = f"notification_rules:v5:{tenant_id}"
         rules_json = self.redis_client.get(key)
         if rules_json:
             rules_data = json.loads(rules_json)
@@ -127,14 +135,37 @@ class Cache:
         self._ensure_connection()
         if not self.redis_client:
             return
-        key = f"notification_rules:{tenant_id}"
+        key = f"notification_rules:v5:{tenant_id}"
         with self.redis_client.pipeline() as pipe:
             try:
                 pipe.delete(key)
+                pipe.delete(f"notification_defaults:v1:{tenant_id}")
+                # Earlier keys too, for older pods still running during a rollout.
+                pipe.delete(f"notification_rules:v4:{tenant_id}")
+                pipe.delete(f"notification_rules:v3:{tenant_id}")
+                pipe.delete(f"notification_rules:v2:{tenant_id}")
+                pipe.delete(f"notification_rules:{tenant_id}")
                 pipe.execute()
                 LOG.info(f"Cache entry for key '{key}' deleted successfully.")
             except redis.RedisError as e:
                 LOG.exception(f"Error deleting cache entry for key '{key}': {e}")
+
+    def cache_default_policies(self, tenant_id, policies):
+        self._ensure_connection()
+        if not self.redis_client:
+            return
+        key = f"notification_defaults:v1:{tenant_id}"
+        try:
+            self.redis_client.set(key, json.dumps(policies), ex=settings.redis.cache_expiration_minutes * 60)
+        except redis.RedisError as e:
+            LOG.exception(f"Error caching notification default policies for tenant {tenant_id}: {e}")
+
+    def get_default_policies(self, tenant_id):
+        self._ensure_connection()
+        if not self.redis_client:
+            return None
+        cached = self.redis_client.get(f"notification_defaults:v1:{tenant_id}")
+        return json.loads(cached) if cached else None
 
     def cache_event_entry(self, thread_ts, event_entry):
         self._ensure_connection()
@@ -174,23 +205,43 @@ class Cache:
         raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
 
     def update_event_entry(self, thread_ts, **kwargs):
+        """Merge `kwargs` into the cached entry. Safe against concurrent callers
+        updating different fields on the same entry (e.g. the Slack progress
+        poller's own thread claiming stream_ts while the request's main thread
+        writes channel_context_used) — WATCH detects a conflicting write between
+        our read and write and retries with a fresh copy, instead of silently
+        clobbering it with a stale merge."""
         self._ensure_connection()
         if not self.redis_client:
             return False
         key = f"chat_event:{thread_ts}"
-        with self.redis_client.pipeline() as pipe:
+        updates = {k: v for k, v in kwargs.items() if v is not None}
+        for _ in range(_UPDATE_EVENT_ENTRY_MAX_RETRIES):
             try:
-                event_json = self.redis_client.get(key)
-                if event_json:
+                with self.redis_client.pipeline() as pipe:
+                    pipe.watch(key)
+                    event_json = pipe.get(key)
+                    if not event_json:
+                        pipe.unwatch()
+                        return False
                     event_entry = json.loads(event_json)
-                    event_entry.update({k: v for k, v in kwargs.items() if v is not None})
+                    event_entry.update(updates)
                     event_entry["timestamp"] = time.time()
+                    pipe.multi()
                     pipe.set(key, json.dumps(event_entry, default=self._json_serializable))
                     pipe.expire(key, settings.redis.conversation_cache_expiration_minutes * 60)
                     pipe.execute()
                     return True
+            except redis.WatchError:
+                continue
             except redis.RedisError as e:
                 LOG.exception(f"Error updating event entry {thread_ts}: {e}")
+                return False
+        LOG.warning(
+            "Giving up updating event entry %s after %d retries (concurrent writer contention)",
+            thread_ts,
+            _UPDATE_EVENT_ENTRY_MAX_RETRIES,
+        )
         return False
 
     def remove_event_keys(self, thread_ts, keys):
@@ -303,6 +354,61 @@ class Cache:
             except json.JSONDecodeError:
                 return []
         return []
+
+    # A watch runs up to 24h — longer than the conversation cache TTL — so the
+    # status-message coords need their own key. 25h = small margin over that.
+    WATCH_STATUS_TTL_SECONDS = 25 * 60 * 60
+
+    def cache_watch_status(self, watch_id, status_data, nx=False):
+        """Store the 'watching…' message coords (channel/thread/status_msg_ts/team/
+        platform) under watch_id so the terminal callback can retire it.
+        nx=True -> atomic SET NX, doubling as a claim: only one concurrent
+        watch_registered wins. False if already claimed or on any Redis error."""
+        self._ensure_connection()
+        if not self.redis_client or not watch_id:
+            return False
+        key = f"watch_status:{watch_id}"
+        try:
+            status_data = dict(status_data)
+            status_data["timestamp"] = time.time()
+            value = json.dumps(status_data, default=self._json_serializable)
+            # One SET w/ `ex` -> value + expiry land atomically (SET/EXPIRE could
+            # strand a TTL-less key). With nx it is also the claim: None if taken.
+            return bool(self.redis_client.set(key, value, nx=nx, ex=self.WATCH_STATUS_TTL_SECONDS))
+        except (TypeError, redis.RedisError) as e:
+            LOG.exception(f"Error caching watch status for {watch_id}: {e}")
+            return False
+
+    def get_watch_status(self, watch_id):
+        """Return the stored watch status coordinates, or None if absent/expired."""
+        self._ensure_connection()
+        if not self.redis_client or not watch_id:
+            return None
+        key = f"watch_status:{watch_id}"
+        try:
+            status_json = self.redis_client.get(key)
+        except redis.RedisError as e:
+            LOG.exception(f"Error retrieving watch status for {watch_id}: {e}")
+            return None
+        if status_json:
+            try:
+                return json.loads(status_json)
+            except json.JSONDecodeError:
+                return None
+        return None
+
+    def remove_watch_status(self, watch_id):
+        """Drop the watch status entry once its message has been finalized."""
+        self._ensure_connection()
+        if not self.redis_client or not watch_id:
+            return False
+        key = f"watch_status:{watch_id}"
+        try:
+            self.redis_client.delete(key)
+            return True
+        except redis.RedisError as e:
+            LOG.exception(f"Error removing watch status for {watch_id}: {e}")
+            return False
 
     def cache_channel_session_mapping(self, channel_id, team_id, session_id, account_id=None, tenant_id=None):
         """Cache the mapping between channel_id and session_id from /channels/join"""
@@ -473,6 +579,34 @@ class Cache:
         except redis.RedisError as e:
             LOG.exception(f"Error deduping event {event_id}: {e}")
             return True
+
+    def claim_event_analysis_poller(self, event_id, ttl_seconds):
+        """First claim for event_id wins (True); a second, still-live claim
+        gets False -- guards against two overlapping clicks on the same event
+        each spawning their own poller. Fails open (True) when Redis is
+        unavailable, so an outage degrades to "no dedup" rather than
+        silently dropping the poller."""
+        self._ensure_connection()
+        if not self.redis_client:
+            return True
+        try:
+            return bool(self.redis_client.set(f"event_analysis_poll:{event_id}", "1", nx=True, ex=ttl_seconds))
+        except redis.RedisError as e:
+            LOG.exception(f"Error claiming event analysis poller for {event_id}: {e}")
+            return True
+
+    def release_event_analysis_poller(self, event_id):
+        """Releases a claim taken by claim_event_analysis_poller -- without
+        this, a claim only ever clears on its own after the full TTL, so any
+        retry for the same event stays blocked for that long even though no
+        poller is actually running any more."""
+        self._ensure_connection()
+        if not self.redis_client:
+            return
+        try:
+            self.redis_client.delete(f"event_analysis_poll:{event_id}")
+        except redis.RedisError as e:
+            LOG.exception(f"Error releasing event analysis poller for {event_id}: {e}")
 
     def rebuild_watched_channels(self, platform, team_id, channel_ids):
         """Reseed one workspace's mirror from the DB truth (e.g. after a flush)."""

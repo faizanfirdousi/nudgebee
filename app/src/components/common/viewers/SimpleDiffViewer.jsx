@@ -1,6 +1,7 @@
 import React, { useMemo, useState } from 'react';
 import PropTypes from 'prop-types';
-import { Box, Button, Typography } from '@mui/material';
+import { Box, Typography } from '@mui/material';
+import { Button } from '@ui/Button';
 import { ChevronRight, ExpandMore, Code } from '@mui/icons-material';
 
 /**
@@ -131,7 +132,32 @@ const processLines = (lines) => {
  * @param {string} props.title - Header title text
  * @param {boolean} props.showHeader - Whether to show the collapsible header
  */
-const SimpleDiffViewer = ({ gitDiff, fileName = 'code', defaultExpanded = true, title = 'Code Changes', showHeader = true }) => {
+// A git diff can carry several files, each introduced by its own "diff --git" header. Splitting on
+// that boundary is what keeps every hunk under the file it belongs to: parsed as one blob, the first
+// file's name is stamped on every later file's changes and all the counts are summed into it — so a
+// three-file fix read as one file with someone else's edits in it. Content before any header (a bare
+// unified diff, or jsdiff output) stays as a single section, which is the old behaviour.
+export const splitDiffByFile = (diff) => {
+  const lines = preprocessDiff(diff).split('\n');
+  const sections = [];
+  let current = null;
+  for (const line of lines) {
+    if (line.startsWith('diff --git') && current) {
+      sections.push(current);
+      current = null;
+    }
+    if (!current) {
+      current = [];
+    }
+    current.push(line);
+  }
+  if (current) {
+    sections.push(current);
+  }
+  return sections.map((section) => section.join('\n')).filter((section) => section.trim().length > 0);
+};
+
+const SingleFileDiff = ({ gitDiff, fileName = 'code', defaultExpanded = true, title = 'Code Changes', showHeader = true }) => {
   const [expanded, setExpanded] = useState(defaultExpanded);
 
   const parsedDiff = useMemo(() => {
@@ -207,27 +233,24 @@ const SimpleDiffViewer = ({ gitDiff, fileName = 'code', defaultExpanded = true, 
           onClick={() => setExpanded(!expanded)}
         >
           <Button
-            variant='ghost'
-            size='small'
-            sx={{
-              minWidth: 'auto',
-              padding: 'var(--ds-space-1)',
-              marginRight: 'var(--ds-space-2)',
-            }}
+            tone='ghost'
+            size='sm'
+            composition='icon-only'
+            aria-label={expanded ? 'Collapse diff' : 'Expand diff'}
+            icon={expanded ? <ExpandMore /> : <ChevronRight />}
+            style={{ marginRight: 'var(--ds-space-2)' }}
             onClick={(e) => {
               e.stopPropagation();
               setExpanded(!expanded);
             }}
-          >
-            {expanded ? <ExpandMore sx={{ fontSize: 'var(--ds-text-title)' }} /> : <ChevronRight sx={{ fontSize: 'var(--ds-text-title)' }} />}
-          </Button>
+          />
 
           <Code sx={{ fontSize: 'var(--ds-text-body-lg)', marginRight: 'var(--ds-space-2)' }} />
 
           <Typography
             sx={{
               fontSize: 'var(--ds-text-body-lg)',
-              fontFamily: 'monospace',
+              fontFamily: 'var(--ds-font-mono)',
               flex: 1,
               color: 'var(--ds-gray-600)',
             }}
@@ -240,7 +263,7 @@ const SimpleDiffViewer = ({ gitDiff, fileName = 'code', defaultExpanded = true, 
               fontSize: 'var(--ds-text-small)',
               marginLeft: 'var(--ds-space-4)',
               color: 'var(--ds-green-500)',
-              fontFamily: 'monospace',
+              fontFamily: 'var(--ds-font-mono)',
             }}
           >
             +{parsedDiff.additions}
@@ -251,7 +274,7 @@ const SimpleDiffViewer = ({ gitDiff, fileName = 'code', defaultExpanded = true, 
               fontSize: 'var(--ds-text-small)',
               marginLeft: 'var(--ds-space-2)',
               color: 'var(--ds-red-500)',
-              fontFamily: 'monospace',
+              fontFamily: 'var(--ds-font-mono)',
             }}
           >
             -{parsedDiff.deletions}
@@ -262,7 +285,7 @@ const SimpleDiffViewer = ({ gitDiff, fileName = 'code', defaultExpanded = true, 
       {expanded && (
         <Box
           sx={{
-            fontFamily: 'monospace',
+            fontFamily: 'var(--ds-font-mono)',
             fontSize: 'var(--ds-text-small)',
             overflow: 'auto',
           }}
@@ -305,6 +328,38 @@ const SimpleDiffViewer = ({ gitDiff, fileName = 'code', defaultExpanded = true, 
           ))}
         </Box>
       )}
+    </Box>
+  );
+};
+
+SingleFileDiff.propTypes = {
+  gitDiff: PropTypes.string.isRequired,
+  fileName: PropTypes.string,
+  defaultExpanded: PropTypes.bool,
+  title: PropTypes.string,
+  showHeader: PropTypes.bool,
+};
+
+const SimpleDiffViewer = ({ gitDiff, fileName = 'code', defaultExpanded = true, title = 'Code Changes', showHeader = true }) => {
+  const sections = useMemo(() => (gitDiff ? splitDiffByFile(gitDiff) : []), [gitDiff]);
+
+  // One file, or a diff with no git headers at all: unchanged from before.
+  if (sections.length <= 1) {
+    return <SingleFileDiff gitDiff={gitDiff} fileName={fileName} defaultExpanded={defaultExpanded} title={title} showHeader={showHeader} />;
+  }
+
+  return (
+    <Box>
+      {sections.map((section, index) => (
+        <SingleFileDiff
+          key={`diff-file-${index}`}
+          gitDiff={section}
+          fileName={fileName}
+          defaultExpanded={defaultExpanded}
+          title={title}
+          showHeader={showHeader}
+        />
+      ))}
     </Box>
   );
 };

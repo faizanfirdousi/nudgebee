@@ -301,6 +301,60 @@ func (r RemediationExecuteTool) Call(nbRequestContext core.NbToolContext, input 
 		ExecutedAt: startTime.Format(time.RFC3339),
 	}
 
+	// The executor comes from the account's provider, the same way the remediation panel picks it, so
+	// the two callers cannot disagree about where a command runs.
+	//
+	// A cloud CLI has to go through its own tool to get the account's credentials injected. Run it
+	// anywhere else and it executes unauthenticated, prints its auth-required hint to stdout, exits 0,
+	// and gets recorded as a successful remediation for an action that never happened (#28804).
+	substrate := RemediationSubstrateFor(GetCloudProviderForAccount(nbRequestContext.AccountId), command)
+	if substrate.Reject != "" {
+		logger.Warn("remediation: command does not match the account's provider", "command", command, "reason", substrate.Reject)
+		return core.NBToolResponse{
+			Data:   "Command rejected: " + substrate.Reject,
+			Status: core.NBToolResponseStatusError,
+		}, fmt.Errorf("remediation: %s", substrate.Reject)
+	}
+	if cloudCliTool := substrate.CloudCliTool; cloudCliTool != "" {
+		stdout, execErr := ExecuteCloudCli(nbRequestContext.Ctx, cloudCliTool, nbRequestContext.AccountId, nbRequestContext.ConversationId, command)
+		result.Duration = time.Since(startTime).String()
+		result.Stdout = stdout
+		if execErr != nil {
+			logger.Error("remediation: cloud cli command failed", "command", command, "tool", cloudCliTool, "error", execErr)
+			result.Success = false
+			result.ExitCode = 1
+			result.Error = execErr.Error()
+			result.Stderr = execErr.Error()
+			responseData, formatErr := r.formatExecutionResult(result)
+			if formatErr != nil {
+				logger.Error("remediation: failed to format execution result after command error", "format_error", formatErr, "command_error", execErr)
+				return core.NBToolResponse{
+					Data:   fmt.Sprintf("Command failed (%s) and formatting the result also failed: %s", execErr, formatErr),
+					Status: core.NBToolResponseStatusError,
+				}, nil
+			}
+			return core.NBToolResponse{
+				Data:   responseData,
+				Type:   core.NBToolResponseTypeJson,
+				Status: core.NBToolResponseStatusError,
+			}, nil
+		}
+		result.Success = true
+		result.ExitCode = 0
+		responseData, err := r.formatExecutionResult(result)
+		if err != nil {
+			return core.NBToolResponse{
+				Data:   fmt.Sprintf("Command executed but failed to format result: %v", err),
+				Status: core.NBToolResponseStatusError,
+			}, err
+		}
+		return core.NBToolResponse{
+			Data:   responseData,
+			Type:   core.NBToolResponseTypeJson,
+			Status: core.NBToolResponseStatusSuccess,
+		}, nil
+	}
+
 	wm := workspace.NewWorkspaceManager()
 	response, err := wm.ExecuteOrLazyCreate(nbRequestContext.Ctx, nbRequestContext.AccountId, nbRequestContext.ConversationId, command, map[string]string{
 		workspace.ENV_NB_TOOL_CONFIG_NAME: nbRequestContext.ToolConfig.Name,
@@ -318,7 +372,14 @@ func (r RemediationExecuteTool) Call(nbRequestContext core.NbToolContext, input 
 			result.Stdout = response
 		}
 
-		responseData, _ := r.formatExecutionResult(result)
+		responseData, formatErr := r.formatExecutionResult(result)
+		if formatErr != nil {
+			logger.Error("remediation: failed to format execution result after command error", "format_error", formatErr, "command_error", err)
+			return core.NBToolResponse{
+				Data:   fmt.Sprintf("Command failed (%s) and formatting the result also failed: %s", err, formatErr),
+				Status: core.NBToolResponseStatusError,
+			}, nil
+		}
 		return core.NBToolResponse{
 			Data:   responseData,
 			Type:   core.NBToolResponseTypeJson,
@@ -386,6 +447,151 @@ func ValidateCommandSafety(command string) error {
 	for _, pattern := range dangerousPatterns {
 		if strings.Contains(lowerCmd, pattern) {
 			return fmt.Errorf("blocked destructive command pattern: %s", pattern)
+		}
+	}
+
+	if err := validateCloudCommandSafety(lowerCmd); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// irreversibleCloudOperations are cloud operations that destroy state no rollback can restore.
+//
+// The k8s list above is deliberately permissive because its worst cases are recoverable: a deleted
+// pod is rescheduled, a deleted deployment is redeployed from git. Cloud is not symmetric. A
+// terminated instance takes its instance-store data and its identity with it, a deleted RDS
+// instance without a final snapshot is unrecoverable, and neither has a rollback_command that
+// means anything — the plan would offer one and it would be a lie.
+//
+// So these are blocked outright rather than left to the approval workflow. An operator who
+// genuinely needs to terminate an instance can do it in the AWS console, where the consequence is
+// unambiguous and the audit trail is theirs. That is a deliberately worse workflow for a
+// deliberately rare action.
+var irreversibleCloudOperations = []string{
+	"terminate-instances",
+	"delete-db-instance",
+	"delete-db-cluster",
+	"delete-cluster",
+	"delete-bucket",
+	"delete-vpc",
+	"delete-nat-gateway",
+	"delete-volume",
+	"delete-snapshot",
+	"deregister-image",
+	"delete-key-pair",
+	"delete-load-balancer",
+	"delete-auto-scaling-group",
+	"delete-stack",
+	"delete-secret",
+	"schedule-key-deletion",
+	"delete-file-system",
+	"delete-table",
+	// `aws s3 rb` is the same destruction as s3api delete-bucket under a shorter name.
+	"s3 rb",
+	// Azure equivalents.
+	"vm delete",
+	"group delete",
+	"sql server delete",
+	"sql db delete",
+	"storage account delete",
+	"aks delete",
+	"disk delete",
+	"snapshot delete",
+	"keyvault delete",
+	// GCP equivalents.
+	"instances delete",
+	"clusters delete",
+	"sql instances delete",
+	"disks delete",
+	"snapshots delete",
+	"buckets delete",
+	// Any gsutil rm is an object delete with no rollback. Scoped to the subcommand path, so the
+	// recursive flag that makes it a bucket wipe is not needed to catch it - and object deletion is
+	// not a remediation for an infrastructure alarm in the first place.
+	"gsutil rm",
+}
+
+// leadingCommandNoise are tokens that can precede the real executable without changing what runs.
+// Stripped before deciding whether this is a cloud CLI invocation.
+var leadingCommandNoise = map[string]bool{
+	"sudo": true, "env": true, "time": true, "command": true, "nohup": true, "exec": true,
+}
+
+// cloudCommandTokens returns the command's tokens with leading environment assignments and wrapper
+// programs removed, and the executable reduced to its base name. Returns nil when what remains is
+// not a cloud CLI invocation.
+//
+// This is deliberately more permissive about what counts as a cloud command than CloudCliToolFor,
+// which matches fields[0] exactly. The asymmetry is the safe direction and is intentional: the
+// router decides whether to inject credentials, and being strict there means an odd invocation
+// simply fails; this guard decides whether to refuse, and being strict here would let
+// "sudo aws ec2 terminate-instances" past. Today those two agreeing is what stops the prefixed form
+// doing damage - it is not routed, so it runs without credentials and fails. That is a coincidence
+// between two functions, not an invariant, and it stops holding the moment the execution
+// environment gains ambient credentials (an instance profile on the workspace pod, for one). So the
+// guard does not rely on it.
+func cloudCommandTokens(lowerCmd string) []string {
+	fields := strings.Fields(lowerCmd)
+	for len(fields) > 0 {
+		head := fields[0]
+		// FOO=bar prefixes: an assignment cannot be the program being run.
+		if i := strings.Index(head, "="); i > 0 && !strings.ContainsAny(head[:i], "/-.") {
+			fields = fields[1:]
+			continue
+		}
+		if leadingCommandNoise[head] {
+			fields = fields[1:]
+			continue
+		}
+		break
+	}
+	if len(fields) == 0 {
+		return nil
+	}
+	// /usr/local/bin/aws and aws are the same program.
+	exe := fields[0]
+	if i := strings.LastIndex(exe, "/"); i >= 0 {
+		exe = exe[i+1:]
+	}
+	switch exe {
+	case "aws", "az", "gcloud", "gsutil":
+	default:
+		return nil
+	}
+	out := append([]string{exe}, fields[1:]...)
+	return out
+}
+
+// validateCloudCommandSafety blocks irreversible cloud operations. Only applied to cloud CLI
+// invocations so a kubectl or shell command containing a similar word is unaffected.
+func validateCloudCommandSafety(lowerCmd string) error {
+	tokens := cloudCommandTokens(lowerCmd)
+	if tokens == nil {
+		return nil
+	}
+
+	// Match against the subcommand path only - the tokens before the first flag. A provider CLI
+	// puts service and operation there ("aws ec2 terminate-instances"), so this still catches every
+	// real invocation while a resource that merely happens to be NAMED like one stops being a false
+	// positive: `aws ec2 describe-instances --filters Name=tag:Name,Values=delete-volume` is a
+	// read, and blocking it would train people to route around the guard.
+	path := tokens
+	for i, tok := range tokens {
+		if strings.HasPrefix(tok, "-") {
+			path = tokens[:i]
+			break
+		}
+	}
+	joined := strings.Join(path, " ")
+
+	for _, op := range irreversibleCloudOperations {
+		if strings.Contains(joined, op) {
+			return fmt.Errorf(
+				"blocked irreversible cloud operation %q: this destroys state that no rollback can "+
+					"restore, so it is not available as an automated remediation - run it from the "+
+					"cloud console if it is genuinely required", op)
 		}
 	}
 

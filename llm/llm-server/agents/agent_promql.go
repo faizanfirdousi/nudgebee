@@ -51,7 +51,7 @@ func (p *PromqlAgent) GetName() string {
 }
 
 func (l *PromqlAgent) GetNameAliases() []string {
-	return []string{"PromQL Query"}
+	return []string{"PromQL Query Writer", "PromQL Query"}
 }
 
 func (p *PromqlAgent) GetDescription() string {
@@ -101,7 +101,7 @@ func (l *PromqlAgent) GetSystemPrompt(ctx *security.RequestContext, query core.N
 
 	// otel metrices
 	if !l.externalHostsCached {
-		l.externalHosts = tools.GetCurrentOtelHosts(query.AccountId)
+		l.externalHosts = tools.GetCurrentOtelHosts(ctx, query.AccountId)
 		l.externalHostsCached = true
 	}
 
@@ -222,9 +222,15 @@ func (l *PromqlAgent) GetSystemPrompt(ctx *security.RequestContext, query core.N
 }
 
 func (p *PromqlAgent) GetSupportedTools(ctx *security.RequestContext) []toolcore.NBTool {
+	// Resolved once rather than per tool: the lookup is an uncached call to the
+	// api-server. This agent writes PromQL for whichever backend the account uses,
+	// so its discovery tools have to enumerate that backend's metrics, not
+	// Prometheus's.
+	metricsProvider := tools.MetricsDiscoveryProvider(p.accountId)
+
 	return []toolcore.NBTool{
-		tools.MetricsListTool{Provider: "prometheus"},
-		tools.ListMetricsLabelsTool{Provider: "prometheus"},
+		tools.MetricsListTool{Provider: metricsProvider},
+		tools.ListMetricsLabelsTool{Provider: metricsProvider},
 	}
 }
 

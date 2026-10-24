@@ -20,6 +20,7 @@ const (
 	ConversationStatusWaiting              ConversationStatus = "WAITING"
 	ConversationStatusWaitingForClientTool ConversationStatus = "WAITING_FOR_CLIENT_TOOL"
 	ConversationStatusTerminated           ConversationStatus = "TERMINATED"
+	ConversationStatusQueued               ConversationStatus = "QUEUED"
 )
 
 // IsTerminalConversationStatus returns true if the conversation has reached a
@@ -55,6 +56,8 @@ const (
 	ConversationSourceUserInvestigationCLI ConversationSource = "UserInvestigationCli"
 	ConversationSourceOptimize             ConversationSource = "Optimize"
 	ConversationSourceAutomation           ConversationSource = "Automation"
+	ConversationSourcePRLifecycle          ConversationSource = "pr_lifecycle"
+	ConversationSourceRecommendation       ConversationSource = "recommendation"
 )
 
 // ImageAttachment represents an image attached to an agent request.
@@ -67,25 +70,32 @@ type ImageAttachment struct {
 
 // DO not use for API calls
 type NBAgentRequest struct {
-	Query                 string                     `json:"query" mapstructure:"required" validate:"required"`
-	AccountId             string                     `json:"account_id" mapstructure:"required" validate:"required"`
-	ConversationId        string                     `json:"conversation_id"`
-	AgentId               string                     `json:"agent_id"`
-	ParentAgentId         string                     `json:"parent_agent_id"`
-	MessageId             string                     `json:"message_id"`
-	UserId                string                     `json:"user_id"`
-	ConversationContext   string                     `json:"conversation_context"`
-	QueryContext          string                     `json:"query_context"`
-	QueryConfig           toolcore.NBQueryConfig     `json:"query_config"`
-	EnableQueryRefinement bool                       `json:"enable_query_refinement"`
-	AccountPrompt         string                     `json:"account_prompt"`
-	SessionId             string                     `json:"session_id"`
-	ConversationSource    ConversationSource         `json:"source"`
-	EnableCritique        bool                       `json:"enable_critique"`
-	ClientTools           []toolcore.NBToolCommand   `json:"client_tools"`
-	Capabilities          toolcore.AgentCapabilities `json:"capabilities"`
-	PreviousState         string                     `json:"previous_state"`
-	Images                []ImageAttachment          `json:"images,omitempty"`
+	KnowledgePolicy         KnowledgePolicy        `json:"-"`
+	KnowledgePolicyResolved bool                   `json:"-"`
+	Query                   string                 `json:"query" mapstructure:"required" validate:"required"`
+	AccountId               string                 `json:"account_id" mapstructure:"required" validate:"required"`
+	ConversationId          string                 `json:"conversation_id"`
+	AgentId                 string                 `json:"agent_id"`
+	ParentAgentId           string                 `json:"parent_agent_id"`
+	MessageId               string                 `json:"message_id"`
+	UserId                  string                 `json:"user_id"`
+	ConversationContext     string                 `json:"conversation_context"`
+	QueryContext            string                 `json:"query_context"`
+	QueryConfig             toolcore.NBQueryConfig `json:"query_config"`
+	EnableQueryRefinement   bool                   `json:"enable_query_refinement"`
+	// AccountContext is the stable, account-wide GlobalContext. ReAct planners
+	// place it in their account-scoped cacheable system prefix.
+	AccountContext string `json:"account_context,omitempty"`
+	// AccountPrompt is request/entry-point-specific additional guidance (for
+	// example event-analysis instructions) and stays in the dynamic human turn.
+	AccountPrompt      string                     `json:"account_prompt"`
+	SessionId          string                     `json:"session_id"`
+	ConversationSource ConversationSource         `json:"source"`
+	EnableCritique     bool                       `json:"enable_critique"`
+	ClientTools        []toolcore.NBToolCommand   `json:"client_tools"`
+	Capabilities       toolcore.AgentCapabilities `json:"capabilities"`
+	PreviousState      string                     `json:"previous_state"`
+	Images             []ImageAttachment          `json:"images,omitempty"`
 	// SkillsContext carries fully-rendered skill content (a `<skills>...</skills>` block)
 	// for agents whose planner type is AgentPlannerTypeCustom AND whose Execute()
 	// makes direct LLM calls (loganalysis, logs_default.generateFinalResponse,
@@ -109,12 +119,8 @@ type NBAgentRequest struct {
 	// executor entry and propagated unchanged through delegation. Empty means this
 	// is the top-level invocation; non-empty means we are running under a parent.
 	OriginalQuery string `json:"original_query,omitempty"`
-	// SelectedSkillIds is the question-aware short-list computed once at the
-	// top-level invocation when LlmServerSkillSelectionTopK > 0. Both the eager
-	// LoadActiveAgentSkillContents path and the lazy injectKBContext path filter to
-	// these IDs (∪ the sub-agent's own mapped KBs). nil means "no filtering / show
-	// every mapped skill" (selection disabled, or no mapped skills, or top-level
-	// fan-out smaller than K).
+	// SelectedSkillIds is retained for custom code-analysis and compatibility
+	// paths. Account-wide runtime knowledge discovery does not use it.
 	SelectedSkillIds []string `json:"selected_skill_ids,omitempty"`
 	// IsResume marks the request as a resume of an already-active conversation
 	// (client-tool-result, dead-worker recovery). When true, handleConversationRequest
@@ -125,22 +131,22 @@ type NBAgentRequest struct {
 	// #29973). New-turn requests must keep IsResume=false so legitimate races
 	// (user submits while another turn is running) still surface as errors.
 	IsResume bool `json:"is_resume,omitempty"`
-	// KBPrestepContent holds knowledge base content retrieved by the pre-step
-	// (retrieveRelevantKB) before planning. Populated only when
-	// LlmServerKBPrestepEnabled is on. The planner renders it into the human
-	// message — not the cacheable system prefix — so per-request KB content
-	// never thrashes the LLM cache.
+	// IsQueuedDispatch is internal: the queue claim owns this fresh message.
+	IsQueuedDispatch bool `json:"-" mapstructure:"-"`
+	// KBPrestepContent holds relevant knowledge retrieved before planning. The
+	// planner renders it into the human message, not the cacheable system prefix.
 	KBPrestepContent string `json:"kb_prestep_content,omitempty"`
+	// RAGExamples holds the agent's RAG examples retrieved for this query. They
+	// vary per query, so the planner renders them into the human message, not
+	// the cacheable system prefix.
+	RAGExamples string `json:"rag_examples,omitempty"`
 	// KBReferences holds references to knowledge base sources retrieved by the pre-step.
 	KBReferences []AgentReference `json:"kb_references,omitempty"`
 	// KBPrestepExecuted indicates whether pre-step RAG retrieval has already been performed
 	// for this turn or propagated from a parent invocation, avoiding redundant embedding and RAG queries.
 	KBPrestepExecuted bool `json:"kb_prestep_executed,omitempty"`
-	// SkillListsMenu holds the `<skill-lists>` discovery block (names +
-	// descriptions, no bodies) when LlmServerKBPrestepEnabled is on. Like
-	// KBPrestepContent it is rendered into the human message instead of the
-	// system prompt. When the flag is off this stays empty and the legacy
-	// injectKBContext path prepends the block to the system prompt instead.
+	// SkillListsMenu holds the compact `<skill-lists>` candidate index. Like
+	// KBPrestepContent, it is rendered into the human message.
 	SkillListsMenu string `json:"skill_lists_menu,omitempty"`
 	// ChannelContext holds conversation observed in a messaging channel the
 	// tenant opted into watching. It is third-party text that nobody addressed
@@ -160,6 +166,10 @@ type NBAgentRequest struct {
 	// patterns, decisions, collective, plus the <memory_index> audit footer).
 	// Rendered as a reference-framed <user_memory> block in the human message.
 	MemoryContext string `json:"memory_context,omitempty"`
+	// ReplyRef is an opaque per-question correlator echoed back unchanged on
+	// the /llm/response webhook — see ConversationApiRequest.ReplyRef. Never
+	// read by any agent; carried only for sendReplyToNotificationServer.
+	ReplyRef string `json:"reply_ref,omitempty"`
 }
 
 // DO not use for API calls
@@ -197,8 +207,13 @@ type NBAgentPlannerToolActionCondition struct {
 type NBAgentPlannerToolAction struct {
 	Tool      string `json:"tool"`
 	ToolInput string `json:"tool_input"`
-	Log       string `json:"log"`
-	ToolID    string `json:"tool_id"`
+	// NativeToolInput preserves the provider's original function arguments for
+	// exact ReAct4 history replay. ToolInput is the execution-safe form with
+	// planner metadata such as _thought removed. Empty for ReAct3 and for
+	// steps persisted before native per-call attribution existed.
+	NativeToolInput string `json:"native_tool_input,omitempty"`
+	Log             string `json:"log"`
+	ToolID          string `json:"tool_id"`
 	// DisplayID is a human-readable sequential identifier (e.g. "E1", "E2", "E3")
 	// assigned by the ReAct3 planner as steps are generated, for use in citations
 	// and the response formatter. Empty for planner types that do not run react_3
@@ -206,9 +221,46 @@ type NBAgentPlannerToolAction struct {
 	DisplayID  string                            `json:"display_id,omitempty"`
 	Dependency []string                          `json:"dependency"`
 	Condition  NBAgentPlannerToolActionCondition `json:"condition"`
+	// TurnID groups the actions that the model emitted in a SINGLE completion
+	// (a parallel tool-call batch). react_4 flattens each action into its own
+	// step, so without this marker the rebuilt history splits one assistant turn
+	// into N separate assistant messages. That reshaping is not cosmetic for
+	// Gemini thinking models: they attach the reasoning signature to the FIRST
+	// functionCall part of a turn only, so siblings replayed as standalone
+	// messages arrive with no signature of their own and the request is rejected
+	// ("...missing a thought_signature..., position 2"). Empty for steps
+	// persisted before this field existed, which are then replayed one per
+	// message exactly as before.
+	TurnID string `json:"turn_id,omitempty"`
+	// ExecutionBatchID groups tool calls that were emitted in one multi-action
+	// planner turn. ExecutionMode records whether the shared executor actually
+	// dispatched that batch through its parallel or sequential path; this is a
+	// dispatch-strategy marker, not a claim that calls overlapped in wall-clock
+	// time. A safety pre-flight can downgrade a model-emitted batch to sequential.
+	ExecutionBatchID          string `json:"execution_batch_id,omitempty"`
+	ExecutionMode             string `json:"execution_mode,omitempty"`
+	ExecutionBatchSize        int    `json:"execution_batch_size,omitempty"`
+	ExecutionParallelismLimit int    `json:"execution_parallelism_limit,omitempty"`
+	SequentialFallbackReason  string `json:"sequential_fallback_reason,omitempty"`
+	PlannerIteration          int    `json:"planner_iteration,omitempty"`
+	// ThoughtSignature is the provider's opaque record of the reasoning that
+	// produced THIS tool call. Gemini 2.5/3.x thinking models return one with
+	// each native function call and require it replayed verbatim whenever that
+	// call reappears in history; on 3.x a replay without it fails the request
+	// with HTTP 400 ("Function call is missing a thought_signature in
+	// functionCall parts").
+	//
+	// It lives on the action rather than in planner-local state because react_4
+	// rebuilds its native message list from the persisted steps on every Plan()
+	// call — including after a suspend/resume — so anything not stored here is
+	// gone by the next turn. Only the originating provider can produce it: it is
+	// opaque, must never be synthesized, and is simply absent for planners and
+	// providers that do not use native tool calling.
+	ThoughtSignature []byte `json:"thought_signature,omitempty"`
 	// MemoryRefs is the LLM's self-attribution: which injected memory
-	// item(s) shaped THIS action. Populated when the model emits
+	// item(s) shaped THIS action. ReAct3 populates it when the model emits
 	//   <action>...<memory_used><ref n="N" note="..."/></memory_used></action>
+	// ReAct4 populates it from the reserved native `_memory_refs` argument.
 	// The N is the 1-based [mN] position from the memory block's
 	// <memory_index> footer. Persisted verbatim on the tool_calls row
 	// (llm_conversation_tool_calls.memory_refs jsonb) so a query-time
@@ -301,6 +353,9 @@ type ToolInvocation struct {
 	Response   llms.ToolCallResponse
 	Log        string
 	References []toolcore.NBToolResponseReference
+	// Failed is true when the step's tool reported failure, so a wrapper that
+	// forwards Response.Content upward doesn't relabel an error as success.
+	Failed bool
 }
 
 type NBAgentPlanner interface {
@@ -331,6 +386,10 @@ type MemoryFact struct {
 	// "you decided X because Y" subtitle is populated on auto-extracted
 	// rows.
 	Rationale string `json:"rationale,omitempty"`
+	// EvidenceQuote is the user's own words that justify an inferred fact
+	// (a short verbatim snippet from the turn). Stored as provenance so a
+	// human can verify why the memory was inferred.
+	EvidenceQuote string `json:"evidence_quote,omitempty"`
 	// PatternKind is the snake_case category the extractor assigns to a
 	// pattern record (e.g. frequent_namespace, preferred_diagnostic_flow).
 	// Required when IsPattern is true — without it the projection step
@@ -402,12 +461,57 @@ const (
 	AgentPlannerTypeClassification AgentPlannerType = "classification"
 )
 
+// AgentKnowledgeMode controls how question-relevant account knowledge is
+// presented to an agent. ReAct agents default to a compact candidate index and
+// load individual candidates on demand. Custom agents must opt in because they
+// build their own LLM messages and cannot call load_skills unless their Execute
+// implementation provides a tool loop.
+type AgentKnowledgeMode string
+
+const (
+	AgentKnowledgeDisabled   AgentKnowledgeMode = "disabled"
+	AgentKnowledgeIndexOnly  AgentKnowledgeMode = "index_only"
+	AgentKnowledgeAutoChunks AgentKnowledgeMode = "auto_chunks"
+)
+
+// NBAgentKnowledgeModeProvider is implemented by custom agents that directly
+// consume bounded, question-relevant knowledge chunks in their LLM prompt.
+// Custom delegators should remain disabled and let their underlying ReAct
+// provider agent perform its own discovery for the delegated task.
+type NBAgentKnowledgeModeProvider interface {
+	GetKnowledgeMode() AgentKnowledgeMode
+}
+
 // AgentPlannerTypeReAct3 is the runtime ENGINE, not a declared type: no agent's
 // GetPlannerType() returns it. resolveEffectivePlannerType maps the ReAct and
 // Orchestrating intents to it. It exists as a value (rather than only the
 // *NBReActPlanner3 concrete type) because prompt assembly and response formatting
 // must select react-style behavior before the planner instance is created.
 const AgentPlannerTypeReAct3 AgentPlannerType = "react_3"
+
+// AgentPlannerTypeReAct4 is the provider-native tool-calling ENGINE (also not a
+// declared type). Like ReAct3 it is produced at runtime, not returned by any
+// agent's GetPlannerType(): a ReAct/Orchestrating agent resolves to ReAct4
+// when LlmServerPlannerEngine is auto/react4 AND the resolved provider/model supports
+// native tool calling (see SupportsNativeTools / useReAct4Engine); otherwise it
+// falls back to ReAct3. See docs/planner_react_4.md.
+const AgentPlannerTypeReAct4 AgentPlannerType = "react_4"
+
+// NBAgentReAct4Provider is an opt-in marker. An agent implementing it with
+// PrefersReAct4() == true runs under the ReAct4 native tool-calling planner
+// regardless of LlmServerPlannerEngine — but never bypasses the capability
+// gate: if the resolved provider/model lacks native tool support it still falls
+// back to ReAct3 (fail-closed, see useReAct4Engine).
+//
+// It exists so a ReAct4 mirror of an agent can be registered under its own
+// handle for side-by-side evaluation without flipping the global flag for every
+// account. An implementing agent keeps declaring its normal planner type
+// (Orchestrating/ReAct), so every gate keyed on the DECLARED type — query cap,
+// memory extraction, response formatting, DisplayID assignment — behaves
+// identically to the agent it mirrors. Only the planner engine differs.
+type NBAgentReAct4Provider interface {
+	PrefersReAct4() bool
+}
 
 type NBAgentPromptRagFormat string
 
@@ -510,6 +614,22 @@ func isSingleShotClassifier(agent NBAgent) bool {
 	return agent != nil && agent.GetPlannerType() == AgentPlannerTypeClassification
 }
 
+// isContextExtractionApplicable reports whether a conversation source should run
+// asynchronous conversation context distillation (context_memories_extractions).
+// Headless automated pipelines (alert investigations, PR lifecycle bots, workflow
+// automations, and recommendation generators) never reuse conversational context.
+func isContextExtractionApplicable(source ConversationSource) bool {
+	switch source {
+	case ConversationSourceInvestigation,
+		ConversationSourceAutomation,
+		ConversationSourcePRLifecycle,
+		ConversationSourceRecommendation:
+		return false
+	default:
+		return true
+	}
+}
+
 // NBAgentCacheScopeProvider is an optional interface that allows agents to define
 // their caching stability scope (e.g. Account or Global level vs Conversation).
 type NBAgentCacheScopeProvider interface {
@@ -574,6 +694,28 @@ type NBAgentTimeoutProvider interface {
 	GetTimeout() time.Duration
 }
 
+// NBAgentParentTerminalProvider is an explicit opt-in for agents whose terminal
+// result is also the final result of the calling parent. Most ReAct agents mark
+// their own final answer IsTerminal, but that only means the child has finished;
+// ordinary agent-as-tool calls must return that answer as evidence and let the
+// parent synthesize it with sibling results. Specialized agents such as the
+// automation builder opt in because their finalized artifact must bubble through
+// ancestor planners unchanged.
+type NBAgentParentTerminalProvider interface {
+	PropagateTerminalResponseToParent() bool
+}
+
+// ResolveAgentParentTerminal separates child completion from parent
+// finalization. Parent termination is fail-closed: it requires both a terminal
+// child response and an explicit provider opt-in.
+func ResolveAgentParentTerminal(agent NBAgent, childTerminal bool) bool {
+	if !childTerminal {
+		return false
+	}
+	provider, ok := agent.(NBAgentParentTerminalProvider)
+	return ok && provider.PropagateTerminalResponseToParent()
+}
+
 // NBAgentNotebookSectionProvider lets an agent opt out of the planner's
 // notebook/working-memory section in the system prompt. Default (when not
 // implemented) is true — notebook discipline is mandated for SRE-style
@@ -592,6 +734,56 @@ func ResolveAgentNotebookEnabled(agent NBAgent) bool {
 		return p.GetNotebookEnabled()
 	}
 	return true
+}
+
+// NBAgentAccountContextProvider controls whether stable account-wide Global
+// Context is added to an agent's system prompt. Built-in agents include it by
+// default. User-curated custom agents opt out because their stored prompt and
+// explicitly selected tools are their context contract; a future custom-agent
+// setting can opt back in through this same capability.
+type NBAgentAccountContextProvider interface {
+	GetAccountContextEnabled() bool
+}
+
+// ResolveAgentAccountContextEnabled preserves the existing enabled default for
+// agents that do not declare an account-context preference.
+func ResolveAgentAccountContextEnabled(agent NBAgent) bool {
+	if p, ok := agent.(NBAgentAccountContextProvider); ok {
+		return p.GetAccountContextEnabled()
+	}
+	return true
+}
+
+// NBAgentMemoryProvider controls whether conversation memory is retrieved and
+// composed for an agent. Built-in agents retain memory by default. User-curated
+// custom agents opt out because their stored prompt and explicitly selected
+// tools are their context contract; a future custom-agent setting can opt back
+// in through this same capability.
+type NBAgentMemoryProvider interface {
+	GetMemoryEnabled() bool
+}
+
+// ResolveAgentMemoryEnabled preserves the existing enabled default for agents
+// that do not declare a memory preference.
+func ResolveAgentMemoryEnabled(agent NBAgent) bool {
+	if p, ok := agent.(NBAgentMemoryProvider); ok {
+		return p.GetMemoryEnabled()
+	}
+	return true
+}
+
+// NBAgentThinkingLevelProvider allows an agent to request a provider-native
+// reasoning level for its planner calls. An empty value preserves the resolved
+// model/default configuration.
+type NBAgentThinkingLevelProvider interface {
+	GetThinkingLevel() string
+}
+
+func ResolveAgentThinkingLevel(agent NBAgent) string {
+	if p, ok := agent.(NBAgentThinkingLevelProvider); ok {
+		return p.GetThinkingLevel()
+	}
+	return ""
 }
 
 // AgentModule identifies the functional bucket an agent belongs to. Used by

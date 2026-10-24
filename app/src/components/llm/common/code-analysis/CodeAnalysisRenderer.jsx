@@ -71,7 +71,7 @@ const SectionTitle = ({ icon, label, count }) => (
       {label}
     </Typography>
     {typeof count === 'number' && (
-      <Typography sx={{ fontSize: 'var(--ds-text-caption)', color: 'var(--ds-gray-600)', fontFamily: 'monospace' }}>({count})</Typography>
+      <Typography sx={{ fontSize: 'var(--ds-text-caption)', color: 'var(--ds-gray-600)', fontFamily: ds.font.mono }}>({count})</Typography>
     )}
   </Box>
 );
@@ -108,7 +108,7 @@ const CollapsibleSection = ({ icon, label, count, defaultExpanded, children }) =
           {label}
         </Typography>
         {typeof count === 'number' && (
-          <Typography sx={{ fontSize: 'var(--ds-text-caption)', color: 'var(--ds-gray-600)', fontFamily: 'monospace' }}>({count})</Typography>
+          <Typography sx={{ fontSize: 'var(--ds-text-caption)', color: 'var(--ds-gray-600)', fontFamily: ds.font.mono }}>({count})</Typography>
         )}
       </Box>
       {expanded && <Box sx={{ padding: `${ds.space.mul(0, 5)} ${ds.space[3]}` }}>{children}</Box>}
@@ -170,7 +170,7 @@ const VerdictCallout = ({ errorMessage, description, onLinkClick }) => {
         <Typography
           sx={{
             fontSize: 'var(--ds-text-small)',
-            fontFamily: 'monospace',
+            fontFamily: ds.font.mono,
             color: 'var(--ds-amber-700)',
             whiteSpace: 'pre-wrap',
             wordBreak: 'break-word',
@@ -180,7 +180,7 @@ const VerdictCallout = ({ errorMessage, description, onLinkClick }) => {
           {errorMessage}
         </Typography>
       )}
-      {isNonEmptyString(description) && <MarkDowns data={description.replace(/~/g, '\\~')} sx={{ width: '100%', p: 0 }} onLinkClick={onLinkClick} />}
+      {isNonEmptyString(description) && <MarkDowns data={description} sx={{ width: '100%', p: 0 }} onLinkClick={onLinkClick} />}
     </Box>
   );
 };
@@ -198,7 +198,7 @@ const RootCauseSection = ({ rootCause, onLinkClick }) => {
   return (
     <Box sx={{ mb: sectionGap }}>
       <SectionTitle icon={<Search sx={{ fontSize: 16, color: 'var(--ds-gray-600)' }} />} label='Root cause' />
-      <MarkDowns data={rootCause.replace(/~/g, '\\~')} sx={{ width: '100%', p: 0 }} onLinkClick={onLinkClick} />
+      <MarkDowns data={rootCause} sx={{ width: '100%', p: 0 }} onLinkClick={onLinkClick} />
     </Box>
   );
 };
@@ -234,7 +234,7 @@ const NumberedCodeBlock = ({ code, startLine, attachedToHeader, maxHeight = ds.s
         margin: 0,
         backgroundColor: 'var(--ds-gray-700)',
         color: 'var(--ds-gray-300)',
-        fontFamily: 'monospace',
+        fontFamily: ds.font.mono,
         fontSize: 'var(--ds-text-small)',
         lineHeight: 1.5,
         overflow: 'auto',
@@ -298,7 +298,7 @@ const AffectedCodeBlock = ({ filePath, lineNumber, codeContext, originalCode }) 
             backgroundColor: 'var(--ds-gray-100)',
             border: '1px solid var(--ds-gray-200)',
             borderRadius: `${ds.radius.sm} ${ds.radius.sm} 0 0`,
-            fontFamily: 'monospace',
+            fontFamily: ds.font.mono,
             fontSize: 'var(--ds-text-small)',
             color: 'var(--ds-brand-500)',
           }}
@@ -340,7 +340,7 @@ const ProposedFixBlock = ({ gitDiff, originalCode, fixedCode }) => {
           padding: `${ds.space.mul(0, 5)} ${ds.space[3]}`,
           backgroundColor: 'var(--ds-gray-700)',
           color: 'var(--ds-gray-300)',
-          fontFamily: 'monospace',
+          fontFamily: ds.font.mono,
           fontSize: 'var(--ds-text-small)',
           lineHeight: 1.5,
           overflow: 'auto',
@@ -407,7 +407,7 @@ const CitationItem = ({ citation, defaultExpanded }) => {
             <ChevronRight sx={{ fontSize: 14, color: 'var(--ds-gray-600)' }} />
           ))}
         <Code sx={{ fontSize: 14, color: 'var(--ds-gray-600)' }} />
-        <Typography sx={{ fontFamily: 'monospace', fontSize: 'var(--ds-text-small)', color: 'var(--ds-brand-500)', wordBreak: 'break-all' }}>
+        <Typography sx={{ fontFamily: ds.font.mono, fontSize: 'var(--ds-text-small)', color: 'var(--ds-brand-500)', wordBreak: 'break-all' }}>
           {isNonEmptyString(citation.file_path) ? citation.file_path : '(unknown file)'}
           {lineRange ? `:${lineRange}` : ''}
         </Typography>
@@ -490,7 +490,7 @@ const ImplementationStepsSection = ({ steps, onLinkClick }) => {
           const text = stringifyStep(step);
           return (
             <li key={`step-${idx}-${text.slice(0, 40)}`}>
-              <MarkDowns data={text.replace(/~/g, '\\~')} sx={{ width: '100%', p: 0, '& p': { margin: 0 } }} onLinkClick={onLinkClick} />
+              <MarkDowns data={text} sx={{ width: '100%', p: 0, '& p': { margin: 0 } }} onLinkClick={onLinkClick} />
             </li>
           );
         })}
@@ -508,7 +508,7 @@ const renderAlternativeFix = (alt, idx, onLinkClick) => {
   if (typeof alt === 'string') {
     return (
       <Box key={`alt-${idx}-${alt.slice(0, 30)}`} sx={{ mb: ds.space[2] }}>
-        <MarkDowns data={alt.replace(/~/g, '\\~')} sx={{ width: '100%', p: 0 }} onLinkClick={onLinkClick} />
+        <MarkDowns data={alt} sx={{ width: '100%', p: 0 }} onLinkClick={onLinkClick} />
       </Box>
     );
   }
@@ -532,9 +532,7 @@ const renderAlternativeFix = (alt, idx, onLinkClick) => {
             {alt.title}
           </Typography>
         )}
-        {isNonEmptyString(alt.description) && (
-          <MarkDowns data={alt.description.replace(/~/g, '\\~')} sx={{ width: '100%', p: 0 }} onLinkClick={onLinkClick} />
-        )}
+        {isNonEmptyString(alt.description) && <MarkDowns data={alt.description} sx={{ width: '100%', p: 0 }} onLinkClick={onLinkClick} />}
         {isNonEmptyString(alt.git_diff) && <SimpleDiffViewer gitDiff={alt.git_diff} defaultExpanded={false} />}
       </Box>
     );
@@ -582,7 +580,7 @@ const InvestigationTrailSection = ({ trail, onLinkClick }) => {
           const text = stringifyStep(step);
           return (
             <li key={`trail-${idx}-${text.slice(0, 40)}`}>
-              <MarkDowns data={text.replace(/~/g, '\\~')} sx={{ width: '100%', p: 0, '& p': { margin: 0 } }} onLinkClick={onLinkClick} />
+              <MarkDowns data={text} sx={{ width: '100%', p: 0, '& p': { margin: 0 } }} onLinkClick={onLinkClick} />
             </li>
           );
         })}
@@ -646,7 +644,7 @@ const ExecutionResultStrip = ({ status, summary, filesModified, verificationPass
         {verificationPassed === true && <Label text='Verification passed' tone='success' />}
         {verificationPassed === false && <Label text='Verification failed' tone='critical' />}
       </Box>
-      {isNonEmptyString(summary) && <MarkDowns data={summary.replace(/~/g, '\\~')} sx={{ width: '100%', p: 0 }} onLinkClick={onLinkClick} />}
+      {isNonEmptyString(summary) && <MarkDowns data={summary} sx={{ width: '100%', p: 0 }} onLinkClick={onLinkClick} />}
       {isNonEmptyArray(filesModified) && (
         <Box mt={ds.space.mul(0, 3)}>
           <Typography
@@ -658,7 +656,7 @@ const ExecutionResultStrip = ({ status, summary, filesModified, verificationPass
             {filesModified.map((f, idx) => (
               <li
                 key={`fm-${idx}-${f}`}
-                style={{ fontFamily: 'monospace', fontSize: 'var(--ds-text-small)', color: 'var(--ds-brand-500)', wordBreak: 'break-all' }}
+                style={{ fontFamily: ds.font.mono, fontSize: 'var(--ds-text-small)', color: 'var(--ds-brand-500)', wordBreak: 'break-all' }}
               >
                 {f}
               </li>
@@ -673,7 +671,7 @@ const ExecutionResultStrip = ({ status, summary, filesModified, verificationPass
           >
             Verification details
           </Typography>
-          <MarkDowns data={verificationDetails.replace(/~/g, '\\~')} sx={{ width: '100%', p: 0 }} onLinkClick={onLinkClick} />
+          <MarkDowns data={verificationDetails} sx={{ width: '100%', p: 0 }} onLinkClick={onLinkClick} />
         </Box>
       )}
     </Box>
@@ -715,7 +713,7 @@ const CommitItem = ({ commit }) => {
         {sha && (
           <Typography
             sx={{
-              fontFamily: 'monospace',
+              fontFamily: ds.font.mono,
               fontSize: 'var(--ds-text-small)',
               color: 'var(--ds-blue-500)',
               fontWeight: 'var(--ds-font-weight-semibold)',
@@ -842,7 +840,7 @@ const ResultFooter = ({ data }) => {
       {(repo || hash) && (
         <Box display='flex' alignItems='center' gap={ds.space[2]} flexWrap='wrap'>
           {repo && (
-            <Typography sx={{ fontSize: 'var(--ds-text-caption)', color: 'var(--ds-gray-600)', fontFamily: 'monospace', wordBreak: 'break-all' }}>
+            <Typography sx={{ fontSize: 'var(--ds-text-caption)', color: 'var(--ds-gray-600)', fontFamily: ds.font.mono, wordBreak: 'break-all' }}>
               {repo}
             </Typography>
           )}
@@ -851,7 +849,7 @@ const ResultFooter = ({ data }) => {
               sx={{
                 fontSize: 'var(--ds-text-caption)',
                 color: 'var(--ds-brand-500)',
-                fontFamily: 'monospace',
+                fontFamily: ds.font.mono,
                 backgroundColor: 'var(--ds-gray-100)',
                 padding: `${ds.space[0]} ${ds.space.mul(0, 3)}`,
                 borderRadius: ds.radius.sm,

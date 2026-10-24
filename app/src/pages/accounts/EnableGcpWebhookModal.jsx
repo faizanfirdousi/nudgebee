@@ -1,22 +1,13 @@
-import {
-  Grid,
-  Typography,
-  Stepper,
-  Step,
-  StepLabel,
-  StepConnector,
-  stepConnectorClasses,
-  styled,
-  Box,
-  Collapse,
-  Alert,
-  CircularProgress,
-  Link,
-} from '@mui/material';
+import { Grid, Typography, Box, CircularProgress } from '@mui/material';
+import { Banner } from '@ui/Banner';
+import { Link } from '@ui/Link';
 import { Input } from '@ui/Input';
-import { ContentCopy, Check, HelpOutline, ExpandMore, ExpandLess, CheckCircleOutline, ErrorOutline } from '@mui/icons-material';
+import { CollapsableCard } from '@ui/CollapsableCard';
+import { Stepper } from '@ui/Stepper';
+import { ContentCopy, Check, HelpOutline } from '@mui/icons-material';
 import { useState, useEffect, useCallback } from 'react';
 import PropTypes from 'prop-types';
+import { getBrandTitle } from '@hooks/useTenantBranding';
 import apiAccount from '@api1/account';
 import apiIntegrations from '@api1/integrations';
 import { Modal } from '@ui/Modal';
@@ -25,53 +16,6 @@ import { toast as snackbar } from '@ui/Toast';
 import MarkDowns from '@shared/viewers/MarkDowns';
 import { ds } from 'src/utils/colors';
 import { safeJSONParse } from 'src/utils/common';
-
-const StepConnectorStyled = styled(StepConnector)(() => ({
-  [`&.${stepConnectorClasses.alternativeLabel}`]: {
-    top: ds.space.mul(1, 5),
-    left: `calc(-50% + ${ds.space[4]})`,
-    right: `calc(50% + ${ds.space[4]})`,
-  },
-  [`&.${stepConnectorClasses.active}, &.${stepConnectorClasses.completed}`]: {
-    [`& .${stepConnectorClasses.line}`]: {
-      borderColor: ds.green[500],
-      borderTopWidth: 2,
-    },
-  },
-  [`& .${stepConnectorClasses.line}`]: {
-    borderColor: ds.brand[200],
-    borderTopWidth: 1,
-    borderRadius: ds.radius.sm,
-  },
-}));
-
-const StepIconCustom = ({ active, completed, icon }) => {
-  const styles = completed
-    ? { backgroundColor: ds.green[500], border: 'none', color: ds.background[100] }
-    : {
-        backgroundColor: ds.background[100],
-        border: active ? `1px solid ${ds.green[500]}` : `1px solid ${ds.brand[200]}`,
-        color: active ? ds.green[500] : ds.gray[600],
-      };
-
-  return (
-    <Box
-      sx={{
-        width: ds.space[5],
-        height: ds.space[5],
-        borderRadius: ds.radius.pill,
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        fontSize: ds.text.bodyLg,
-        fontWeight: 'bold',
-        ...styles,
-      }}
-    >
-      {completed ? <Check sx={{ fontSize: ds.text.title }} /> : icon}
-    </Box>
-  );
-};
 
 const STEPS = ['Prerequisites', 'Verify Permissions', 'Enable Alerts'];
 
@@ -82,17 +26,17 @@ Your GCP service account needs the **Monitoring Editor** role (\`roles/monitorin
 ### How to grant the permission
 
 1. Open the [IAM page](https://console.cloud.google.com/iam-admin/iam?project=${projectId}) for project **${projectId}**
-2. Find the Nudgebee service account email
+2. Find the ${getBrandTitle()} service account email
 3. Click the pencil icon to edit permissions
 4. Click **Add Another Role** and select **Monitoring Editor**
 5. Click **Save**
 `;
 
-const WEBHOOK_INSTRUCTIONS = `### Complete the setup in GCP Console
+const webhookInstructions = () => `### Complete the setup in GCP Console
 
 1. Click **Open GCP Console** below — it opens the webhook notification channel creation page
 2. Paste the **Webhook URL** above into the **Endpoint URL** field
-3. Give the channel a display name (e.g., **Nudgebee Alerts**)
+3. Give the channel a display name (e.g., **${getBrandTitle()} Alerts**)
 4. Click **Save**
 5. Then attach this notification channel to your alert policies
 `;
@@ -151,7 +95,6 @@ const attemptGcpAutoSetup = async (accountId, url) => {
 const EnableGcpWebhookModal = ({ open, onClose, account, isAlreadyEnabled = false, existedIntegration = undefined }) => {
   const [showWizard, setShowWizard] = useState(!isAlreadyEnabled);
   const [step, setStep] = useState(0);
-  const [guideExpanded, setGuideExpanded] = useState(false);
 
   // Step 1: Permission check
   const [isCheckingPermission, setIsCheckingPermission] = useState(false);
@@ -170,7 +113,6 @@ const EnableGcpWebhookModal = ({ open, onClose, account, isAlreadyEnabled = fals
   const clearForm = () => {
     setShowWizard(!isAlreadyEnabled);
     setStep(0);
-    setGuideExpanded(false);
     setIsCheckingPermission(false);
     setPermissionResult(null);
     setIsSettingUp(false);
@@ -297,12 +239,19 @@ const EnableGcpWebhookModal = ({ open, onClose, account, isAlreadyEnabled = fals
       <Box sx={{ px: ds.space[5], pt: ds.space[2], pb: ds.space[5] }}>
         {isAlreadyEnabled && !showWizard && (
           <>
-            <Alert icon={<CheckCircleOutline fontSize='small' />} severity='success' sx={{ mb: ds.space[4], mt: ds.space[4] }}>
-              Real-time alerts are enabled for project <strong>{projectId}</strong>.
-            </Alert>
+            <Box sx={{ mb: ds.space[4], mt: ds.space[4] }}>
+              <Banner
+                tone='success'
+                message={
+                  <>
+                    Real-time alerts are enabled for project <strong>{projectId}</strong>.
+                  </>
+                }
+              />
+            </Box>
             <Typography sx={{ fontSize: ds.text.bodyLg, color: ds.brand[500], mb: ds.space[4] }}>
-              A webhook notification channel is configured and attached to alert policies in this GCP project. Alerts will be forwarded to Nudgebee
-              automatically.
+              A webhook notification channel is configured and attached to alert policies in this GCP project. Alerts will be forwarded to{' '}
+              {getBrandTitle()} automatically.
             </Typography>
             <Box
               sx={{ display: 'flex', justifyContent: 'flex-end', gap: ds.space[4], mt: ds.space[2], '& button': { minWidth: ds.space.mul(1, 35) } }}
@@ -326,65 +275,31 @@ const EnableGcpWebhookModal = ({ open, onClose, account, isAlreadyEnabled = fals
 
         {showWizard && (
           <>
-            <Stepper activeStep={step} alternativeLabel connector={<StepConnectorStyled />} sx={{ mb: ds.space[5], mt: ds.space[4] }}>
-              {STEPS.map((label, idx) => (
-                <Step key={label} completed={step > idx}>
-                  <StepLabel
-                    StepIconComponent={StepIconCustom}
-                    sx={{
-                      '& .MuiStepLabel-label': {
-                        fontSize: ds.text.body,
-                        mt: ds.space[1],
-                        color: step === idx ? ds.green[500] : ds.gray[600],
-                      },
-                    }}
-                  >
-                    {label}
-                  </StepLabel>
-                </Step>
-              ))}
-            </Stepper>
+            <Box sx={{ mb: ds.space[5], mt: ds.space[4] }}>
+              <Stepper steps={STEPS.map((label) => ({ id: label, label }))} current={step} orientation='horizontal' />
+            </Box>
 
             {step === 0 && (
               <>
                 <Typography sx={{ fontSize: ds.text.bodyLg, color: ds.brand[500], mb: ds.space[4] }}>
-                  Forward GCP Cloud Monitoring alerts to Nudgebee in real-time via a webhook notification channel. This lets you see alerts alongside
-                  your cloud resources without delay.
+                  {`Forward GCP Cloud Monitoring alerts to ${getBrandTitle()} in real-time via a webhook notification channel. This lets you see alerts alongside your cloud resources without delay.`}
                 </Typography>
 
-                <Box sx={{ mb: ds.space[4] }}>
-                  <Box
-                    role='button'
-                    tabIndex={0}
-                    sx={{ display: 'flex', alignItems: 'center', cursor: 'pointer', gap: ds.space[1], py: ds.space[2] }}
-                    onClick={() => setGuideExpanded(!guideExpanded)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' || e.key === ' ') {
-                        e.preventDefault();
-                        setGuideExpanded(!guideExpanded);
-                      }
-                    }}
-                  >
-                    <HelpOutline sx={{ fontSize: 18, color: ds.gray[600] }} />
-                    <Typography sx={{ fontSize: ds.text.body, color: ds.gray[600], fontWeight: ds.weight.medium }}>
-                      Setup Guide — IAM permissions required
-                    </Typography>
-                    {guideExpanded ? <ExpandLess sx={{ color: ds.gray[600] }} /> : <ExpandMore sx={{ color: ds.gray[600] }} />}
-                  </Box>
-                  <Collapse in={guideExpanded}>
-                    <Box
-                      sx={{
-                        mt: ds.space[2],
-                        p: ds.space[4],
-                        bgcolor: ds.background[200],
-                        borderRadius: ds.radius.lg,
-                        border: `1px solid ${ds.gray[300]}`,
-                      }}
-                    >
-                      <MarkDowns data={buildSetupGuide(projectId)} sx={{ maxHeight: ds.space.mul(1, 75), overflowY: 'auto' }} />
+                <CollapsableCard
+                  defaultOpen={false}
+                  elevation='flat'
+                  sx={{ mb: ds.space[4] }}
+                  header={
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: ds.space[1] }}>
+                      <HelpOutline sx={{ fontSize: 18, color: ds.gray[600] }} />
+                      <Typography sx={{ fontSize: ds.text.body, color: ds.gray[600], fontWeight: ds.weight.medium }}>
+                        Setup Guide — IAM permissions required
+                      </Typography>
                     </Box>
-                  </Collapse>
-                </Box>
+                  }
+                >
+                  <MarkDowns data={buildSetupGuide(projectId)} sx={{ maxHeight: ds.space.mul(1, 75), overflowY: 'auto' }} />
+                </CollapsableCard>
 
                 <Box
                   sx={{
@@ -419,16 +334,16 @@ const EnableGcpWebhookModal = ({ open, onClose, account, isAlreadyEnabled = fals
                 )}
 
                 {!isCheckingPermission && permissionResult?.has_permission && (
-                  <Alert icon={<CheckCircleOutline fontSize='small' />} severity='success' sx={{ mb: ds.space[4] }}>
-                    Service account has the required monitoring permissions.
-                  </Alert>
+                  <Box sx={{ mb: ds.space[4] }}>
+                    <Banner tone='success' message='Service account has the required monitoring permissions.' />
+                  </Box>
                 )}
 
                 {!isCheckingPermission && permissionResult && !permissionResult.has_permission && (
                   <>
-                    <Alert icon={<ErrorOutline fontSize='small' />} severity='error' sx={{ mb: ds.space[4] }}>
-                      {permissionResult.error_detail || 'Service account lacks Cloud Monitoring permissions.'}
-                    </Alert>
+                    <Box sx={{ mb: ds.space[4] }}>
+                      <Banner tone='critical' message={permissionResult.error_detail || 'Service account lacks Cloud Monitoring permissions.'} />
+                    </Box>
                     <Box
                       sx={{
                         p: ds.space[3],
@@ -441,13 +356,8 @@ const EnableGcpWebhookModal = ({ open, onClose, account, isAlreadyEnabled = fals
                       <Typography sx={{ fontSize: ds.text.body, color: ds.brand[500], mb: ds.space[2] }}>
                         Grant the <strong>Monitoring Editor</strong> role to the service account, then click <strong>Re-check</strong>.
                       </Typography>
-                      <Link
-                        href={`https://console.cloud.google.com/iam-admin/iam?project=${projectId}`}
-                        target='_blank'
-                        rel='noopener noreferrer'
-                        sx={{ fontSize: ds.text.body }}
-                      >
-                        Open GCP IAM Console →
+                      <Link href={`https://console.cloud.google.com/iam-admin/iam?project=${projectId}`} openInNew>
+                        Open GCP IAM Console
                       </Link>
                     </Box>
                   </>
@@ -487,22 +397,33 @@ const EnableGcpWebhookModal = ({ open, onClose, account, isAlreadyEnabled = fals
                 )}
 
                 {setupError && (
-                  <Alert severity='error' sx={{ mb: ds.space[4] }}>
-                    {setupError}
-                  </Alert>
+                  <Box sx={{ mb: ds.space[4] }}>
+                    <Banner tone='critical' message={setupError} />
+                  </Box>
                 )}
 
                 {String(setupStatus) === 'success' && (
-                  <Alert icon={<CheckCircleOutline fontSize='small' />} severity='success' sx={{ mb: ds.space[4] }}>
-                    Real-time alerts enabled successfully. A webhook notification channel has been created in project <strong>{projectId}</strong>.
-                  </Alert>
+                  <Box sx={{ mb: ds.space[4] }}>
+                    <Banner
+                      tone='success'
+                      message={
+                        <>
+                          Real-time alerts enabled successfully. A webhook notification channel has been created in project{' '}
+                          <strong>{projectId}</strong>.
+                        </>
+                      }
+                    />
+                  </Box>
                 )}
 
                 {String(setupStatus) === 'fallback' && webhookUrl && (
                   <>
-                    <Alert severity='warning' sx={{ mb: ds.space[4] }}>
-                      {setupFailReason || 'Auto-setup could not complete. You can set it up manually using the instructions below.'}
-                    </Alert>
+                    <Box sx={{ mb: ds.space[4] }}>
+                      <Banner
+                        tone='warning'
+                        message={setupFailReason || 'Auto-setup could not complete. You can set it up manually using the instructions below.'}
+                      />
+                    </Box>
 
                     <Grid container spacing={ds.space[4]} mb={ds.space[4]}>
                       <Grid item xs={12}>
@@ -531,7 +452,7 @@ const EnableGcpWebhookModal = ({ open, onClose, account, isAlreadyEnabled = fals
                       </Grid>
                     </Grid>
 
-                    <MarkDowns data={WEBHOOK_INSTRUCTIONS} sx={{ width: 'auto' }} />
+                    <MarkDowns data={webhookInstructions()} sx={{ width: 'auto' }} />
                   </>
                 )}
 

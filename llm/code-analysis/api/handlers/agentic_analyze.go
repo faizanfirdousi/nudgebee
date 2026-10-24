@@ -8,8 +8,10 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -76,9 +78,42 @@ func NewAgenticAnalyzeHandler(cfg *config.Config, gitClient *git.GitClient, cred
 	}, nil
 }
 
+// cleanupOrphanedAnalysisWorkspaces removes only the temporary directories
+// created by the remote-repository analysis path. Execution workspaces and
+// caller-provided local repositories are deliberately outside this sweep.
+// SweepOrphanedAnalysisWorkspaces removes abandoned remote-repository analysis
+// directories. maxAge==0 is used at process startup; a positive age allows a
+// live workspace pod to sweep old folders without touching an active run.
+func SweepOrphanedAnalysisWorkspaces(maxAge time.Duration) {
+	entries, err := os.ReadDir(os.TempDir())
+	if err != nil {
+		log.Printf("WARN: cannot scan temporary directory for orphaned analyses: %v", err)
+		return
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "code-analysis-") {
+			continue
+		}
+		if maxAge > 0 {
+			info, infoErr := entry.Info()
+			if infoErr != nil || time.Since(info.ModTime()) <= maxAge {
+				continue
+			}
+		}
+		if err := os.RemoveAll(filepath.Join(os.TempDir(), entry.Name())); err != nil {
+			log.Printf("WARN: failed to remove orphaned analysis workspace %s: %v", entry.Name(), err)
+		}
+	}
+}
+
 type GitRepository struct {
-	URL           string `json:"url" binding:"required_without=LocalPath"`
-	Branch        string `json:"branch,omitempty"`
+	URL    string `json:"url" binding:"required_without=LocalPath"`
+	Branch string `json:"branch,omitempty"`
+	// Commit pins the analysis to one revision. Use it when the question is about
+	// the code as it was at a point in time — the commit a workload was actually
+	// running when an incident fired — rather than the current tip of Branch.
+	// Branch still governs PR targeting, which cannot accept a SHA.
+	Commit        string `json:"commit,omitempty"`
 	DefaultBranch string `json:"default_branch,omitempty"`
 	LocalPath     string `json:"local_path,omitempty"` // Path to existing local repository
 	Provider      string `json:"provider,omitempty"`   // Git provider: "github", "gitlab", or auto-detect if empty
@@ -116,7 +151,7 @@ type AgenticAnalyzeRequest struct {
 	EventId          string `json:"event_id,omitempty"`
 	RecommendationId string `json:"recommendation_id,omitempty"`
 	// WorkflowId is the originating workflow definition id. When set, the PR
-	// description links back to the workflow (/workflow/<id>).
+	// description links back to the workflow (/automation/<id>).
 	WorkflowId     string               `json:"workflow_id,omitempty"`
 	AccountId      string               `json:"account_id,omitempty"`
 	ConversationId string               `json:"conversation_id,omitempty"`
@@ -129,7 +164,8 @@ type AgenticAnalyzeRequest struct {
 	// Skills is a pre-rendered <skills> block of operator-authored skills mapped
 	// to the code agent. Resolved and forwarded by llm-server (which owns the
 	// skills DB); injected verbatim into the internal agent prompts.
-	Skills string `json:"skills,omitempty"`
+	Skills         string                   `json:"skills,omitempty"`
+	KnowledgeFiles []KnowledgeFileReference `json:"knowledge_files,omitempty"`
 
 	// PR followup fields — used to address CI failures and review comments on existing PRs
 	Followup bool   `json:"followup,omitempty"`
@@ -147,13 +183,14 @@ type AgenticAnalyzeRequest struct {
 // llm-server (see core.ForwardedLLMConfig). Only non-empty fields override the
 // startup defaults. The API key is plaintext and must never be logged.
 type LLMConfigOverride struct {
-	Provider    string `json:"provider,omitempty"`
-	Model       string `json:"model,omitempty"`
-	ApiKey      string `json:"api_key,omitempty"`
-	ApiEndpoint string `json:"endpoint,omitempty"`
-	ApiVersion  string `json:"api_version,omitempty"`
-	ApiType     string `json:"api_type,omitempty"`
-	Region      string `json:"region,omitempty"`
+	Provider     string `json:"provider,omitempty"`
+	Model        string `json:"model,omitempty"`
+	ApiKey       string `json:"api_key,omitempty"`
+	ApiEndpoint  string `json:"endpoint,omitempty"`
+	ApiVersion   string `json:"api_version,omitempty"`
+	ApiType      string `json:"api_type,omitempty"`
+	Region       string `json:"region,omitempty"`
+	ExtraHeaders string `json:"extra_headers,omitempty"`
 	// AccessKey/SecretKey/SessionToken are the AWS static credentials for
 	// Bedrock, which authenticates with a SigV4 credential triple instead of a
 	// single API key. llm-server sends them only as a complete pair. Like the
@@ -182,6 +219,7 @@ func (o *LLMConfigOverride) toConfigOverride() config.LLMOverride {
 		ApiVersion:   o.ApiVersion,
 		ApiType:      o.ApiType,
 		Region:       o.Region,
+		ExtraHeaders: o.ExtraHeaders,
 		AccessKey:    o.AccessKey,
 		SecretKey:    o.SecretKey,
 		SessionToken: o.SessionToken,
@@ -411,7 +449,7 @@ func (ah *AgenticAnalyzeHandler) HandleAgenticAnalyze(ctx context.Context, req A
 // (common.InitAnalysis / common.GetAnalysisState / common.CleanupAnalysis).
 //
 // Why this MUST NOT be derived from req.ConversationId or any other client
-// field: a single conversation can issue multiple agent_code_2 calls
+// field: a single conversation can issue multiple code_analyzer calls
 // back-to-back (e.g. an explore call followed by a fix call). When call #1
 // completes, it schedules a 5-minute deferred CleanupAnalysis(id). If call #2
 // reuses the same id, the deferred cleanup from #1 wipes #2's still-running
@@ -420,6 +458,8 @@ func (ah *AgenticAnalyzeHandler) HandleAgenticAnalyze(ctx context.Context, req A
 func newAnalysisID() string {
 	return fmt.Sprintf("analysis_%d_%s", time.Now().UnixNano(), uuid.NewString())
 }
+
+var analysisLeaseMinInterval = 5 * time.Second
 
 func (ah *AgenticAnalyzeHandler) HandleAnalyze(c *gin.Context) {
 	var req AgenticAnalyzeRequest
@@ -436,19 +476,32 @@ func (ah *AgenticAnalyzeHandler) HandleAnalyze(c *gin.Context) {
 	// original "correlate this K8s workload's logs" use case — generic requests
 	// (chat fixes, repo maintenance) have no workload and are equally valid.
 
+	// Request-received line: records mode/raise_pr and the originating
+	// conversation so an event investigation's explore call (debug agent
+	// localising a change) is distinguishable from its Step-3 fix call. The
+	// prompt and logs are deliberately not logged — they carry raw application
+	// log excerpts (tokens, connection strings, PII).
+	log.Printf("INFO: /analyze request received - mode=%s raise_pr=%v event_id=%s conversation_id=%s message_id=%s agent_id=%s logs_len=%d",
+		req.Mode, req.RaisePR, req.EventId, req.ConversationId, req.MessageId, req.AgentID, len(req.Logs))
+
 	analysisID := newAnalysisID()
 
 	common.InitAnalysis(analysisID)
+	analysisCtx, cancel := context.WithTimeout(context.Background(), ah.config.Analysis.MaxProcessingTime)
+	common.SetCancelFunc(analysisID, cancel)
+	cancelLogger := common.NewLogger(analysisID, req.GitRepository.URL, req.Tenant, nil)
+	cancelLogger.SetConversationID(req.ConversationId)
 
 	// Bind the progress-store key onto the request so PerformAgenticAnalysis can
 	// attach its tool tracker to this analysis state for live /status streaming.
 	req.AnalysisID = analysisID
 
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), ah.config.Analysis.MaxProcessingTime)
+		releaseWorkspace := workspaceGCFor(ah.config.Analysis.WorkspaceDir).Acquire(analysisID)
+		defer releaseWorkspace()
 		defer cancel()
 
-		response, err := ah.HandleAgenticAnalyze(ctx, req)
+		response, err := ah.HandleAgenticAnalyze(analysisCtx, req)
 		switch {
 		case err != nil:
 			common.FailAnalysis(analysisID, err.Error())
@@ -465,6 +518,7 @@ func (ah *AgenticAnalyzeHandler) HandleAnalyze(c *gin.Context) {
 		default:
 			common.CompleteAnalysis(analysisID, response)
 		}
+		ah.logAnalysisStoppedIfCancelled(cancelLogger, analysisID, "cancelled_context_returned")
 
 		// Keep result available for 5 minutes after completion, then clean up
 		time.AfterFunc(5*time.Minute, func() {
@@ -472,11 +526,49 @@ func (ah *AgenticAnalyzeHandler) HandleAnalyze(c *gin.Context) {
 		})
 	}()
 
+	// The caller is expected to check in through /status. If the caller dies,
+	// cancel the work rather than allowing an orphaned analysis to consume LLM
+	// budget and retain its repository clone until the 30-minute deadline.
+	go ah.watchAnalysisLease(analysisID, analysisCtx)
+
 	c.JSON(http.StatusAccepted, gin.H{
 		"success":     true,
 		"analysis_id": analysisID,
 		"status":      "running",
 	})
+}
+
+func (ah *AgenticAnalyzeHandler) watchAnalysisLease(analysisID string, ctx context.Context) {
+	if ah.config.Analysis.CheckInTimeout <= 0 {
+		return
+	}
+	interval := ah.config.Analysis.CheckInTimeout / 4
+	if interval < analysisLeaseMinInterval {
+		interval = analysisLeaseMinInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			state := common.Snapshot(analysisID)
+			if state == nil || state.Status != "running" {
+				return
+			}
+			if time.Since(state.LastCheckIn) > ah.config.Analysis.CheckInTimeout {
+				logger := common.NewLogger(analysisID, "code-analysis", "system", nil)
+				logger.Log(common.EventAnalysisCancelRequested, "Code analysis cancellation requested", map[string]any{
+					"reason":           "check_in_timeout",
+					"last_check_in":    state.LastCheckIn.UTC().Format(time.RFC3339),
+					"check_in_timeout": ah.config.Analysis.CheckInTimeout.String(),
+				})
+				common.CancelAnalysis(analysisID)
+				return
+			}
+		}
+	}
 }
 
 // HandleStatus returns the current progress and result of an async analysis.
@@ -487,6 +579,7 @@ func (ah *AgenticAnalyzeHandler) HandleStatus(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "analysis not found"})
 		return
 	}
+	common.CheckIn(analysisID)
 
 	resp := gin.H{
 		"analysis_id": analysisID,
@@ -506,6 +599,37 @@ func (ah *AgenticAnalyzeHandler) HandleStatus(c *gin.Context) {
 		resp["error"] = state.Error
 	}
 	c.JSON(http.StatusOK, resp)
+}
+
+// HandleCancel stops one analysis without deleting the shared workspace pod.
+func (ah *AgenticAnalyzeHandler) HandleCancel(c *gin.Context) {
+	analysisID := strings.TrimPrefix(c.Param("id"), "/")
+	logger := common.NewLogger(analysisID, "code-analysis", "system", nil)
+	if common.CancelAnalysis(analysisID) {
+		logger.Log(common.EventAnalysisCancelRequested, "Code analysis cancellation requested", map[string]any{
+			"reason": "cancel_endpoint",
+			"status": "cancelling",
+		})
+		c.JSON(http.StatusAccepted, gin.H{"analysis_id": analysisID, "status": "cancelling"})
+		return
+	}
+	state := common.Snapshot(analysisID)
+	if state == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "analysis not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"analysis_id": analysisID, "status": state.Status})
+}
+
+func (ah *AgenticAnalyzeHandler) logAnalysisStoppedIfCancelled(logger *common.Logger, analysisID, reason string) {
+	state := common.Snapshot(analysisID)
+	if state == nil || state.Status != "cancelled" {
+		return
+	}
+	logger.Log(common.EventAnalysisStopped, "Code analysis stopped after cancellation", map[string]any{
+		"reason": reason,
+		"status": state.Status,
+	})
 }
 
 // resolveClients returns the LLM client and orchestrator to use for this
@@ -541,6 +665,22 @@ func (ah *AgenticAnalyzeHandler) resolveClients(req AgenticAnalyzeRequest, logge
 			}
 		}
 	}
+	// Every asynchronous analysis gets its own worktree namespace. The Git
+	// client still reuses the shared bare mirror, but the mutable checkout and
+	// its node_modules/venv/target/build outputs can never collide with another
+	// analysis of the same repository.
+	if req.AnalysisID != "" {
+		// Without an llm_config override, cfg is still the handler's shared
+		// *ah.config. Copy before mutating WorkspaceDir: mutating in place both
+		// races with concurrent analyses and re-nests the path on every request
+		// (runs/<id>/runs/<id>...), pushing exec workspaces under runs/ where GC
+		// deletes them.
+		if cfg == ah.config {
+			clone := *ah.config
+			cfg = &clone
+		}
+		cfg.Analysis.WorkspaceDir = filepath.Join(ah.config.Analysis.WorkspaceDir, "runs", req.AnalysisID)
+	}
 	client, err := llm.NewClient(cfg)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to build per-request LLM client: %w", err)
@@ -554,7 +694,41 @@ func (ah *AgenticAnalyzeHandler) resolveClients(req AgenticAnalyzeRequest, logge
 	return cfg, client, agents.NewOrchestratorAgent(cfg, client, ah.gitClient, logger), nil
 }
 
+// secureSessionWorkspace creates (or re-opens) a session workspace at path and
+// leaves it mode 0700, refusing to act on anything that is not a real directory.
+//
+// The path lives in the shared os.TempDir() and its name is derived from the
+// conversation id, so it is guessable by anything else running in the container.
+// os.MkdirAll succeeds on a pre-existing symlink to a directory and os.Chmod
+// re-resolves the name and follows it, so tightening the workspace by path would
+// chmod the symlink's target instead — an attacker-planted link is enough to
+// retarget it at any directory this process can reach (CWE-59).
+//
+// Opening with O_NOFOLLOW|O_DIRECTORY resolves the final component exactly once
+// and fails outright if it is a link or not a directory. Chmod through that
+// descriptor is fchmod(2) on the object already opened, so there is no second
+// path lookup to race: swapping the name afterwards cannot redirect it.
+func secureSessionWorkspace(path string) error {
+	if err := os.MkdirAll(path, 0700); err != nil {
+		return fmt.Errorf("failed to create session workspace directory: %w", err)
+	}
+	dir, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		return fmt.Errorf("session workspace directory is not a usable directory: %w", err)
+	}
+	defer func() { _ = dir.Close() }()
+	// MkdirAll leaves an existing workspace's permissions unchanged. Tighten it
+	// as well, since this directory can contain a private repository clone.
+	if err := dir.Chmod(0700); err != nil {
+		return fmt.Errorf("failed to secure session workspace directory: %w", err)
+	}
+	return nil
+}
+
 func (ah *AgenticAnalyzeHandler) PerformAgenticAnalysis(ctx context.Context, req AgenticAnalyzeRequest) (*AgenticAnalyzeResponse, error) {
+	if len(req.KnowledgeFiles) > 0 {
+		req.Skills += NewFileHandler(ah.config).renderKnowledgeFiles(ctx, req.KnowledgeFiles)
+	}
 	// Normalize and validate request before processing
 	if err := ah.normalizeAndValidateRequest(&req); err != nil {
 		return nil, fmt.Errorf("request validation failed: %w", err)
@@ -564,11 +738,20 @@ func (ah *AgenticAnalyzeHandler) PerformAgenticAnalysis(ctx context.Context, req
 	log.Printf("DEBUG HANDLER: Received request - GitRepository.URL='%s', GitRepository.LocalPath='%s', GitRepository.Branch='%s', Tenant='%s', AgentID='%s'",
 		req.GitRepository.URL, req.GitRepository.LocalPath, req.GitRepository.Branch, req.Tenant, req.AgentID)
 
-	// Create logger for this analysis session
-	logger := common.NewLogger(req.ConversationId, req.GitRepository.URL, req.Tenant, map[string]any{
+	// Create logger for this analysis session. Prefer AnalysisID — the
+	// lifecycle-tracked id that cancel/stop events are logged under (see
+	// newAnalysisID) — so in-flight step/failure logs correlate with those
+	// events. Empty on the sync path (HandleAgenticAnalyze), which falls back
+	// to ConversationId.
+	loggerID := req.AnalysisID
+	if loggerID == "" {
+		loggerID = req.ConversationId
+	}
+	logger := common.NewLogger(loggerID, req.GitRepository.URL, req.Tenant, map[string]any{
 		"repository": req.GitRepository.URL,
 		"branch":     req.GitRepository.Branch,
 	})
+	logger.SetConversationID(req.ConversationId)
 
 	// Resolve the per-request LLM client + a fresh per-request orchestrator.
 	cfg, client, orch, err := ah.resolveClients(req, logger)
@@ -622,22 +805,34 @@ func (ah *AgenticAnalyzeHandler) PerformAgenticAnalysis(ctx context.Context, req
 			"url":  req.GitRepository.URL,
 		})
 	} else if req.GitRepository.URL != "" {
-		// Repository URL provided - create temp directory for agent-managed cloning
+		// Repository URL provided - reuse (or create) the workspace directory for
+		// this conversation. Keyed on ConversationId, not a per-request MkdirTemp
+		// suffix, so a followup turn in the same conversation (e.g. "raise pr?"
+		// after an earlier "show me the diff") lands in the same clone instead of
+		// starting a brand-new one from scratch — os.MkdirTemp guarantees a fresh
+		// random suffix every call, which meant a session's workspace was never
+		// actually reused, only re-derived at full cost each turn. Falls back to
+		// AnalysisID (unique per request) when there is no conversation to key on,
+		// to avoid two ID-less requests colliding on one directory.
+		sessionKey := req.ConversationId
+		if sessionKey == "" {
+			sessionKey = req.AnalysisID
+		}
 		sanitizedID := strings.Map(func(r rune) rune {
 			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
 				return r
 			}
 			return '_'
-		}, req.ConversationId)
-		tempDir, err := os.MkdirTemp("", fmt.Sprintf("code-analysis-%s-", sanitizedID))
-		if err != nil {
-			return nil, fmt.Errorf("failed to create temporary directory: %w", err)
+		}, sessionKey)
+		tempDir := filepath.Join(os.TempDir(), fmt.Sprintf("code-analysis-%s", sanitizedID))
+		if err := secureSessionWorkspace(tempDir); err != nil {
+			return nil, err
 		}
 		repositoryPath = tempDir
 
 		logger.Log(common.EventAnalysisStart, "Repository URL provided - agents will handle cloning as needed", map[string]any{
-			"url":            req.GitRepository.URL,
-			"temp_workspace": repositoryPath,
+			"url":               req.GitRepository.URL,
+			"session_workspace": repositoryPath,
 		})
 	} else {
 		// No repository provided - this should be handled appropriately
@@ -652,6 +847,13 @@ func (ah *AgenticAnalyzeHandler) PerformAgenticAnalysis(ctx context.Context, req
 			return nil, fmt.Errorf("either repository URL or application logs must be provided for analysis")
 		}
 	}
+	// Deliberately not cleaned up here: repositoryPath is now the persistent
+	// per-conversation workspace (see above), and deleting it at the end of
+	// every single request defeated that persistence, forcing every followup
+	// turn to re-clone and re-derive its fix from scratch. Reclaimed instead by
+	// the age-based SweepOrphanedAnalysisWorkspaces sweep (startup + periodic
+	// ticker in cmd/main.go), which already tolerates an actively-reused
+	// workspace via its ModTime-based maxAge check.
 	// Log analysis start
 	logger.AnalysisStart(req.GitRepository.URL, len(req.Logs))
 
@@ -1261,6 +1463,7 @@ func (ah *AgenticAnalyzeHandler) selectAgent(orch *agents.OrchestratorAgent, age
 func (ah *AgenticAnalyzeHandler) createQueryConfigWithPath(req AgenticAnalyzeRequest, resolvedCreds *credentials.ResolvedCredentials, repositoryPath string) map[string]any {
 	config := map[string]any{
 		"branch": req.GitRepository.Branch,
+		"commit": req.GitRepository.Commit,
 		"prompt": req.Prompt,
 		"workload": map[string]string{
 			"name":      req.WorkloadName,
@@ -1862,6 +2065,7 @@ func (ah *AgenticAnalyzeHandler) performFollowupAnalysis(ctx context.Context, cf
 	}
 
 	var workspaceDir string
+	var tempWorkspaceRoot string
 	if req.GitRepository.LocalPath != "" {
 		workspaceDir = req.GitRepository.LocalPath
 	} else {
@@ -1876,6 +2080,12 @@ func (ah *AgenticAnalyzeHandler) performFollowupAnalysis(ctx context.Context, cf
 		if mkdirErr != nil {
 			return nil, fmt.Errorf("failed to create temp directory for followup: %w", mkdirErr)
 		}
+		tempWorkspaceRoot = tempDir
+		defer func() {
+			if cleanupErr := os.RemoveAll(tempWorkspaceRoot); cleanupErr != nil {
+				logger.Log(common.EventAnalysisFailure, "Failed to clean PR followup workspace", map[string]any{"path": tempWorkspaceRoot, "error": cleanupErr.Error()})
+			}
+		}()
 		// git clone requires the target to not exist, so use a subdir of the temp dir
 		workspaceDir = fmt.Sprintf("%s/repo", tempDir)
 

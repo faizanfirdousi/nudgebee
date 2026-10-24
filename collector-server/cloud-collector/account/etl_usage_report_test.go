@@ -1,6 +1,9 @@
 package account
 
 import (
+	"errors"
+	"fmt"
+
 	"nudgebee/collector/cloud/providers"
 	"nudgebee/collector/cloud/security"
 	"os"
@@ -53,43 +56,56 @@ func TestStoreUsageGCloud(t *testing.T) {
 	assert.NotEmpty(t, response)
 }
 
-// TestSummarizeDailySpend_ExcludesCreditsAndRefunds verifies that credit/refund line
-// items (negative costs) are excluded from the daily and month-to-date totals, so the
-// cost notification reports gross spend instead of net-of-credits. Net-of-credits is
-// what produced the negative figures reported in issue #29455.
-func TestSummarizeDailySpend_ExcludesCreditsAndRefunds(t *testing.T) {
-	yesterday := time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC)
-	earlierThisMonth := time.Date(2026, 4, 10, 12, 0, 0, 0, time.UTC)
-
-	items := []providers.UsageReportItem{
-		// Usage on the anchor day — counts toward both daily and monthly.
-		{ProductCode: "AmazonEC2", CostCategory: providers.UsageReportItemTypeUsage, Cost: 5.0, CostCurrency: "USD", EndDate: yesterday},
-		// Tax on the anchor day — part of the bill, counts.
-		{ProductCode: "AmazonEC2", CostCategory: providers.UsageReportItemTypeTax, Cost: 0.5, CostCurrency: "USD", EndDate: yesterday},
-		// Large credit on the anchor day — must be excluded (previously drove totals negative).
-		{ProductCode: "AmazonEC2", CostCategory: providers.UsageReportCostCategory("Credit"), Cost: -100.0, CostCurrency: "USD", EndDate: yesterday},
-		// Refund on the anchor day — must be excluded.
-		{ProductCode: "AmazonS3", CostCategory: providers.UsageReportCostCategory("Refund"), Cost: -3.0, CostCurrency: "USD", EndDate: yesterday},
-		// Usage earlier in the month — counts toward monthly only, not daily.
-		{ProductCode: "AmazonS3", CostCategory: providers.UsageReportItemTypeUsage, Cost: 7.0, CostCurrency: "USD", EndDate: earlierThisMonth},
-		// Credit earlier in the month — excluded from monthly.
-		{ProductCode: "AmazonS3", CostCategory: providers.UsageReportCostCategory("Credit"), Cost: -50.0, CostCurrency: "USD", EndDate: earlierThisMonth},
+// TestAgentStatusForUsageSync pins that an account with no cost reporting is
+// not reported as a disconnected agent.
+//
+// Onboarding accepts an AWS account with no usable Cost & Usage Report, so that
+// account is working as intended — events, resources and recommendations all
+// sync, and only spend is empty. Marking the agent disconnected for it showed
+// customers a red "The Agent is not connected" banner sitting directly above a
+// feature table where every row read Connected, and would trip agent-health
+// alerting for a supported configuration.
+//
+// A genuine failure must still mark the agent disconnected.
+func TestAgentStatusForUsageSync(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want AgentStatus
+	}{
+		{
+			name: "clean sync stays connected",
+			want: AgentStatusConnected,
+		},
+		{
+			name: "cost simply not configured stays connected",
+			err:  providers.ErrCostNotConfigured,
+			want: AgentStatusConnected,
+		},
+		{
+			name: "unsupported provider stays connected",
+			err:  errors.ErrUnsupported,
+			want: AgentStatusConnected,
+		},
+		{
+			// The sentinel is wrapped in practice (resolveCostReportDefinition
+			// wraps the AWS denial), so matching must survive unwrapping.
+			name: "wrapped not-configured stays connected",
+			err:  fmt.Errorf("resolve cost report: %w", providers.ErrCostNotConfigured),
+			want: AgentStatusConnected,
+		},
+		{
+			name: "a real failure disconnects",
+			err:  errors.New("failed to fetch cost report manifest: AccessDenied on the CUR bucket"),
+			want: AgentStatusDisconnected,
+		},
 	}
 
-	summary := summarizeDailySpend(items, yesterday)
-
-	// Daily = 5.0 (EC2 usage) + 0.5 (tax); credit and refund excluded.
-	assert.InDelta(t, 5.5, summary.totalDay, 1e-9, "daily total must exclude credits/refunds")
-	// Monthly = 5.0 + 0.5 + 7.0; both credits and the refund excluded.
-	assert.InDelta(t, 12.5, summary.totalMonth, 1e-9, "monthly total must exclude credits/refunds")
-	// The core of issue #29455: totals must stay positive, not net-of-credits.
-	assert.Greater(t, summary.totalDay, 0.0)
-	assert.Greater(t, summary.totalMonth, 0.0)
-	// Only the two non-credit anchor-day items are retained as "today's" items.
-	assert.Len(t, summary.todayItems, 2)
-	// Per-service monthly breakdown also excludes credits.
-	assert.InDelta(t, 5.5, summary.monthlyServices["AmazonEC2"], 1e-9)
-	assert.InDelta(t, 7.0, summary.monthlyServices["AmazonS3"], 1e-9)
-	assert.Equal(t, "USD", summary.currency)
-	assert.False(t, summary.mixedCurrencies)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := agentStatusForUsageSync(tt.err); got != tt.want {
+				t.Fatalf("agentStatusForUsageSync() = %q, want %q", got, tt.want)
+			}
+		})
+	}
 }

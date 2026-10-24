@@ -114,7 +114,7 @@ class TestDiscoveryShape(unittest.TestCase):
 
         with mock.patch.object(dh.database, "insert_data", side_effect=fake_insert), mock.patch.object(
             dh.database, "run_query", return_value=[]
-        ), mock.patch.object(dh, "acquire_discovery_lock", fake_lock), mock.patch.object(dh, "publish_kg_update"):
+        ), mock.patch.object(dh, "acquire_discovery_lock", fake_lock), mock.patch("handlers.kg_update.publish_message"):
             dh.run_async_discovery_handler(message)
 
         return captured
@@ -166,10 +166,47 @@ class TestDiscoveryShape(unittest.TestCase):
             "workload_name",
             "labels",
             "meta",
+            # The Summary counts and the Status filter read this column, not the
+            # phase in "status" (#36593), so the write path has to carry it.
+            "container_status",
         ):
             self.assertIn(key, pod, f"k8s_pods row missing {key!r} (Go converter reads it)")
         self.assertEqual(pod["workload_name"], "api")
         self.assertEqual(pod["workload_type"], "Deployment")
+        # Healthy pod: no reason, so readers fall back to the phase.
+        self.assertIsNone(pod["container_status"])
+
+    def test_crashlooping_pod_row_carries_the_reason(self):
+        """A pod whose phase says Running but whose container is in CrashLoopBackOff
+        must land with the reason in container_status -- that column is what the
+        cluster Summary counts and the Status filter select on."""
+        message = _service_message()
+        message["data"][1]["status_dict"] = {
+            "containerStatuses": [{"ready": False, "state": {"waiting": {"reason": "CrashLoopBackOff"}}}]
+        }
+
+        pod = self._run_and_capture(message)["k8s_pods"][0]
+
+        self.assertEqual(pod["status"], "Running")
+        self.assertEqual(pod["container_status"], "CrashLoopBackOff")
+
+    def test_null_data_payload_is_discarded_at_the_entry_guard(self):
+        """`"data": null` must be rejected before _process_discovery sees it.
+
+        It used to reach len(data["data"]) and raise TypeError, which the
+        consumer answered by rejecting the message to the DLQ (170 discovery
+        batches lost over 7 days). Coercing None to [] would be worse: on a last
+        batch the deletion pass would diff against an empty active set and mark
+        every resource for the account deleted.
+        """
+        message = _service_message()
+        message["data"] = None
+
+        with mock.patch.object(dh, "_process_discovery") as process:
+            captured = self._run_and_capture(message)
+
+        process.assert_not_called()
+        self.assertEqual(captured, {})
 
 
 if __name__ == "__main__":

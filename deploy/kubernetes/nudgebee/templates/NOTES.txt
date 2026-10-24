@@ -22,6 +22,25 @@ To retrieve the password from the secret, run the following command:
 kubectl get secret nudgebee -n {{ .Release.Namespace }} -o jsonpath='{.data.NEXTAUTH_DUMMY_CREDS_PASSWORD}' | base64 --decode
 {{- end }}
 
+{{- if .Values.admin.email }}
+
+Sign in as {{ .Values.admin.email }} — the admin and its organisation were created
+during install, so there is nothing to set up on first login. The shared password
+works for this address only.
+{{- end }}
+
+{{- if .Values.agent.enabled }}
+
+The bundled agent connects this cluster as
+"{{ .Values.agent.clusterName | default "nb-control-plane-k8s" }}". If it does not appear:
+
+  kubectl logs -n {{ .Release.Namespace }} deploy/services-server | grep -iE 'first run|local agent'
+
+It is on by default — if this cluster is already monitored by a separately
+installed agent, set agent.enabled=false to avoid a duplicate account.
+Offline render (Argo CD, Flux) must set agent.accessKey/accessSecret.
+{{- end }}
+
 {{- /* The chart has no local/dev/prod environment marker, so this warns on
        every install/upgrade with dummy creds enabled — imprecise but with no
        false negatives. */}}
@@ -39,6 +58,56 @@ kubectl get secret nudgebee -n {{ .Release.Namespace }} -o jsonpath='{.data.NEXT
 
    The default in values.yaml is intentionally `true` for the first-run
    bootstrap experience; production overlays should disable it explicitly.
+{{- end }}
+
+{{- /* Only fires on clusters that DO run the Prometheus Operator: there the
+       monitors are worth having, and the default (off, so the chart installs on
+       clusters without the CRDs) is the wrong choice. Silence for everyone
+       else. */}}
+{{- if .Capabilities.APIVersions.Has "monitoring.coreos.com/v1" }}
+{{- /* Per datastore: bundled here AND not being scraped. A release pointed at an
+       external Postgres has nothing for this chart to monitor.
+
+       Nested `with` rather than `dig`: Helm stores a subchart's values as
+       chartutil.Values, and dig's internal map[string]interface{} assertion
+       panics on that type - it took down every install with the clickhouse
+       subchart present once already (afdf7757). `with` is nil-safe on a partial
+       override and type-agnostic. */}}
+{{- $pgUnmonitored := false }}
+{{- with .Values.postgresql }}
+  {{- if .enabled }}
+    {{- $pgUnmonitored = true }}
+    {{- with .metrics }}{{- with .serviceMonitor }}{{- if .enabled }}
+    {{- $pgUnmonitored = false }}
+    {{- end }}{{- end }}{{- end }}
+  {{- end }}
+{{- end }}
+{{- $mqUnmonitored := false }}
+{{- with .Values.rabbitmq }}
+  {{- if .enabled }}
+    {{- $mqUnmonitored = true }}
+    {{- with .metrics }}{{- with .serviceMonitor }}{{- if .enabled }}
+    {{- $mqUnmonitored = false }}
+    {{- end }}{{- end }}{{- end }}
+  {{- end }}
+{{- end }}
+{{- if or $pgUnmonitored $mqUnmonitored }}
+
+ℹ️  This cluster has the Prometheus Operator, but the bundled Postgres and
+   RabbitMQ exporters are not being scraped: their ServiceMonitor and
+   PrometheusRule objects are off by default so the chart installs on clusters
+   without the operator CRDs. Turn them on with:
+
+     helm upgrade {{ .Release.Name }} ... \
+       --set postgresql.metrics.serviceMonitor.enabled=true \
+       --set postgresql.metrics.prometheusRule.enabled=true \
+       --set rabbitmq.metrics.serviceMonitor.enabled=true \
+       --set rabbitmq.metrics.prometheusRule.enabled=true
+
+   The same four values ship as values-monitoring.yaml inside the chart, if you
+   install from a checkout or keep your own values file.
+
+{{- end }}
 {{- end }}
 
 {{- $existing := lookup "v1" "Secret" .Release.Namespace "nudgebee" }}

@@ -184,7 +184,7 @@ def _get_integrations_cached(cache, lock, cloud_account_id, integration_type):
         try:
             with engine.connect() as connection:
                 query = text("""
-                    SELECT i.id, ica.cloud_account_id, icv.name, icv.value
+                    SELECT i.id, ica.cloud_account_id, icv.name, icv.value, icv.is_encrypted
                     FROM integrations i
                     JOIN integration_config_values icv
                     ON i.id = icv.integration_id
@@ -203,7 +203,28 @@ def _get_integrations_cached(cache, lock, cloud_account_id, integration_type):
                         integrations[integration_id]["account_id"] = row.cloud_account_id
                         integrations[integration_id]["config"] = {}
 
-                    integrations[integration_id]["config"][row.name] = row.value
+                    # Secrets are stored encrypted and the row says so, the same flag
+                    # llm-server reads (getLLMIntegrationsForAccount). Handing the stored
+                    # form straight to a provider sends ciphertext as the credential,
+                    # which comes back as "API key not valid" on a key that is perfectly
+                    # good.
+                    value = row.value
+                    if row.is_encrypted and value:
+                        decrypted = decrypt_value(value)
+                        if decrypted == value:
+                            # decrypt_value returns its input unchanged when it fails, so
+                            # an undecryptable secret is indistinguishable from a real one.
+                            # Drop it and let the caller fall back to configuration rather
+                            # than authenticate with ciphertext.
+                            logger.warning(
+                                "Integration %s: could not decrypt %s; leaving it unset",
+                                integration_id,
+                                row.name,
+                            )
+                            continue
+                        value = decrypted
+
+                    integrations[integration_id]["config"][row.name] = value
 
                 data = list(integrations.values())
                 cache[cloud_account_id] = {"data": data, "time": time.time()}
@@ -217,6 +238,71 @@ def _get_integrations_cached(cache, lock, cloud_account_id, integration_type):
 
 def get_llm_integrations(cloud_account_id):
     return _get_integrations_cached(_llm_integrations_cache, _llm_integrations_cache_lock, cloud_account_id, "llm")
+
+
+def get_default_llm_integration(cloud_account_id):
+    """The one LLM integration this account resolves against, or None.
+
+    Mirrors llm-server's ``selectAccountLLMIntegration``
+    (agents/core/llm_common.go) so both services pick the same credential for
+    the same account, in its order: the integration flagged
+    ``default_llm_provider`` on its account link; failing that, the account's
+    only enabled LLM integration, since linking exactly one is itself the
+    operator's choice; failing that, the tenant's default provider when it is
+    among the account's links, because the integrations list shows that provider
+    as "Default" for every account it is linked to whether or not the link row
+    carries the flag.
+
+    The tenant default lives in ``integration_config_values``, written by the
+    "Default LLM provider" checkbox, and is a separate thing from the per-account
+    link flag. Reading only the link flag makes an account whose default was set
+    that way look like it has none, which drops the whole ingest onto the
+    environment defaults — a different model, and a different bill, from the one
+    its operator picked.
+
+    Every ambiguous shape — several flagged, or several linked with no single
+    default of either kind — returns None and falls through to the environment
+    defaults, exactly as llm-server does. Picking one anyway would silently bind
+    an account to a credential nobody chose, and for figure description that
+    shows up as "no vision-capable model" on an account that has one.
+    """
+    query = text("""
+        SELECT i.id, ia.default_llm_provider, COALESCE(icv.value = 'true', false) AS tenant_default
+        FROM integrations i
+        JOIN integrations_cloud_accounts ia ON i.id = ia.integration_id
+        LEFT JOIN integration_config_values icv
+               ON icv.integration_id = i.id AND icv.name = 'default_llm_provider'
+        WHERE i.type = 'llm' AND i.status = 'enabled' AND ia.cloud_account_id = :ac_id
+        """)
+    try:
+        with engine.connect() as connection:
+            rows = connection.execute(query, {"ac_id": cloud_account_id}).fetchall()
+    except Exception as exc:
+        logger.error(f"Failed to select default LLM integration for {cloud_account_id}: {exc}")
+        return None
+
+    all_ids = [row[0] for row in rows]
+    defaults = [row[0] for row in rows if row[1]]
+    tenant_defaults = [row[0] for row in rows if row[2]]
+
+    if len(defaults) == 1:
+        return defaults[0]
+    if len(defaults) > 1:
+        logger.error(
+            f"LLM config: account {cloud_account_id} has {len(defaults)} integrations flagged default; "
+            "falling back to environment defaults"
+        )
+        return None
+    if len(all_ids) == 1:
+        return all_ids[0]
+    if len(tenant_defaults) == 1:
+        return tenant_defaults[0]
+    if len(all_ids) > 1:
+        logger.warning(
+            f"LLM config: account {cloud_account_id} has {len(all_ids)} enabled LLM integrations and no single "
+            f"default ({len(tenant_defaults)} marked the tenant default); falling back to environment defaults"
+        )
+    return None
 
 
 def get_embeddings_integrations(cloud_account_id):
@@ -343,6 +429,36 @@ def _as_uuid_str(value):
         return None
 
 
+def _kb_collection_name(row):
+    """Vector-collection name a ``llm_knowledgebases`` row owns."""
+    if row.integration_id:
+        return f"{row.integration_id}_knowledge_base"
+    return f"kb_{row.id}"
+
+
+def _live_kb_names_from_rows(rows, account_uuid):
+    """Collapse ``llm_knowledgebases`` rows into the searchable collection names.
+
+    Enabled rows contribute their collection name. Disabled rows contribute
+    nothing — and a disabled row belonging to ``account_uuid`` additionally
+    *removes* that name, overriding any sibling row that would have added it.
+
+    That asymmetry exists because an integration's vector collection is shared
+    by every account in the tenant, while the switch is per KB row. Without the
+    subtraction, "account A turned this Confluence KB off" would be silently
+    undone by account B leaving its own row on. A disabled row in another
+    account never subtracts — it has no say over what this account searches.
+    """
+    names, disabled_here = set(), set()
+    for row in rows:
+        name = _kb_collection_name(row)
+        if row.enabled:
+            names.add(name)
+        elif account_uuid and str(row.account_id) == account_uuid:
+            disabled_here.add(name)
+    return names - disabled_here
+
+
 def get_live_kb_collection_names(account_id, tenant_id):
     """Vector-collection names still backed by a live knowledge base.
 
@@ -366,9 +482,17 @@ def get_live_kb_collection_names(account_id, tenant_id):
     asynchronous, and search must not serve a disabled integration's content
     while it catches up.
 
+    Rows the user has switched off (``kb.enabled = false``) are excluded, and —
+    unlike every other rule here — a switched-off row for *this account* also
+    subtracts the name a sibling row would have contributed. The scope clause is
+    an OR across account and tenant, and integration KBs share one collection
+    per integration across the tenant's accounts, so without the subtraction one
+    account disabling its row would be overruled by another account that left
+    the same integration on. See ``_live_kb_names_from_rows``.
+
     Returns ``None`` when the scope can't be resolved (neither identifier is a
-    UUID) or the query fails. Callers treat ``None`` as "don't filter", so a
-    database blip degrades to today's behaviour instead of emptying search.
+    UUID) or the query fails. Search excludes KB-backed collections in that case;
+    exact document reads reject access rather than assuming eligibility.
     """
     account_uuid = _as_uuid_str(account_id)
     tenant_uuid = _as_uuid_str(tenant_id)
@@ -376,8 +500,10 @@ def get_live_kb_collection_names(account_id, tenant_id):
         return None
     try:
         with engine.connect() as connection:
+            # kb.enabled is NOT filtered in SQL: the disabled rows are needed
+            # below to subtract this account's own switched-off collections.
             query = text("""
-                SELECT kb.id, kb.integration_id
+                SELECT kb.id, kb.integration_id, kb.account_id, kb.enabled
                 FROM llm_knowledgebases kb
                 LEFT JOIN integrations i ON kb.integration_id = i.id
                 WHERE kb.status != 'archived'
@@ -385,14 +511,7 @@ def get_live_kb_collection_names(account_id, tenant_id):
                   AND (kb.integration_id IS NULL OR i.status = 'enabled')
             """)
             result = connection.execute(query, {"account_id": account_uuid, "tenant_id": tenant_uuid})
-
-            names = set()
-            for row in result:
-                if row.integration_id:
-                    names.add(f"{row.integration_id}_knowledge_base")
-                else:
-                    names.add(f"kb_{row.id}")
-            return names
+            return _live_kb_names_from_rows(result, account_uuid)
     except Exception as e:
         logger.exception("Error fetching live knowledge bases for account %s / tenant %s: %s", account_id, tenant_id, e)
         return None

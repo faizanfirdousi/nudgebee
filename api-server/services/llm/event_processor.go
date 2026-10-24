@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"nudgebee/services/common"
 	"nudgebee/services/config"
+	"nudgebee/services/event/lifecycle"
 	"nudgebee/services/security"
 	"nudgebee/services/tenant"
 	"strings"
@@ -72,12 +73,12 @@ func ProcessEvent(ctx *security.RequestContext, event map[string]any) (err error
 		return nil
 	}
 
-	// Triage classified this event as suppressed — auto-investigation would
-	// resurface noise the user explicitly silenced. Reads from the in-memory
+	// Triage classified this event as suppressed or dropped — auto-investigation
+	// would resurface noise the user explicitly silenced. Reads from the in-memory
 	// map populated at consumer pickup, so it catches later firings of an
 	// already-suppressed chain; a same-batch race with concurrent triage is
 	// not covered here (would need ordered processors in PostProcessEvent).
-	if nbStatus, _ := event["nb_status"].(string); strings.EqualFold(nbStatus, "SUPPRESSED") {
+	if nbStatus, _ := event["nb_status"].(string); lifecycle.SilencedByTriage(nbStatus) {
 		return nil
 	}
 
@@ -89,12 +90,13 @@ func ProcessEvent(ctx *security.RequestContext, event map[string]any) (err error
 		}
 	}
 
-	// Consumer strips evidences from the map to avoid memory bloat;
-	// check the has_evidences flag instead.
-	hasEvidences, _ := event["has_evidences"].(bool)
-	if !hasEvidences {
-		return nil
-	}
+	// No evidence gate here on purpose. The analysis pipeline gathers its own
+	// evidence at run time (kubectl, logs, metrics, knowledge-graph lookups);
+	// the event's ``evidences`` payload is just what the upstream alert happened
+	// to carry. Gating on it made investigation conditional on how verbose the
+	// source monitor is, which silently dropped events we can analyse perfectly
+	// well — the same inherited-from-source dependency that makes webhook
+	// fingerprints unreliable.
 
 	// for now filter error logs
 	if aggregationKey == "HighErrorCriticalLogs" || aggregationKey == "Anomaly" {
@@ -124,10 +126,6 @@ func ProcessEvent(ctx *security.RequestContext, event map[string]any) (err error
 		} else {
 			return nil
 		}
-	}
-
-	if !config.Config.FeatureEventAutoAiSummaryEnabled {
-		return nil
 	}
 
 	// accountId extracted before the FF gate so it can be account-scoped.

@@ -1,4 +1,5 @@
-import { Box, Tooltip, Typography } from '@mui/material';
+import { Box, Typography } from '@mui/material';
+import Tooltip from '@ui/Tooltip';
 import React, { useEffect, useState, type JSX } from 'react';
 import type { ICustomTableRow } from './types';
 import MoreVertIcon from '@mui/icons-material/MoreVert';
@@ -960,7 +961,7 @@ const InstancesView = (props: {
               },
               {
                 text: 'Action History',
-                value: 3,
+                value: 4,
                 key: 'ec2-action-history',
                 componentFn: function (_opt: any, drilldownQuery: any, _row: any) {
                   return <ResourceActionHistory accountId={props?.accountId ?? ''} resourceId={drilldownQuery.resourse_id} />;

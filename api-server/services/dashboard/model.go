@@ -9,13 +9,16 @@ import (
 // the account; `nudgebee` routes to the internal query engine (events,
 // recommendations, spend, tickets) and needs no external provider at all.
 //
-// `redis`, `rabbitmq` and `postgresql` are a different shape: they run a
-// READ-ONLY command against the account's integration through the relay and
-// tabulate the output. They return a snapshot, not a series, so they render as a
-// table and ignore the dashboard's time range. See integration_query.go.
+// `redis`, `rabbitmq`, `postgresql` and `kubectl` are a different shape: they run
+// a READ-ONLY command in the account's cluster through the relay and tabulate the
+// output. They return a snapshot, not a series, so they render as a table and
+// ignore the dashboard's time range. See integration_query.go.
 //
-// Each value doubles as the INTEGRATION TYPE looked up for the account, so it
-// must match the name the integration registers (`postgresql`, not `postgres`).
+// The first three double as the INTEGRATION TYPE looked up for the account, so
+// they must match the name the integration registers (`postgresql`, not
+// `postgres`). `kubectl` is the exception: there is no kubectl integration — it
+// runs against the account's own agent, which is why it is restricted to
+// Kubernetes accounts.
 const (
 	DatasourceMetrics  = "metrics"
 	DatasourceLogs     = "logs"
@@ -24,12 +27,22 @@ const (
 	DatasourceRedis    = "redis"
 	DatasourceRabbitMQ = "rabbitmq"
 	DatasourcePostgres = "postgresql"
+	DatasourceKubectl  = "kubectl"
 )
+
+// IsProviderDatasource reports whether a panel resolves an observability provider
+// per account — the only datasources on which Panel.Provider means anything. The
+// entity datasources read the internal query engine, and a command datasource IS
+// its integration.
+func IsProviderDatasource(datasource string) bool {
+	return datasource == DatasourceMetrics || datasource == DatasourceLogs || datasource == DatasourceTraces
+}
 
 // IsCommandDatasource reports whether a panel's data comes from running a
 // command through the relay rather than from an observability provider.
 func IsCommandDatasource(datasource string) bool {
-	return datasource == DatasourceRedis || datasource == DatasourceRabbitMQ || datasource == DatasourcePostgres
+	return datasource == DatasourceRedis || datasource == DatasourceRabbitMQ ||
+		datasource == DatasourcePostgres || datasource == DatasourceKubectl
 }
 
 // Panel visualisation types supported by the renderer. Kept deliberately small —
@@ -38,6 +51,7 @@ func IsCommandDatasource(datasource string) bool {
 const (
 	VizTimeseries = "timeseries"
 	VizStat       = "stat"
+	VizGauge      = "gauge"
 	VizTable      = "table"
 	VizBar        = "bar"
 	VizText       = "text"
@@ -107,10 +121,31 @@ type Panel struct {
 	// Definitions written before the change still carry it; upgradeDefinition
 	// folds it into AccountIds on read and clears it, so `omitempty` drops it the
 	// next time the dashboard is written. Never set this.
-	LegacyAccountId string        `json:"account_id,omitempty"`
-	GridPos         GridPos       `json:"grid_pos"`
-	Targets         []PanelTarget `json:"targets,omitempty"`
-	Unit            string        `json:"unit,omitempty"`
+	LegacyAccountId string  `json:"account_id,omitempty"`
+	GridPos         GridPos `json:"grid_pos"`
+	// Provider pins which observability backend the panel's expression is written
+	// for — "prometheus", "ES", "datadog", … — on a metrics/logs/traces panel.
+	//
+	// A panel holds ONE expression in ONE query language, but each of its accounts
+	// resolves its own provider server-side, so a panel spanning a Prometheus
+	// account and an Elasticsearch one is only ever valid for one of them. Naming
+	// the provider makes the panel say which, and sends it on the query rather
+	// than letting each account fall back to its own default.
+	//
+	// Empty means "each account's own default", which is what every panel written
+	// before this field did and still does — so it needs no migration.
+	Provider string `json:"provider,omitempty"`
+	// ProviderIndex pins the Elasticsearch index (or wildcard pattern) the panel
+	// queries, for a panel whose Provider is ES.
+	//
+	// Empty means each account's own configured index — the per-account
+	// `index_account_mapping` override, else the integration's top-level
+	// {metrics,log,trace}_index, exactly as every panel resolved before this
+	// field. Only meaningful alongside Provider: without one, each account is on
+	// its own default provider and forcing one index across them is nonsense.
+	ProviderIndex string        `json:"provider_index,omitempty"`
+	Targets       []PanelTarget `json:"targets,omitempty"`
+	Unit          string        `json:"unit,omitempty"`
 	// Content backs the `text` panel type.
 	Content string `json:"content,omitempty"`
 	// Options carries per-visualisation settings the renderer understands.

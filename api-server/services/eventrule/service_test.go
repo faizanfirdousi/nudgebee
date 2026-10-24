@@ -345,6 +345,43 @@ func TestNormalizeEventSource(t *testing.T) {
 			in:      EventConfig{Source: "", AlertType: ""},
 			wantSrc: "prometheus",
 		},
+		{
+			// A webhook rule mirrors an alert that already exists in the external
+			// system. Reverse-mapping its source onto the provider's own source sent
+			// it into the external-create branch, which tried to create a second rule
+			// in the customer's Elasticsearch (PUT /_watcher/watch/...) and failed the
+			// whole ingest.
+			name:    "webhook source is left alone even with a metric_provider",
+			in:      EventConfig{Source: "elasticsearch_webhook", AlertType: "metric", MetricProvider: "ES"},
+			wantSrc: "elasticsearch_webhook",
+		},
+		{
+			name:    "webhook source with no metric_provider is left alone",
+			in:      EventConfig{Source: "datadog_webhook", AlertType: "metric"},
+			wantSrc: "datadog_webhook",
+		},
+		{
+			// A hosted Prometheus connected without an agent (prometheus:user) has
+			// no PrometheusRule CR to land in; its rules go to the ruler API.
+			name:    "direct prometheus provider routes to the ruler path",
+			in:      EventConfig{Source: "prometheus", AlertType: "metric", MetricProvider: "prometheus", MetricProviderSource: "user"},
+			wantSrc: "prometheus_user",
+		},
+		{
+			name:    "agent prometheus provider keeps the relay path",
+			in:      EventConfig{Source: "nudgebee", AlertType: "metric", MetricProvider: "prometheus", MetricProviderSource: "agent"},
+			wantSrc: "prometheus",
+		},
+		{
+			name:    "bare prometheus provider with no source keeps the relay path",
+			in:      EventConfig{Source: "", AlertType: "", MetricProvider: "prometheus"},
+			wantSrc: "prometheus",
+		},
+		{
+			name:    "direct prometheus provider on a non-metric rule is left alone",
+			in:      EventConfig{Source: "nudgebee", AlertType: "event", MetricProvider: "prometheus", MetricProviderSource: "user"},
+			wantSrc: "nudgebee",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -353,4 +390,27 @@ func TestNormalizeEventSource(t *testing.T) {
 			assert.Equal(t, tc.wantSrc, req.Source)
 		})
 	}
+}
+
+// Alert-rule create/update/delete only reaches the external provider when the
+// source is recognised as external; without this, CubeAPM rule push is dead code.
+func TestCubeAPMIsAnExternalProviderSource(t *testing.T) {
+	assert.True(t, isExternalProviderSource("cubeapm"),
+		"cubeapm rules must route to the external provider")
+
+	provider, providerSource := resolveProviderFromSource("cubeapm")
+	assert.Equal(t, "cubeapm", provider)
+	assert.Equal(t, "user", providerSource)
+
+	// The reverse mapping is the safety net for a request that omits the source.
+	assert.Equal(t, "cubeapm", resolveSourceFromMetricProvider("cubeapm"))
+}
+
+// prometheus_user is an external-provider source (ruler API), never the relay.
+func TestPrometheusUserIsAnExternalProviderSource(t *testing.T) {
+	assert.True(t, isExternalProviderSource("prometheus_user"))
+	assert.False(t, isExternalProviderSource("prometheus"), "the agent path is not an external provider")
+	provider, source := resolveProviderFromSource("prometheus_user")
+	assert.Equal(t, "prometheus", provider)
+	assert.Equal(t, "user", source)
 }

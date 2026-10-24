@@ -15,10 +15,11 @@ async function goToServicesTab(page: Page, locators: CloudAccountLocators) {
   await expect(locators.AnchorTabServices).toBeVisible();
   await locators.AnchorTabServices.click();
   await page.waitForLoadState("networkidle");
+  // GCP's services cost query regularly takes longer than 30s on dev.
   await page
     .locator("#servicesTable tbody tr")
     .first()
-    .waitFor({ state: "visible", timeout: 30000 });
+    .waitFor({ state: "visible", timeout: 60000 });
 }
 
 async function expandFirstServiceRow(page: Page, locators: CloudAccountLocators) {
@@ -29,7 +30,7 @@ async function expandFirstServiceRow(page: Page, locators: CloudAccountLocators)
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-test("API testing Cloud Account -> GCP -> Services", async ({
+test("API testing Cloud Account -> GCP -> Services", { tag: ["@dev", "@test", "@oss", "@smoke", "@functional"] }, async ({
   page,
 }, testInfo) => {
   test.setTimeout(120000);
@@ -47,7 +48,7 @@ test("API testing Cloud Account -> GCP -> Services", async ({
   );
 });
 
-test("API testing Cloud Account -> GCP -> Services -> Resources tab", async ({
+test("API testing Cloud Account -> GCP -> Services -> Resources tab", { tag: ["@dev", "@test", "@oss", "@smoke", "@functional"] }, async ({
   page,
 }, testInfo) => {
   test.setTimeout(120000);
@@ -65,7 +66,7 @@ test("API testing Cloud Account -> GCP -> Services -> Resources tab", async ({
   );
 });
 
-test("API testing Cloud Account -> GCP -> Services -> Cost Trend tab", async ({
+test("API testing Cloud Account -> GCP -> Services -> Cost Trend tab", { tag: ["@dev", "@test", "@oss", "@smoke", "@functional"] }, async ({
   page,
 }, testInfo) => {
   test.setTimeout(120000);
@@ -82,7 +83,7 @@ test("API testing Cloud Account -> GCP -> Services -> Cost Trend tab", async ({
   );
 });
 
-test("API testing Cloud Account -> GCP -> Services -> Resources -> Details tab", async ({
+test("Cloud Account GCP Services - open Services, expand the first service, expand a resource row, verify the Details panel opens", { tag: ["@dev", "@test", "@oss", "@smoke", "@functional"] }, async ({
   page,
 }) => {
   test.setTimeout(120000);
@@ -96,11 +97,12 @@ test("API testing Cloud Account -> GCP -> Services -> Resources -> Details tab",
 
   // ListCloudResources has known GQL errors (acceptable backend issue), plain assertions used
   await locators.getResourceRowExpandButton().click();
-  await expect(page.getByRole("tab", { name: "Details" })).toBeVisible();
+  await expect(locators.getResourceRowCollapseButton()).toBeVisible();
+  await expect(locators.getResourceDetailsPanel()).toBeVisible();
   await page.waitForLoadState("networkidle");
 });
 
-test("API testing Cloud Account -> GCP -> Services -> Recommendations tab", async ({
+test("API testing Cloud Account -> GCP -> Services -> Recommendations tab", { tag: ["@dev", "@test", "@oss", "@smoke", "@functional"] }, async ({
   page,
 }, testInfo) => {
   test.setTimeout(120000);

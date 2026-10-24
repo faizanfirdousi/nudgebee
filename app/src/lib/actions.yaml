@@ -37,6 +37,30 @@ actions:
     permissions:
       - role: tenant_admin
       - role: tenant_admin_readonly
+  - name: integrations_list_webhook_events
+    comment: List incoming webhook events for one integration's Activity Log
+    definition:
+      kind: "synchronous"
+      handler: '{{SERVICE_API_SERVER_URL}}/rpc/query'
+      forward_client_headers: true
+      headers:
+        - name: X-ACTION-TOKEN
+          value_from_env: ACTION_API_SERVER_TOKEN
+    permissions:
+      - role: tenant_admin
+      - role: tenant_admin_readonly
+  - name: integrations_aggregate_webhook_events
+    comment: Count incoming webhook events for one integration's Activity Log widgets
+    definition:
+      kind: "synchronous"
+      handler: '{{SERVICE_API_SERVER_URL}}/rpc/query'
+      forward_client_headers: true
+      headers:
+        - name: X-ACTION-TOKEN
+          value_from_env: ACTION_API_SERVER_TOKEN
+    permissions:
+      - role: tenant_admin
+      - role: tenant_admin_readonly
   - name: notifications_aggregate_rules
     comment: Aggregate notification rules grouped by severity, source and account
     definition:
@@ -436,6 +460,57 @@ actions:
       - role: k8s_namespace_admin
       - role: account_admin_readonly
       - role: account_admin
+  - name: ai_delete_conversation_queued_message
+    comment: Delete a queued message in an investigation
+    definition:
+      kind: synchronous
+      handler: '{{LLM_SERVER_URL}}/v1/completions/queued_message_delete'
+      forward_client_headers: true
+      headers:
+        - name: X-ACTION-TOKEN
+          value_from_env: LLM_SERVER_TOKEN
+    permissions:
+      - role: tenant_usage
+      - role: tenant_admin_readonly
+      - role: tenant_admin
+      - role: k8s_namespace_admin_readonly
+      - role: k8s_namespace_admin
+      - role: account_admin_readonly
+      - role: account_admin
+  - name: ai_update_conversation_queued_message
+    comment: Update a queued message text in an investigation
+    definition:
+      kind: synchronous
+      handler: '{{LLM_SERVER_URL}}/v1/completions/queued_message_update'
+      forward_client_headers: true
+      headers:
+        - name: X-ACTION-TOKEN
+          value_from_env: LLM_SERVER_TOKEN
+    permissions:
+      - role: tenant_usage
+      - role: tenant_admin_readonly
+      - role: tenant_admin
+      - role: k8s_namespace_admin_readonly
+      - role: k8s_namespace_admin
+      - role: account_admin_readonly
+      - role: account_admin
+  - name: ai_execute_queued_message
+    comment: Force execute a queued message immediately
+    definition:
+      kind: synchronous
+      handler: '{{LLM_SERVER_URL}}/v1/completions/queued_message_force'
+      forward_client_headers: true
+      headers:
+        - name: X-ACTION-TOKEN
+          value_from_env: LLM_SERVER_TOKEN
+    permissions:
+      - role: tenant_usage
+      - role: tenant_admin_readonly
+      - role: tenant_admin
+      - role: k8s_namespace_admin_readonly
+      - role: k8s_namespace_admin
+      - role: account_admin_readonly
+      - role: account_admin
   - name: ai_generate_log_query
     comment: Generate and validate a log query for the account's configured log backend, from a natural-language request
     definition:
@@ -454,10 +529,10 @@ actions:
       - role: tenant_admin
       - role: tenant_admin_readonly
       - role: tenant_usage
-  - name: ai_generate_prometheus_query
+  - name: ai_generate_metrics_query
     definition:
       kind: synchronous
-      handler: '{{LLM_SERVER_URL}}/v1/completions/prometheus-query'
+      handler: '{{LLM_SERVER_URL}}/v1/completions/metrics-query'
       forward_client_headers: true
       headers:
         - name: X-ACTION-TOKEN
@@ -471,7 +546,7 @@ actions:
       - role: account_admin_readonly
       - role: account_admin
       - role: tenant_admin
-    comment: Generate Prometheus Query
+    comment: Generate Metrics Query
   - name: ai_generate_workflow
     comment: Generate an automation workflow from a natural-language description
     definition:
@@ -753,6 +828,29 @@ actions:
       timeout: 60
     permissions:
       - role: tenant_admin_readonly
+      - role: tenant_admin
+  - name: ai_get_cost_report_schedule
+    comment: Read this tenant's configured AI Cost Daily Report send hour (UTC), or the 06:00 default if unset
+    definition:
+      kind: synchronous
+      handler: '{{LLM_SERVER_URL}}/v1/conversations/ai_get_cost_report_schedule'
+      forward_client_headers: true
+      headers:
+        - name: X-ACTION-TOKEN
+          value_from_env: LLM_SERVER_TOKEN
+    permissions:
+      - role: tenant_admin_readonly
+      - role: tenant_admin
+  - name: ai_upsert_cost_report_schedule
+    comment: Set this tenant's AI Cost Daily Report send hour (UTC)
+    definition:
+      kind: synchronous
+      handler: '{{LLM_SERVER_URL}}/v1/conversations/ai_upsert_cost_report_schedule'
+      forward_client_headers: true
+      headers:
+        - name: X-ACTION-TOKEN
+          value_from_env: LLM_SERVER_TOKEN
+    permissions:
       - role: tenant_admin
   # Cross-tenant critique reads, no account/tenant scoping in the query.
   # Gated tenant_admin(_readonly)/super_admin(_readonly) — sees ALL tenants' data.
@@ -1314,6 +1412,19 @@ actions:
       - role: account_admin_readonly
       - role: tenant_admin
     comment: List all agents with their KB mapping counts
+  - name: ai_list_kb_agents
+    definition:
+      kind: "synchronous"
+      handler: '{{LLM_SERVER_URL}}/v1/knowledgebases'
+      forward_client_headers: true
+      headers:
+        - name: X-ACTION-TOKEN
+          value_from_env: LLM_SERVER_TOKEN
+    permissions:
+      - role: account_admin
+      - role: account_admin_readonly
+      - role: tenant_admin
+    comment: List the agents a knowledge base is mapped to
   - name: ai_list_gc
     definition:
       kind: "synchronous"
@@ -1355,6 +1466,83 @@ actions:
       - role: account_admin_readonly
       - role: tenant_admin
     comment: Get load history for a knowledge base
+  - name: ai_list_kb_documents
+    definition:
+      kind: "synchronous"
+      handler: '{{LLM_SERVER_URL}}/v1/knowledgebases'
+      forward_client_headers: true
+      headers:
+        - name: X-ACTION-TOKEN
+          value_from_env: LLM_SERVER_TOKEN
+    permissions:
+      - role: account_admin
+      - role: account_admin_readonly
+      - role: tenant_admin
+    comment: List a page of the stored documents of a knowledge base (title and link)
+  - name: ai_get_kb_document
+    definition:
+      kind: "synchronous"
+      handler: '{{LLM_SERVER_URL}}/v1/knowledgebases'
+      forward_client_headers: true
+      headers:
+        - name: X-ACTION-TOKEN
+          value_from_env: LLM_SERVER_TOKEN
+    permissions:
+      - role: account_admin
+      - role: account_admin_readonly
+      - role: tenant_admin
+    comment: Get one stored document of a knowledge base with its content
+  - name: ai_upsert_kb_document_category
+    definition:
+      kind: synchronous
+      handler: '{{LLM_SERVER_URL}}/v1/knowledgebases'
+      forward_client_headers: true
+      headers:
+        - name: X-ACTION-TOKEN
+          value_from_env: LLM_SERVER_TOKEN
+    permissions:
+      - role: account_admin
+      - role: tenant_admin
+    comment: Mark one document of a knowledge base as a procedure (sop) or reference material (fact)
+  - name: ai_get_kb_document_source
+    definition:
+      kind: "synchronous"
+      handler: '{{LLM_SERVER_URL}}/v1/knowledgebases'
+      forward_client_headers: true
+      headers:
+        - name: X-ACTION-TOKEN
+          value_from_env: LLM_SERVER_TOKEN
+    permissions:
+      - role: account_admin
+      - role: account_admin_readonly
+      - role: tenant_admin
+    comment: Get one document's source exactly as it was fetched, by content hash
+  - name: ai_list_kb_run_documents
+    definition:
+      kind: "synchronous"
+      handler: '{{LLM_SERVER_URL}}/v1/knowledgebases'
+      forward_client_headers: true
+      headers:
+        - name: X-ACTION-TOKEN
+          value_from_env: LLM_SERVER_TOKEN
+    permissions:
+      - role: account_admin
+      - role: account_admin_readonly
+      - role: tenant_admin
+    comment: List the documents one knowledge-base load captured
+  - name: ai_list_kb_retrieval
+    definition:
+      kind: "synchronous"
+      handler: '{{LLM_SERVER_URL}}/v1/knowledgebases'
+      forward_client_headers: true
+      headers:
+        - name: X-ACTION-TOKEN
+          value_from_env: LLM_SERVER_TOKEN
+    permissions:
+      - role: account_admin
+      - role: account_admin_readonly
+      - role: tenant_admin
+    comment: List the knowledge base documents a query would retrieve, ranked, with whether each would reach the agent
   - name: ai_sync_kb
     definition:
       kind: synchronous
@@ -1779,6 +1967,18 @@ actions:
       - role: account_admin
       - role: tenant_admin
     comment: Update a knowledge base
+  - name: ai_update_kb_enabled
+    definition:
+      kind: synchronous
+      handler: '{{LLM_SERVER_URL}}/v1/knowledgebases'
+      forward_client_headers: true
+      headers:
+        - name: X-ACTION-TOKEN
+          value_from_env: LLM_SERVER_TOKEN
+    permissions:
+      - role: account_admin
+      - role: tenant_admin
+    comment: Turn a knowledge base on or off without changing its content
   - name: ai_update_tool
     comment: Update a custom agent tool
     definition:
@@ -1844,6 +2044,76 @@ actions:
       - role: k8s_namespace_admin
       - role: account_admin_readonly
       - role: account_admin
+  - name: eventrules_get_capabilities
+    definition:
+      kind: synchronous
+      handler: '{{SERVICE_API_SERVER_URL}}/rpc/eventrule'
+      forward_client_headers: true
+      headers:
+        - name: X-ACTION-TOKEN
+          value_from_env: ACTION_API_SERVER_TOKEN
+    permissions:
+      - role: tenant_usage
+      - role: tenant_admin_readonly
+      - role: tenant_admin
+      - role: k8s_namespace_admin_readonly
+      - role: k8s_namespace_admin
+      - role: account_admin_readonly
+      - role: account_admin
+    comment: Which changes (edit, threshold, disable at source, mute, PR) Nudgebee can really make to each alert rule, with the reason when it cannot
+  - name: eventrules_update_mute
+    definition:
+      kind: synchronous
+      handler: '{{SERVICE_API_SERVER_URL}}/rpc/eventrule'
+      forward_client_headers: true
+      headers:
+        - name: X-ACTION-TOKEN
+          value_from_env: ACTION_API_SERVER_TOKEN
+    permissions:
+      - role: tenant_admin
+      - role: account_admin
+    comment: Mute or unmute an alert rule in Nudgebee (suppression rules; the source rule is not changed)
+  - name: eventrules_get_event_alert_controls
+    definition:
+      kind: synchronous
+      handler: '{{SERVICE_API_SERVER_URL}}/rpc/eventrule'
+      forward_client_headers: true
+      headers:
+        - name: X-ACTION-TOKEN
+          value_from_env: ACTION_API_SERVER_TOKEN
+    permissions:
+      - role: tenant_usage
+      - role: tenant_admin_readonly
+      - role: tenant_admin
+      - role: k8s_namespace_admin_readonly
+      - role: k8s_namespace_admin
+      - role: account_admin_readonly
+      - role: account_admin
+    comment: What the investigation screen can do about an event's alert — the alert rule it belongs to and its capabilities, the mute scopes with 7-day counts, and the suppressions that apply
+  - name: eventrules_apply_rule_change
+    definition:
+      kind: synchronous
+      handler: '{{SERVICE_API_SERVER_URL}}/rpc/eventrule'
+      forward_client_headers: true
+      headers:
+        - name: X-ACTION-TOKEN
+          value_from_env: ACTION_API_SERVER_TOKEN
+    permissions:
+      - role: tenant_admin
+      - role: account_admin
+    comment: Change one alert rule's expression and/or `for` where it is defined, refusing if the rule changed since the change was proposed (Nubi remediation plan)
+  - name: eventrules_update_event_mute
+    definition:
+      kind: synchronous
+      handler: '{{SERVICE_API_SERVER_URL}}/rpc/eventrule'
+      forward_client_headers: true
+      headers:
+        - name: X-ACTION-TOKEN
+          value_from_env: ACTION_API_SERVER_TOKEN
+    permissions:
+      - role: tenant_admin
+      - role: account_admin
+    comment: Mute or unmute an event's alert in Nudgebee for its workload or for every firing, for a set time (suppression rules; the source rule is not changed)
   - name: alertmanager_update_rule
     definition:
       kind: synchronous
@@ -2533,7 +2803,7 @@ actions:
       - role: tenant_admin
       - role: account_admin
   - name: dashboards_execute_query
-    comment: Run one dashboard panel's read-only redis/rabbitmq command against an account (server enforces a read-only command allowlist plus account read access)
+    comment: Run one dashboard panel's read-only redis/rabbitmq/postgresql/kubectl command against an account (server enforces a read-only command allowlist plus account read access)
     definition:
       kind: synchronous
       handler: '{{SERVICE_API_SERVER_URL}}/rpc/dashboard'
@@ -3046,6 +3316,34 @@ actions:
     permissions:
       - role: tenant_admin
       - role: account_admin
+  - name: event_update_status
+    comment: Manually open or close an event's alert status from the Events three-dot menu
+    definition:
+      kind: synchronous
+      handler: '{{SERVICE_API_SERVER_URL}}/rpc/event'
+      forward_client_headers: true
+      headers:
+        - name: X-ACTION-TOKEN
+          value_from_env: ACTION_API_SERVER_TOKEN
+    permissions:
+      - role: tenant_admin
+      - role: account_admin
+  - name: event_get_status_change
+    comment: Batch-get the most recent manual open/close for a set of events, if any (prefetched for the Alert Status "Closed by" tooltip)
+    definition:
+      kind: synchronous
+      handler: '{{SERVICE_API_SERVER_URL}}/rpc/event'
+      forward_client_headers: true
+      headers:
+        - name: X-ACTION-TOKEN
+          value_from_env: ACTION_API_SERVER_TOKEN
+    permissions:
+      - role: tenant_admin
+      - role: tenant_admin_readonly
+      - role: k8s_namespace_admin_readonly
+      - role: k8s_namespace_admin
+      - role: account_admin_readonly
+      - role: account_admin
   - name: event_update_nb_status
     definition:
       kind: synchronous
@@ -3125,18 +3423,6 @@ actions:
       - role: tenant_admin
       - role: account_admin
     comment: Setup GCP Cloud Monitoring webhook notification channel for real-time alerts
-  - name: gcp_get_onboard_pubsub_url
-    definition:
-      kind: synchronous
-      handler: '{{SERVICE_API_SERVER_URL}}/rpc/account'
-      forward_client_headers: true
-      headers:
-        - name: X-ACTION-TOKEN
-          value_from_env: ACTION_API_SERVER_TOKEN
-    permissions:
-      - role: tenant_admin
-      - role: account_admin
-    comment: Generate GCP Deployment Manager template URL for Pub/Sub real-time integration
   - name: ml_generate_node_recommendations
     definition:
       kind: synchronous
@@ -3312,6 +3598,21 @@ actions:
       timeout: 120
     permissions:
       - role: tenant_admin
+  - name: integrations_diagnose_connection
+    comment: Safely diagnose connectivity of a saved integration visible through a linked account
+    definition:
+      kind: synchronous
+      handler: '{{SERVICE_API_SERVER_URL}}/rpc/integration'
+      forward_client_headers: true
+      headers:
+        - name: X-ACTION-TOKEN
+          value_from_env: ACTION_API_SERVER_TOKEN
+      timeout: 120
+    permissions:
+      - role: tenant_admin
+      - role: tenant_admin_readonly
+      - role: account_admin
+      - role: account_admin_readonly
   - name: integrations_check_connection_config
     comment: Test connectivity of integration settings before saving
     definition:
@@ -4235,6 +4536,41 @@ actions:
           value_from_env: NOTIFICATION_SERVER_TOKEN
     permissions:
       - role: tenant_admin
+  - name: notifications_list_default_policies
+    comment: List what happens to notifications no rule matches, for all types and per type
+    definition:
+      kind: synchronous
+      handler: '{{NOTIFICATION_SERVICE_URL}}/api/rules/defaults'
+      forward_client_headers: true
+      headers:
+        - name: X-ACTION-TOKEN
+          value_from_env: NOTIFICATION_SERVER_TOKEN
+    permissions:
+      - role: tenant_admin
+      - role: tenant_admin_readonly
+  - name: notifications_upsert_default_policy
+    comment: Set what happens to notifications no rule matches, for all types or one type
+    definition:
+      kind: synchronous
+      handler: '{{NOTIFICATION_SERVICE_URL}}/api/rules/defaults/save'
+      forward_client_headers: true
+      headers:
+        - name: X-ACTION-TOKEN
+          value_from_env: NOTIFICATION_SERVER_TOKEN
+    permissions:
+      - role: tenant_admin
+  - name: notifications_check_route
+    comment: Check where a notification would go under the current rules, without sending it
+    definition:
+      kind: synchronous
+      handler: '{{NOTIFICATION_SERVICE_URL}}/api/rules/check'
+      forward_client_headers: true
+      headers:
+        - name: X-ACTION-TOKEN
+          value_from_env: NOTIFICATION_SERVER_TOKEN
+    permissions:
+      - role: tenant_admin
+      - role: tenant_admin_readonly
   - name: observability_list_provider_capabilities
     comment: List logs, metrics and traces capabilities per observability provider
     definition:
@@ -4250,6 +4586,20 @@ actions:
       - role: account_admin
       - role: tenant_admin_readonly
       - role: tenant_usage
+  - name: observability_get_label_mapping
+    comment: Resolve the effective canonical to provider log field mapping, with the tier each value came from
+    definition:
+      kind: "synchronous"
+      handler: '{{SERVICE_API_SERVER_URL}}/rpc/provider'
+      forward_client_headers: true
+      headers:
+        - name: X-ACTION-TOKEN
+          value_from_env: ACTION_API_SERVER_TOKEN
+    permissions:
+      - role: tenant_admin
+      - role: account_admin_readonly
+      - role: account_admin
+      - role: tenant_admin_readonly
   - name: recommendation_export
     comment: Export recommendations to a downloadable file
     definition:
@@ -4421,6 +4771,32 @@ actions:
       - role: k8s_namespace_admin
       - role: account_admin
       - role: tenant_admin
+  - name: security_scan_vm_account
+    comment: Trigger an on-demand VM package inventory + vulnerability scan for every instance in an account
+    definition:
+      kind: synchronous
+      handler: '{{SERVICE_API_SERVER_URL}}/rpc/recommendation'
+      forward_client_headers: true
+      headers:
+        - name: X-ACTION-TOKEN
+          value_from_env: ACTION_API_SERVER_TOKEN
+    permissions:
+      - role: k8s_namespace_admin
+      - role: account_admin
+      - role: tenant_admin
+  - name: security_list_vm_scan_statuses
+    comment: List each VM's most recent scan outcome (started/completed/failed) for an account
+    definition:
+      kind: synchronous
+      handler: '{{SERVICE_API_SERVER_URL}}/rpc/recommendation'
+      forward_client_headers: true
+      headers:
+        - name: X-ACTION-TOKEN
+          value_from_env: ACTION_API_SERVER_TOKEN
+    permissions:
+      - role: k8s_namespace_admin
+      - role: account_admin
+      - role: tenant_admin
   - name: slo_config_create
     comment: Create an SLO configuration
     definition:
@@ -4530,6 +4906,20 @@ actions:
       - role: account_admin
   - name: spend_groupings_v2
     comment: Aggregate cloud spend grouped by service, account and time
+    definition:
+      kind: "synchronous"
+      handler: '{{SERVICE_API_SERVER_URL}}/rpc/query'
+      forward_client_headers: true
+      headers:
+        - name: X-ACTION-TOKEN
+          value_from_env: ACTION_API_SERVER_TOKEN
+    permissions:
+      - role: account_admin_readonly
+      - role: account_admin
+      - role: tenant_admin_readonly
+      - role: tenant_admin
+  - name: spend_summary_windows_v2
+    comment: This-month / last-month / year-to-date spend (net, gross, credits) for one account in a single query
     definition:
       kind: "synchronous"
       handler: '{{SERVICE_API_SERVER_URL}}/rpc/query'
@@ -5640,6 +6030,22 @@ actions:
       - role: k8s_namespace_admin
       - role: account_admin_readonly
       - role: account_admin
+  - name: users_update_token
+    comment: Update an API access token's expiry and limits
+    definition:
+      kind: synchronous
+      handler: '{{SERVICE_API_SERVER_URL}}/rpc/user'
+      forward_client_headers: true
+      headers:
+        - name: X-ACTION-TOKEN
+          value_from_env: ACTION_API_SERVER_TOKEN
+    permissions:
+      - role: tenant_admin_readonly
+      - role: tenant_admin
+      - role: k8s_namespace_admin_readonly
+      - role: k8s_namespace_admin
+      - role: account_admin_readonly
+      - role: account_admin
   - name: cloud_check_credentials
     definition:
       kind: synchronous
@@ -6087,6 +6493,22 @@ actions:
     permissions:
       - role: account_admin
       - role: tenant_admin
+  - name: workflow_check_trigger_match
+    comment: Check whether an event payload would fire an automation's trigger
+    definition:
+      kind: "synchronous"
+      handler: '{{WORKFLOW_SERVER_URL}}/rpc'
+      forward_client_headers: true
+      headers:
+        - name: X-ACTION-TOKEN
+          value_from_env: WORKFLOW_SERVER_TOKEN
+    permissions:
+      - role: tenant_admin_readonly
+      - role: tenant_admin
+      - role: k8s_namespace_admin_readonly
+      - role: k8s_namespace_admin
+      - role: account_admin_readonly
+      - role: account_admin
   - name: workflow_check
     comment: Validate a workflow definition
     definition:
@@ -6344,6 +6766,22 @@ actions:
       - role: account_admin
   - name: cloud_vm_package_groupings_v2
     comment: Aggregate VM package inventory by resource, OS and package type
+    definition:
+      kind: "synchronous"
+      handler: '{{SERVICE_API_SERVER_URL}}/rpc/query'
+      forward_client_headers: true
+      headers:
+        - name: X-ACTION-TOKEN
+          value_from_env: ACTION_API_SERVER_TOKEN
+    permissions:
+      - role: k8s_namespace_admin
+      - role: k8s_namespace_admin_readonly
+      - role: tenant_admin_readonly
+      - role: tenant_admin
+      - role: account_admin_readonly
+      - role: account_admin
+  - name: cloud_list_account_integrations
+    comment: List integrations wired to a cloud account (name, type, status only; no config values)
     definition:
       kind: "synchronous"
       handler: '{{SERVICE_API_SERVER_URL}}/rpc/query'
@@ -6972,6 +7410,8 @@ custom_types:
     - name: DisableAlertRule
     - name: security_scan_image_input
     - name: security_scan_vm_input
+    - name: security_scan_vm_account_input
+    - name: security_list_vm_scan_statuses_input
     - name: tenant_user_roles_upsert_one_input
     - name: tenant_group_roles_upsert_one_input
     - name: account_user_roles_upsert_one_input
@@ -7055,7 +7495,7 @@ custom_types:
     - name: ApplicationRequest
     - name: ApplicationMetricsRequest
     - name: NudgebeeAIGetPrometheusQueryRequest
-    - name: AIGetPrometheusQueryRequest
+    - name: AIGetMetricsQueryRequest
     - name: AIGetLogQueryRequest
     - name: AiFeedbackCreateRequest
     - name: GetInvestigateQueryRequest
@@ -7163,6 +7603,7 @@ custom_types:
     - name: WorkflowTaskLayoutRequest
     - name: WorkflowTriggerRequest
     - name: WorkflowDryrunRequest
+    - name: WorkflowCheckTriggerMatchRequest
     - name: WorkflowExecutionListRequest
     - name: WorkflowExecutionGetRequest
     - name: TraceHeatMapInput
@@ -7225,7 +7666,6 @@ custom_types:
     - name: MetricsQueryUtilisationRequest
     - name: AwsOnboardStatusInput
     - name: AzureEventGridOnboardInput
-    - name: GcpPubSubOnboardInput
     - name: NotificationRulesWhereRequest
     - name: UserGroupsWhereRequest
     - name: IntegrationWhereRequest
@@ -7356,7 +7796,6 @@ custom_types:
     - name: AwsOrgRefreshTokenOutput
     - name: AwsOnboardStatusOutput
     - name: AzureEventGridOnboardOutput
-    - name: GcpPubSubOnboardOutput
     - name: ValidateCloudCredentialsOutput
     - name: PermissionStatusOutput
     - name: get_openai_query_recommendations_output
@@ -7410,6 +7849,8 @@ custom_types:
     - name: auto_optimize_recommendation_output
     - name: security_scan_image_output
     - name: security_scan_vm_output
+    - name: security_scan_vm_account_output
+    - name: security_list_vm_scan_statuses_output
     - name: tenant_user_roles_upsert_one_output
     - name: tenant_group_roles_upsert_one_output
     - name: account_user_roles_upsert_one_output
@@ -7527,8 +7968,8 @@ custom_types:
     - name: ApplicationDeploymentMetrics
     - name: NudgebeeAIGetPrometheusQueryResponse
     - name: NudgebeeAIGetPrometheusQuery
-    - name: AIGetPrometheusQueryResponse
-    - name: AIGetPrometheusQuery
+    - name: AIGetMetricsQueryResponse
+    - name: AIGeneratedQuery
     - name: AIGetLogQueryResponse
     - name: GenerateFeedbackResponse
     - name: FeedbackResponse
@@ -7756,6 +8197,7 @@ custom_types:
     - name: Error
     - name: WorkflowValidateResponse
     - name: WorkflowDryrunResponse
+    - name: WorkflowCheckTriggerMatchResponse
     - name: ExportRecommendationResponse
     - name: WorkflowDefinitionFailurePolicyResponse
     - name: WorkflowDefinitionRetryPolicyResponse

@@ -1,20 +1,22 @@
 import React, { useState, useEffect, useRef, forwardRef, useImperativeHandle } from 'react';
 import PropTypes from 'prop-types';
-import { Box, IconButton, CircularProgress, Tooltip } from '@mui/material';
+import { Box, IconButton, CircularProgress } from '@mui/material';
+import Tooltip from '@ui/Tooltip';
 import PlayArrowRoundedIcon from '@mui/icons-material/PlayArrowRounded';
 import { Button } from '@ui/Button';
 import { Card } from '@ui/Card';
 import { Label } from '@ui/Label';
 import { CodeBlock } from '@ui/CodeBlock';
 import { ds } from '@utils/colors';
-import { hasWriteAccess, hasFeatureAccess } from '@lib/auth';
+import { hasWriteAccess } from '@lib/auth';
 import apiKubernetes from '@api1/kubernetes';
 import apiRecommendations from '@api1/recommendation';
 import apiTriage from '@api1/triage';
-
-// Feature flag that opts an account into auto-generating the remediation plan once the investigation
-// completes (off by default). Checked via hasFeatureAccess, the same mechanism that gates GENERATE_RCA.
-const AUTO_GENERATE_REMEDIATION_FLAG = 'AUTO_GENERATE_REMEDIATION';
+import apiKubernetes1 from '@api1/kubernetes1';
+import { getBrandTitle } from '@hooks/useTenantBranding';
+import { reportContainsInvestigation } from '@utils/investigationReport';
+import AlertRuleChangeAction from './AlertRuleChangeAction';
+import { buildAlertRuleContext, isAlertRuleChangeApplied } from './remediationAlertRule';
 
 const STATUS_META = {
   SUCCESS: { text: 'Success', tone: 'success' },
@@ -194,7 +196,10 @@ HypothesisBlock.propTypes = {
 // A single command with an inline play button and its output. The server re-derives read-vs-write
 // and enforces write RBAC + the safety blocklist, so the click here is the human approval. Exposes an
 // imperative run() (returning success) so the action block can sequence execute → verify.
-const CommandRow = forwardRef(function CommandRow({ label, tone, command, accountId, eventId, canRun, disabled, onExecuted, slot }, ref) {
+const CommandRow = forwardRef(function CommandRow(
+  { label, tone, command, accountId, eventId, canRun, disabled, onExecuted, slot, executeCommand },
+  ref
+) {
   const [status, setStatus] = useState('IDLE');
   const [result, setResult] = useState(null);
 
@@ -209,7 +214,7 @@ const CommandRow = forwardRef(function CommandRow({ label, tone, command, accoun
     setStatus('RUNNING');
     setResult(null);
     try {
-      const res = await apiKubernetes.executeRemediationCommand(accountId, command, eventId, undefined, slot);
+      const res = await apiKubernetes.executeRemediationCommand(accountId, command, eventId, undefined, slot, executeCommand);
       if (res && typeof res === 'object') {
         setResult(res);
         const observedNothing = slot === 'verify' && !trimmedString(res.stdout);
@@ -242,7 +247,10 @@ const CommandRow = forwardRef(function CommandRow({ label, tone, command, accoun
         <Box sx={{ flex: 1, minWidth: 0 }}>
           <CodeBlock code={command} language='bash' tone='dark' wrap copyToast='Command copied' />
         </Box>
-        <Tooltip title={!canRun ? 'Requires write access' : status === 'RUNNING' ? 'Running…' : `Run ${label.toLowerCase()} command`}>
+        <Tooltip
+          title={!canRun ? 'Requires write access' : status === 'RUNNING' ? 'Running…' : `Run ${label.toLowerCase()} command`}
+          placement='bottom'
+        >
           <span>
             <IconButton
               size='small'
@@ -320,6 +328,8 @@ CommandRow.propTypes = {
   disabled: PropTypes.bool,
   onExecuted: PropTypes.func,
   slot: PropTypes.oneOf(['execute', 'verify', 'rollback']).isRequired,
+  // Only sent for the verify slot; identifies the attempt whose result this checks.
+  executeCommand: PropTypes.string,
 };
 
 // CodeFixDetails shows the actual change behind a code-fix action: the files touched and the diff
@@ -363,7 +373,7 @@ CodeFixDetails.propTypes = {
 // confidence, shown inline — there is no separate hypotheses box), and its command rows. A per-block
 // "Run" button runs this action's execute → verify one-by-one, stopping on the first failure.
 // A code-fix action carries no command, so it renders the diff instead of command rows.
-function ActionCard({ index, action, hypothesis, accountId, eventId, canRun, appliedAt, onExecuted, codeFix }) {
+function ActionCard({ index, action, hypothesis, accountId, eventId, canRun, appliedAt, onExecuted, codeFix, alertControls, onAlertRuleApplied }) {
   const [running, setRunning] = useState(false);
   const execRef = useRef(null);
   const verifyRef = useRef(null);
@@ -379,7 +389,10 @@ function ActionCard({ index, action, hypothesis, accountId, eventId, canRun, app
   const hypConfidence = formatConfidence(hypothesis?.confidence);
   // Only a command-less fix stands in for the code change; a mitigation with a command shows its
   // command rows instead, and must not carry someone else's diff.
-  const showCodeFix = !execCmd && trimmedString(action?.kind).toLowerCase() === 'fix' && !!codeFix;
+  // A change to the alert rule is applied from the card, not by a command, and is not the code fix.
+  const ruleChange = action?.alert_rule_change || null;
+  const ruleChangeApplied = ruleChange ? isAlertRuleChangeApplied(ruleChange, alertControls) : false;
+  const showCodeFix = !execCmd && !ruleChange && trimmedString(action?.kind).toLowerCase() === 'fix' && !!codeFix;
 
   // Run the action's execute command, then (only if it succeeded) its verify command. Rollback is
   // never auto-run. Each row shows its own output live as it runs.
@@ -415,6 +428,7 @@ function ActionCard({ index, action, hypothesis, accountId, eventId, canRun, app
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 'var(--ds-space-2)' }}>
             {kindMeta ? <Label tone={kindMeta.tone} size='sm' text={kindMeta.text} /> : null}
             {appliedAt ? <Label tone='success' size='sm' text={appliedLabel ? `Applied · ${appliedLabel}` : 'Applied'} /> : null}
+            {ruleChangeApplied ? <Label tone='success' size='sm' text='Applied' /> : null}
             {confidence !== null ? (
               // Says what the number measures. The hypothesis below carries its own percentage
               // measuring something different (is this the cause), and two bare "confidence" chips
@@ -424,7 +438,7 @@ function ActionCard({ index, action, hypothesis, accountId, eventId, canRun, app
               >{`${confidence}% likely to resolve`}</Box>
             ) : null}
             {execCmd ? (
-              <Tooltip title={!canRun ? 'Requires write access' : 'Run this action (execute, then verify), stopping on failure'}>
+              <Tooltip title={!canRun ? 'Requires write access' : 'Run this action (execute, then verify), stopping on failure'} placement='bottom'>
                 <span>
                   <Button
                     tone={appliedAt ? 'secondary' : 'primary'}
@@ -457,6 +471,16 @@ function ActionCard({ index, action, hypothesis, accountId, eventId, canRun, app
           </Box>
         ) : null}
         {showCodeFix ? <CodeFixDetails codeFix={codeFix} /> : null}
+        {ruleChange ? (
+          <AlertRuleChangeAction
+            change={ruleChange}
+            controls={alertControls}
+            accountId={accountId}
+            eventId={eventId}
+            canRun={canRun}
+            onApplied={onAlertRuleApplied}
+          />
+        ) : null}
         {execCmd ? (
           <CommandRow
             ref={execRef}
@@ -478,6 +502,8 @@ function ActionCard({ index, action, hypothesis, accountId, eventId, canRun, app
             slot='verify'
             tone='neutral'
             command={verifyCmd}
+            // Correlation key: the server attaches this verify's result to the execute attempt.
+            executeCommand={execCmd}
             accountId={accountId}
             eventId={eventId}
             canRun={canRun}
@@ -523,6 +549,8 @@ ActionCard.propTypes = {
   appliedAt: PropTypes.string,
   onExecuted: PropTypes.func,
   codeFix: PropTypes.object,
+  alertControls: PropTypes.object,
+  onAlertRuleApplied: PropTypes.func,
 };
 
 // RemediationPanel renders below the investigation analysis. "Generate Remediation" reuses the
@@ -539,8 +567,14 @@ const RESOLVED_STATUSES = ['RESOLVED', 'CLOSED'];
 
 const RemediationPanel = ({ accountId, eventId, nbStatus }) => {
   const [plan, setPlan] = useState(null);
+  // The event's alert rule and what can be changed on it: sent with generate so the
+  // plan can propose a rule fix, and read back to show when that fix is applied.
+  const [alertControls, setAlertControls] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  // Whether pressing the button again could plausibly succeed. A failed fetch is worth retrying; an
+  // investigation that completed with no text is not, and offering a retry there only wastes a click.
+  const [errorRetryable, setErrorRetryable] = useState(true);
   // Successfully-executed commands for this event, keyed by command → applied timestamp. Lets the panel
   // show "already applied" and turn Run into Re-run on reload.
   const [executedCommands, setExecutedCommands] = useState({});
@@ -566,6 +600,15 @@ const RemediationPanel = ({ accountId, eventId, nbStatus }) => {
 
   const isResolved = typeof nbStatus === 'string' && RESOLVED_STATUSES.includes(nbStatus.toUpperCase());
 
+  const loadAlertControls = async () => {
+    try {
+      const controls = await apiKubernetes1.getEventAlertControls({ event_id: eventId, account_id: accountId });
+      if (mountedRef.current) setAlertControls(controls);
+    } catch (err) {
+      console.error('RemediationPanel: failed to load alert rule controls', err);
+    }
+  };
+
   const loadExecutions = async () => {
     if (!eventId) return;
     try {
@@ -587,9 +630,15 @@ const RemediationPanel = ({ accountId, eventId, nbStatus }) => {
   const generate = async () => {
     setLoading(true);
     setError('');
+    setErrorRetryable(true);
     try {
       // Reuse the stored investigation/RCA text as context so we do not re-investigate.
       let context = '';
+      // Whether the context came back empty because the event genuinely has none, or because the
+      // fetch failed. Both leave `context` empty, and conflating them told operators an event had no
+      // investigation when it had thousands of characters of one — the fetch had simply errored.
+      let contextUnavailable = false;
+      let contextFailureDetail = '';
       // Surfaces that actually hold something applicable for this event. An action with no command is
       // carried out on one of these, so the server uses this list to decide whether such an action is
       // real — without it the model will still describe a code change it has no artifact for.
@@ -600,16 +649,26 @@ const RemediationPanel = ({ accountId, eventId, nbStatus }) => {
           const fix = extractCodeFix(rec);
           if (mountedRef.current) setCodeFix(fix);
           if (fix) artifacts.push('code_fix');
-          context = [rec.summary, rec.investigation, rec.detailed_response, rec.root_cause_analysis]
+          // #38925: passing the investigation and the report that already opens with it sends the
+          // model the same text twice, crowding the prompt with no added evidence.
+          const investigationInReport = reportContainsInvestigation(rec.detailed_response, rec.investigation);
+          context = [rec.summary, investigationInReport ? '' : rec.investigation, rec.detailed_response, rec.root_cause_analysis]
             .filter((part) => typeof part === 'string' && part.trim())
             .join('\n\n');
           // Code analysis may already have produced the actual fix (file list + diff) on this same
           // record. Without it the model only sees prose and re-derives a fix from scratch — which is
           // how a code defect ends up "remediated" by a restart. Pass it through verbatim.
           context = [context, formatCodeFixContext(rec)].filter(Boolean).join('\n\n');
+        } else if (typeof rec === 'string' && rec.trim()) {
+          // The API hands back the server's message in place of the record when the call fails
+          // (`...?.data || parseHttpResponseBodyMessage(...)`), so a string here is an error that
+          // never threw — the one shape that used to be reported as "this event has no
+          // investigation content".
+          contextUnavailable = true;
+          contextFailureDetail = rec.trim();
         }
       } catch (err) {
-        // Non-fatal: fall through; the generate call reports an empty-context error if needed.
+        contextUnavailable = true;
         console.error('RemediationPanel: failed to fetch investigation context', err);
       }
       // A tuned threshold is a remediation in its own right, and triage may already have computed one
@@ -625,10 +684,32 @@ const RemediationPanel = ({ accountId, eventId, nbStatus }) => {
       // structured data). The server rejects an empty context with a 400, which surfaced as a bare
       // failure; say plainly that there is nothing to work from instead.
       if (!context.trim()) {
-        setError('This event has no investigation content to build a remediation from.');
+        if (contextUnavailable) {
+          setError(`Could not load this event's investigation${contextFailureDetail ? `: ${contextFailureDetail}` : '.'}`);
+        } else {
+          // Nothing to retry: the investigation completed and produced no text. Saying so plainly
+          // beats a red failure and a button that would fail again identically.
+          setError('This event has no investigation content to build a remediation from.');
+          setErrorRetryable(false);
+        }
         return;
       }
-      const res = await apiKubernetes.generateRemediation(accountId, eventId, context, artifacts);
+      // The event's alert rule, when the plan could change it. Appended after the check above
+      // so a rule definition alone never counts as investigation content. Best-effort.
+      let alertRule = null;
+      try {
+        const controls = await apiKubernetes1.getEventAlertControls({ event_id: eventId, account_id: accountId });
+        if (mountedRef.current) setAlertControls(controls);
+        const built = buildAlertRuleContext(controls, getBrandTitle());
+        if (built) {
+          artifacts.push('alert_rule');
+          alertRule = built.alertRule;
+          context = [context, built.text].join('\n\n');
+        }
+      } catch (err) {
+        console.error('RemediationPanel: failed to fetch alert rule controls', err);
+      }
+      const res = await apiKubernetes.generateRemediation(accountId, eventId, context, artifacts, alertRule);
       if (res && typeof res === 'object' && Array.isArray(res.actions)) {
         setPlan(res);
       } else {
@@ -641,9 +722,17 @@ const RemediationPanel = ({ accountId, eventId, nbStatus }) => {
     }
   };
 
-  // On mount: restore the saved plan + past runs. Only if there's no saved plan and the account opts in
-  // via the feature flag do we auto-generate. The panel is keyed on event + investigation refresh in the
-  // parent, so a fresh mount corresponds to a completed investigation for this event.
+  // On mount: restore the saved plan + past runs, and generate one if the event has none. The panel is
+  // keyed on event + investigation refresh in the parent, so a fresh mount corresponds to a completed
+  // investigation for this event.
+  //
+  // This mount only happens when the Remediation tab is opened (TabPanel renders its children behind
+  // `value === index`), so generation follows someone actually looking for a remediation. It is
+  // bounded by the saved-plan check — a plan is generated once per event, not once per visit — and by
+  // autoTriggered, which holds across the StrictMode double-mount.
+  //
+  // The generation itself is not budget-checked server-side, so this is the only place that decides
+  // whether the call happens. Anything that needs to cap it belongs on the endpoint, not here.
   useEffect(() => {
     let cancelled = false;
     const init = async () => {
@@ -653,6 +742,8 @@ const RemediationPanel = ({ accountId, eventId, nbStatus }) => {
         if (saved && typeof saved === 'object' && Array.isArray(saved.actions)) {
           loaded = true;
           if (!cancelled) setPlan(saved);
+          // A restored rule change shows Applied from the rule's live state.
+          if (saved.actions.some((a) => a?.alert_rule_change)) loadAlertControls();
           // A restored plan holds no diff (only generate() sees the analysis record), so fetch it
           // when the plan actually has a command-less fix to show it against. Skipped otherwise so
           // the common all-commands plan costs no extra request.
@@ -669,11 +760,8 @@ const RemediationPanel = ({ accountId, eventId, nbStatus }) => {
       if (cancelled) return;
       setInitializing(false);
       if (!loaded && !autoTriggered.current) {
-        const enabled = await hasFeatureAccess(AUTO_GENERATE_REMEDIATION_FLAG).catch(() => false);
-        if (!cancelled && enabled) {
-          autoTriggered.current = true;
-          generate();
-        }
+        autoTriggered.current = true;
+        generate();
       }
     };
     init();
@@ -704,19 +792,24 @@ const RemediationPanel = ({ accountId, eventId, nbStatus }) => {
       <Box sx={{ mt: 'var(--ds-space-4)', display: 'flex', flexDirection: 'column', gap: 'var(--ds-space-2)' }}>
         {resolvedBanner}
         <Box sx={{ display: 'flex' }}>
-          {initializing ? (
+          {/* The plan now generates on its own when the tab is opened, so the button is what is left
+              when that produced nothing — a retry after a failure, or after a plan was cleared. Showing
+              it while generation is already running would invite a click that does nothing. */}
+          {initializing || loading ? (
             <Box
               sx={{ display: 'flex', alignItems: 'center', gap: 'var(--ds-space-2)', color: 'var(--ds-gray-500)', fontSize: 'var(--ds-text-small)' }}
             >
-              <CircularProgress size={16} thickness={5} /> Loading remediation…
+              <CircularProgress size={16} thickness={5} /> {initializing ? 'Loading remediation…' : 'Generating remediation…'}
             </Box>
-          ) : (
-            <Button tone='primary' size='sm' onClick={generate} loading={loading} disabled={loading} data-testid='generate-remediation-btn'>
-              Generate Remediation
+          ) : !error || errorRetryable ? (
+            <Button tone='primary' size='sm' onClick={generate} data-testid='generate-remediation-btn'>
+              {error ? 'Try again' : 'Generate Remediation'}
             </Button>
-          )}
+          ) : null}
         </Box>
-        {error ? <Box sx={{ color: 'var(--ds-red-500)', fontSize: 'var(--ds-text-small)' }}>{error}</Box> : null}
+        {/* An unretryable message states a fact about the event, not a failure of the system, so it is
+            not dressed as one. */}
+        {error ? <Box sx={{ color: errorRetryable ? ds.red[500] : ds.gray[600], fontSize: ds.text.small }}>{error}</Box> : null}
       </Box>
     );
   }
@@ -791,6 +884,8 @@ const RemediationPanel = ({ accountId, eventId, nbStatus }) => {
               appliedAt={executedCommands[trimmedString(action?.execute_command)] || ''}
               onExecuted={loadExecutions}
               codeFix={codeFix}
+              alertControls={alertControls}
+              onAlertRuleApplied={loadAlertControls}
             />
           ))}
         </>

@@ -8,6 +8,15 @@ export function generateWorkflowName(baseName: string): string {
   return `${baseName} ${suffix}`;
 }
 
+export async function leaveWorkflowEditor(page: Page, locators: WorkflowLocators): Promise<void> {
+  await locators.backBtn.click();
+  const leavePageBtn = page.getByRole("button", { name: "Leave page" });
+  await leavePageBtn
+    .waitFor({ state: "visible", timeout: 3000 })
+    .then(() => leavePageBtn.click())
+    .catch(() => {});
+}
+
 export async function deleteCreatedWorkflow(
   page: Page,
   locators: WorkflowLocators,
@@ -20,12 +29,7 @@ export async function deleteCreatedWorkflow(
     workflowId = undefined;
   }
 
-  await locators.backBtn.click();
-  const leavePageBtn = page.getByRole("button", { name: "Leave page" });
-  await leavePageBtn
-    .waitFor({ state: "visible", timeout: 3000 })
-    .then(() => leavePageBtn.click())
-    .catch(() => {});
+  await leaveWorkflowEditor(page, locators);
 
   await locators.nameSearchInput
     .waitFor({ state: "visible", timeout: 15000 })
@@ -328,15 +332,24 @@ export async function selectTicketIntegration(
   console.log(`Selected integration: ${integrationName}`);
 }
 
+// project keys are "<owner>/<repo>" for GitHub/GitLab - the owner is a real username, so keep it out of CI logs
+function maskProjectKeyOwner(projectKey: string): string {
+  const parts = projectKey.split("/");
+  return parts.length > 1 ? `***/${parts.slice(1).join("/")}` : projectKey;
+}
+
 export async function selectProjectKey(
   page: Page,
   locators: WorkflowLocators,
   projectKey: string
 ): Promise<void> {
   if (!(await locators.projectKeyDropdown.isVisible().catch(() => false))) {
+    // The mode toggle is ds/ToggleGroup (role="group" wrapper) on migrated fields and
+    // still MuiToggleButtonGroup elsewhere - probe for both shapes.
+    // Exact text: the broader base selector would otherwise catch "Select issue type".
     const selectTab = locators.dialog
-      .locator(".MuiToggleButtonGroup-grouped")
-      .filter({ hasText: "Select" })
+      .locator(".MuiToggleButtonGroup-grouped, [role='group'] button")
+      .filter({ hasText: /^Select$/ })
       .last();
     if (await selectTab.isVisible().catch(() => false)) {
       await selectTab.scrollIntoViewIfNeeded();
@@ -358,7 +371,56 @@ export async function selectProjectKey(
     const repoSegment = projectKey.split("/").pop() ?? projectKey;
     await page.locator('[role="option"]').filter({ hasText: repoSegment }).first().click();
   }
-  console.log(`Selected Project Key: ${projectKey}`);
+  console.log(`Selected Project Key: ${maskProjectKeyOwner(projectKey)}`);
+}
+
+export async function selectAssignee(
+  page: Page,
+  locators: WorkflowLocators,
+  preferredAssignee: string
+): Promise<void> {
+  await locators.assigneeDropdown.waitFor({ state: "visible", timeout: 15000 });
+  await locators.assigneeDropdown.click();
+  await locators.assigneeSearchInput.waitFor({ state: "visible", timeout: 10000 });
+
+  let selected = "";
+  let source = "GITHUB_ASSIGNEE";
+  if (preferredAssignee) {
+    await locators.assigneeSearchInput.fill(preferredAssignee);
+    // exact match - hasText alone is a substring match, so "john" would also match "johnny"
+    const exactOption = locators.assigneeOptions
+      .filter({ has: page.getByText(preferredAssignee, { exact: true }) })
+      .first();
+    // an assignee the repo does not offer is an expected branch, not a failure
+    const isOffered = await exactOption
+      .waitFor({ state: "visible", timeout: 5000 })
+      .then(() => true)
+      .catch(() => false);
+    if (isOffered) {
+      await exactOption.click();
+      selected = preferredAssignee;
+    }
+  }
+
+  // GITHUB_ASSIGNEE may not be a collaborator on this env's repo - fall back to one it does offer
+  if (!selected) {
+    await locators.assigneeSearchInput.fill("");
+    const firstOption = locators.assigneeOptions.first();
+    await firstOption.waitFor({ state: "visible", timeout: 10000 });
+    selected = (await firstOption.innerText()).trim();
+    await firstOption.click();
+    source = "the repo's offered options";
+    console.log("GITHUB_ASSIGNEE is not assignable on this repo - fell back to a repo-offered assignee");
+  }
+
+  // Escape only while the options popup is still open; with it already closed, Escape dismisses the whole action dialog.
+  if (await locators.assigneeSearchInput.isVisible()) {
+    await page.keyboard.press("Escape");
+    await expect(locators.assigneeSearchInput).toBeHidden({ timeout: 10000 });
+  }
+  await expect(locators.dialog).toBeVisible();
+  await expect(locators.assigneeDropdown).toContainText(selected, { timeout: 10000 });
+  console.log(`Selected assignee from ${source}`);
 }
 
 export async function closeActionPanel(

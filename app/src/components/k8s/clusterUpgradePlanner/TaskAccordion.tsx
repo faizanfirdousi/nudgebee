@@ -30,10 +30,13 @@ import apiUser from '@api1/user';
 import FilterDropdown from '@ui/FilterDropdown';
 import Tooltip from '@ui/Tooltip';
 import { Modal } from '@ui/Modal';
+import { Banner } from '@ui/Banner';
+import { CodeBlock } from '@ui/CodeBlock';
 import apiKubernetes1 from '@api1/kubernetes1';
 import { toast as snackbar } from '@ui/Toast';
 import { hasWriteAccess } from '@lib/auth';
 import { ds } from '@utils/colors';
+import { isMutatingCommand, mutatingCommandWarning } from './commandRisk';
 
 interface Task {
   id: string;
@@ -136,6 +139,10 @@ const TaskAccordion: React.FC<TaskAccordionProps> = ({
   const [commandResults, setCommandResults] = useState<any>(null);
   const [commandLoading, setCommandLoading] = useState(false);
   const [executedCommand, setExecutedCommand] = useState<string>('');
+  // Set to the command awaiting confirmation; null when nothing is pending. Held
+  // as the command text rather than a boolean so the dialog can show exactly what
+  // is about to run.
+  const [pendingCommand, setPendingCommand] = useState<string | null>(null);
 
   const tableHeaders: Array<{ name: string; width: string }> = [
     { name: 'Actioned By', width: '20%' },
@@ -249,7 +256,7 @@ const TaskAccordion: React.FC<TaskAccordionProps> = ({
             {
               text: <Datetime value={audit.created_at} />,
               component: (
-                <Typography sx={{ fontSize: 'var(--ds-text-small)', color: 'var(--ds-gray-600)', fontFamily: 'monospace' }}>
+                <Typography sx={{ fontSize: 'var(--ds-text-small)', color: 'var(--ds-gray-600)', fontFamily: ds.font.mono }}>
                   <Datetime value={audit.created_at} />
                 </Typography>
               ),
@@ -303,8 +310,28 @@ const TaskAccordion: React.FC<TaskAccordionProps> = ({
     return '';
   };
 
-  // Function to handle command execution
+  // Entry point for the Run button on a plan step. Read-only steps (kubectl get /
+  // describe / logs, aws eks describe-* …) run straight away so a plan stays
+  // walkable; anything that changes the cluster stops here for a confirmation
+  // first. See commandRisk.ts for how the two are told apart.
   const handleCommandExecution = async (command: string) => {
+    if (isMutatingCommand(command)) {
+      setPendingCommand(command);
+      return;
+    }
+    await runCommand(command);
+  };
+
+  const confirmPendingCommand = async () => {
+    const command = pendingCommand;
+    setPendingCommand(null);
+    if (command) {
+      await runCommand(command);
+    }
+  };
+
+  // Function to handle command execution
+  const runCommand = async (command: string) => {
     if (!selectedTask || !selectedStep || !clusterInfo?.plan_id || !accountId) {
       console.error('Missing required data for command execution');
       return;
@@ -396,7 +423,7 @@ const TaskAccordion: React.FC<TaskAccordionProps> = ({
                       fontSize: 'var(--ds-text-small)',
                       fontWeight: 'var(--ds-font-weight-regular)',
                       color: 'var(--ds-gray-500)',
-                      fontFamily: 'poppins',
+                      fontFamily: ds.font.display,
                       letterSpacing: '-0.01em',
                     }}
                   >
@@ -410,7 +437,7 @@ const TaskAccordion: React.FC<TaskAccordionProps> = ({
                     fontSize: 'var(--ds-text-title)',
                     fontWeight: 'var(--ds-font-weight-semibold)',
                     color: 'var(--ds-gray-600)',
-                    fontFamily: 'poppins',
+                    fontFamily: ds.font.display,
                     letterSpacing: '-0.025em',
                   }}
                 >
@@ -612,6 +639,35 @@ const TaskAccordion: React.FC<TaskAccordionProps> = ({
         </Box>
       </Box>
 
+      {/* Confirmation for a command that changes the cluster. Read-only steps never reach this. */}
+      <Modal
+        open={pendingCommand !== null}
+        onClose={() => setPendingCommand(null)}
+        handleClose={() => setPendingCommand(null)}
+        title='Run this command on your cluster?'
+        width='md'
+        actionButtons={
+          <>
+            <DsButton id='cancel-run-command-btn' tone='secondary' size='md' onClick={() => setPendingCommand(null)}>
+              Cancel
+            </DsButton>
+            <DsButton id='confirm-run-command-btn' tone='danger' size='md' onClick={confirmPendingCommand}>
+              Run command
+            </DsButton>
+          </>
+        }
+      >
+        <Box sx={{ p: ds.space[5], display: 'flex', flexDirection: 'column', gap: ds.space[4] }}>
+          <Banner tone='warning' message={pendingCommand ? mutatingCommandWarning(pendingCommand) : ''} />
+          <Box>
+            <Typography variant='body2' sx={{ color: 'var(--ds-gray-700)', mb: ds.space[2] }}>
+              This runs as written, against the live cluster:
+            </Typography>
+            <CodeBlock code={pendingCommand || ''} language='bash' wrap showCopy={false} />
+          </Box>
+        </Box>
+      </Modal>
+
       {/* Command Execution Results Popup */}
       <Modal open={commandPopupOpen} onClose={() => setCommandPopupOpen(false)} title='Command Execution Results' width='lg'>
         <Box sx={{ p: 'var(--ds-space-5) var(--ds-space-5)', minHeight: ds.space.mul(0, 150) }}>
@@ -621,7 +677,7 @@ const TaskAccordion: React.FC<TaskAccordionProps> = ({
                 sx={{
                   fontSize: 'var(--ds-text-body-lg)',
                   color: 'var(--ds-gray-600)',
-                  fontFamily: 'poppins',
+                  fontFamily: ds.font.display,
                 }}
               >
                 Executing command...
@@ -637,7 +693,7 @@ const TaskAccordion: React.FC<TaskAccordionProps> = ({
                       fontSize: 'var(--ds-text-title)',
                       fontWeight: 'var(--ds-font-weight-semibold)',
                       color: 'var(--ds-gray-600)',
-                      fontFamily: 'poppins',
+                      fontFamily: ds.font.display,
                       letterSpacing: '-0.025em',
                     }}
                   />
@@ -652,7 +708,7 @@ const TaskAccordion: React.FC<TaskAccordionProps> = ({
                       fontWeight: 'var(--ds-font-weight-medium)',
                       color: 'var(--ds-gray-500)',
                       mb: ds.space[2],
-                      fontFamily: 'poppins',
+                      fontFamily: ds.font.display,
                       textTransform: 'uppercase',
                       letterSpacing: '0.5px',
                     }}
@@ -665,7 +721,7 @@ const TaskAccordion: React.FC<TaskAccordionProps> = ({
                       border: '1px solid var(--ds-brand-150)',
                       borderRadius: 'var(--ds-radius-md)',
                       padding: 'var(--ds-space-2) var(--ds-space-3)',
-                      fontFamily: '"Roboto Mono", monospace',
+                      fontFamily: ds.font.mono,
                       fontSize: 'var(--ds-text-body)',
                       color: 'var(--ds-gray-600)',
                       wordBreak: 'break-all',
@@ -682,7 +738,7 @@ const TaskAccordion: React.FC<TaskAccordionProps> = ({
                       color: 'var(--ds-red-500)',
                       mt: ds.space[2],
                       fontSize: 'var(--ds-text-body)',
-                      fontFamily: 'poppins',
+                      fontFamily: ds.font.display,
                     }}
                   >
                     <strong>Error:</strong> {commandResults.error}
@@ -699,7 +755,7 @@ const TaskAccordion: React.FC<TaskAccordionProps> = ({
                       fontWeight: 'var(--ds-font-weight-medium)',
                       color: 'var(--ds-gray-600)',
                       mb: ds.space[4],
-                      fontFamily: 'poppins',
+                      fontFamily: ds.font.display,
                     }}
                   >
                     Command Output
@@ -710,7 +766,7 @@ const TaskAccordion: React.FC<TaskAccordionProps> = ({
                       color: 'var(--ds-brand-150)',
                       padding: 'var(--ds-space-4) var(--ds-space-5)',
                       borderRadius: 'var(--ds-radius-lg)',
-                      fontFamily: '"Roboto Mono", monospace',
+                      fontFamily: ds.font.mono,
                       fontSize: 'var(--ds-text-body)',
                       lineHeight: 1.6,
                       whiteSpace: 'pre-wrap',
@@ -746,7 +802,7 @@ const TaskAccordion: React.FC<TaskAccordionProps> = ({
                 sx={{
                   fontSize: 'var(--ds-text-body-lg)',
                   color: 'var(--ds-gray-600)',
-                  fontFamily: 'poppins',
+                  fontFamily: ds.font.display,
                 }}
               >
                 No results to display

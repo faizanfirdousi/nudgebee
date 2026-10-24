@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { Modal } from '@ui/Modal';
+import { useBrandingConfig } from '@hooks/useTenantBranding';
 import { Typography, Box } from '@mui/material';
 import { Input } from '@ui/Input';
 import { Checkbox } from '@ui/Checkbox';
@@ -10,6 +11,7 @@ import PropTypes from 'prop-types';
 import { Button } from '@ui/Button';
 import { toast as snackbar } from '@ui/Toast';
 import { ds } from 'src/utils/colors';
+import { getIntegrationDescription } from '@lib/integrationDescriptions';
 
 // Pure display placeholder shown in edit mode to indicate a token is stored.
 // The real token is never sent to the client. A field still equal to this on
@@ -17,6 +19,7 @@ import { ds } from 'src/utils/colors';
 const TOKEN_PLACEHOLDER = '••••••••';
 
 const ZenDutyAccountModal = ({ openModal, handleClose, editConfig = null }) => {
+  const { title: baseTitle } = useBrandingConfig();
   const isEdit = !!editConfig;
   const [zenDutyName, setZenDutyName] = useState('');
   const [zenDutyAccountName, setZenDutyAccountName] = useState('');
@@ -174,6 +177,7 @@ const ZenDutyAccountModal = ({ openModal, handleClose, editConfig = null }) => {
       open={openModal}
       handleClose={handleCloseZenDutyModal}
       title={isEdit ? 'Edit ZenDuty Account' : 'Add ZenDuty Account'}
+      subtitle={getIntegrationDescription('ZENDUTY')}
       loader={isSubmitting}
     >
       <Box sx={{ minHeight: ds.space.mul(0, 100), pt: ds.space[5], pb: ds.space[2] }}>
@@ -302,7 +306,7 @@ const ZenDutyAccountModal = ({ openModal, handleClose, editConfig = null }) => {
               onChange={(next) => setRcaWritebackEnabled(next)}
               disabled={isSubmitting}
               label='Post RCA analysis to ZenDuty incidents'
-              description='When enabled, NudgeBee posts its root-cause analysis as a note on the originating ZenDuty incident (HIGH severity).'
+              description={`When enabled, ${baseTitle} posts its root-cause analysis as a note on the originating ZenDuty incident (HIGH severity).`}
             />
           </Box>
         </Box>

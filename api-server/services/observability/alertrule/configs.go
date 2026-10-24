@@ -4,9 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
+	neturl "net/url"
 	"strings"
 
 	"nudgebee/services/common"
+	"nudgebee/services/integrations/promclient"
 	"nudgebee/services/internal/database"
 	"nudgebee/services/security"
 )
@@ -22,6 +25,33 @@ type integrationConfigValue struct {
 // This is a local replacement for core.ListIntegrationConfigs to avoid import cycles.
 func listIntegrationConfigValues(sc *security.RequestContext, accountId, integrationType string) ([]integrationConfigValue, error) {
 	return listIntegrationConfigValuesWithSource(sc, accountId, integrationType, "")
+}
+
+// hasIntegrationWithSource reports whether the account has an integration of this type
+// and source. Unlike listIntegrationConfigValuesWithSource it treats "no such row" as a
+// normal answer (false, nil) rather than an error, so callers asking a question about
+// configuration can tell an absent integration apart from a failed query.
+func hasIntegrationWithSource(sc *security.RequestContext, accountId, integrationType, source string) (bool, error) {
+	dbms, err := database.GetDatabaseManager(database.Metastore)
+	if err != nil {
+		return false, fmt.Errorf("failed to get database manager: %w", err)
+	}
+
+	var exists bool
+	err = dbms.Db.Get(&exists, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM integrations i
+			JOIN integrations_cloud_accounts ica ON i.id = ica.integration_id
+			WHERE i.type = $1
+			  AND i.tenant_id = $2
+			  AND ica.cloud_account_id = $3
+			  AND i.source = $4
+		)`, integrationType, sc.GetSecurityContext().GetTenantId(), accountId, source)
+	if err != nil {
+		return false, fmt.Errorf("failed to check for %s/%s integration: %w", integrationType, source, err)
+	}
+	return exists, nil
 }
 
 // listIntegrationConfigValuesWithSource is like listIntegrationConfigValues but optionally filters by source.
@@ -230,6 +260,88 @@ type elasticsearchConfig struct {
 	TlsSkipVerify bool
 }
 
+// lokiRulerConfig is the resolved connection for the Loki ruler API.
+type lokiRulerConfig struct {
+	Url string
+	// RulesUrl is the ruler endpoint when it is a separate service from the query
+	// endpoint; empty means the ruler shares Url (single-binary Loki).
+	RulesUrl string
+	// AuthType mirrors the integration form's loki_auth_type; only the selected
+	// method's credential is sent.
+	AuthType    string
+	Username    string
+	Password    string
+	BearerToken string
+	TenantID    string
+	Headers     map[string]string
+}
+
+// RulerBaseURL returns the base URL ruler calls should target.
+func (c *lokiRulerConfig) RulerBaseURL() string {
+	if c.RulesUrl != "" {
+		return c.RulesUrl
+	}
+	return c.Url
+}
+
+// getLokiConfigs returns Loki configs (user-sourced integrations only). Agent-sourced
+// rows carry no URL — LokiAlertRuleSource serves those over the relay instead.
+func getLokiConfigs(sc *security.RequestContext, accountId string) (*lokiRulerConfig, error) {
+	configs, err := listIntegrationConfigValuesWithSource(sc, accountId, "loki", "user")
+	if err != nil {
+		return nil, fmt.Errorf("failed to get loki integration: %w", err)
+	}
+
+	cfg := &lokiRulerConfig{Headers: map[string]string{}}
+	for _, c := range configs {
+		value, err := decryptConfigValue(c)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decrypt loki config %s: %w", c.Name, err)
+		}
+		switch c.Name {
+		case "loki_url":
+			cfg.Url = strings.TrimRight(strings.TrimSpace(value), "/")
+		case "loki_rules_url":
+			cfg.RulesUrl = strings.TrimRight(strings.TrimSpace(value), "/")
+		case "loki_auth_type":
+			cfg.AuthType = strings.TrimSpace(value)
+		case "loki_username":
+			cfg.Username = strings.TrimSpace(value)
+		case "loki_password":
+			cfg.Password = value
+		case "loki_bearer_token":
+			cfg.BearerToken = strings.TrimSpace(value)
+		case "loki_tenant_id":
+			cfg.TenantID = strings.TrimSpace(value)
+		case "loki_headers":
+			headers := map[string]string{}
+			if trimmed := strings.TrimSpace(value); trimmed != "" {
+				if err := json.Unmarshal([]byte(trimmed), &headers); err != nil {
+					return nil, fmt.Errorf("loki integration has invalid loki_headers: %w", err)
+				}
+			}
+			cfg.Headers = headers
+		}
+	}
+
+	// Integrations saved before the auth selector existed carry no loki_auth_type.
+	if cfg.AuthType == "" {
+		switch {
+		case cfg.Username != "" && cfg.Password != "":
+			cfg.AuthType = "basic"
+		case cfg.BearerToken != "":
+			cfg.AuthType = "bearer_token"
+		default:
+			cfg.AuthType = "none"
+		}
+	}
+
+	if cfg.Url == "" {
+		return nil, fmt.Errorf("missing required loki configuration values")
+	}
+	return cfg, nil
+}
+
 // getElasticsearchConfigs returns Elasticsearch configs (user-sourced integrations only).
 func getElasticsearchConfigs(sc *security.RequestContext, accountId string) (*elasticsearchConfig, error) {
 	configs, err := listIntegrationConfigValuesWithSource(sc, accountId, "ES", "user")
@@ -394,4 +506,144 @@ func getChronosphereConfigs(sc *security.RequestContext, accountId string) (stri
 	}
 
 	return chronoUrl, bearerToken, nil
+}
+
+// cubeAPMConn holds CubeAPM connection config for alert-rule management.
+//
+// Duplicated from integrations.CubeAPMConfig rather than reused: this package
+// cannot import integrations (integrations → event → triage → alertrule is an
+// import cycle), which is the same reason listIntegrationConfigValues exists.
+// Only the fields alert-rule management needs are carried — the query URL is here
+// solely to explain, in the error, why the admin URL could not be derived.
+type cubeAPMConn struct {
+	QueryURL   string
+	AdminURL   string
+	AdminToken string
+}
+
+// CubeAPM port pair. The admin API is a separate server from the query API, and
+// on a standard deployment they differ only by port — so an unset admin URL is
+// derived rather than demanded.
+const (
+	cubeAPMQueryPort = "3140"
+	cubeAPMAdminPort = "3199"
+)
+
+// getCubeAPMConfigs returns CubeAPM connection config for alert-rule management.
+func getCubeAPMConfigs(sc *security.RequestContext, accountId string) (cubeAPMConn, error) {
+	// listIntegrationConfigValues is always tenant-scoped, but its
+	// cloud_account_id filter is conditional and the query ends in LIMIT 1 — so an
+	// empty accountId returns an arbitrary CubeAPM integration from the tenant
+	// rather than none, and alert rules would be written to the wrong account's
+	// CubeAPM.
+	if accountId == "" {
+		return cubeAPMConn{}, fmt.Errorf("account_id is required to resolve a CubeAPM integration")
+	}
+
+	configs, err := listIntegrationConfigValues(sc, accountId, "cubeapm")
+	if err != nil {
+		return cubeAPMConn{}, fmt.Errorf("failed to list cubeapm integration configs: %w", err)
+	}
+
+	var conn cubeAPMConn
+	for _, c := range configs {
+		value, err := decryptConfigValue(c)
+		if err != nil {
+			return cubeAPMConn{}, fmt.Errorf("failed to decrypt cubeapm config %s: %w", c.Name, err)
+		}
+		switch c.Name {
+		case "cubeapm_url":
+			conn.QueryURL = normalizeCubeAPMBaseURL(value, cubeAPMQueryPort)
+		case "cubeapm_admin_url":
+			conn.AdminURL = normalizeCubeAPMBaseURL(value, cubeAPMAdminPort)
+		case "cubeapm_admin_token":
+			conn.AdminToken = strings.TrimSpace(value)
+		}
+	}
+
+	if conn.AdminURL == "" {
+		conn.AdminURL = deriveCubeAPMAdminBaseURL(conn.QueryURL)
+	}
+	return conn, nil
+}
+
+// normalizeCubeAPMBaseURL strips any path/query/fragment so a URL pasted from the
+// browser still resolves. The port is preserved deliberately — for CubeAPM it
+// selects which server answers.
+//
+// An http:// URL with no port gets defaultPort; https:// is left alone because
+// it means a TLS-terminating proxy on 443. Must match integrations'
+// normalizeCubeAPMURL, or queries and alert rules resolve different hosts.
+func normalizeCubeAPMBaseURL(raw, defaultPort string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	parsed, err := neturl.Parse(raw)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return strings.TrimRight(raw, "/")
+	}
+	host := parsed.Host
+	if parsed.Scheme == "http" && parsed.Port() == "" && defaultPort != "" {
+		host = net.JoinHostPort(parsed.Hostname(), defaultPort)
+	}
+	return parsed.Scheme + "://" + host
+}
+
+// deriveCubeAPMAdminBaseURL turns a query URL into the admin URL by swapping the
+// port. Returns "" when the query URL is on a non-standard port: guessing there
+// would silently target whatever else is listening, so the caller asks the
+// operator for the admin URL explicitly instead.
+func deriveCubeAPMAdminBaseURL(queryURL string) string {
+	parsed, err := neturl.Parse(queryURL)
+	if err != nil || parsed.Host == "" {
+		return ""
+	}
+	host, port, err := net.SplitHostPort(parsed.Host)
+	if err != nil || port != cubeAPMQueryPort {
+		return ""
+	}
+	return parsed.Scheme + "://" + net.JoinHostPort(host, cubeAPMAdminPort)
+}
+
+// cubeAPMAdminHeaders builds the header set for an admin API call. The
+// Authorization header is omitted entirely when no token is configured: CubeAPM's
+// http-token-admin setting is optional, and sending `Bearer ` with an empty value
+// is a malformed credential rather than an absent one.
+func cubeAPMAdminHeaders(token string) map[string]string {
+	headers := map[string]string{"Content-Type": "application/json"}
+	if token = strings.TrimSpace(token); token != "" {
+		headers["Authorization"] = "Bearer " + token
+	}
+	return headers
+}
+
+// getPrometheusUserConfig loads the account's user-source Prometheus row into the
+// shared client config. Like getLokiConfigs, this reads the row locally: the
+// package cannot import integrations (eventrule → alertrule → integrations →
+// eventrule), so the row is read here and handed to promclient, which holds the
+// one auth implementation the metric queries also use.
+func getPrometheusUserConfig(sc *security.RequestContext, accountId string) (promclient.PrometheusUserConfig, error) {
+	configs, err := listIntegrationConfigValuesWithSource(sc, accountId, "prometheus", "user")
+	if err != nil {
+		return promclient.PrometheusUserConfig{}, fmt.Errorf("failed to get prometheus integration: %w", err)
+	}
+
+	values := make(map[string]string, len(configs))
+	for _, c := range configs {
+		value, err := decryptConfigValue(c)
+		if err != nil {
+			return promclient.PrometheusUserConfig{}, fmt.Errorf("failed to decrypt prometheus config %s: %w", c.Name, err)
+		}
+		values[c.Name] = value
+	}
+
+	cfg, err := promclient.NewPrometheusUserConfig(values)
+	if err != nil {
+		return cfg, fmt.Errorf("prometheus integration has invalid settings: %w", err)
+	}
+	if cfg.URL == "" {
+		return cfg, fmt.Errorf("missing required prometheus configuration values")
+	}
+	return cfg, nil
 }

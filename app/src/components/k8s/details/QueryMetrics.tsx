@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import KubernetesTable2 from '@components/k8s/common/KubernetesTable2';
 import { Box, Typography } from '@mui/material';
 import { ToggleGroup } from '@ui/ToggleGroup';
@@ -32,13 +32,50 @@ import observability from '@api1/observability';
 import cache from '@lib/cache';
 import apiAccount from '@api1/account';
 import { useData } from '@context/DataContext';
-import { Info as InfoIcon } from '@mui/icons-material';
+import { Info as InfoIcon, KeyboardArrowDown as KeyboardArrowDownIcon } from '@mui/icons-material';
+import { DropdownMenu } from '@ui/DropdownMenu';
 import { Label } from '@ui/Label';
+import { buildSeriesChart, decimateData, MAX_CHART_DATASETS, MAX_CHART_DATA_POINTS } from '@utils/metricSeriesChart';
+
+// One entry of observability_get_default_provider.available_providers: a provider the
+// account can query for metrics, with the operator catalog it supports.
+interface AvailableMetricsProvider {
+  provider: string;
+  supported_operator_descriptors?: OperatorDescriptor[];
+}
+
+// snakeToTitleCase would render the hyphenated provider name verbatim, so spell the
+// one provider whose id is not snake_case out by hand.
+const metricsProviderLabel = (provider: string) => (provider === 'victoria-metrics' ? 'Victoria Metrics' : snakeToTitleCase(provider));
 
 // Data limiting constants to prevent memory issues with large datasets
 const MAX_TABLE_ROWS = 100;
-const MAX_CHART_DATASETS = 20;
-const MAX_CHART_DATA_POINTS = 500;
+
+// A metric series can hold values JSON cannot carry as numbers: +Inf and -Inf from a
+// ratio query whose denominator hit zero, NaN from 0/0, or something the provider sent
+// that was not a number at all. The backend sends each of those points as null and
+// reports what it was per series in `non_finite`, so the chart gap can be explained
+// instead of leaving the reader to guess whether data is missing or broken.
+const NON_FINITE_LABELS: Record<string, string> = {
+  nan: 'undefined (NaN)',
+  '+inf': 'infinite (+Inf)',
+  '-inf': 'negative infinite (-Inf)',
+  unparseable: 'not numeric',
+};
+
+const summariseNonFinite = (results: any[]): Record<string, number> => {
+  const totals: Record<string, number> = {};
+  results?.forEach((result: any) => {
+    result?.payload?.forEach((series: any) => {
+      Object.entries(series?.non_finite || {}).forEach(([kind, count]) => {
+        if (typeof count === 'number' && count > 0) {
+          totals[kind] = (totals[kind] || 0) + count;
+        }
+      });
+    });
+  });
+  return totals;
+};
 
 interface QueryMetricsProps {
   accountId: string;
@@ -93,12 +130,23 @@ const QueryMetrics: React.FC<QueryMetricsProps> = ({
   const [queryKeys, setQueryKeys] = useState(['']);
   const [solarwindsRequest, setSolarwindsRequest] = useState<any>(null);
   const [esIndex, setEsIndex] = useState<string>('');
+  // ES Code-tab query language ('dsl' | 'kql'), mirrored from QueryModeSwitcher.
+  // Builder mode ignores it — that path sends the cross-provider builder shape.
+  const [esQueryType, setEsQueryType] = useState<string>('dsl');
   const [llmQueryResponse, setLlmQueryResponse] = useState('');
   const [instant, setInstant] = useState(false);
   const [promqlItems, setPromqlItems] = useState<Array<{ key: string; query: string; title?: string }>>([]);
   const [generateQuestionText, _setGenerateQuestionText] = useState('');
   const [qLEditor, setQLEditor] = useState('code');
   const [metricsProvider, setMetricsProvider] = useState('prometheus');
+  // The account's configured default. Kept apart from metricsProvider so the switcher
+  // can tell "switched back to default" (restore the resolved index) from an override.
+  const [defaultProvider, setDefaultProvider] = useState('');
+  const [defaultIndex, setDefaultIndex] = useState('');
+  const [availableProviders, setAvailableProviders] = useState<AvailableMetricsProvider[]>([]);
+  // Guards the async ES-index resolve below against a stale response landing after
+  // the user has switched providers again.
+  const selectedProviderRef = useRef('');
   const [operatorDescriptors, setOperatorDescriptors] = useState<OperatorDescriptor[] | undefined>(undefined);
   const [isAiLoading, setIsAiLoading] = useState(false);
   const [truncationWarnings, setTruncationWarnings] = useState<{
@@ -106,16 +154,25 @@ const QueryMetrics: React.FC<QueryMetricsProps> = ({
     chartDatasets?: { total: number; shown: number };
     chartDataPoints?: { total: number; shown: number };
   }>({});
+  // Counts of samples the provider returned that cannot be plotted, keyed by what
+  // they were ("nan", "+inf", "-inf", "unparseable"). The backend sends those points
+  // as null so the gap lands at the right time; without this the chart would show an
+  // unexplained hole and the reader could not tell a divide-by-zero from bad data.
+  const [nonFiniteCounts, setNonFiniteCounts] = useState<Record<string, number>>({});
 
   const deleteDataOnQueryBlockDeletion = (query_key: string) => {
     setData((prevData) => prevData.filter((item) => item.query_key !== query_key));
   };
 
   const fetchDefaultProvider = async () => {
-    const cached = cache.get(`${accountId}-metrics-v3`);
+    // v4: cache payload widened to carry available_providers + default_index so the
+    // switcher can render from cache without a refetch.
+    const cached = cache.get(`${accountId}-metrics-v4`);
     if (cached && typeof cached === 'object' && cached.provider) {
       setOperatorDescriptors(cached.operator_descriptors);
-      setEsIndex(cache.get(`${accountId}-metrics-index`) || '');
+      setAvailableProviders(cached.available_providers || []);
+      setDefaultIndex(cached.default_index || '');
+      setEsIndex(cached.default_index || '');
       return cached.provider;
     }
     try {
@@ -129,20 +186,47 @@ const QueryMetrics: React.FC<QueryMetricsProps> = ({
         return '';
       }
 
-      const defaultIndex = res?.data?.data?.observability_get_default_provider?.default_index || '';
-      const descriptors = res?.data?.data?.observability_get_default_provider?.capabilities?.supported_operator_descriptors;
-      setOperatorDescriptors(descriptors);
-      setEsIndex(defaultIndex);
-      if (defaultIndex) {
-        cache.set(`${accountId}-metrics-index`, defaultIndex, 5 * 60);
+      const obs = res?.data?.data?.observability_get_default_provider;
+      const resolvedDefaultIndex = obs?.default_index || '';
+      const descriptors = obs?.capabilities?.supported_operator_descriptors;
+      const provider = obs?.provider || '';
+      // Drop any malformed entry without a provider name so the dropdown map never
+      // hits snakeToTitleCase(undefined) or builds an invalid option id.
+      const providers: AvailableMetricsProvider[] = Array.isArray(obs?.available_providers)
+        ? obs.available_providers.filter((p: AvailableMetricsProvider) => p?.provider)
+        : [];
+      // Guarantee the active default is always one of the selectable options (it can
+      // be missing when `provider` came from the cluster fallback), so it shows a
+      // check-mark and the user can switch back to it.
+      if (provider && !providers.some((p) => p?.provider === provider)) {
+        providers.unshift({ provider, supported_operator_descriptors: descriptors });
       }
-      const provider = res?.data?.data?.observability_get_default_provider?.provider || '';
-      cache.set(`${accountId}-metrics-v3`, { provider, operator_descriptors: descriptors }, 5 * 60);
+      setOperatorDescriptors(descriptors);
+      setAvailableProviders(providers);
+      setDefaultIndex(resolvedDefaultIndex);
+      setEsIndex(resolvedDefaultIndex);
+      cache.set(
+        `${accountId}-metrics-v4`,
+        { provider, operator_descriptors: descriptors, available_providers: providers, default_index: resolvedDefaultIndex },
+        5 * 60
+      );
       return provider;
     } catch (error: any) {
       snackbar.error(error.message || 'Failed to fetch default provider');
       return '';
     }
+  };
+
+  // Operator catalog for a given provider. Each available_providers entry carries its
+  // own supported_operator_descriptors; fall back to the default provider's entry,
+  // then to whatever catalog is currently loaded.
+  const getDescriptorsForProvider = (providerName: string): OperatorDescriptor[] | undefined => {
+    const entry = availableProviders?.find((p) => p?.provider === providerName);
+    if (entry?.supported_operator_descriptors) {
+      return entry.supported_operator_descriptors;
+    }
+    const defaultEntry = availableProviders?.find((p) => p?.provider === defaultProvider);
+    return defaultEntry?.supported_operator_descriptors ?? operatorDescriptors;
   };
 
   const resetAllStates = () => {
@@ -156,6 +240,51 @@ const QueryMetrics: React.FC<QueryMetricsProps> = ({
     setIsAiLoading(false);
     setLoading(false);
     setTruncationWarnings({});
+    setNonFiniteCounts({});
+  };
+
+  // Switch the active metrics provider. Treated like a fresh provider: clears the
+  // current query/results, swaps in the new provider's operator catalog, and resets
+  // the ES index (restoring the configured default only when switching back to the
+  // account default). metricsProvider is already sent as `metric_provider` on every
+  // request, so the fetch follows the selection with no extra plumbing.
+  const handleProviderChange = (newProvider: string) => {
+    if (!newProvider || newProvider === metricsProvider) {
+      return;
+    }
+    const descriptors = getDescriptorsForProvider(newProvider);
+    resetAllStates();
+    setSolarwindsRequest(null);
+    setEsQueryType('dsl');
+    setOperatorDescriptors(descriptors);
+    selectedProviderRef.current = newProvider;
+    setMetricsProvider(newProvider);
+
+    if (newProvider === defaultProvider) {
+      // Switching back to the account default — its per-account/top-level index was
+      // already resolved on load.
+      setEsIndex(defaultIndex);
+      return;
+    }
+
+    // Overriding to a non-default provider. The index picker only renders for ES, so
+    // only ES needs a resolved default; ask the backend for ES's per-account
+    // (Advanced Settings mapping) / top-level index instead of leaving it blank.
+    setEsIndex('');
+    if (newProvider === 'ES' && accountId && accountId !== 'demo') {
+      apiAccount
+        .getDefaultProvider({ account_id: accountId, provider_type: 'metrics', provider: 'ES' })
+        .then((res: any) => {
+          const resolved = res?.data?.data?.observability_get_default_provider?.default_index || '';
+          // Ignore a stale response if the user has since switched providers.
+          if (resolved && selectedProviderRef.current === 'ES') {
+            setEsIndex(resolved);
+          }
+        })
+        .catch(() => {
+          // Non-fatal: the index picker just starts empty and the user picks one.
+        });
+    }
   };
 
   // Execute queries from URL parameters when router is ready and metrics provider is prometheus
@@ -184,11 +313,13 @@ const QueryMetrics: React.FC<QueryMetricsProps> = ({
     const init = async () => {
       if (accountId === 'demo') {
         setMetricsProvider('prometheus');
+        setDefaultProvider('prometheus');
+        selectedProviderRef.current = 'prometheus';
       } else {
-        const defaultProvider = await fetchDefaultProvider();
+        const resolvedDefault = await fetchDefaultProvider();
         let metricsProvider = '';
-        if (defaultProvider) {
-          metricsProvider = defaultProvider;
+        if (resolvedDefault) {
+          metricsProvider = resolvedDefault;
         } else {
           metricsProvider = selectedCluster?.agent?.connection_status?.prometheusUrl?.includes('chronosphere')
             ? 'chronosphere'
@@ -199,6 +330,8 @@ const QueryMetrics: React.FC<QueryMetricsProps> = ({
             : '';
         }
         setMetricsProvider(metricsProvider);
+        setDefaultProvider(metricsProvider);
+        selectedProviderRef.current = metricsProvider;
       }
       const queryFromUrl = router.query.query as string;
       if ((!preparedEvidences || preparedEvidences.length === 0) && !queryFromUrl) {
@@ -284,49 +417,10 @@ const QueryMetrics: React.FC<QueryMetricsProps> = ({
       setData(tableData);
       setChartData(graphData);
       setTruncationWarnings(truncationInfo);
+      setNonFiniteCounts(summariseNonFinite(preparedEvidences));
       setLoading(false);
     }
   }, [preparedEvidences]);
-
-  /**
-   * Decimates an array to a maximum number of points, preserving peaks
-   * Uses a bucket-based approach to maintain visual accuracy
-   */
-  const decimateData = (data: number[], maxPoints: number): number[] => {
-    if (data.length <= maxPoints) {
-      return data;
-    }
-
-    const step = data.length / maxPoints;
-    const decimated: number[] = [];
-
-    for (let i = 0; i < maxPoints; i++) {
-      const startIdx = Math.floor(i * step);
-      const endIdx = Math.floor((i + 1) * step);
-
-      // Take the max value in each bucket to preserve peaks
-      let maxVal = data[startIdx];
-      for (let j = startIdx; j < endIdx && j < data.length; j++) {
-        if (data[j] > maxVal) {
-          maxVal = data[j];
-        }
-      }
-      decimated.push(maxVal);
-    }
-
-    return decimated;
-  };
-
-  /**
-   * Decimates labels to match decimated data
-   */
-  const decimateLabels = <T,>(labels: T[], maxPoints: number): T[] => {
-    if (labels.length <= maxPoints) {
-      return labels;
-    }
-    const step = labels.length / maxPoints;
-    return Array.from({ length: maxPoints }, (_, i) => labels[Math.floor(i * step)]);
-  };
 
   const processEvidenceDataKeys = (
     evidenceData: any,
@@ -380,48 +474,16 @@ const QueryMetrics: React.FC<QueryMetricsProps> = ({
           ];
         }
 
-        const labels = [...new Set(g.payload?.flatMap((e: any) => e.timestamps) ?? [])];
-        labels.sort();
+        // Series alignment + downsampling is shared with the cloud account's
+        // Metrics tab; only the table half below is specific to this screen.
+        const chart = buildSeriesChart(g.payload);
+        const decimatedLabels = chart.labels;
+        const chartDataDataset = chart.dataset;
 
-        // Track original counts for truncation warning
-        maxTotalDatasets = Math.max(maxTotalDatasets, g.payload.length);
-        maxTotalDataPoints = Math.max(maxTotalDataPoints, labels.length);
-
-        // Limit number of datasets for charts
-        const limitedPayload = g.payload.slice(0, MAX_CHART_DATASETS);
-        datasetsWereTruncated = datasetsWereTruncated || g.payload.length > MAX_CHART_DATASETS;
-
-        // Check if decimation is needed
-        const needsDecimation = labels.length > MAX_CHART_DATA_POINTS;
-        pointsWereDecimated = pointsWereDecimated || needsDecimation;
-        const decimatedLabels = needsDecimation ? decimateLabels(labels, MAX_CHART_DATA_POINTS) : labels;
-
-        const chartDataDataset: any[] = [];
-
-        // Process limited payload for charts
-        limitedPayload?.forEach((item: any) => {
-          // Create a Map for O(1) lookups instead of O(N) indexOf calls
-          const timestampToValue = new Map<any, number>();
-          item.timestamps?.forEach((ts: any, idx: number) => {
-            timestampToValue.set(ts, parseFloat(item.values[idx]));
-          });
-
-          const values: any[] = [];
-          labels.forEach((label) => {
-            const value = timestampToValue.get(label);
-            values.push(value !== undefined ? value : 0);
-          });
-
-          // Decimate values for chart
-          const chartValues = needsDecimation ? decimateData(values, MAX_CHART_DATA_POINTS) : values;
-
-          chartDataDataset.push({
-            label: Object.entries(item.metric)
-              .map(([key, value]) => `${key}=${value}`)
-              .join('\n'),
-            data: chartValues,
-          });
-        });
+        maxTotalDatasets = Math.max(maxTotalDatasets, chart.totalDatasets);
+        maxTotalDataPoints = Math.max(maxTotalDataPoints, chart.totalDataPoints);
+        datasetsWereTruncated = datasetsWereTruncated || chart.datasetsWereTruncated;
+        pointsWereDecimated = pointsWereDecimated || chart.pointsWereDecimated;
 
         // Process all payload for table (will be limited later)
         const groupData = fromMetric
@@ -455,7 +517,11 @@ const QueryMetrics: React.FC<QueryMetricsProps> = ({
           : g.payload[0]?.timestamps?.map((item: any, indx: any) => {
               return [
                 {
-                  text: new Date(item * 1000).toString(),
+                  // Result.timestamps is already Unix epoch MILLISECONDS (see the
+                  // Result struct in api-server observability/entity.go); every
+                  // provider converts to ms before marshalling. Scaling by 1000
+                  // again pushed dates ~56,000 years into the future.
+                  text: new Date(item).toString(),
                 },
                 {
                   text: g.payload[0]?.values[indx] || '-',
@@ -479,7 +545,8 @@ const QueryMetrics: React.FC<QueryMetricsProps> = ({
         graphData.push({
           ...getQueryByKey(g.query_key),
           data: {
-            labels: decimatedLabels.map((e: any) => convertNumberToTimestamp(e * 1000)),
+            // Already milliseconds — see the note on the table branch above.
+            labels: decimatedLabels.map((e: number) => convertNumberToTimestamp(e)),
             data: fromMetric
               ? chartDataDataset
               : [{ label: 'Value', data: decimateData(g.payload[0]?.values?.map((e: string) => parseFloat(e)) || [], MAX_CHART_DATA_POINTS) }],
@@ -581,16 +648,6 @@ const QueryMetrics: React.FC<QueryMetricsProps> = ({
     };
   };
 
-  const createUserHistory = async (query: string, status: string, duration: number) => {
-    await observability.createUserHistory({
-      account_id: accountId,
-      data: query,
-      duration: duration,
-      module: `metrics_query_${metricsProvider}`,
-      status: status,
-    });
-  };
-
   const handleSubmit = (
     query = '',
     queryKeys = [''],
@@ -601,7 +658,14 @@ const QueryMetrics: React.FC<QueryMetricsProps> = ({
   ) => {
     if (!query && (!queriesToExecute || queriesToExecute.length === 0)) {
       if (fromOnSubmit) {
-        snackbar.error('Please enter a query before submitting');
+        // In Builder mode there is no query box to type into — the query is empty
+        // because no label filter was added. Match the logs builder's wording and
+        // severity (KubernetesLogs) rather than telling the user to type a query.
+        if (qLEditor === 'build') {
+          snackbar.warning('Please select at least one label filter');
+        } else {
+          snackbar.error('Please enter a query before submitting');
+        }
       }
       return;
     }
@@ -609,8 +673,8 @@ const QueryMetrics: React.FC<QueryMetricsProps> = ({
     setData([]);
     setChartData([]);
     setTruncationWarnings({});
+    setNonFiniteCounts({});
 
-    const now = new Date().getTime();
     const queryBlocks = query
       .replace(/^;+|;+$/g, '')
       .split(';')
@@ -634,16 +698,32 @@ const QueryMetrics: React.FC<QueryMetricsProps> = ({
     setQueryKeys(newQueryKeys);
     setLlmQueryResponse(llmQueryResponse);
 
+    // The provider-native query the backend actually executed, keyed like `promqls`.
+    // ES sends the cross-provider builder shape and the backend renders it into an
+    // _search body, so echoing what we sent showed a query that never ran.
+    const executedQueries: Record<string, string> = {};
+
+    // KQL is translated to DSL server-side, so the executed query is unreadable
+    // next to what was typed. Surface the source too — but only for KQL: in
+    // Builder mode the sent string is the internal `_binary` shape, which is
+    // exactly what this chip stopped showing.
+    const showSourceQuery = metricsProvider === 'ES' && qLEditor === 'code' && esQueryType === 'kql';
+
     const getQueryByKey = (key: string) => {
-      const entry: any = promqls[key];
+      // `||`, not `??`: Datadog/Splunk-O11y/Chronosphere/CloudWatch never set Query,
+      // so the value arrives as '' and must still fall back to the string we sent.
+      const entry: any = executedQueries[key] || promqls[key];
+      const sourceQuery = showSourceQuery && promqls[key] !== entry ? promqls[key] : '';
       return entry
         ? {
             query: entry,
+            sourceQuery,
             title: '',
             query_key: key,
           }
         : {
             query: '',
+            sourceQuery: '',
             title: '',
             query_key: key,
           };
@@ -657,13 +737,30 @@ const QueryMetrics: React.FC<QueryMetricsProps> = ({
       instant: instant,
       ...(metricsProvider !== null && metricsProvider !== undefined ? { metric_provider: metricsProvider } : {}),
       ...(metricsProvider === 'solarwinds' && solarwindsRequest ? { request: solarwindsRequest } : {}),
-      ...(metricsProvider === 'ES' && esIndex ? { request: { metric_name: esIndex, ...(qLEditor === 'code' ? { query_type: 'dsl' } : {}) } } : {}),
+      // query_type tells the backend the query is raw ES text rather than the
+      // cross-provider builder shape. Gating it on the Code tab alone meant a query
+      // written by the AI tab arrived unlabelled, so the backend parsed it as a
+      // builder where-clause list and rejected it outright. Builder mode is the only
+      // mode that must omit it.
+      ...(metricsProvider === 'ES' && esIndex
+        ? { request: { metric_name: esIndex, ...(qLEditor !== 'build' ? { query_type: esQueryType || 'dsl' } : {}) } }
+        : {}),
+      // The backend records query history; this flag distinguishes a real submit
+      // from the date-range/instant-toggle re-runs that reuse this same path.
+      // See FetchMetricsRequest.RecordHistory.
+      record_history: fromOnSubmit,
     };
 
     observability
       .metricsQuery(requestBody)
       .then((res) => {
         const results = res?.data?.data?.metrics_list?.results || [];
+
+        results.forEach((result: any) => {
+          if (result?.query_key && result?.query) {
+            executedQueries[result.query_key] = result.query;
+          }
+        });
 
         const resultsWithErrors = results.filter((result: any) => result.error);
 
@@ -675,22 +772,19 @@ const QueryMetrics: React.FC<QueryMetricsProps> = ({
           const displayMessage =
             errorMessages.length > 0 ? errorMessages.join('\n') : 'Invalid query: No data returned. Please check your query syntax.';
           snackbar.error(displayMessage);
-          fromOnSubmit && createUserHistory(query, 'FAILED', new Date().getTime() - now);
         } else if (results?.length) {
           const { tableData, graphData, truncationInfo } = processEvidenceDataKeys(results, getQueryByKey);
           setData(tableData);
           setChartData(graphData);
           setTruncationWarnings(truncationInfo);
-          fromOnSubmit && createUserHistory(query, 'SUCCESS', new Date().getTime() - now);
+          setNonFiniteCounts(summariseNonFinite(results));
         } else if (res?.data?.errors?.length) {
           setData([]);
           setChartData([]);
           snackbar.error(`failed to query metrics ${parseHttpResponseBodyMessage(res?.data)}`);
-          fromOnSubmit && createUserHistory(query, 'FAILED', new Date().getTime() - now);
         } else {
           setData([]);
           setChartData([]);
-          fromOnSubmit && createUserHistory(query, 'SUCCESS', new Date().getTime() - now);
         }
         if (type == 'ai') {
           aiCreateFeedback(true, query, llmQueryResponse);
@@ -698,7 +792,6 @@ const QueryMetrics: React.FC<QueryMetricsProps> = ({
       })
       .catch(() => {
         snackbar.error('Failed to fetch the Data');
-        fromOnSubmit && createUserHistory(query, 'FAILED', new Date().getTime() - now);
       })
       .finally(() => {
         setLoading(false);
@@ -728,6 +821,7 @@ const QueryMetrics: React.FC<QueryMetricsProps> = ({
         setData(tableData);
         setChartData(graphData);
         setTruncationWarnings(truncationInfo);
+        setNonFiniteCounts(summariseNonFinite([{ payload: metricsData }]));
       }
     }
   }, [llmQueryResponse]);
@@ -740,6 +834,42 @@ const QueryMetrics: React.FC<QueryMetricsProps> = ({
   };
 
   // Truncation warning component for large datasets
+  const NonFiniteNotice = () => {
+    const kinds = Object.entries(nonFiniteCounts).filter(([, count]) => count > 0);
+
+    if (kinds.length === 0) {
+      return null;
+    }
+
+    const total = kinds.reduce((sum, [, count]) => sum + count, 0);
+    const described = kinds.map(([kind, count]) => `${count} ${NON_FINITE_LABELS[kind] || kind}`).join(', ');
+
+    return (
+      <Box
+        sx={{
+          padding: 'var(--ds-space-2) var(--ds-space-4)',
+          backgroundColor: 'var(--ds-amber-100)',
+          border: '1px solid var(--ds-amber-200)',
+          borderRadius: 'var(--ds-radius-sm)',
+          marginTop: 'var(--ds-space-4)',
+          marginBottom: 'var(--ds-space-2)',
+          display: 'flex',
+          alignItems: 'center',
+          gap: 'var(--ds-space-2)',
+        }}
+        data-testid='metrics-non-finite-notice'
+      >
+        <InfoIcon sx={{ color: 'var(--ds-amber-700)', fontSize: 'var(--ds-text-title)' }} />
+        <Typography sx={{ fontSize: 'var(--ds-text-body)', color: 'var(--ds-amber-700)' }}>
+          <strong>
+            {total} data {total === 1 ? 'point' : 'points'} could not be plotted:
+          </strong>{' '}
+          {described}. They appear as gaps at the time they occurred.
+        </Typography>
+      </Box>
+    );
+  };
+
   const TruncationWarning = () => {
     const warnings: string[] = [];
 
@@ -795,6 +925,8 @@ const QueryMetrics: React.FC<QueryMetricsProps> = ({
                     metricsProvider === 'solarwinds' ||
                     metricsProvider === 'victoria-metrics' ||
                     metricsProvider === 'splunk_observability_platform' ||
+                    metricsProvider === 'cubeapm' ||
+                    metricsProvider === 'openobserve' ||
                     metricsProvider === 'ES') && (
                     <>
                       <Button
@@ -845,7 +977,7 @@ const QueryMetrics: React.FC<QueryMetricsProps> = ({
                       )}
                     </>
                   )}
-                  <UserHistoryButton accountId={accountId} module={`metrics_query_${metricsProvider}`} />
+                  <UserHistoryButton accountId={accountId} module={`metrics_query_${metricsProvider?.toLowerCase()}`} />
                 </>
               )}
               {showDateTime && (
@@ -867,9 +999,9 @@ const QueryMetrics: React.FC<QueryMetricsProps> = ({
         >
           {showQueryBox && (
             <>
-              {!!metricsProvider && (
-                <Box
-                  sx={{
+              {!!metricsProvider &&
+                (() => {
+                  const badgeSx = {
                     display: 'flex',
                     alignItems: 'center',
                     gap: 'var(--ds-space-2)',
@@ -878,29 +1010,69 @@ const QueryMetrics: React.FC<QueryMetricsProps> = ({
                     borderRadius: 'var(--ds-radius-md)',
                     border: '1px solid var(--ds-gray-alpha-200)',
                     minWidth: 'fit-content',
-                  }}
-                >
-                  <Text
-                    value='Metrics Provider:'
-                    sx={{
-                      fontSize: 'var(--ds-text-body-lg)',
-                      fontWeight: 'var(--ds-font-weight-medium)',
-                      color: 'var(--ds-gray-600)',
-                      whiteSpace: 'nowrap',
-                    }}
-                  />
-                  <CloudProviderIcon cloud_provider={metricsProvider} width='20px' height='20px' />
-                  <Text
-                    value={metricsProvider === 'victoria-metrics' ? 'Victoria Metrics' : snakeToTitleCase(metricsProvider)}
-                    sx={{
-                      fontSize: 'var(--ds-text-body-lg)',
-                      fontWeight: 'var(--ds-font-weight-semibold)',
-                      color: 'var(--ds-gray-700)',
-                      whiteSpace: 'nowrap',
-                    }}
-                  />
-                </Box>
-              )}
+                  } as const;
+                  const badgeInner = (
+                    <>
+                      <Text
+                        value='Metrics Provider:'
+                        sx={{
+                          fontSize: 'var(--ds-text-body-lg)',
+                          fontWeight: 'var(--ds-font-weight-medium)',
+                          color: 'var(--ds-gray-600)',
+                          whiteSpace: 'nowrap',
+                        }}
+                      />
+                      <CloudProviderIcon cloud_provider={metricsProvider} width='20px' height='20px' />
+                      <Text
+                        value={metricsProviderLabel(metricsProvider)}
+                        sx={{
+                          fontSize: 'var(--ds-text-body-lg)',
+                          fontWeight: 'var(--ds-font-weight-semibold)',
+                          color: 'var(--ds-gray-700)',
+                          whiteSpace: 'nowrap',
+                        }}
+                      />
+                    </>
+                  );
+
+                  // Only offer a switcher when the account has more than one
+                  // configured metrics provider; otherwise keep the static badge.
+                  if (availableProviders.length <= 1) {
+                    return <Box sx={badgeSx}>{badgeInner}</Box>;
+                  }
+
+                  return (
+                    <DropdownMenu
+                      align='start'
+                      minWidth={220}
+                      trigger={
+                        <Box
+                          component='button'
+                          type='button'
+                          id='metrics-provider-switcher'
+                          sx={{
+                            ...badgeSx,
+                            font: 'inherit',
+                            cursor: 'pointer',
+                            transition: 'border-color 120ms ease, background-color 120ms ease',
+                            '&:hover': { borderColor: 'var(--ds-gray-300)', backgroundColor: 'var(--ds-gray-alpha-200)' },
+                          }}
+                        >
+                          {badgeInner}
+                          <KeyboardArrowDownIcon sx={{ fontSize: 'var(--ds-text-heading)', color: 'var(--ds-gray-500)' }} />
+                        </Box>
+                      }
+                      items={availableProviders.map((p) => ({
+                        id: `metrics-provider-option-${p.provider}`,
+                        label: metricsProviderLabel(p.provider),
+                        icon: <CloudProviderIcon cloud_provider={p.provider} width='16px' height='16px' />,
+                        kbd: p.provider === metricsProvider ? '\u2713' : undefined,
+                        searchText: p.provider,
+                        onSelect: () => handleProviderChange(p.provider),
+                      }))}
+                    />
+                  );
+                })()}
               <ToggleGroup
                 selection='single'
                 size='md'
@@ -937,12 +1109,20 @@ const QueryMetrics: React.FC<QueryMetricsProps> = ({
               accountId={accountId}
               params={{ ...selectedDateRange }}
               logProvider={metricsProvider}
+              // The ES index picker lists targets through the logs action (there is no
+              // metrics equivalent), which resolves the account's DEFAULT LOG provider
+              // when no provider is pinned. On an account whose logs default is Loki,
+              // picking ES here asked Loki for indexes and 400'd. Pin the selected
+              // metrics provider so the listing resolves ES. Safe for the metrics
+              // formatted-query preview, which branches to its own handler.
+              providerOverride={metricsProvider}
               operatorDescriptors={operatorDescriptors}
               onQueryChange={(e: any) => {
                 setQuery(e.query);
                 setQueryKeys(e.queryKeys);
                 setSolarwindsRequest(e.solarwindsRequest || null);
                 if (e.index !== undefined) setEsIndex(e.index);
+                if (e.queryType !== undefined) setEsQueryType(e.queryType);
               }}
               queryItems={promqlItems as any}
               setQueryItems={setPromqlItems}
@@ -995,6 +1175,7 @@ const QueryMetrics: React.FC<QueryMetricsProps> = ({
           )}
           <Box sx={{ width: '100%', maxWidth: '100%', marginTop: 'var(--ds-space-4)' }}>
             <TruncationWarning />
+            <NonFiniteNotice />
             {loading ? (
               <Skeleton shape='rect' height='400px' width='98%' />
             ) : showChartView ? (
@@ -1029,6 +1210,12 @@ const QueryMetrics: React.FC<QueryMetricsProps> = ({
                           wordBreak: 'break-word',
                         }}
                       >
+                        {cd.sourceQuery && (
+                          <>
+                            KQL: {cd.sourceQuery}
+                            <br />
+                          </>
+                        )}
                         Query: {cd.query}
                       </Typography>
                     </Box>
@@ -1098,6 +1285,12 @@ const QueryMetrics: React.FC<QueryMetricsProps> = ({
                           wordBreak: 'break-word',
                         }}
                       >
+                        {cd.sourceQuery && (
+                          <>
+                            KQL: {cd.sourceQuery}
+                            <br />
+                          </>
+                        )}
                         Query: {cd.query}
                       </Typography>
                     </Box>
@@ -1158,7 +1351,7 @@ const QueryMetrics: React.FC<QueryMetricsProps> = ({
                                               ? query?.value?.[0] != null
                                                 ? [convertNumberToTimestamp(query.value[0] * 1000)]
                                                 : []
-                                              : query?.timestamps?.map((e: number) => convertNumberToTimestamp(e * 1000)) || []
+                                              : query?.timestamps?.map((e: number) => convertNumberToTimestamp(e)) || []
                                           }
                                           chartLabel={'Count'}
                                         />

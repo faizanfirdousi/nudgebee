@@ -10,6 +10,7 @@ import (
 	"nudgebee/llm/events"
 	"nudgebee/llm/security"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -70,6 +71,22 @@ func init() {
 	if err != nil {
 		slog.Error("sync: unable to create sync_stuck_event_analyses job", "error", err)
 	}
+
+	// Registered everywhere, pods included. The dead-worker reaper above can only recover
+	// a message whose owner has vanished from nb_workers, so it is blind to any process
+	// that comes back under the SAME worker name — which is exactly what an OOMKilled
+	// container does: the pod (and its name) survives, only the container restarts, and
+	// the heartbeat resumes as if nothing happened. Its in-flight messages then stay
+	// IN_PROGRESS forever, with the restarted process often being the very leader running
+	// the reaper that skips them. Observed on dev: llm-server-7f86ddd467-d6scf, OOMKilled
+	// twice in one afternoon, still holding an orphan 35 minutes later.
+	//
+	// Safe in-cluster because bootCutoff() bounds the sweep to work that predates this
+	// process: a restarted container recovers what it abandoned and cannot touch a request
+	// its siblings are still serving.
+	if err := common.NewPooledJob("sync_own_orphan_messages", syncOwnOrphanMessages); err != nil {
+		slog.Error("sync: unable to create sync_own_orphan_messages job", "error", err)
+	}
 }
 
 // checkBudgetAndRestartMessage checks budget limits and conversation state before restarting a message.
@@ -128,16 +145,114 @@ func syncDeadWorkerMessages() error {
 	}
 
 	messages = lo.Filter(messages, func(message core.ConversationMessage, index int) bool {
-		if message.MessageType == "followup" {
-			return false
-		}
-		if message.WorkerName != nil && (*message.WorkerName == "localhost" || *message.WorkerName == "127.0.0.1" || *message.WorkerName == "0.0.0.0" || *message.WorkerName == "::" || strings.Contains(*message.WorkerName, ".local")) {
-			return false
-		}
-		return true
+		return isDeadWorkerMessageRecoverable(message)
 	})
 
 	slog.Info("sync: restarting conversation messages for dead workers", "count", len(messages))
+	restartMessages(dao, messages)
+	return nil
+}
+
+// syncOwnOrphanMessages restarts the in-progress messages this worker owns. It runs
+// once at boot on processes that can never win the leader election, whose abandoned
+// conversations nothing else will pick up.
+//
+// Running at boot is what makes it safe: a message still marked in-progress under our
+// own name before we have started any work was necessarily left behind by a previous
+// run of this same process. There is no live execution to race with, so no staleness
+// heuristic is needed — unlike the dead-worker path, which cannot use our own name
+// because we re-register it on startup and so never look dead to ourselves.
+func syncOwnOrphanMessages() error {
+	dao := core.GetConversationDao()
+	if dao == nil {
+		return common.Error{Message: "conversation dao is not initialized"}
+	}
+	messages, err := dao.ListConversationMessages(core.ConversationStatusInProgress, config.Config.ServerName, "", false)
+	if err != nil {
+		return err
+	}
+
+	cutoff := bootCutoff()
+	messages = lo.Filter(messages, func(message core.ConversationMessage, index int) bool {
+		return isOwnOrphanRecoverable(message, cutoff)
+	})
+
+	if len(messages) == 0 {
+		return nil
+	}
+
+	slog.Info("sync: restarting own conversation messages orphaned by a previous run",
+		"count", len(messages), "worker_name", config.Config.ServerName)
+	restartMessages(dao, messages)
+	return nil
+}
+
+// isDeadWorkerMessageRecoverable reports whether the cluster may restart a message
+// left behind by a worker that is no longer registered.
+func isDeadWorkerMessageRecoverable(message core.ConversationMessage) bool {
+	if message.MessageType == "followup" {
+		return false
+	}
+	// A conversation owned by a machine outside the cluster is that machine's to
+	// recover (syncOwnOrphanMessages). Restarting it here would run someone's local
+	// session on cluster infrastructure, against whatever credentials and code that
+	// pod happens to have.
+	if message.WorkerName != nil && config.IsLocalWorkerName(*message.WorkerName) {
+		return false
+	}
+	return true
+}
+
+// processStartedAt is captured at package init, before the HTTP listener can accept
+// anything. Only its *elapsed* value is ever used, never its wall-clock value — see
+// bootCutoff.
+var processStartedAt = time.Now()
+
+// bootCutoff returns the moment this process started, expressed on the database's
+// clock. updated_at is written by the database, so comparing it against a laptop's
+// time.Now() would make this bound only as trustworthy as the skew between the two
+// machines — and it guards a window a few seconds wide, so seconds of skew are enough
+// to matter. Instead the elapsed time comes from Go's monotonic clock and now() from
+// the database: each side reads only its own clock.
+func bootCutoff() time.Time {
+	dbManager, err := common.GetDatabaseManager(common.Metastore)
+	if err == nil {
+		var cutoff time.Time
+		if err = dbManager.Db.Get(&cutoff, "SELECT now() - make_interval(secs => $1)",
+			time.Since(processStartedAt).Seconds()); err == nil {
+			return cutoff
+		}
+	}
+	// Fall back to the local clock rather than skipping recovery entirely: a slightly
+	// skewed bound still rules out almost everything, whereas no bound reopens the
+	// boot race this exists to close.
+	slog.Warn("sync: could not read boot cutoff from the database clock, using local time", "error", err)
+	return processStartedAt
+}
+
+// isOwnOrphanRecoverable reports whether a message this worker owns is worth
+// restarting at boot.
+func isOwnOrphanRecoverable(message core.ConversationMessage, bootCutoff time.Time) bool {
+	if message.MessageType == "followup" {
+		return false
+	}
+	if message.UpdatedAt == nil {
+		return false
+	}
+	// Only work that predates this process can be an orphan of a previous run. The
+	// listener starts serving a few seconds before this one-time job fires, so without
+	// this bound the sweep can race a conversation the current process just accepted
+	// and restart it underneath itself.
+	if !message.UpdatedAt.Before(bootCutoff) {
+		return false
+	}
+	// Same horizon the dead-worker query applies, from the one shared constant.
+	return time.Since(*message.UpdatedAt) < config.OrphanRecoveryHorizon
+}
+
+// restartMessages re-dispatches messages whose owning worker is gone, after checking
+// budget and conversation state for each.
+func restartMessages(dao core.IConversationDao, messages []core.ConversationMessage) {
 	for _, message := range messages {
 		// Check budget before restarting
 		if !checkBudgetAndRestartMessage(dao, message) {
@@ -171,7 +286,6 @@ func syncDeadWorkerMessages() error {
 		// Throttle to avoid OOM spike
 		time.Sleep(100 * time.Millisecond)
 	}
-	return nil
 }
 
 // syncStuckEventAnalyses reconciles event analysis records that are stuck in IN_PROGRESS status.
@@ -184,6 +298,10 @@ func syncStuckEventAnalyses() error {
 
 	// Use a system request context for the job
 	ctx := security.NewRequestContextForSuperAdmin()
+
+	// Pending workflow tokens remain eligible after the last stage becomes
+	// terminal, including when the immediate confirmation read failed.
+	syncPendingEventAnalysisTerminals(ctx, dbManager, publishAnalysisCompletedTerminal)
 
 	analyses, err := repo.ListInProgressAnalysis(ctx)
 	if err != nil {
@@ -245,7 +363,10 @@ func syncStuckEventAnalyses() error {
 			break
 		}
 
-		k := key{a.EventFingerprint, a.AccountId, a.AnalysisType == events.AnalysisTypeRCA}
+		k := key{a.EventFingerprint, a.AccountId, isRCAAnalysisType(a.AnalysisType)}
+		if a.AnalysisType == events.AnalysisTypeRCAAttempt {
+			k.eventFingerprint = a.ID
+		}
 		if processed[k] {
 			continue
 		}
@@ -260,8 +381,8 @@ func syncStuckEventAnalyses() error {
 
 		// Check conversation status
 		parentSessionId := events.SessionIdPrefixEvent + a.EventFingerprint
-		if a.AnalysisType == events.AnalysisTypeRCA {
-			parentSessionId = events.SessionIdPrefixEventRCA + a.EventFingerprint
+		if isRCAAnalysisType(a.AnalysisType) {
+			parentSessionId = rcaRecoverySession(a)
 		}
 
 		conv, err := core.GetConversationDao().GetConversationBySession(a.AccountId, parentSessionId)
@@ -289,15 +410,20 @@ func syncStuckEventAnalyses() error {
 			continue
 		}
 
-		// If the analysis has been IN_PROGRESS for too long without a running conversation,
+		// If the analysis has been IN_PROGRESS for too long without a running or completed conversation,
 		// mark it as FAILED to stop the infinite retry loop.
-		if time.Since(a.UpdatedAt) > maxRecoveryAge {
+		// If the conversation reached COMPLETED, do not abandon it solely because of event-row age —
+		// reconcile the completed findings into the event report (#37865).
+		if conv.Status != core.ConversationStatusCompleted && time.Since(a.UpdatedAt) > maxRecoveryAge {
 			slog.Warn("sync: marking stale event analysis as failed — exceeded max recovery age",
 				"event_id", a.EventId, "session", parentSessionId, "conv_status", conv.Status,
 				"updated_at", a.UpdatedAt, "age", time.Since(a.UpdatedAt).Round(time.Minute))
 			failCtx := security.NewRequestContextForTenantAccountAdmin(tenantId, security.GetSystemUserId(), []string{a.AccountId})
-			if updateErr := repo.UpdateEventAnalysisStatusById(failCtx, a.ID, string(events.AnalysisStatusFailed), "recovery abandoned: analysis stuck for over 24 hours"); updateErr != nil {
-				slog.Error("sync: failed to mark stale analysis as failed", "error", updateErr, "event_id", a.EventId)
+			failResp, terminal, failErr := failAbandonedEventAnalysis(failCtx, a, dbManager)
+			if failErr != nil {
+				slog.Error("sync: failed to mark stale analysis as failed", "error", failErr, "event_id", a.EventId)
+			} else if terminal {
+				publishAnalysisCompletedTerminal(context.WithoutCancel(failCtx.GetContext()), a.AccountId, a.EventId, failResp, failResp.Status)
 			}
 			continue
 		}
@@ -317,11 +443,16 @@ func syncStuckEventAnalyses() error {
 				defer cancel()
 				newCtx := security.NewRequestContextForTenantAccountAdmin(tenantId, security.GetSystemUserId(), []string{a.AccountId})
 
-				if a.AnalysisType == events.AnalysisTypeRCA {
+				if isRCAAnalysisType(a.AnalysisType) {
 					req := EventRCAAnalysisRequest{
 						EventId:   a.EventId,
 						AccountId: a.AccountId,
 						UserId:    security.GetSystemUserId(),
+					}
+					if a.AnalysisType == events.AnalysisTypeRCAAttempt {
+						req.AttemptID = a.ID
+					} else {
+						req.LegacyAnalysisID = a.ID
 					}
 					_, _ = analyzeEventRCAUsingAgentsAndUpdateDb(newCtx, req)
 				} else {
@@ -330,7 +461,18 @@ func syncStuckEventAnalyses() error {
 						AccountId: a.AccountId,
 						UserId:    security.GetSystemUserId(),
 					}
-					_, _ = analyzeEventUsingAgentsAndUpdateDb(newCtx, req)
+					recoveredResp, recErr := analyzeEventUsingAgentsAndUpdateDb(newCtx, req)
+					if recErr != nil {
+						slog.Error("sync: event analysis recovery failed", "error", recErr, "event_id", a.EventId)
+					}
+					// A worker response cannot prove persistence or sibling-stage completion.
+					// Use the same database confirmation as the normal MQ completion path.
+					if confirmed, terminal := getConfirmedTerminalAnalysis(newCtx, req, dbManager); terminal {
+						publishAnalysisCompletedTerminal(context.WithoutCancel(newCtx.GetContext()), a.AccountId, a.EventId, confirmed, confirmed.Status)
+					} else {
+						slog.Info("sync: recovery not confirmed terminal, preserving pending tokens",
+							"event_id", a.EventId, "status", recoveredResp.Status)
+					}
 				}
 			})
 			if err != nil {
@@ -345,4 +487,74 @@ func syncStuckEventAnalyses() error {
 
 	slog.Info("sync: recovery cycle completed", "submitted", submitted, "total_stuck", len(analyses))
 	return nil
+}
+
+// failAbandonedEventAnalysis persists abandonment before checking the normal pipeline.
+// RCA uses a separate conversation and must never drain normal investigation tokens.
+func failAbandonedEventAnalysis(ctx *security.RequestContext, analysis events.InProgressAnalysis, dbManager *common.DatabaseManager) (EventAnalysisResponse, bool, error) {
+	repo := events.NewEventAnalysisRepository(dbManager)
+	const reason = "recovery abandoned: analysis stuck for over 24 hours"
+	switch analysis.AnalysisType {
+	case events.AnalysisTypeRCAAttempt:
+		return EventAnalysisResponse{}, false, repo.UpdateRCAAttemptStatus(ctx, analysis.ID, analysis.EventId, analysis.AccountId, string(events.AnalysisStatusFailed), reason)
+	case events.AnalysisTypeRCA:
+		return EventAnalysisResponse{}, false, repo.UpdateLegacyRCAStatus(ctx, analysis.ID, analysis.EventId, analysis.AccountId, string(events.AnalysisStatusFailed), reason)
+	}
+	if err := repo.UpdateEventAnalysisStatusById(ctx, analysis.ID, string(events.AnalysisStatusFailed), reason); err != nil {
+		return EventAnalysisResponse{}, false, err
+	}
+	response, terminal := getConfirmedTerminalAnalysis(ctx, EventAnalysisRequest{EventId: analysis.EventId, AccountId: analysis.AccountId}, dbManager)
+	return response, terminal, nil
+}
+
+var pendingAnalysisScan struct {
+	sync.Mutex
+	cursor uint64
+}
+
+// syncPendingEventAnalysisTerminals does not restart agents or consume tokens
+// until the normal investigation pipeline is confirmed terminal in Postgres.
+func syncPendingEventAnalysisTerminals(ctx *security.RequestContext, db *common.DatabaseManager, publish func(context.Context, string, string, EventAnalysisResponse, string)) {
+	scanCtx, cancel := context.WithTimeout(ctx.GetContext(), 5*time.Second)
+	defer cancel()
+	// MATCH filters after Redis scans the shared database. Traverse multiple
+	// pages per tick so unrelated cache keys do not postpone retries past the
+	// token TTL, while bounding Redis work and wall time per recovery tick.
+	pendingAnalysisScan.Lock()
+	ids := make([]string, 0)
+	seen := make(map[string]bool)
+	for page := 0; page < 100; page++ {
+		batch, next, err := common.ScanPendingTokenEvents(scanCtx, pendingAnalysisScan.cursor)
+		if err != nil {
+			ctx.GetLogger().Warn("sync: unable to enumerate pending investigation tokens", "error", err)
+			break
+		}
+		pendingAnalysisScan.cursor = next
+		for _, id := range batch {
+			if !seen[id] {
+				seen[id] = true
+				ids = append(ids, id)
+			}
+		}
+		if next == 0 || scanCtx.Err() != nil {
+			break
+		}
+	}
+	pendingAnalysisScan.Unlock()
+	for _, id := range ids {
+		reconcilePendingEventAnalysisTerminal(ctx, db, id, publish)
+	}
+}
+
+func reconcilePendingEventAnalysisTerminal(ctx *security.RequestContext, db *common.DatabaseManager, eventID string, publish func(context.Context, string, string, EventAnalysisResponse, string)) {
+	// Tokens already identify a globally unique event. Resolve its account from
+	// the authoritative event row rather than changing the shared registry shape.
+	var accountID string
+	if err := db.Db.GetContext(ctx.GetContext(), &accountID, "SELECT cloud_account_id FROM events WHERE id = $1", eventID); err != nil {
+		ctx.GetLogger().Warn("sync: unable to resolve pending investigation account", "event_id", eventID, "error", err)
+		return
+	}
+	if response, terminal := getConfirmedTerminalAnalysis(ctx, EventAnalysisRequest{EventId: eventID, AccountId: accountID}, db); terminal {
+		publish(context.WithoutCancel(ctx.GetContext()), accountID, eventID, response, response.Status)
+	}
 }

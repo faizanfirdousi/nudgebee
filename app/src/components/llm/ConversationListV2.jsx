@@ -1,7 +1,5 @@
-import { useRef, useEffect, useState, useMemo, useCallback } from 'react';
+import { useRef, useEffect, useState, useMemo } from 'react';
 import { Box, List, ListItemButton, Typography } from '@mui/material';
-import ChevronLeftIcon from '@mui/icons-material/ChevronLeft';
-import ChevronRightIcon from '@mui/icons-material/ChevronRight';
 import PropTypes from 'prop-types';
 import Text from '@shared/format/Text';
 import Tooltip from '@ui/Tooltip';
@@ -12,9 +10,10 @@ import {
   ShareIconBlue,
   DeleteIconRed,
   LogEventsIcon,
-  SaveIconOutline,
   UserIconOutline,
   CollapseLeftIcon,
+  SaveIconOutline,
+  FilterIcon,
   RunningIcon,
 } from '@assets';
 import { resolveStatusLabel, getStatusIcon } from '@utils/conversationStatus';
@@ -25,12 +24,44 @@ import { ds } from '@utils/colors';
 import { toast as snackbar } from '@ui/Toast';
 import { Button } from '@ui/Button';
 import SearchInput from '@ui/SearchInput';
-import ToggleButtons from '@components/workflow/NewToggleButtons';
+import { DropdownMenu } from '@ui/DropdownMenu';
+import { Toggle } from '@ui/Toggle';
+import { Modal } from '@ui/Modal';
 import { useRouter } from 'next/router';
 import { getUserSession } from '@lib/auth';
+import { applyFiltersOnRouter } from '@lib/router';
+import FilterDropdown from '@ui/FilterDropdown';
+import CloudProviderIcon from '@shared/icons/CloudIcon';
+import { useData } from '@context/DataContext';
+
+const conversationSources = [
+  { value: 'UserInvestigation', label: 'User Chat' },
+  { value: 'Optimize', label: 'Optimize' },
+  { value: 'PrometheusQuery', label: 'Prometheus Query' },
+  { value: 'LokiQuery', label: 'Loki Query' },
+  { value: 'ESQuery', label: 'ES Query' },
+  { value: 'Investigation', label: 'Event Analysis' },
+  { value: 'InstantNotification', label: 'Slack Channel' },
+  { value: 'Automation', label: 'Automation' },
+];
+
+const allSourceValues = conversationSources.map((s) => s.value);
+const sourceLabels = Object.fromEntries(conversationSources.map((s) => [s.value, s.label]));
+
+// Users distinguish three kinds of conversations, not nine sources: things
+// they said, things the system ran, and query-page transcripts. Individual
+// sources stay reachable as sub-options for the rare precise need.
+const TYPE_GROUPS = {
+  Chats: ['UserInvestigation', 'InstantNotification'],
+  System: ['Investigation', 'Automation', 'Optimize'],
+  Queries: ['PrometheusQuery', 'LokiQuery', 'ESQuery'],
+};
+
+const parseAccountIds = (raw) => (raw ? String(raw).split(',').filter(Boolean) : []);
+
+const renderAccountGroupIcon = (provider) => <CloudProviderIcon cloud_provider={provider} width='14px' height='14px' />;
 
 const ConversationList = ({
-  accountId,
   onSelectConversation,
   selectedId,
   isConversationListVisible,
@@ -63,64 +94,109 @@ const ConversationList = ({
   const [loading, setLoading] = useState(false);
   const [searchText, setSearchText] = useState('');
   const [hoveredItemId, setHoveredItemId] = useState(null);
-  const initialFilter = router.query.status === 'WAITING' ? 'Waiting' : 'All';
-  const [activeFilter, setActiveFilter] = useState(initialFilter);
-  const [filterMine, setFilterMine] = useState(router.query.filter === 'Mine');
-
-  const conversationSources = [
-    { value: 'UserInvestigation', label: 'User Chat' },
-    { value: 'Optimize', label: 'Optimize' },
-    { value: 'PrometheusQuery', label: 'Prometheus Query' },
-    { value: 'LokiQuery', label: 'Loki Query' },
-    { value: 'ESQuery', label: 'ES Query' },
-    { value: 'Investigation', label: 'Event Analysis' },
-    { value: 'InstantNotification', label: 'Slack Channel' },
-    { value: 'Automation', label: 'Automation' },
-  ];
-
-  const allSourceValues = conversationSources.map((s) => s.value);
-  const sourceLabels = Object.fromEntries(conversationSources.map((s) => [s.value, s.label]));
+  // Set to the conversation awaiting delete confirmation. A chat is the only record
+  // of an investigation's reasoning, and the delete is not recoverable.
+  const [pendingDelete, setPendingDelete] = useState(null);
+  // Scope (whose conversations) and state (Waiting/Saved) are independent
+  // axes — the old All/Mine/Saved/Waiting tabs flattened them into one
+  // exclusive row, which made "my waiting conversations" inexpressible.
+  // Deep links: ?status=WAITING preselects the Waiting toggle, ?filter=Mine
+  // the Mine scope (also the default).
+  const [scope, setScope] = useState(router.query.filter === 'Everyone' ? 'Everyone' : 'Mine');
+  const [stateFilter, setStateFilter] = useState(router.query.status === 'WAITING' ? 'Waiting' : '');
+  const [waitingCount, setWaitingCount] = useState(null);
+  const [savedCount, setSavedCount] = useState(null);
 
   const [selectedSources, setSelectedSources] = useState(allSourceValues);
-  const [selectedChip, setSelectedChip] = useState('All');
-  const chipScrollRef = useRef(null);
-  const [canScrollLeft, setCanScrollLeft] = useState(false);
-  const [canScrollRight, setCanScrollRight] = useState(false);
+  const [selectedType, setSelectedType] = useState('All');
 
-  const updateScrollArrows = useCallback(() => {
-    const el = chipScrollRef.current;
-    if (!el) return;
-    setCanScrollLeft(el.scrollLeft > 0);
-    setCanScrollRight(el.scrollLeft + el.clientWidth < el.scrollWidth - 1);
-  }, []);
+  // The list spans every account the user can see; ?accountIds= narrows it. An empty
+  // selection still sends the full id list rather than omitting the filter: the
+  // conversations table is only indexed by (account_id, updated_at), so an unfiltered
+  // tenant-wide query would sort the whole tenant on every 5s poll.
+  const { allCluster } = useData();
+  // allCluster always carries the synthetic 'demo' account, which has no conversations and
+  // must never reach the backend (the api layer drops every scalar 'demo' request).
+  const accounts = useMemo(() => (allCluster || []).filter((c) => c.value && c.value !== 'demo'), [allCluster]);
+  const [filterAccountIds, setFilterAccountIds] = useState(() => parseAccountIds(router.query.accountIds));
+  const allAccountIds = useMemo(() => accounts.map((c) => c.value), [accounts]);
+  const queryAccountIds = filterAccountIds.length > 0 ? filterAccountIds : allAccountIds;
+  // Effects key on the ids by value: allCluster can be re-set to an identical list.
+  const queryAccountKey = queryAccountIds.join(',');
+  const accountNames = useMemo(() => new Map(accounts.map((c) => [c.value, c.label])), [accounts]);
+  const accountProviders = useMemo(() => new Map(accounts.map((c) => [c.value, c.cloud_provider])), [accounts]);
+  const accountOptions = useMemo(
+    () =>
+      accounts.map((c) => ({
+        value: c.value,
+        label: c.label,
+        group: c.cloud_provider || 'Other',
+        searchText: c.label,
+      })),
+    [accounts]
+  );
+  const accountFilterValue = useMemo(() => accountOptions.filter((o) => filterAccountIds.includes(o.value)), [accountOptions, filterAccountIds]);
+  // A single-account list says the account once, in the filter; every row repeating it is noise.
+  const showRowAccount = filterAccountIds.length !== 1;
 
-  const scrollChips = (direction) => {
-    const el = chipScrollRef.current;
-    if (!el) return;
-    el.scrollBy({ left: direction === 'left' ? -100 : 100, behavior: 'smooth' });
+  useEffect(() => {
+    if (!router.isReady) return;
+    setFilterAccountIds(parseAccountIds(router.query.accountIds));
+  }, [router.isReady, router.query.accountIds]);
+
+  const handleAccountFilterChange = (_e, value) => {
+    const ids = (value || []).map((v) => v.value);
+    setFilterAccountIds(ids);
+    applyFiltersOnRouter(router, { accountIds: ids.join(',') }, { shallow: true });
   };
 
-  const handleChipClick = (chipValue) => {
-    setSelectedChip(chipValue);
-    if (chipValue === 'All') {
+  const handleTypeSelect = (value) => {
+    const next = value || 'All';
+    setSelectedType(next);
+    if (next === 'All') {
       setSelectedSources(allSourceValues);
+    } else if (TYPE_GROUPS[next]) {
+      setSelectedSources(TYPE_GROUPS[next]);
     } else {
-      setSelectedSources([chipValue]);
+      setSelectedSources([next]);
     }
   };
 
-  useEffect(() => {
-    updateScrollArrows();
-  }, [isConversationListVisible, updateScrollArrows]);
+  const typeTriggerLabel =
+    selectedType === 'All' ? 'Type: All' : TYPE_GROUPS[selectedType] ? selectedType : sourceLabels[selectedType] || selectedType;
 
-  const handleFilterClick = (filter) => {
-    setActiveFilter(filter);
-    setFilterMine(false);
-    // Clear status and filter query params when user manually changes filter
+  // On a hard page load router.query is empty until hydration, so the useState
+  // initializers above miss deep links; re-sync once the router is ready.
+  useEffect(() => {
+    if (!router.isReady) {
+      return;
+    }
+    if (router.query.filter === 'Everyone') {
+      setScope('Everyone');
+    } else if (router.query.filter === 'Mine') {
+      setScope('Mine');
+    }
+    if (router.query.status === 'WAITING') {
+      setStateFilter('Waiting');
+    }
+  }, [router.isReady, router.query.filter, router.query.status]);
+
+  const clearDeepLinkParams = () => {
     if (router.query.status || router.query.filter) {
       const { status: _status, filter: _filter, ...rest } = router.query;
       router.replace({ pathname: router.pathname, query: rest }, undefined, { shallow: true });
     }
+  };
+
+  const handleScopeChange = (value) => {
+    setScope(value);
+    clearDeepLinkParams();
+  };
+
+  // Waiting and Saved are toggles: clicking the active one turns it off.
+  const handleStateToggle = (value) => {
+    setStateFilter((prev) => (prev === value ? '' : value));
+    clearDeepLinkParams();
   };
 
   const mergeConversations = (prevConversations, newConversations, source) => {
@@ -174,7 +250,7 @@ const ConversationList = ({
     inFlightEpochRef.current = epoch;
     setLoading(true);
     const query = {
-      account_id: accountId,
+      account_id: queryAccountIds,
       source:
         selectedSources.length > 0
           ? selectedSources
@@ -192,10 +268,11 @@ const ConversationList = ({
       limit: PAGE_SIZE,
       offset: source !== 'polling' ? page * PAGE_SIZE : 0,
       latestLastRecordedAt: source !== 'polling' ? '' : latestLastRecordedAtRef.current,
-      activeFilter: activeFilter,
+      activeFilter: stateFilter === 'Saved' ? 'Saved' : 'All',
+      ...(stateFilter === 'Waiting' && { status: 'WAITING' }),
       searchText: searchText,
       skipTotalCount: true,
-      ...(filterMine && { user_username: getUserSession()?.user?.email }),
+      ...(scope === 'Mine' && { user_username: getUserSession()?.user?.email }),
     };
     apiAskNudgebee
       .llmConversationHistory(query)
@@ -238,9 +315,7 @@ const ConversationList = ({
         // A stale request must not reschedule a poll: its closure still carries the
         // previous filter, and the effect cleanup has already run for it.
         if (epoch !== requestEpochRef.current) return;
-        const shouldPollForFilter =
-          activeFilter === 'All' || (activeFilter === 'Mine' && (selectedChip === 'All' || selectedChip === 'UserInvestigation'));
-        if (source === 'polling' && shouldPollForFilter && isConversationListVisible && searchText === '') {
+        if (source === 'polling' && isConversationListVisible && searchText === '') {
           pollingTimeoutRef.current = setTimeout(() => {
             fetchConversations('polling');
           }, 5000);
@@ -248,30 +323,37 @@ const ConversationList = ({
       });
   };
 
+  const confirmDelete = () => {
+    const data = pendingDelete;
+    if (!data) return;
+    setPendingDelete(null);
+    apiAskNudgebee
+      .deleteConversation({
+        conversation_id: data.id,
+      })
+      .then((res) => {
+        const response = res?.data?.data?.ai_delete_llm_conversation_by_id?.data?.success ?? false;
+        if (response) {
+          setRawConversations((prevConversations) => prevConversations.filter((convo) => convo.id !== data.id));
+          snackbar.success('Conversation deleted successfully');
+          if (data.sessionId == router.query?.session_id) {
+            triggerHandleNewChat();
+          }
+        } else {
+          snackbar.error('Failed to delete conversation');
+        }
+      })
+      .catch((error) => {
+        console.error('Error deleting conversation:', error);
+        snackbar.error('An error occurred while deleting the conversation');
+      });
+  };
+
   const onMenuClick = (menuItem, data) => {
     if (menuItem.id === 'share') {
       handleShare();
     } else if (menuItem.id === 'delete') {
-      apiAskNudgebee
-        .deleteConversation({
-          conversation_id: data.id,
-        })
-        .then((res) => {
-          const response = res?.data?.data?.ai_delete_llm_conversation_by_id?.data?.success ?? false;
-          if (response) {
-            setRawConversations((prevConversations) => prevConversations.filter((convo) => convo.id !== data.id));
-            snackbar.success('Conversation deleted successfully');
-            if (data.sessionId == router.query?.session_id) {
-              triggerHandleNewChat();
-            }
-          } else {
-            snackbar.error('Failed to delete conversation');
-          }
-        })
-        .catch((error) => {
-          console.error('Error deleting conversation:', error);
-          snackbar.error('An error occurred while deleting the conversation');
-        });
+      setPendingDelete(data);
     } else if (menuItem.id === 'toggle-save') {
       handleLike(data.id, likedConversations.includes(data.id));
     }
@@ -322,6 +404,7 @@ const ConversationList = ({
         message,
         created_at: item.created_at,
         source: item.source,
+        accountId: item.account_id,
         status,
         userName: item?.user?.display_name ?? '-',
         email: item?.user?.username ?? '-',
@@ -374,9 +457,10 @@ const ConversationList = ({
     // filter the user just left.
     requestEpochRef.current += 1;
 
-    // 2. STOP if the list is not visible.
+    // 2. STOP if the list is not visible, or the accounts to query have not loaded yet.
     // This prevents API calls and polling when the drawer is closed.
-    if (!isConversationListVisible) {
+    // Until the router is ready ?accountIds= is not read yet, so the first fetch would be for every account.
+    if (!isConversationListVisible || queryAccountIds.length === 0 || !router.isReady) {
       return;
     }
 
@@ -385,7 +469,7 @@ const ConversationList = ({
     // that fetch is triggered manually by the 'onEnterPress' in SearchInput. A filter /
     // account / source change still has to refetch, otherwise switching to 'Mine' mid-search
     // leaves the previous filter's rows on screen.
-    const queryIdentity = JSON.stringify([accountId, activeFilter, selectedSources, filterMine]);
+    const queryIdentity = JSON.stringify([queryAccountIds, scope, stateFilter, selectedSources]);
     const queryIdentityChanged = queryIdentity !== lastQueryIdentityRef.current;
     lastQueryIdentityRef.current = queryIdentity;
     if (searchText !== '' && !queryIdentityChanged) {
@@ -401,12 +485,9 @@ const ConversationList = ({
       scrollContainerRef.current.scrollTop = 0;
     }
 
-    // 5. Trigger standard data loading
-    if (activeFilter === 'All') {
-      fetchConversations('polling');
-    } else if (activeFilter === 'Mine' || activeFilter === 'Saved' || activeFilter === 'Waiting') {
-      fetchConversations();
-    }
+    // 5. Trigger standard data loading (fetchConversations defaults to the
+    // polling style, which primes the incremental-merge cursor)
+    fetchConversations('polling');
 
     // Cleanup function strictly for unmounting/re-running
     return () => {
@@ -415,13 +496,53 @@ const ConversationList = ({
       }
     };
   }, [
-    accountId,
-    activeFilter,
+    queryAccountKey,
+    router.isReady,
+    scope,
+    stateFilter,
     selectedSources,
     isConversationListVisible, // Added dependency
     searchText, // Added dependency
-    filterMine,
   ]);
+
+  // Waiting badge: cheap count query (limit 1 + total_count), scoped like the
+  // list. Refreshed on scope/account change and on a slow interval while the
+  // drawer is visible.
+  useEffect(() => {
+    if (queryAccountIds.length === 0 || !isConversationListVisible || !router.isReady) return undefined;
+    let active = true;
+    const countQuery = (extra) => ({
+      account_id: queryAccountIds,
+      source: allSourceValues,
+      limit: 1,
+      offset: 0,
+      latestLastRecordedAt: '',
+      searchText: '',
+      skipTotalCount: false,
+      ...(scope === 'Mine' && { user_username: getUserSession()?.user?.email }),
+      ...extra,
+    });
+    const readCount = (res) => {
+      const count = res?.data?.data?.llm_conversations_aggregate?.aggregate?.count;
+      return typeof count === 'number' ? count : null;
+    };
+    const fetchStateCounts = () => {
+      apiAskNudgebee
+        .llmConversationHistory(countQuery({ activeFilter: 'All', status: 'WAITING' }))
+        .then((res) => active && setWaitingCount(readCount(res)))
+        .catch(() => active && setWaitingCount(null));
+      apiAskNudgebee
+        .llmConversationHistory(countQuery({ activeFilter: 'Saved' }))
+        .then((res) => active && setSavedCount(readCount(res)))
+        .catch(() => active && setSavedCount(null));
+    };
+    fetchStateCounts();
+    const interval = setInterval(fetchStateCounts, 60000);
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
+  }, [queryAccountKey, router.isReady, scope, isConversationListVisible]);
 
   useEffect(() => {
     if (page > 0) {
@@ -443,7 +564,7 @@ const ConversationList = ({
 
   const handleSelectConversation = (conversation) => {
     setSelectedConversation(conversation);
-    onSelectConversation(conversation.sessionId, conversation.userName ?? '-');
+    onSelectConversation(conversation.sessionId, conversation.userName ?? '-', conversation.accountId);
   };
 
   const handleScroll = (event) => {
@@ -545,113 +666,138 @@ const ConversationList = ({
             />
           </Box>
 
-          {/* Mine/Saved/All toggle */}
-          <Box sx={{ px: ds.space[3] }}>
-            <ToggleButtons
+          {/* Row 1: scope (Mine/Everyone) + accounts */}
+          <Box sx={{ px: ds.space[3], display: 'flex', alignItems: 'center', gap: ds.space[2] }}>
+            <Toggle
               options={[
-                { value: 'All', label: 'All', icon: LogEventsIcon },
                 { value: 'Mine', label: 'Mine', icon: UserIconOutline },
-                { value: 'Saved', label: 'Saved', icon: SaveIconOutline },
-                { value: 'Waiting', label: 'Waiting', icon: RunningIcon },
+                { value: 'Everyone', label: 'Everyone', icon: LogEventsIcon },
               ]}
-              activeValue={activeFilter}
+              activeValue={scope}
               size='sm'
-              onChange={(value) => handleFilterClick(value)}
+              onChange={(value) => handleScopeChange(value)}
             />
+            <Box sx={{ flex: 1, minWidth: 0 }}>
+              <FilterDropdown
+                id='conv-account-filter'
+                label=''
+                placeholder='All accounts'
+                size='sm'
+                multiple
+                grouped
+                groupIcon={renderAccountGroupIcon}
+                options={accountOptions}
+                value={accountFilterValue}
+                onSelect={handleAccountFilterChange}
+                searchPlaceholder='Search accounts'
+                disablePortal={false}
+                data-testid='conv-account-filter'
+                sx={{ minWidth: 'unset', width: '100%' }}
+              />
+            </Box>
           </Box>
 
-          {/* Source chip filters */}
-          <Box sx={{ position: 'relative', p: ds.space[3] }}>
-            {canScrollLeft && (
-              <Box
-                onClick={() => scrollChips('left')}
-                sx={{
-                  position: 'absolute',
-                  left: ds.space[1],
-                  top: '50%',
-                  transform: 'translateY(-50%)',
-                  zIndex: 1,
-                  cursor: 'pointer',
-                  color: 'var(--ds-gray-400)',
-                  backgroundColor: 'var(--ds-background-100)',
-                  borderRadius: '50%',
-                  width: ds.space.mul(1, 5),
-                  height: ds.space.mul(1, 5),
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  boxShadow: `0px 1px 3px color-mix(in srgb, ${ds.gray[700]} 12%, transparent)`,
-                }}
-              >
-                <ChevronLeftIcon sx={{ fontSize: 16 }} />
-              </Box>
-            )}
-            <Box
-              ref={chipScrollRef}
-              onScroll={updateScrollArrows}
-              sx={{
-                display: 'flex',
-                gap: ds.space.mul(0, 3),
-                overflowX: 'auto',
-                scrollbarWidth: 'none',
-                '&::-webkit-scrollbar': { display: 'none' },
-                scrollBehavior: 'smooth',
-              }}
-            >
-              {[{ value: 'All', label: 'All' }, ...conversationSources].map((chip) => {
-                const isActive = selectedChip === chip.value;
-                return (
+          {/* Row 2: type menu, then Saved, then Waiting */}
+          <Box sx={{ px: ds.space[3], pt: ds.space[2], pb: ds.space[2], display: 'flex', alignItems: 'center', gap: ds.space.mul(0, 3) }}>
+            <Box sx={{ flex: 1, display: 'flex' }}>
+              <DropdownMenu
+                align='start'
+                size='sm'
+                disablePortal={false}
+                trigger={
                   <Box
-                    key={chip.value}
-                    onClick={() => handleChipClick(chip.value)}
+                    data-testid='conv-type-menu'
                     sx={{
+                      width: '100%',
                       px: ds.space.mul(0, 5),
                       py: ds.space[1],
                       borderRadius: ds.space.mul(1, 5),
                       fontSize: 'var(--ds-text-caption)',
                       fontFamily: ds.font.sans,
-                      fontWeight: isActive ? 500 : 400,
+                      fontWeight: selectedType !== 'All' ? 500 : 400,
                       whiteSpace: 'nowrap',
                       cursor: 'pointer',
-                      flexShrink: 0,
-                      backgroundColor: isActive ? 'var(--ds-blue-100)' : 'var(--ds-background-200)',
-                      color: isActive ? 'var(--ds-blue-500)' : 'var(--ds-gray-400)',
-                      border: isActive ? `1px solid var(--ds-blue-500)` : '1px solid transparent',
-                      transition: 'all 0.2s ease',
-                      '&:hover': {
-                        backgroundColor: isActive ? 'var(--ds-blue-100)' : 'var(--ds-background-200)',
-                      },
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      gap: ds.space[1],
+                      backgroundColor: selectedType !== 'All' ? 'var(--ds-blue-100)' : 'var(--ds-background-200)',
+                      color: selectedType !== 'All' ? 'var(--ds-blue-500)' : 'var(--ds-gray-400)',
+                      border: selectedType !== 'All' ? `1px solid var(--ds-blue-500)` : '1px solid transparent',
                     }}
                   >
-                    {chip.label}
+                    <SafeIcon src={FilterIcon} alt='' width={12} height={12} />
+                    {typeTriggerLabel} ▾
                   </Box>
-                );
-              })}
+                }
+                itemsMaxHeight='70vh'
+                items={[
+                  { label: 'All types', active: selectedType === 'All', onSelect: () => handleTypeSelect('All') },
+                  {
+                    label: 'Chats',
+                    description: 'User Chat · Slack Channel',
+                    active: selectedType === 'Chats',
+                    onSelect: () => handleTypeSelect('Chats'),
+                  },
+                  {
+                    label: 'System',
+                    description: 'Event Analysis · Automation · Optimize',
+                    active: selectedType === 'System',
+                    onSelect: () => handleTypeSelect('System'),
+                  },
+                  {
+                    label: 'Query transcripts',
+                    description: 'Prometheus · Loki · ES',
+                    active: selectedType === 'Queries',
+                    onSelect: () => handleTypeSelect('Queries'),
+                  },
+                  { type: 'section', label: 'Specific source' },
+                  ...conversationSources.map((src) => ({
+                    label: src.label,
+                    active: selectedType === src.value,
+                    onSelect: () => handleTypeSelect(src.value),
+                  })),
+                ]}
+              />
             </Box>
-            {canScrollRight && (
-              <Box
-                onClick={() => scrollChips('right')}
-                sx={{
-                  position: 'absolute',
-                  right: ds.space[1],
-                  top: '50%',
-                  transform: 'translateY(-50%)',
-                  zIndex: 1,
-                  cursor: 'pointer',
-                  color: 'var(--ds-gray-400)',
-                  backgroundColor: 'var(--ds-background-100)',
-                  borderRadius: '50%',
-                  width: ds.space.mul(1, 5),
-                  height: ds.space.mul(1, 5),
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  boxShadow: `0px 1px 3px color-mix(in srgb, ${ds.gray[700]} 12%, transparent)`,
-                }}
-              >
-                <ChevronRightIcon sx={{ fontSize: 16 }} />
-              </Box>
-            )}
+            {[
+              { value: 'Saved', label: 'Saved', count: savedCount, icon: SaveIconOutline },
+              { value: 'Waiting', label: 'Waiting', count: waitingCount, icon: RunningIcon },
+            ].map((chip) => {
+              const isActive = stateFilter === chip.value;
+              return (
+                <Box
+                  key={chip.value}
+                  title={chip.count != null ? `${chip.count} ${chip.value.toLowerCase()} conversation${chip.count === 1 ? '' : 's'}` : undefined}
+                  onClick={() => handleStateToggle(chip.value)}
+                  data-testid={`conv-state-${chip.value.toLowerCase()}`}
+                  sx={{
+                    flex: 1,
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    gap: ds.space[1],
+                    px: ds.space.mul(0, 5),
+                    py: ds.space[1],
+                    borderRadius: ds.space.mul(1, 5),
+                    fontSize: 'var(--ds-text-caption)',
+                    fontFamily: ds.font.sans,
+                    fontWeight: isActive ? 500 : 400,
+                    whiteSpace: 'nowrap',
+                    cursor: 'pointer',
+                    backgroundColor: isActive ? 'var(--ds-blue-100)' : 'var(--ds-background-200)',
+                    color: isActive ? 'var(--ds-blue-500)' : 'var(--ds-gray-400)',
+                    border: isActive ? `1px solid var(--ds-blue-500)` : '1px solid transparent',
+                    transition: 'all 0.2s ease',
+                  }}
+                >
+                  <Box component='span' sx={{ display: 'inline-flex', filter: isActive ? 'none' : 'grayscale(1)', opacity: isActive ? 1 : 0.65 }}>
+                    <SafeIcon src={chip.icon} alt='' width={12} height={12} />
+                  </Box>
+                  {chip.label}
+                </Box>
+              );
+            })}
           </Box>
         </Box>
         <Box
@@ -754,8 +900,34 @@ const ConversationList = ({
                           </Box>
                         )}
                       </Box>
-                      {/* Row 2: Source badge + Author */}
-                      <Box display='flex' alignItems='center' gap={ds.space.mul(0, 3)} mt={ds.space[1]} sx={{ pl: ds.space.mul(1, 5) }}>
+                      {/* Row 2: Account + Source badge + Author */}
+                      <Box display='flex' alignItems='center' gap={ds.space.mul(0, 3)} mt={ds.space[1]} sx={{ pl: ds.space.mul(1, 5), minWidth: 0 }}>
+                        {showRowAccount && item.data.accountId && (
+                          <Box
+                            data-testid='conv-row-account'
+                            title={accountNames.get(item.data.accountId) || item.data.accountId}
+                            sx={{
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              gap: ds.space[1],
+                              minWidth: 0,
+                              maxWidth: ds.space.mul(2, 15),
+                              px: ds.space.mul(0, 3),
+                              py: ds.space[0],
+                              borderRadius: ds.radius.sm,
+                              fontSize: 'var(--ds-text-caption)',
+                              fontFamily: ds.font.sans,
+                              fontWeight: 'var(--ds-font-weight-medium)',
+                              backgroundColor: 'var(--ds-brand-100)',
+                              color: 'var(--ds-brand-500)',
+                            }}
+                          >
+                            <CloudProviderIcon cloud_provider={accountProviders.get(item.data.accountId)} width='12px' height='12px' />
+                            <Box component='span' sx={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                              {accountNames.get(item.data.accountId) || 'Unknown account'}
+                            </Box>
+                          </Box>
+                        )}
                         {item.data.source && sourceLabels[item.data.source] && (
                           <Box
                             sx={{
@@ -773,7 +945,7 @@ const ConversationList = ({
                             {sourceLabels[item.data.source]}
                           </Box>
                         )}
-                        {activeFilter !== 'Mine' && (
+                        {scope !== 'Mine' && (
                           <Typography
                             sx={{
                               fontSize: 'var(--ds-text-caption)',
@@ -809,12 +981,38 @@ const ConversationList = ({
           )}
         </Box>
       </Box>
+
+      <Modal
+        open={Boolean(pendingDelete)}
+        handleClose={() => setPendingDelete(null)}
+        onClose={() => setPendingDelete(null)}
+        title='Delete conversation'
+        width='sm'
+      >
+        <Box sx={{ padding: ds.space[5] }}>
+          <Typography sx={{ fontSize: 'var(--ds-text-body)', color: 'var(--ds-gray-700)' }}>
+            Delete this conversation? Its questions, answers and investigation history are removed permanently.
+          </Typography>
+          {pendingDelete ? (
+            <Typography sx={{ fontSize: 'var(--ds-text-caption)', color: 'var(--ds-gray-500)', mt: ds.space[3], overflowWrap: 'anywhere' }}>
+              {pendingDelete.title || pendingDelete.name}
+            </Typography>
+          ) : null}
+          <Box sx={{ display: 'flex', justifyContent: 'flex-end', gap: ds.space[3], mt: ds.space[4] }}>
+            <Button tone='secondary' size='sm' onClick={() => setPendingDelete(null)}>
+              Cancel
+            </Button>
+            <Button tone='danger' size='sm' onClick={confirmDelete} data-testid='confirm-delete-conversation'>
+              Delete
+            </Button>
+          </Box>
+        </Box>
+      </Modal>
     </Box>
   );
 };
 
 ConversationList.propTypes = {
-  accountId: PropTypes.string,
   onSelectConversation: PropTypes.func.isRequired,
   selectedId: PropTypes.string,
   isConversationListVisible: PropTypes.bool,

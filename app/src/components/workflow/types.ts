@@ -1,3 +1,5 @@
+import type { PropertyExample } from './utils/fieldTypeUtils';
+
 export interface SubCategory {
   label: string;
   description: string;
@@ -88,6 +90,8 @@ export interface TaskDefinitionField {
   options?: string[];
   sub_type?: string;
   is_encrypted?: boolean;
+  help?: string;
+  examples?: PropertyExample[];
 }
 
 export interface TaskDefinitionSchema {
@@ -157,6 +161,15 @@ export interface WorkflowSettings {
    * server enforces the same flag on every AI-originated run.
    */
   aiInvocable: boolean;
+  /**
+   * Let the AI assistant run this automation without asking the user to confirm
+   * first. Off by default, and meaningless on its own: the server rejects it
+   * unless aiInvocable is also on, and clears it whenever that is cleared.
+   *
+   * Also workflow-level, for the same reason aiInvocable is — withdrawing
+   * consent to unattended runs must not wait for a publish.
+   */
+  aiAutoApprove: boolean;
   /**
    * What the AI needs to know: what this automation does and, more importantly,
    * WHEN to reach for it. Required before aiInvocable can be turned on.

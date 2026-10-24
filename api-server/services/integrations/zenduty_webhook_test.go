@@ -41,8 +41,14 @@ const zendutyGrafanaPayload = `{
   }
 }`
 
-// Prometheus alert routed through Zenduty. Title prefix [Prometheus][...] is the
-// convention we see in dev — the summary still uses Alertmanager firing format.
+// Prometheus alert whose summary happens to carry the Alertmanager firing text.
+//
+// CAUTION: this shape is NOT what Zenduty's Prometheus integration actually
+// sends. Measured over every Zenduty webhook we have ever stored (3,345 rows):
+// 0 of 3,272 [Prometheus][...] deliveries carried a Labels: block, while 38 of
+// 38 [Grafana]-routed ones did. See zendutyPrometheusNoLabelsPayload for the
+// real dev shape. Kept because it still exercises the summary-labels path, which
+// is a genuine (Grafana-routed) case — just not this title prefix.
 const zendutyPrometheusPayload = `{
   "payload": {
     "event_type": "triggered",
@@ -353,7 +359,7 @@ func TestZendutyFingerprint_Precedence(t *testing.T) {
 
 	t.Run("upstream Alertmanager fingerprint wins", func(t *testing.T) {
 		assert.Equal(t, "000fd06b1274d965",
-			zendutyFingerprint(amFP, "HighP95Latency", "nudgebee", "cloud-collector-server", "zd-key", "zd-uid"))
+			zendutyFingerprint(amFP, "HighP95Latency", "nudgebee", "cloud-collector-server", "a title", "zd-key", "zd-uid"))
 	})
 
 	// Two sibling alerts on ONE workload, told apart only by a label the resolved
@@ -361,40 +367,162 @@ func TestZendutyFingerprint_Precedence(t *testing.T) {
 	// the canonical fallback below cannot, which is exactly why it is the fallback.
 	t.Run("sibling alerts on one workload stay apart", func(t *testing.T) {
 		detect := zendutyFingerprint(map[string]string{"nb_alert_fingerprint": "b8d86a653803d8e0"},
-			"NBLLMEgressFilterFlagging", "nudgebee", "llm-server", "", "zd-1")
+			"NBLLMEgressFilterFlagging", "nudgebee", "llm-server", "a title", "", "zd-1")
 		redacted := zendutyFingerprint(map[string]string{"nb_alert_fingerprint": "bd0d9149542ad5f3"},
-			"NBLLMEgressFilterFlagging", "nudgebee", "llm-server", "", "zd-2")
+			"NBLLMEgressFilterFlagging", "nudgebee", "llm-server", "a title", "", "zd-2")
 		assert.NotEqual(t, detect, redacted)
 
-		merged := zendutyFingerprint(nil, "NBLLMEgressFilterFlagging", "nudgebee", "llm-server", "", "zd-1")
+		merged := zendutyFingerprint(nil, "NBLLMEgressFilterFlagging", "nudgebee", "llm-server", "a title", "", "zd-1")
 		assert.Equal(t, merged,
-			zendutyFingerprint(nil, "NBLLMEgressFilterFlagging", "nudgebee", "llm-server", "", "zd-2"),
-			"documents the known coarseness of the no-payload fallback")
+			zendutyFingerprint(nil, "NBLLMEgressFilterFlagging", "nudgebee", "llm-server", "another title", "", "zd-2"),
+			"documents the known coarseness of the no-payload fallback: one alertname, one chain")
 	})
 
 	t.Run("canonical when no payload was recovered", func(t *testing.T) {
 		assert.Equal(t,
 			core.CanonicalFingerprint("zenduty", "HighP95Latency", "nudgebee", "cloud-collector-server"),
-			zendutyFingerprint(nil, "HighP95Latency", "nudgebee", "cloud-collector-server", "zd-key", "zd-uid"))
+			zendutyFingerprint(nil, "HighP95Latency", "nudgebee", "cloud-collector-server", "a title", "zd-key", "zd-uid"))
+	})
+
+	// The degraded shape that produced the dev incident: Zenduty sent no labels
+	// and the alerts API was throttled, so nothing named the alert — but a
+	// subject did resolve. Keying on the subject alone put every alert on that
+	// workload in one occurrence chain; the title has to carry the alert identity.
+	t.Run("title identifies the alert when nothing else does", func(t *testing.T) {
+		rollout := zendutyFingerprint(nil, "", "", "redis-replicas",
+			"[Prometheus][KubeDeploymentRolloutStuck] - Deployment rollout is not progressing.", "zd-key-1", "zd-uid-1")
+		latency := zendutyFingerprint(nil, "", "", "redis-replicas",
+			"[Prometheus][HighP95Latency] - High P95 latency for redis-replicas", "zd-key-2", "zd-uid-2")
+		assert.NotEqual(t, rollout, latency,
+			"two different alerts on one workload must not share an occurrence chain")
+
+		assert.NotEqual(t, core.CanonicalFingerprint("zenduty", "", "", "redis-replicas"), rollout,
+			"the subject-only key is what merged unrelated alerts; it must not be produced")
+
+		repeat := zendutyFingerprint(nil, "", "", "redis-replicas",
+			"[Prometheus][KubeDeploymentRolloutStuck] - Deployment rollout is not progressing.", "zd-key-3", "zd-uid-3")
+		assert.Equal(t, rollout, repeat,
+			"repeat firings still share a chain — neither incident_key nor unique_id may leak in")
 	})
 
 	t.Run("repeat firings share a key at every tier", func(t *testing.T) {
 		// Same alert, two incidents: Zenduty mints a fresh unique_id and a fresh
 		// random incident_key for each. Neither may leak into the key.
-		a := zendutyFingerprint(amFP, "HighP95Latency", "nudgebee", "svc", "key-a", "uid-a")
-		b := zendutyFingerprint(amFP, "HighP95Latency", "nudgebee", "svc", "key-b", "uid-b")
+		a := zendutyFingerprint(amFP, "HighP95Latency", "nudgebee", "svc", "a title", "key-a", "uid-a")
+		b := zendutyFingerprint(amFP, "HighP95Latency", "nudgebee", "svc", "a title", "key-b", "uid-b")
 		assert.Equal(t, a, b)
 
-		c := zendutyFingerprint(nil, "HighP95Latency", "nudgebee", "svc", "key-a", "uid-a")
-		d := zendutyFingerprint(nil, "HighP95Latency", "nudgebee", "svc", "key-b", "uid-b")
+		c := zendutyFingerprint(nil, "HighP95Latency", "nudgebee", "svc", "a title", "key-a", "uid-a")
+		d := zendutyFingerprint(nil, "HighP95Latency", "nudgebee", "svc", "a title", "key-b", "uid-b")
 		assert.Equal(t, c, d)
 	})
 
+	// A title with no subject to anchor it to is not an identity — the caller's
+	// own incident_key still wins for the Events-API shape.
 	t.Run("incident_key only without any alert identity", func(t *testing.T) {
-		assert.Equal(t, "zd-key", zendutyFingerprint(nil, "", "", "", "zd-key", "zd-uid"))
+		assert.Equal(t, "zd-key", zendutyFingerprint(nil, "", "", "", "a title", "zd-key", "zd-uid"))
 	})
 
 	t.Run("unique_id is the last resort", func(t *testing.T) {
-		assert.Equal(t, "zd-uid", zendutyFingerprint(nil, "", "", "", "", "zd-uid"))
+		assert.Equal(t, "zd-uid", zendutyFingerprint(nil, "", "", "", "a title", "", "zd-uid"))
 	})
+}
+
+// Regression: a payload with no recoverable alert identity must flag its
+// aggregation_key as unstable. The fallback RuleId is incident.UniqueID, which
+// Zenduty generates fresh per incident — registering it as an event type mints
+// one event_rules row per firing (397 junk rows on dev before this guard).
+// See event.LabelUnstableAggregationKey.
+func TestZenduty_NoAlertIdentity_FlagsUnstableAggregationKey(t *testing.T) {
+	zd := newZendutyIntegration(t)
+
+	out, err := zd.ProcessEventWebook(newTestCtx(), []core.IntegrationConfigValue{}, os.Getenv("TEST_ACCOUNT"), zendutyCustomPayload)
+	assert.NoError(t, err)
+	assert.Len(t, out, 1)
+
+	inv := out[0].Investigation
+	assert.Equal(t, "ZD-999", inv.RuleId, "guard: this payload must fall back to the incident id")
+	assert.Equal(t, "true", inv.Labels[event.LabelUnstableAggregationKey],
+		"per-incident rule id must be flagged so event-type registration skips it")
+}
+
+// The mirror of the above: when an alertname IS recovered the rule id is a real
+// alert identity, shared across firings, and must NOT be flagged — otherwise the
+// guard would suppress legitimate event-type registration.
+func TestZenduty_WithAlertIdentity_DoesNotFlagUnstableAggregationKey(t *testing.T) {
+	zd := newZendutyIntegration(t)
+
+	out, err := zd.ProcessEventWebook(newTestCtx(), []core.IntegrationConfigValue{}, os.Getenv("TEST_ACCOUNT"), zendutyPrometheusPayload)
+	assert.NoError(t, err)
+	assert.Len(t, out, 1)
+
+	inv := out[0].Investigation
+	assert.Equal(t, "KubePodCrashLooping", inv.RuleId, "guard: this payload must resolve a real alertname")
+	assert.NotContains(t, inv.Labels, event.LabelUnstableAggregationKey)
+}
+
+// The shape Zenduty's Prometheus integration ACTUALLY delivers: a one-line
+// summary rendered from the alert's summary annotation, with the Alertmanager
+// label block dropped entirely. Structure copied from a real dev delivery
+// (incident fjtuytA7jxKNH2wCHVfFny, 2026-08-31); identifiers synthesised.
+//
+// This is the overwhelmingly common case — 3,272 of 3,345 stored Zenduty
+// webhooks — and it was the one shape no fixture covered, which is why the
+// enrichment-failure path shipped unguarded.
+const zendutyPrometheusNoLabelsPayload = `{
+  "payload": {
+    "event_type": "triggered",
+    "incident": {
+      "summary": "High error rate for app-dev in nudgebee",
+      "incident_number": 1674,
+      "creation_date": "2026-08-31T04:05:25.873290Z",
+      "status": 1,
+      "unique_id": "ZDFAKEINCIDENT00000002",
+      "title": "[Prometheus][ApplicationAPIFailures] - High error rate for app-dev in nudgebee",
+      "incident_key": "ZDFAKEKEY00000000002",
+      "service": {
+        "name": "Platform Team",
+        "unique_id": "00000000-0000-0000-0000-00000000fake"
+      },
+      "urgency": 1
+    }
+  }
+}`
+
+// Reproduces the dev failure exactly: Zenduty's Prometheus integration sends no
+// labels, the API enrichment that would recover them is unavailable (rate
+// limited in dev, absent in this unit test), so the rule identity degrades to
+// the per-incident id. That id must be flagged, or every firing registers a new
+// event type — 397 junk event_rules rows before this guard.
+func TestZenduty_RealPrometheusShape_NoLabels_FlagsUnstableKey(t *testing.T) {
+	zd := newZendutyIntegration(t)
+
+	out, err := zd.ProcessEventWebook(newTestCtx(), []core.IntegrationConfigValue{}, os.Getenv("TEST_ACCOUNT"), zendutyPrometheusNoLabelsPayload)
+	assert.NoError(t, err)
+	assert.Len(t, out, 1)
+
+	inv := out[0].Investigation
+	assert.Empty(t, inv.Labels["alertname"], "guard: this shape carries no Alertmanager labels")
+	assert.Equal(t, "ZDFAKEINCIDENT00000002", inv.RuleId, "degrades to the per-incident id")
+	assert.Equal(t, "true", inv.Labels[event.LabelUnstableAggregationKey])
+}
+
+// A run that could not reach Zenduty's API must say so on the alert. The
+// LLM then sees nothing but a title, and a generic title ("Deployment rollout is
+// not progressing.") names no workload — so its answer is a guess that must not
+// be promoted to a learned title→service mapping. On dev one throttled webhook
+// on 2026-08-31 taught the tenant that KubeDeploymentRolloutStuck means
+// redis-replicas (a StatefulSet, which cannot even have a Deployment rollout),
+// and every firing for the next nine days reused it without asking again.
+func TestZenduty_EnrichmentUnavailable_IsFlaggedForTheLearnGuard(t *testing.T) {
+	zd := newZendutyIntegration(t)
+
+	out, err := zd.ProcessEventWebook(newTestCtx(), []core.IntegrationConfigValue{}, os.Getenv("TEST_ACCOUNT"), zendutyPrometheusNoLabelsPayload)
+	assert.NoError(t, err)
+	assert.Len(t, out, 1)
+
+	inv := out[0].Investigation
+	assert.Empty(t, inv.Labels["alertname"], "guard: this shape carries no Alertmanager labels")
+	assert.Equal(t, "true", inv.Labels[LabelZendutyEnrichUnavailable],
+		"no API enrichment ran, so a guessed subject must not be learned")
 }

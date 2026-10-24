@@ -1,3 +1,6 @@
+# Extra Secret to load env from, in addition to the main nudgebee Secret.
+# Referenced optionally, so a missing Secret does not block startup.
+extraEnvFromSecret: ''
 # Default values for services-server-server.
 # This is a YAML-formatted file.
 # Declare variables to be passed into your templates.
@@ -67,13 +70,66 @@ ingress:
 
 secretName: 'nudgebee'
 
+# Small-tier defaults. See docs/sizing-and-tiers.md for the tier definitions and
+# the measurements these come from; values-medium/large.yaml override them.
+# Memory: steady state is 90-240Mi, but the finops-score recompute cron runs every
+# 6h for 80-90 minutes and materialises the whole recommendation set — 1.0Gi peak on
+# a small estate, 6.7Gi on the largest measured one. The old 1500Mi limit was below
+# that peak even at Small, so the cron OOM-killed the pod. Do not lower the limit
+# without changing the cron (tracked as the batch-recompute streaming fix).
+#
+# 4Gi, not 2Gi: a 15-day re-measurement found the dev deployment OOM-killing this
+# container 11 times against a 2500Mi limit — i.e. the recompute exceeds 2.5Gi on a
+# mid-sized estate even though the 30s-resolution working-set samples only caught
+# 1804Mi. The sampled peak is a floor on the real peak, not the peak, so the limit
+# has to clear the largest limit observed to fail, not the largest sample observed.
+# CPU: p95 is 24-46m; the old 300m request reserved ~10x what the service uses.
 resources:
   limits:
-    cpu: 500m
-    memory: 1500Mi
+    cpu: 1000m
+    memory: 4Gi
   requests:
-    cpu: 300m
-    memory: 1024Mi
+    cpu: 150m
+    memory: 500Mi
+
+# Background-job ("worker") deployment.
+#
+# Off by default: with worker.enabled false there is exactly one deployment and
+# it does what it always did — serve HTTP *and* drain every RabbitMQ queue. That
+# is what every single-replica, OSS and on-prem install wants, and it is the
+# only shape a one-pod install can have.
+#
+# Turn it on and the deployment splits in two: the existing deployment runs with
+# SERVER_ROLE=api and serves only HTTP, while a second `<fullname>-worker`
+# deployment runs the consumers and the EE background goroutines. The two roles
+# are complementary by construction, so there is no way to end up with a queue
+# nobody consumes — see templates/_helpers.tpl "services-server.serverRole".
+#
+# Scheduled crons: runbook-server fires them at /rpc-cron, and each one runs as
+# a goroutine on whichever pod took the call. Enabling the worker also renders a
+# `<fullname>-worker` Service; set runbook-server's SERVICE_API_SERVER_CRON_URL
+# to it to move those jobs onto the worker. Unset, they stay on the API pods.
+# Enable the worker before setting that URL, and unset it before disabling the
+# worker — runbook-server bakes the URL into its schedules at startup.
+#
+# Worth knowing before enabling: background work started from inside a
+# user-facing HTTP handler (scan_orchestrator's heartbeat evaluation,
+# application/profiler tickers, triage's rule-match batcher) is NOT moved by
+# this — it still runs on the API pods. Don't size API resources down on the
+# assumption they are now HTTP-only.
+worker:
+  enabled: false
+  # Fixed on purpose — no HPA. The point of the split is a known, deterministic
+  # number of consumers; autoscaling would silently change per-queue
+  # concurrency (replicas x the rabbit_mq_*_concurrency config values).
+  replicaCount: 1
+  # Each of the following falls back to the top-level value when unset, so a
+  # worker only needs to override what genuinely differs from the API pods.
+  resources: {}
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
 
 autoscaling:
   enabled: false
@@ -91,14 +147,16 @@ affinity: {}
 annotations: {}
 
 # Scanner images for scan_orchestrator. Tags live here — bump in a PR or let
-# CI resolve them. trivy/popeye/kube-bench/cert-scanner are mirrored to
-# ghcr.io/nudgebee by .github/workflows/scanner-images-mirror.yaml. Nova is
-# published directly by nova/.github/workflows/build-image.yaml and bumped by
-# the nudgebee-build-*.yaml workflows.
+# CI resolve them. trivy/kube-bench are upstream Aqua images republished under
+# ghcr.io/nudgebee; popeye is our fork. Nova is published by
+# nova/.github/workflows/build-image.yaml, and release.yaml bumps the Nova and
+# Popeye tags at package time.
+#
+# Keep in sync with the defaults in
+# api-server/services/scan_orchestrator/images.go — scanner-images-verify.yaml
+# fails the build if a tag here doesn't resolve on its registry.
 env:
-  NOVA_IMAGE: 'ghcr.io/nudgebee/nova:2026-05-12T15-41-58_3b33692e2739d958a11eb43346c4240a70fd15cd'
-  K8S_VERSION_UPGRADE_IMAGE: 'ghcr.io/nudgebee/nova:2026-05-12T15-41-58_3b33692e2739d958a11eb43346c4240a70fd15cd'
+  NOVA_IMAGE: 'ghcr.io/nudgebee/nova:2026-05-22T07-15-34_decaacbbf56e1789c3299a89f790b8e824ab741c'
   TRIVY_IMAGE: 'ghcr.io/nudgebee/trivy:0.58.0'
   POPEYE_IMAGE: 'ghcr.io/nudgebee/popeye:v0.11.1-nudgebee.1'
   KUBE_BENCH_IMAGE: 'ghcr.io/nudgebee/kube-bench:v0.10.4'
-  CERT_SCANNER_IMAGE: 'ghcr.io/nudgebee/cert-scanner:v0.1.0'

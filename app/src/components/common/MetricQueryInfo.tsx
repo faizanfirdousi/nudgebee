@@ -11,6 +11,9 @@ export const K8S_METRIC_QUERY_LABELS: Record<string, string> = {
   memory_usage: 'Usage',
   memory_request: 'Requested',
   memory_limit: 'Limit',
+  pod_count: 'Running pods',
+  cpu_usage_max_pod: 'Busiest pod',
+  memory_usage_max_pod: 'Busiest pod',
 };
 
 /**
@@ -57,7 +60,7 @@ const MetricQueryInfo = ({ queries, labelMap }: MetricQueryInfoProps) => {
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: ds.space[3], p: ds.space[1] }}>
       {entries.map(([key, query]) => (
         <Box key={key}>
-          <Typography sx={{ fontSize: ds.text.caption, fontWeight: 600, color: ds.brand[500], mb: ds.space[1] }}>
+          <Typography sx={{ fontSize: ds.text.caption, fontWeight: ds.weight.semibold, color: ds.brand[500], mb: ds.space[1] }}>
             {labelMap?.[key] || humanizeKey(key)}
           </Typography>
           <Box

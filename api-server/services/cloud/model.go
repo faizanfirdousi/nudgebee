@@ -14,6 +14,10 @@ type StoreUsageRequest struct {
 	AccountId string     `json:"account_id" validate:"required"`
 	Month     time.Month `json:"month" validate:"required"`
 	Year      int        `json:"year" validate:"required"`
+	// Backfill also ingests the historical billing periods the provider already
+	// has, rather than just the requested month. Set when an account is first
+	// connected.
+	Backfill bool `json:"backfill"`
 }
 
 type QueryMetricsRequest struct {
@@ -81,6 +85,10 @@ type ListNotificationTargetsRequest struct {
 	// Region scopes the listing for providers with regional targets (AWS SNS
 	// topics). Ignored by GCP and Azure.
 	Region string `json:"region"`
+	// ResourceId lets the server resolve Region from the resource the alarm is
+	// for when the client does not know it; the Optimise listing does not carry
+	// a region column, so the AWS picker could otherwise never load.
+	ResourceId string `json:"resource_id"`
 }
 
 // NotificationTarget is a provider-side notification destination an alarm can

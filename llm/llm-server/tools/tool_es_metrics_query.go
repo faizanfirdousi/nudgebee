@@ -62,41 +62,80 @@ func (m ESMetricsQueryTool) InputSchema() core.ToolSchema {
 	}
 }
 
-func (m ESMetricsQueryTool) Call(nbRequestContext core.NbToolContext, input core.NBToolCallRequest) (core.NBToolResponse, error) {
-	nbRequestContext.Ctx.GetLogger().Info("es_metrics_query: executing metrics query", "input", input.Command)
-
-	// Parse the input to extract index and query.
+// parseESMetricsQueryInput resolves time macros in the raw tool input, then reads
+// the index pattern and DSL body out of it. It returns the caller-facing message
+// alongside the error so Call stays a thin wrapper, and — the reason it is a
+// separate function at all — so the macro substitution is testable without a
+// network round trip.
+//
+// `[[Time:...]]` is how a relative window is written everywhere else in this
+// codebase (common/time_macros.go), and this tool's own description tells the model
+// to "always include a range filter on @timestamp", so the model reaches for the
+// macro here too. Nothing used to substitute it: the literal `[[Time:-24h]]` went
+// into the ES range filter, matched nothing, and still came back HTTP 200 — an
+// empty result the caller reads as "this environment has no data" rather than as a
+// malformed query. Reproduced against a live index that returned 10,000 documents
+// for the same query without the macro and 0 with it.
+//
+// Substituting before the unmarshal, rather than on the marshalled body, also fixes
+// extractTimestampFromDSL: it reads the DSL's lower bound to size the api-server
+// window, and an unparseable macro sent it to a blanket 7 days.
+func parseESMetricsQueryInput(command string) (indexPattern string, queryObj any, userMsg string, err error) {
 	var inputObj map[string]any
-	if err := common.UnmarshalJson([]byte(input.Command), &inputObj); err != nil {
-		return core.NBToolResponse{
-			Data:   "Invalid input format. Provide a JSON object with 'index' and 'query' fields.",
-			Status: core.NBToolResponseStatusError,
-		}, fmt.Errorf("es_metrics_query: invalid input JSON: %w", err)
+	if err := common.UnmarshalJson([]byte(common.SubstituteDateMacros(command)), &inputObj); err != nil {
+		return "", nil, "Invalid input format. Provide a JSON object with 'index' and 'query' fields.",
+			fmt.Errorf("es_metrics_query: invalid input JSON: %w", err)
 	}
 
-	indexPattern, _ := inputObj["index"].(string)
-	if indexPattern == "" {
-		return core.NBToolResponse{
-			Data:   "Missing required 'index' field. Provide an Elasticsearch index pattern (e.g. 'metrics-*').",
-			Status: core.NBToolResponseStatusError,
-		}, fmt.Errorf("es_metrics_query: missing index field")
-	}
-
-	queryObj, ok := inputObj["query"]
+	// Absent, wrong-typed and blank are reported separately. The message goes back
+	// to the model as its only signal, and this ticket is a case study in what a
+	// misleading one costs: told "missing index" when it had in fact sent a
+	// non-string index, the model re-sends the same shape instead of correcting it.
+	rawIndex, ok := inputObj["index"]
 	if !ok {
-		return core.NBToolResponse{
-			Data:   "Missing required 'query' field. Provide the Elasticsearch DSL query body.",
-			Status: core.NBToolResponseStatusError,
-		}, fmt.Errorf("es_metrics_query: missing query field")
+		return "", nil, "Missing required 'index' field. Provide an Elasticsearch index pattern (e.g. 'metrics-*').",
+			fmt.Errorf("es_metrics_query: missing index field")
+	}
+	indexPattern, ok = rawIndex.(string)
+	if !ok {
+		return "", nil, fmt.Sprintf("Field 'index' must be a string index pattern (e.g. 'metrics-*'), got %T.", rawIndex),
+			fmt.Errorf("es_metrics_query: index field is %T, want string", rawIndex)
+	}
+	if strings.TrimSpace(indexPattern) == "" {
+		return "", nil, "Field 'index' is empty. Provide an Elasticsearch index pattern (e.g. 'metrics-*').",
+			fmt.Errorf("es_metrics_query: empty index field")
+	}
+
+	queryObj, ok = inputObj["query"]
+	if !ok {
+		return "", nil, "Missing required 'query' field. Provide the Elasticsearch DSL query body.",
+			fmt.Errorf("es_metrics_query: missing query field")
+	}
+	if err := validateESMetricsQueryShape(queryObj); err != nil {
+		return "", nil,
+			fmt.Sprintf("Invalid Elasticsearch DSL: %s. Build a new query using a real query clause, for example {\"query\":{\"bool\":{\"filter\":[{\"exists\":{\"field\":\"metric.value\"}}]}}}.", err),
+			fmt.Errorf("es_metrics_query: invalid DSL: %w", err)
 	}
 
 	// Ensure queryObj is wrapped in {"query": ...} so api-server receives a valid ES _search body.
 	if qMap, isMap := queryObj.(map[string]any); isMap && qMap != nil {
 		if _, hasQuery := qMap["query"]; !hasQuery {
-			queryObj = map[string]any{
-				"query": qMap,
-			}
+			queryObj = map[string]any{"query": qMap}
 		}
+	}
+
+	return indexPattern, queryObj, "", nil
+}
+
+func (m ESMetricsQueryTool) Call(nbRequestContext core.NbToolContext, input core.NBToolCallRequest) (core.NBToolResponse, error) {
+	nbRequestContext.Ctx.GetLogger().Info("es_metrics_query: executing metrics query", "input", input.Command)
+
+	indexPattern, queryObj, userMsg, err := parseESMetricsQueryInput(input.Command)
+	if err != nil {
+		return core.NBToolResponse{
+			Data:   userMsg,
+			Status: core.NBToolResponseStatusError,
+		}, err
 	}
 
 	// Serialize the query object to a JSON string for the queries map.
@@ -184,6 +223,64 @@ func (m ESMetricsQueryTool) Call(nbRequestContext core.NbToolContext, input core
 		Type:   core.NBToolResponseTypeJson,
 		Status: core.NBToolResponseStatusSuccess,
 	}, nil
+}
+
+// validateESMetricsQueryShape catches malformed model output that is valid JSON but
+// cannot be an ES query. Keep this narrow: Elasticsearch remains the authority for
+// the full DSL, including provider-specific clauses.
+func validateESMetricsQueryShape(input any) error {
+	body, ok := input.(map[string]any)
+	if !ok || body == nil {
+		return fmt.Errorf("query must be a JSON object")
+	}
+	clause := body
+	if q, hasQuery := body["query"]; hasQuery {
+		var valid bool
+		clause, valid = q.(map[string]any)
+		if !valid || clause == nil {
+			return fmt.Errorf("query clause must be a JSON object")
+		}
+	}
+	for key := range clause {
+		if strings.HasPrefix(key, "bool_") || strings.HasPrefix(key, "query_bool_") {
+			return fmt.Errorf("%s is not an Elasticsearch query clause; use bool with nested filter clauses", key)
+		}
+	}
+	if _, bad := clause["filter"]; bad {
+		return fmt.Errorf("filter must be inside a bool query")
+	}
+	return validateESMetricsBoolClause(clause)
+}
+
+func validateESMetricsBoolClause(clause map[string]any) error {
+	rawBool, hasBool := clause["bool"]
+	if !hasBool {
+		return nil
+	}
+	boolClause, ok := rawBool.(map[string]any)
+	if !ok || boolClause == nil {
+		return fmt.Errorf("bool query must be a JSON object")
+	}
+	for _, name := range []string{"filter", "must", "must_not", "should"} {
+		raw, exists := boolClause[name]
+		if !exists {
+			continue
+		}
+		children := []any{raw}
+		if list, ok := raw.([]any); ok {
+			children = list
+		}
+		for _, child := range children {
+			query, ok := child.(map[string]any)
+			if !ok || query == nil {
+				return fmt.Errorf("bool.%s must contain query objects", name)
+			}
+			if err := validateESMetricsQueryShape(query); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // collectESMetricsErrors returns a joined error text if any result in the batch

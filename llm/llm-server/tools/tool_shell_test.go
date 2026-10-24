@@ -3,13 +3,36 @@ package tools
 import (
 	"errors"
 	"fmt"
+	"nudgebee/llm/security"
 	"testing"
 
 	core "nudgebee/llm/tools/core"
 	"nudgebee/llm/workspace"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+type captureShellWorkspaceManager struct {
+	workspace.WorkspaceManager
+	command string
+}
+
+func (m *captureShellWorkspaceManager) ExecuteOrLazyCreate(_ *security.RequestContext, _, _ string, command string, _ map[string]string) (string, error) {
+	m.command = command
+	return "ok", nil
+}
+
+func TestShellCallDoesNotSourceWritableProfile(t *testing.T) {
+	capture := &captureShellWorkspaceManager{}
+	tool := ShellTool{workspaceManager: capture}
+	ctx := core.NewNbToolContext(security.NewRequestContextForSuperAdmin(), tool, "", "", "conversation", "", "", "", nil, "", core.NBQueryConfig{}, "")
+	response, err := tool.Call(ctx, core.NBToolCallRequest{Command: "printf hello"})
+	require.NoError(t, err)
+	assert.Equal(t, core.NBToolResponseStatusSuccess, response.Status)
+	assert.Equal(t, "printf hello", capture.command)
+	assert.NotContains(t, capture.command, ".nb_profile")
+}
 
 // --- Change 1: grep/find/jq exit 1 reclassified as success-with-no-matches ---
 
@@ -118,6 +141,11 @@ func TestLooksLikeMissingDynamicFile(t *testing.T) {
 		{
 			name:     "missing system-offloaded evidence file",
 			response: "grep: evidence_logs_77c1f690.txt: No such file or directory\n",
+			want:     true,
+		},
+		{
+			name:     "missing structured event evidence file",
+			response: "jq: error: Could not open event_77c1f690_evidence.json: No such file or directory\n",
 			want:     true,
 		},
 		{
@@ -410,7 +438,7 @@ func TestCommandFailure_IsErrWorkspaceCommandFailed(t *testing.T) {
 //   - no_matches semantic — if this drops out, the LLM goes back to
 //     interpreting grep-family exit-1 as a tool failure and retries.
 //     (find and jq were dropped post-review; see TestIsNoMatchExit.)
-//   - Credential auto-injection — if this drops out, the LLM plans
+//   - Automatic credential handling — if this drops out, the LLM plans
 //     `aws configure` / `gcloud auth login` / `gh auth login` steps
 //     that pollute the shared workspace and confuse later turns.
 func TestShellToolDescription_CarriesWorkspaceContract(t *testing.T) {
@@ -421,24 +449,25 @@ func TestShellToolDescription_CarriesWorkspaceContract(t *testing.T) {
 		"per-conversation directory": "must state the cwd scope is per-conversation, not per-account or per-task",
 		"`/tmp/`":                    "must explicitly call out absolute /tmp/... as the cross-conversation leak vector",
 		"shared with other conversations on the same account": "must explain the /tmp/ scope so the LLM treats it as system scratch, not per-chat scratch",
-		"`ls -la`":                    "must point the LLM at the discovery move for tool-saved artifacts",
-		"`.nb_profile`":               "must teach env-var persistence, since each shell_execute is a fresh sh -c",
-		"`kubectl`":                   "must surface the shim CLIs the LLM is supposed to call via shell when no specialized agent fits",
-		"`aws`":                       "must surface the cloud CLIs the LLM is supposed to call via shell when no specialized agent fits",
-		"`gh`":                        "must surface the GitHub CLI (auto-injected token relies on it)",
-		"`python3`":                   "must surface python3, which the LLM uses for arithmetic / quick data shaping",
-		"`logs_*`":                    "must name the tool-saved artifact pattern so cleanup advice has a concrete referent",
-		"evidence chain":              "must justify why tool-saved artifacts must not be deleted",
-		"no_matches":                  "must teach the grep-family exit-1 semantic so the LLM stops retrying empty matches",
-		"auto-injected":               "must teach that cloud + GITHUB_TOKEN credentials are auto-injected, so the LLM does not plan an `aws configure` / `gh auth login` step",
-		"`error_hint`":                "must teach the LLM how to read the structured-error envelope produced by Change 6 wrappers (unbalanced quotes, no-such-file, command-not-found)",
-		"`original_error`":            "must teach that raw stderr is preserved verbatim under original_error so the LLM still sees the underlying signal",
-		"It does NOT apply to `find`": "must clarify the post-review narrowing of the no-match rule — find exit 1 is a real error and is NOT reclassified",
+		"`ls -la`": "must point the LLM at the discovery move for tool-saved artifacts",
+		"environment setup and the command that consumes it in the same call": "must explain how to use environment variables without persistent executable profiles",
+		"`kubectl`":                         "must surface the shim CLIs the LLM is supposed to call via shell when no specialized agent fits",
+		"`aws`":                             "must surface the cloud CLIs the LLM is supposed to call via shell when no specialized agent fits",
+		"`gh`":                              "must surface the GitHub CLI (auto-injected token relies on it)",
+		"`python3`":                         "must surface python3, which the LLM uses for arithmetic / quick data shaping",
+		"`logs_*`":                          "must name the tool-saved artifact pattern so cleanup advice has a concrete referent",
+		"evidence chain":                    "must justify why tool-saved artifacts must not be deleted",
+		"no_matches":                        "must teach the grep-family exit-1 semantic so the LLM stops retrying empty matches",
+		"Credentials handled automatically": "must teach that CLI credentials are provided by their execution boundary, so the LLM does not plan an `aws configure` / `gh auth login` step",
+		"`error_hint`":                      "must teach the LLM how to read the structured-error envelope produced by Change 6 wrappers (unbalanced quotes, no-such-file, command-not-found)",
+		"`original_error`":                  "must teach that raw stderr is preserved verbatim under original_error so the LLM still sees the underlying signal",
+		"It does NOT apply to `find`":       "must clarify the post-review narrowing of the no-match rule — find exit 1 is a real error and is NOT reclassified",
 	}
 	for snippet, why := range required {
 		assert.Contains(t, desc, snippet,
 			"ShellTool.Description() is missing %q — %s", snippet, why)
 	}
+	assert.NotContains(t, desc, ".nb_profile", "writable shell profiles must not be advertised or sourced automatically")
 
 	// --- Negative assertions: claims the execution handler contradicts ---
 	forbidden := map[string]string{

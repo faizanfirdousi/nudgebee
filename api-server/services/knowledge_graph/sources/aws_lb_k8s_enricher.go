@@ -6,7 +6,8 @@ import (
 	"log/slog"
 	"nudgebee/services/cloud"
 	"nudgebee/services/knowledge_graph/core"
-	"nudgebee/services/relay"
+	"nudgebee/services/knowledge_graph/flow_sources"
+	"nudgebee/services/observability"
 	"nudgebee/services/security"
 	"strings"
 	"time"
@@ -29,6 +30,10 @@ const portKeyFormat = "%s:%d"
 // This runs after both aws_source and k8s_source complete, creating cross-source relationships
 type LoadBalancerK8sEnricher struct {
 	logger *slog.Logger
+	// topology serves load-balancer target groups from cloud_resourses. Set per
+	// run in EnrichCrossSources — the registry builds a fresh enricher per graph
+	// build, so this is not shared across tenants. Nil means CLI-only.
+	topology *flow_sources.CloudTopologyStore
 }
 
 // NewLoadBalancerK8sEnricher creates a new LoadBalancerK8sEnricher
@@ -51,6 +56,15 @@ func (e *LoadBalancerK8sEnricher) EnrichCrossSources(
 	allEdges []*core.DbEdge,
 	tenantID string,
 ) ([]*core.DbNode, []*core.DbEdge, error) {
+
+	topology, err := flow_sources.NewCloudTopologyStore(tenantID, e.logger)
+	if err != nil {
+		e.logger.Warn("failed to build cloud topology store, falling back to cloud CLI",
+			"tenant_id", tenantID, "error", err)
+		topology = nil
+	}
+	e.topology = topology
+	defer topology.LogStats("aws_lb_k8s_enricher")
 
 	// 1. Filter LoadBalancer nodes from aws_source
 	lbNodes := make([]*core.DbNode, 0)
@@ -272,7 +286,7 @@ func (e *LoadBalancerK8sEnricher) linkManagedClusterToK8sCluster(
 			},
 			tenantID,
 			n.CloudAccountID,
-			"aws_lb_k8s_enricher",
+			e.GetName(),
 		)
 		newEdges = append(newEdges, edge)
 		e.logger.Debug("linked ManagedCluster → K8s Cluster",
@@ -358,7 +372,7 @@ func (e *LoadBalancerK8sEnricher) linkBackendPoolToWorkload(
 						},
 						tenantID,
 						bpNode.CloudAccountID,
-						"aws_lb_k8s_enricher",
+						e.GetName(),
 					)
 					newEdges = append(newEdges, edge)
 					e.logger.Debug("linked BackendPool → Workload via EC2 node resolution",
@@ -539,37 +553,14 @@ func (e *LoadBalancerK8sEnricher) getTargetGroups(
 	awsAccountID, arn, region string,
 ) ([]map[string]interface{}, error) {
 
-	tgCommand := fmt.Sprintf(
-		"aws elbv2 describe-target-groups --region %s --load-balancer-arn %s --output json",
-		region, arn,
-	)
-
-	tgResp, err := cloud.ExecuteCli(reqCtx, cloud.CloudExecuteCliCommandRequest{
-		AccountID: awsAccountID,
-		Command:   tgCommand,
-	})
+	targetGroups, err := flow_sources.FetchLoadBalancerTargetGroups(reqCtx, awsAccountID, region, arn, e.topology)
 	if err != nil {
 		e.logger.Debug("Failed to query target groups",
 			"arn", arn,
 			"error", err)
 		return nil, err
 	}
-
-	// Parse target groups
-	data, ok := tgResp["data"].(string)
-	if !ok || data == "" || !strings.HasPrefix(strings.TrimSpace(data), "{") {
-		return nil, fmt.Errorf("unexpected or non-JSON response format from cloud collector")
-	}
-
-	var tgData struct {
-		TargetGroups []map[string]interface{} `json:"TargetGroups"`
-	}
-	if err := json.Unmarshal([]byte(data), &tgData); err != nil {
-		e.logger.Debug("Failed to parse target groups response", "error", err)
-		return nil, err
-	}
-
-	return tgData.TargetGroups, nil
+	return targetGroups, nil
 }
 
 // collectTargetIPs collects all target IPs from target groups, resolving EC2 instances to IPs
@@ -722,7 +713,7 @@ func (e *LoadBalancerK8sEnricher) createEdge(
 		properties,
 		tenantID,
 		lbNode.CloudAccountID,
-		"aws_lb_k8s_enricher",
+		e.GetName(),
 	)
 }
 
@@ -914,37 +905,10 @@ func isAlphanumeric(s string) bool {
 	return true
 }
 
-// parsePrometheusResponse extracts the result array from various Prometheus response formats
-// Handles three formats:
-// 1. {"query_name": [...]} - query name as direct key
-// 2. {"data": [...]} - data array wrapper
-// 3. {"data": {"query_name": {"result": [...]}}} - nested structure
-func (e *LoadBalancerK8sEnricher) parsePrometheusResponse(resp map[string]any, queryName string) []interface{} {
-	// Format 1: Query name as direct key
-	if data, ok := resp[queryName].([]interface{}); ok {
-		return data
-	}
-
-	// Format 2: Data array wrapper
-	if data, ok := resp["data"].([]interface{}); ok {
-		return data
-	}
-
-	// Format 3: Nested structure
-	if data, ok := resp["data"].(map[string]interface{}); ok {
-		if queryData, ok := data[queryName].(map[string]interface{}); ok {
-			if result, ok := queryData["result"].([]interface{}); ok {
-				return result
-			}
-		}
-	}
-
-	return nil
-}
-
 // queryPodInfoByIPs queries kube_pod_info from Prometheus to map IPs to pods
 // Returns a map of IP -> podMetricInfo
 func (e *LoadBalancerK8sEnricher) queryPodInfoByIPs(
+	reqCtx *security.RequestContext,
 	k8sAccountID string,
 	targetIPs map[string]bool,
 ) (map[string]*podMetricInfo, error) {
@@ -967,13 +931,17 @@ func (e *LoadBalancerK8sEnricher) queryPodInfoByIPs(
 		"pod_info": fmt.Sprintf(`kube_pod_info{pod_ip=~"%s"}`, ipFilter),
 	}
 
-	// Use UTC: relay.ExecutePrometheus formats the timestamp with a "UTC"
-	// suffix; the value must already be UTC. Defense in depth with the
-	// relay-side fix.
 	endTime := time.Now().UTC()
 	startTime := endTime.Add(-5 * time.Minute)
 
-	resp, err := relay.ExecutePrometheus(k8sAccountID, startTime, endTime, queries, true)
+	resp, err := observability.FetchMetricsQuery(reqCtx, observability.FetchMetricsRequest{
+		AccountId:      k8sAccountID,
+		MetricProvider: "prometheus",
+		Queries:        queries,
+		StartTime:      startTime.UnixMilli(),
+		EndTime:        endTime.UnixMilli(),
+		Instant:        true,
+	})
 	if err != nil {
 		e.logger.Warn("Failed to query kube_pod_info",
 			"k8s_account", k8sAccountID,
@@ -981,7 +949,7 @@ func (e *LoadBalancerK8sEnricher) queryPodInfoByIPs(
 		return nil, err
 	}
 
-	resultArray := e.parsePrometheusResponse(resp, "pod_info")
+	resultArray := observability.PromQLLabels(resp, "pod_info")
 	if len(resultArray) == 0 {
 		e.logger.Debug("No pod info results from Prometheus",
 			"k8s_account", k8sAccountID,
@@ -991,29 +959,13 @@ func (e *LoadBalancerK8sEnricher) queryPodInfoByIPs(
 
 	// Parse results into podMetricInfo structs
 	result := make(map[string]*podMetricInfo)
-	for _, item := range resultArray {
-		pod, ok := item.(map[string]interface{})
-		if !ok {
-			continue
-		}
-
-		metric, ok := pod["metric"].(map[string]interface{})
-		if !ok {
-			continue
-		}
-
-		podIP, _ := metric["pod_ip"].(string)
+	for _, metric := range resultArray {
+		podIP := metric["pod_ip"]
 		if podIP == "" {
 			continue
 		}
 
-		// Extract all labels
-		labels := make(map[string]string)
-		for k, v := range metric {
-			if strVal, ok := v.(string); ok {
-				labels[k] = strVal
-			}
-		}
+		labels := metric
 
 		result[podIP] = &podMetricInfo{
 			PodIP:         podIP,
@@ -1038,6 +990,7 @@ func (e *LoadBalancerK8sEnricher) queryPodInfoByIPs(
 // queryReplicaSetOwners queries kube_replicaset_owner to resolve RS -> Deployment chain
 // Groups queries by namespace for efficiency
 func (e *LoadBalancerK8sEnricher) queryReplicaSetOwners(
+	reqCtx *security.RequestContext,
 	k8sAccountID string,
 	replicaSets map[string]bool, // key: "namespace/rsName"
 ) (map[string]*replicaSetOwner, error) {
@@ -1076,13 +1029,17 @@ func (e *LoadBalancerK8sEnricher) queryReplicaSetOwners(
 		"rs_owner": rsQuery,
 	}
 
-	// Use UTC: relay.ExecutePrometheus formats the timestamp with a "UTC"
-	// suffix; the value must already be UTC. Defense in depth with the
-	// relay-side fix.
 	endTime := time.Now().UTC()
 	startTime := endTime.Add(-5 * time.Minute)
 
-	resp, err := relay.ExecutePrometheus(k8sAccountID, startTime, endTime, queries, true)
+	resp, err := observability.FetchMetricsQuery(reqCtx, observability.FetchMetricsRequest{
+		AccountId:      k8sAccountID,
+		MetricProvider: "prometheus",
+		Queries:        queries,
+		StartTime:      startTime.UnixMilli(),
+		EndTime:        endTime.UnixMilli(),
+		Instant:        true,
+	})
 	if err != nil {
 		e.logger.Warn("Failed to query kube_replicaset_owner",
 			"k8s_account", k8sAccountID,
@@ -1090,24 +1047,14 @@ func (e *LoadBalancerK8sEnricher) queryReplicaSetOwners(
 		return nil, err
 	}
 
-	resultArray := e.parsePrometheusResponse(resp, "rs_owner")
+	resultArray := observability.PromQLLabels(resp, "rs_owner")
 	result := make(map[string]*replicaSetOwner)
 
-	for _, item := range resultArray {
-		rs, ok := item.(map[string]interface{})
-		if !ok {
-			continue
-		}
-
-		metric, ok := rs["metric"].(map[string]interface{})
-		if !ok {
-			continue
-		}
-
-		rsNamespace, _ := metric["namespace"].(string)
-		rsName, _ := metric["replicaset"].(string)
-		ownerKind, _ := metric["owner_kind"].(string)
-		ownerName, _ := metric["owner_name"].(string)
+	for _, metric := range resultArray {
+		rsNamespace := metric["namespace"]
+		rsName := metric["replicaset"]
+		ownerKind := metric["owner_kind"]
+		ownerName := metric["owner_name"]
 
 		if rsNamespace != "" && rsName != "" {
 			key := fmt.Sprintf("%s/%s", rsNamespace, rsName)
@@ -1231,7 +1178,7 @@ func (e *LoadBalancerK8sEnricher) matchByPrometheus(
 	}
 
 	// Step 3: Query Prometheus for pod info
-	podInfoMap, err := e.queryPodInfoByIPs(k8sAccountID, targetIPs)
+	podInfoMap, err := e.queryPodInfoByIPs(reqCtx, k8sAccountID, targetIPs)
 	if err != nil || len(podInfoMap) == 0 {
 		return newNodes, newEdges
 	}
@@ -1245,7 +1192,7 @@ func (e *LoadBalancerK8sEnricher) matchByPrometheus(
 	}
 
 	// Step 5: Query ReplicaSet owners
-	rsOwners, _ := e.queryReplicaSetOwners(k8sAccountID, replicaSetsToQuery)
+	rsOwners, _ := e.queryReplicaSetOwners(reqCtx, k8sAccountID, replicaSetsToQuery)
 
 	// Step 6: Process each pod and create edges/nodes
 	processedOwners := make(map[string]bool)      // Track processed owner keys to avoid duplicates

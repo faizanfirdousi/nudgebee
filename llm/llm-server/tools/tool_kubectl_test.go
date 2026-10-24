@@ -2,9 +2,11 @@ package tools
 
 import (
 	"encoding/json"
+	"nudgebee/llm/tools/core"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestSplitKubectlStderrNoise(t *testing.T) {
@@ -26,6 +28,54 @@ func TestSplitKubectlStderrNoise(t *testing.T) {
 			stdout, stderr := splitKubectlStderrNoise(tc.response)
 			assert.Equal(t, tc.wantStdout, stdout, "stdout mismatch")
 			assert.Equal(t, tc.wantStderr, stderr, "stderr mismatch")
+		})
+	}
+}
+
+// TestContainerDefaultWarning guards against a real production miss: a
+// multi-container pod with no default-container annotation silently returns
+// only one container's logs, and — before this warning existed — nothing in
+// the observation told the LLM another container was never checked. See
+// namespace-233's cart-cache-test repro: the agent concluded "no issues" off
+// a single clean container while the other one carried the actual warning.
+func TestContainerDefaultWarning(t *testing.T) {
+	cases := []struct {
+		name   string
+		stderr string
+		want   string // "" means no warning expected; non-empty checked via Contains
+	}{
+		{"no stderr", "", ""},
+		{"stderr with unrelated noise only", "Warning: some other notice", ""},
+		{
+			"multi-container defaulted — warns and names the others",
+			`Defaulted container "cache" out of: cache, redis`,
+			"redis",
+		},
+		{
+			"single-container pod — kubectl never emits 'out of' with one name, nothing to warn about",
+			`Defaulted container "app" out of: app`,
+			"",
+		},
+		{
+			"three containers — lists every one not fetched",
+			`Defaulted container "main" out of: main, sidecar, exporter`,
+			"sidecar",
+		},
+		{
+			"CRLF line ending and irregular spacing — names parsed without stray whitespace",
+			"Defaulted container \"cache\" out of: cache,  redis \r\n",
+			"(redis)",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := containerDefaultWarning(tc.stderr)
+			if tc.want == "" {
+				assert.Empty(t, got)
+				return
+			}
+			assert.Contains(t, got, tc.want)
+			assert.Contains(t, got, "does not mean the pod is healthy")
 		})
 	}
 }
@@ -106,6 +156,57 @@ func TestKubectlNamespace(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			assert.Equal(t, tc.want, kubectlNamespace(tc.command))
+		})
+	}
+}
+
+func TestInferKubectlVerbType(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  core.ToolRequestType
+	}{
+		{"incomplete describe remains read", "kubectl describe pods -n nudgebee -l", core.ToolRequestTypeRead},
+		{"json wrapped describe", `{"command":"kubectl describe pods -n nudgebee -l"}`, core.ToolRequestTypeRead},
+		{"port-forward is read", "kubectl port-forward svc/my-svc 8080:80", core.ToolRequestTypeRead},
+		{"proxy is read", "kubectl proxy --port=8001", core.ToolRequestTypeRead},
+		{"global flags before read verb", "kubectl --context prod -n nudgebee get pods", core.ToolRequestTypeRead},
+		{"read config current-context", "kubectl config current-context", core.ToolRequestTypeRead},
+		{"read config get-contexts", "kubectl config get-contexts", core.ToolRequestTypeRead},
+		{"read config get-clusters", "kubectl config get-clusters", core.ToolRequestTypeRead},
+		{"read config view", "kubectl config view --minify", core.ToolRequestTypeRead},
+		{"read rollout status deployment/api", "kubectl rollout status deployment/api", core.ToolRequestTypeRead},
+		{"read rollout history deployment/api", "kubectl rollout history deployment/api", core.ToolRequestTypeRead},
+		{"read auth can-i update deployments", "kubectl auth can-i update deployments", core.ToolRequestTypeRead},
+		{"read --context prod auth can-i patch pods", "kubectl --context prod auth can-i patch pods", core.ToolRequestTypeRead},
+		{"fallback config set-context prod", "kubectl config set-context prod", ""},
+		{"fallback config use-context prod", "kubectl config use-context prod", ""},
+		{"fallback rollout restart deployment/api", "kubectl rollout restart deployment/api", ""},
+		{"fallback rollout undo deployment/api", "kubectl rollout undo deployment/api", ""},
+		{"fallback auth reconcile -f roles.yaml", "kubectl auth reconcile -f roles.yaml", ""},
+		{"fallback config --unknown get-contexts", "kubectl config --unknown get-contexts", ""},
+		{"fallback flag before config view", "kubectl config --kubeconfig=foo view", ""},
+		{"create", "kubectl create deployment api --image=nginx", core.ToolRequestTypeCreate},
+		{"update", "kubectl scale deployment api --replicas=2", core.ToolRequestTypeUpdate},
+		{"delete", "kubectl delete pod api-123 -n nudgebee", core.ToolRequestTypeDelete},
+		{"mutating command help is read", "kubectl delete pod --help", core.ToolRequestTypeRead},
+		{"quoted help token does not turn update into read", `kubectl annotate pod api note='run -h now'`, core.ToolRequestTypeUpdate},
+		{"context-dependent exec falls through", "kubectl exec api-123 -- touch /tmp/x", ""},
+		{"exec payload help flag still falls through", "kubectl exec api-123 -- sh -h", ""},
+		{"unknown verb falls through", "kubectl frobnicate pods", ""},
+		{"missing kubectl prefix falls through", "describe pods -n nudgebee", ""},
+		{"other shell command falls through", "rm -rf /tmp/work", ""},
+		{"pipeline falls through", "kubectl get pods | grep api", ""},
+		{"compound read then delete falls through", "kubectl get pods && kubectl delete pod api", ""},
+		{"redirect falls through", "kubectl get pods > pods.txt", ""},
+		{"command substitution falls through", "kubectl get pods -l \"app=$(cat selector)\"", ""},
+		{"quoted jsonpath operator remains read", `kubectl get pods -o 'jsonpath={.items[?(@.status.phase=="Running")]}'`, core.ToolRequestTypeRead},
+		{"quoted pipe remains read", `kubectl get pods -o 'jsonpath={.items[*].metadata.name}{"|"}'`, core.ToolRequestTypeRead},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, InferKubectlVerbType(extractCommandFromToolInput(tt.input)))
 		})
 	}
 }
@@ -234,11 +335,182 @@ func TestKubectlReadsSecretFilesystemPath(t *testing.T) {
 		{"interior backslash bypass in path", "kubectl exec mypod -- cat /var/run/se\\crets/foo", true},
 		{"relative path via serviceaccount marker", "kubectl exec mypod -- sh -c \"cd /var/run && cat secrets/kubernetes.io/serviceaccount/token\"", true},
 		{"kubernetes.io serviceaccount marker on its own", "kubectl exec mypod -- cat kubernetes.io/serviceaccount/token", true},
+		{"dot segment path obfuscation", "kubectl exec mypod -- cat /var/run/./secrets/kubernetes.io/serviceaccount/token", true},
+		{"parent segment path obfuscation", "kubectl exec mypod -- cat /var/run/tmp/../secrets/token", true},
+		{"wildcard path obfuscation", "kubectl exec mypod -- sh -c \"cat /var/run/se*rets/token\"", true},
+		{"cp path normalization", "kubectl cp mypod:/var/run/./secrets/token /tmp/token", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			assert.Equal(t, tc.want, kubectlReadsSecretFilesystemPath(tc.command))
 		})
+	}
+}
+
+func TestValidateKubectlCommandAccess(t *testing.T) {
+	blocked := []string{
+		`kubectl get secret -n nudgebee-oss postgresql -o json | jq '.data | map_values(@base64d)'`,
+		`kubectl get secret -n nudgebee -o json | jq '.items[].metadata.name'`,
+		`kubectl get pods && kubectl get secrets -A`,
+		`kubectl exec api -- cat /var/run/secrets/kubernetes.io/serviceaccount/token`,
+		`sec=secrets && kubectl get $sec`,
+		`kubectl get $(printf secrets)`,
+		"kubectl get `printf secrets`",
+		`kubectl exec api -- cat /var/run/./secrets/token`,
+		`kubectl exec api -- sh -c "cat /var/run/se*rets/token"`,
+		`printf secrets | xargs kubectl get`,
+		`kubectl get pods >/dev/null; printf '\163ecrets' | xargs kubectl get`,
+		`kubectl get pods | cat /var/run/secrets/kubernetes.io/serviceaccount/token`,
+		`kubectl get pods | grep -e. /var/run/./secrets/kubernetes.io/serviceaccount/token`,
+		`kubectl cp local.txt api:/tmp/local.txt`,
+		`kubectl --context k8s-dev cp api:/tmp/result.txt result.txt`,
+	}
+	for _, command := range blocked {
+		require.Error(t, validateKubectlCommandAccess(command), command)
+	}
+
+	require.NoError(t, validateKubectlCommandAccess(`kubectl get pods -A -o json | jq '.items[].metadata.name'`))
+	require.NoError(t, validateKubectlCommandAccess(`kubectl get pods -o 'jsonpath={$.items[*].metadata.name}'`))
+	require.NoError(t, validateKubectlCommandAccess(`kubectl get pods -o json | jq '.items | length'`))
+	require.NoError(t, validateKubectlCommandAccess(`kubectl get pods | grep 'foo bar'`))
+	require.NoError(t, validateKubectlCommandAccess(`kubectl get pods | grep -i nginx`))
+	require.NoError(t, validateKubectlCommandAccess(`kubectl get pods | grep -v Running`))
+	require.NoError(t, validateKubectlCommandAccess(`kubectl get pods | grep -E 'a|b'`))
+	require.NoError(t, validateKubectlCommandAccess(`kubectl get pods | grep -F nginx`))
+	require.NoError(t, validateKubectlCommandAccess(`kubectl get pods -o json | jq -e '.items'`))
+	require.NoError(t, validateKubectlCommandAccess(`kubectl get pods -o json | jq -r '.items[].metadata.name'`))
+	require.NoError(t, validateKubectlCommandAccess(`kubectl get pods | head -20`))
+	require.NoError(t, validateKubectlCommandAccess(`kubectl get pods | wc -l`))
+	require.NoError(t, validateKubectlCommandAccess(`kubectl get pods | grep -A 20 nginx`))
+	require.NoError(t, validateKubectlCommandAccess(`kubectl describe nodes | grep -A 5 "Allocated resources"`))
+	require.NoError(t, validateKubectlCommandAccess(`kubectl get events -n ns | tail -n 20`))
+	require.NoError(t, validateKubectlCommandAccess(`kubectl get pods -A | head -n 20`))
+	// sort and uniq pipeline filters
+	require.NoError(t, validateKubectlCommandAccess(`kubectl get pods | sort`))
+	require.NoError(t, validateKubectlCommandAccess(`kubectl get pods | sort -r`))
+	require.NoError(t, validateKubectlCommandAccess(`kubectl get pods | sort -n`))
+	require.NoError(t, validateKubectlCommandAccess(`kubectl get pods | sort -u`))
+	require.NoError(t, validateKubectlCommandAccess(`kubectl get pods | sort -k 2`))
+	require.NoError(t, validateKubectlCommandAccess(`kubectl get pods | sort -k2`))
+	require.NoError(t, validateKubectlCommandAccess(`kubectl get pods | uniq -c`))
+	require.NoError(t, validateKubectlCommandAccess(`kubectl get pods | uniq -i`))
+	require.NoError(t, validateKubectlCommandAccess(`kubectl get pods | sort | uniq -c`))
+	// awk, cut, tr, and sed pipeline filters
+	require.NoError(t, validateKubectlCommandAccess(`kubectl get pods -A --no-headers -o "custom-columns=NAMESPACE:.metadata.namespace" | sort | uniq -c | awk '{print $2"\t"$1}' | sort`))
+	require.NoError(t, validateKubectlCommandAccess(`kubectl get pods | awk '{print $1}'`))
+	require.NoError(t, validateKubectlCommandAccess(`kubectl get pods | awk '{print $2"\t"$1}'`))
+	require.NoError(t, validateKubectlCommandAccess(`kubectl get pods | awk -F, '{print $1}'`))
+	require.NoError(t, validateKubectlCommandAccess(`kubectl get pods | awk -v OFS='\t' '{print $1, $2}'`))
+	require.NoError(t, validateKubectlCommandAccess(`kubectl get pods | cut -d' ' -f1`))
+	require.NoError(t, validateKubectlCommandAccess(`kubectl get pods | tr -s ' '`))
+	require.NoError(t, validateKubectlCommandAccess(`kubectl get pods | sed 's/foo/bar/'`))
+}
+
+func TestValidateKubectlCommandAccess_Pipelines(t *testing.T) {
+	pipelines := []string{
+		// User's exact 5-stage pipeline
+		`kubectl get pods -A --no-headers -o "custom-columns=NAMESPACE:.metadata.namespace" | sort | uniq -c | awk '{print $2"\t"$1}' | sort`,
+		// Real-world multi-stage inspection pipelines
+		`kubectl get nodes -o wide | awk '$2=="NotReady" {print $1}'`,
+		`kubectl get pods | grep -v Running | grep -v Completed`,
+		`kubectl get pods | column -t`,
+		`kubectl get pods | sed 's/nudgebee-//'`,
+		`kubectl get events -A --sort-by=.metadata.creationTimestamp | tail -n 50 | head -n 10`,
+		`kubectl get pods -n kube-system --no-headers | wc -l`,
+		`kubectl get nodes -o json | jq '.items[].status.addresses[] | select(.type=="InternalIP") | .address'`,
+		`kubectl get pods | tr '[:upper:]' '[:lower:]'`,
+		`kubectl get pods | cut -d' ' -f1 | sort -u`,
+	}
+	for _, pipe := range pipelines {
+		require.NoError(t, validateKubectlCommandAccess(pipe), pipe)
+	}
+}
+
+func TestValidateKubectlCommandAccess_SecretExclusion(t *testing.T) {
+	secretCommands := []string{
+		// Secret-bearing kinds
+		`kubectl get secrets`,
+		`kubectl get secret`,
+		`kubectl get secret my-secret`,
+		`kubectl describe secret my-secret`,
+		`kubectl get secrets -A -o json`,
+		`kubectl get sealedsecrets -A`,
+		`kubectl get externalsecrets -n prod`,
+		`kubectl get secretstores`,
+		`kubectl get clustersecretstores`,
+		`kubectl get secretproviderclasses`,
+		`kubectl get secrets.v1.core`,
+		// Mounted secret filesystem paths
+		`kubectl exec api -- cat /var/run/secrets/kubernetes.io/serviceaccount/token`,
+		`kubectl exec api -- sh -c "cat /run/secrets/token"`,
+		`kubectl cp api:/var/run/secrets/token /tmp/token`,
+		`kubectl cp local.txt api:/tmp/local.txt`,
+		`kubectl --context k8s-dev cp api:/tmp/result.txt result.txt`,
+		`kubectl attach api -- cat /var/lib/kubelet/pods/uuid/volumes/kubernetes.io~secret/token`,
+		// Path obfuscations
+		`kubectl exec api -- cat /var/run/./secrets/token`,
+		`kubectl exec api -- cat /var/run/tmp/../secrets/token`,
+		`kubectl exec api -- cat /var/run/sec""rets/token`,
+		`kubectl exec api -- cat /var/run/se\crets/token`,
+		`kubectl exec api -- sh -c "cat /var/run/se*rets/token"`,
+		// Secret paths inside pipeline filters
+		`kubectl get pods | cat /var/run/secrets/kubernetes.io/serviceaccount/token`,
+		`kubectl get pods | grep -e. /var/run/secrets/token`,
+	}
+	for _, cmd := range secretCommands {
+		err := validateKubectlCommandAccess(cmd)
+		require.Error(t, err, cmd)
+		require.Contains(t, err.Error(), "blocked", cmd)
+	}
+}
+
+func TestValidateKubectlRelayCommand(t *testing.T) {
+	blocked := []string{
+		// Metacharacters and compound execution
+		`kubectl get pods; rm -rf /`,
+		`kubectl get pods && rm -rf /`,
+		`kubectl get pods | sort`,
+		`kubectl get pods > /tmp/out`,
+		`kubectl get pods < /tmp/in`,
+		// Non-kubectl commands
+		`helm list`,
+		`bash -c "kubectl get pods"`,
+		// Secret-bearing kinds
+		`kubectl get secrets`,
+		`kubectl get secret my-secret`,
+		`kubectl describe sealedsecret foo`,
+		`kubectl get externalsecrets`,
+		// Secret paths
+		`kubectl exec api -- cat /var/run/secrets/kubernetes.io/serviceaccount/token`,
+		`kubectl cp api:/var/run/secrets/token /tmp/token`,
+		// Expansions
+		`kubectl get $(echo pods)`,
+		"kubectl get `echo pods`",
+	}
+	for _, command := range blocked {
+		require.Error(t, ValidateKubectlRelayCommand(command), command)
+	}
+
+	allowed := []string{
+		`kubectl get pods -A`,
+		`kubectl describe nodes`,
+		`kubectl get deployments -n prod -o json`,
+		`kubectl logs api-123 -n default --tail 500`,
+		`kubectl get pods -o "custom-columns=NAME:.metadata.name"`,
+	}
+	for _, command := range allowed {
+		require.NoError(t, ValidateKubectlRelayCommand(command), command)
+	}
+}
+
+func TestKubectlCopyIsBlockedAtToolAndRelayBoundaries(t *testing.T) {
+	commands := []string{
+		`kubectl cp local.txt api:/tmp/local.txt`,
+		`kubectl --context k8s-dev cp api:/tmp/result.txt result.txt`,
+	}
+	for _, command := range commands {
+		require.ErrorContains(t, validateKubectlCommandAccess(command), "local paths resolve", command)
+		require.ErrorContains(t, ValidateKubectlRelayCommand(command), "local paths resolve", command)
 	}
 }
 
@@ -363,4 +635,37 @@ func TestWrapKubectlError_EnvelopeShape(t *testing.T) {
 		wrapped := wrapKubectlError("", "kubectl get pods")
 		assert.Equal(t, "", wrapped)
 	})
+}
+
+// TestKubectlBlockMessageGivesTheAgentARepairPath pins that a rejection names the
+// offending construct and states the accepted grammar. The fixture is the exact
+// command an agent sent in a real investigation: the old message said only that
+// the command was "blocked", and the agent abandoned the step rather than
+// retrying with one kubectl call per namespace.
+func TestKubectlBlockMessageGivesTheAgentARepairPath(t *testing.T) {
+	realWorldCommand := `kubectl get namespaces --no-headers -o custom-columns='NAME:.metadata.name' | ` +
+		`grep -i nudgebee | while read ns; do printf '%s\t' "$ns"; ` +
+		`kubectl get pods -n "$ns" --no-headers 2>/dev/null | wc -l; done`
+
+	err := validateKubectlCommandAccess(realWorldCommand)
+	require.Error(t, err)
+	// Names what was wrong...
+	require.Contains(t, err.Error(), "blocked because")
+	// ...and what to send instead, or the agent has nothing to act on.
+	require.Contains(t, err.Error(), "exactly one kubectl command")
+	require.Contains(t, err.Error(), "one kubectl call per target")
+
+	for _, tc := range []struct{ command, wants string }{
+		{`kubectl get pods > /tmp/out`, "a redirection"},
+		{`kubectl get pods; rm -rf /`, "a shell operator"},
+		{`kubectl get pods $(whoami)`, "a subshell or command group"},
+		{`kubectl get pods | `, "an empty pipeline stage is not an allowed filter"},
+		{`kubectl get pods | grep 'unterminated`, "unbalanced quote"},
+		{`helm list`, "does not start with kubectl"},
+	} {
+		err := validateKubectlCommandAccess(tc.command)
+		require.Error(t, err, tc.command)
+		require.Contains(t, err.Error(), tc.wants, tc.command)
+		require.Contains(t, err.Error(), "exactly one kubectl command", tc.command)
+	}
 }

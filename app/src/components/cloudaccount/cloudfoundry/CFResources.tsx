@@ -1,4 +1,4 @@
-import { Box, Typography, Chip } from '@mui/material';
+import { Box, Typography } from '@mui/material';
 import React, { useEffect, useState } from 'react';
 import apiCloudAccount from '@api1/cloud-account';
 import CloudAccountTable from '../CloudAccountTable';
@@ -8,6 +8,7 @@ import { usePagination } from '@hooks/usePagination';
 import TagsCell from '../TagsCell';
 import CloudAccountEvents from '../CloudAccountEvents';
 import type { ICustomTableRow } from '../ec2/types';
+import { Chip } from '@ui/Chip';
 import { ListingLayout } from '@ui/ListingLayout';
 import FilterDropdown from '@ui/FilterDropdown';
 import CustomSearch from '@shared/CustomSearch';
@@ -102,7 +103,11 @@ const mapRouteRow = (item: any, enrichment?: AppEnrichment): ICustomTableRow[] =
         <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: ds.space[1] }}>
           {destApps.map((guid: string) => {
             const appName = enrichment?.appNames?.[guid] || guid.substring(0, 8) + '...';
-            return <Chip key={guid} label={appName} size='small' variant='outlined' sx={{ fontSize: ds.text.caption, height: '20px' }} />;
+            return (
+              <Chip key={guid} size='xs' displayTooltip>
+                {appName}
+              </Chip>
+            );
           })}
         </Box>
       ) : (
@@ -298,6 +303,7 @@ const CFResources = (props: any) => {
   // Fetch all app data for enrichment (org/space app counts, memory, app name lookup for routes)
   useEffect(() => {
     if (!props?.accountId) return;
+    let cancelled = false;
     const PAGE_SIZE = 500;
     const fetchParams = { account_id: props.accountId, serviceName: 'apps', type: [] };
 
@@ -322,6 +328,7 @@ const CFResources = (props: any) => {
 
     fetchAllApps()
       .then((apps) => {
+        if (cancelled) return;
         const orgApps: Record<string, { count: number; instances: number; memoryMB: number }> = {};
         const spaceApps: Record<string, { count: number; memoryMB: number }> = {};
         const appNames: Record<string, string> = {};
@@ -351,8 +358,12 @@ const CFResources = (props: any) => {
         setAppEnrichment({ orgApps, spaceApps, appNames });
       })
       .catch((error: any) => {
+        if (cancelled) return;
         console.error('Failed to fetch app enrichment data:', error);
       });
+    return () => {
+      cancelled = true;
+    };
   }, [props?.accountId, resourceType]);
 
   useEffect(() => {
@@ -386,7 +397,7 @@ const CFResources = (props: any) => {
         setResourcesCount(count);
       })
       .catch((error: any) => {
-        console.error(`Failed to fetch CloudFoundry ${resourceType}:`, error);
+        console.error('Failed to fetch CloudFoundry resources', { resourceType, error });
         setLoading(false);
       });
   };

@@ -71,6 +71,7 @@ type FailurePolicy struct {
 type WorkflowUser struct {
 	ID          string `json:"id"`
 	DisplayName string `json:"display_name"`
+	Username    string `json:"username"`
 }
 
 type Workflow struct {
@@ -103,7 +104,22 @@ type Workflow struct {
 	//
 	// Setting it requires the definition to carry a non-empty LLMDescription and
 	// a manual trigger (see validateWorkflowStructLevel).
-	AIInvocable   bool          `json:"ai_invocable" yaml:"ai_invocable,omitempty"`
+	AIInvocable bool `json:"ai_invocable" yaml:"ai_invocable,omitempty"`
+	// AIAutoApprove lets the AI assistant run this workflow without pausing for
+	// the in-chat confirmation card. Default false — every AI-originated run
+	// asks first unless a human has said otherwise for this specific automation.
+	//
+	// It narrows nothing and widens nothing about WHICH automations the AI may
+	// run: assertAIInvocationAllowed and the calling user's own RBAC apply
+	// exactly as before. It only removes the "are you sure" step, and only for
+	// the automation tool synthesised from this workflow.
+	//
+	// Meaningless without AIInvocable, and validated as such: there is no
+	// "auto-approve an automation the AI may not invoke". The two service paths
+	// that drop AIInvocable (an AI-originated update, and a definition that
+	// stops supporting AI invocation) drop this with it, so the pair can never
+	// come apart.
+	AIAutoApprove bool          `json:"ai_auto_approve" yaml:"ai_auto_approve,omitempty"`
 	CreatedBy     string        `json:"created_by,omitempty" yaml:"created_by,omitempty"`
 	CreatedByUser *WorkflowUser `json:"created_by_user,omitempty" yaml:"created_by_user,omitempty"`
 	UpdatedBy     string        `json:"updated_by,omitempty" yaml:"updated_by,omitempty"`
@@ -331,6 +347,39 @@ type Trigger struct {
 	Layout   *WorkflowTaskLayout `yaml:"layout,omitempty" json:"layout,omitempty"`
 }
 
+// ListenAccounts returns the accounts whose events fire this trigger: params.accounts
+// (event) or params.clusters (optimization), else the workflow's own account.
+func (t Trigger) ListenAccounts(ownAccountID string) []string {
+	key := ""
+	switch t.Type {
+	case WorkflowTriggerEvent:
+		key = "accounts"
+	case WorkflowTriggerOptimization:
+		key = "clusters"
+	default:
+		return []string{ownAccountID}
+	}
+	var accounts []string
+	switch v := t.Params[key].(type) {
+	case []any:
+		for _, item := range v {
+			if s, ok := item.(string); ok && s != "" {
+				accounts = append(accounts, s)
+			}
+		}
+	case []string:
+		for _, s := range v {
+			if s != "" {
+				accounts = append(accounts, s)
+			}
+		}
+	}
+	if len(accounts) == 0 {
+		return []string{ownAccountID}
+	}
+	return accounts
+}
+
 // HasManualTrigger reports whether the definition declares a manual trigger.
 //
 // AI invocation is restricted to manually-triggerable automations: a schedule /
@@ -465,11 +514,27 @@ func (t Trigger) Validate(sl validator.StructLevel) {
 			"event_type": {},
 			"filter":     {},
 			"on":         {},
+			"accounts":   {},
 		}
 		for param := range t.Params {
 			if _, exists := allowedParams[param]; !exists {
 				sl.ReportError(t.Params, "params", "Params", "unsupported_event_param", "Unsupported parameter: "+param)
 				return
+			}
+		}
+
+		// `accounts` lists the accounts whose events fire this trigger (default: own).
+		if val, ok := t.Params["accounts"]; ok && val != nil {
+			arr, arrOk := val.([]any)
+			if !arrOk {
+				sl.ReportError(t.Params, "params", "Params", "accounts_invalid_type", "accounts must be an array")
+				return
+			}
+			for _, item := range arr {
+				if s, strOk := item.(string); !strOk || s == "" {
+					sl.ReportError(t.Params, "params", "Params", "accounts_invalid_item", "accounts items must be non-empty strings")
+					return
+				}
 			}
 		}
 
@@ -707,6 +772,9 @@ type AIWorkflowCandidate struct {
 	// Inputs is the live version's input declaration, so the model can fill
 	// parameters in without a second round trip to workflow_get.
 	Inputs []Input `json:"inputs,omitempty"`
+	// AutoApprove says the author has allowed the assistant to run this
+	// automation without asking the user to confirm first.
+	AutoApprove bool `json:"auto_approve,omitempty"`
 }
 
 // AIInvocableWorkflow pairs a workflow's identity with the definition that would
@@ -715,6 +783,10 @@ type AIInvocableWorkflow struct {
 	ID          string
 	Name        string
 	Description string
+	// AutoApprove mirrors Workflow.AIAutoApprove. It travels with the candidate
+	// because llm-server decides whether to show a confirmation card at the
+	// moment it synthesises the tool, and has no other route to this column.
+	AutoApprove bool
 	// Definition is the LIVE version's definition.
 	Definition WorkflowDefinition
 }
@@ -846,6 +918,43 @@ type WorkflowEventTriggerRule struct {
 	Filter         string          `db:"filter"`
 	TriggerType    WorkflowTrigger `db:"trigger_type"`
 	LifecyclePhase string          `db:"lifecycle_phase"`
+	// ListenAccountID is the account whose events fire this rule; empty means AccountID.
+	ListenAccountID string `db:"listen_account_id"`
+}
+
+// CheckTriggerMatchRequest asks whether a payload would fire a trigger. The trigger
+// is passed in full, not looked up: the builder's copy may not be saved yet.
+type CheckTriggerMatchRequest struct {
+	TriggerType WorkflowTrigger `json:"trigger_type" validate:"required"`
+	// Params as persisted: event -> filter/event_type/on;
+	// optimization -> categories/rule_names/clusters/filter.
+	Params  map[string]any `json:"params"`
+	Payload map[string]any `json:"payload" validate:"required"`
+}
+
+// CheckTriggerMatchGate names the stage that decided the result, so the UI can say
+// which part of the configuration rejected the event.
+type CheckTriggerMatchGate string
+
+const (
+	CheckTriggerGateEventType CheckTriggerMatchGate = "event_type"
+	CheckTriggerGatePhase     CheckTriggerMatchGate = "lifecycle_phase"
+	CheckTriggerGateFilter    CheckTriggerMatchGate = "filter"
+	CheckTriggerGateAccount   CheckTriggerMatchGate = "account"
+)
+
+// CheckTriggerMatchResponse reports whether the payload matched. Error is set
+// when the filter could not be evaluated at all (bad syntax, a filter that
+// panics) — distinct from a filter that evaluated cleanly to false.
+type CheckTriggerMatchResponse struct {
+	Matched bool                  `json:"matched"`
+	Gate    CheckTriggerMatchGate `json:"gate,omitempty"`
+	Reason  string                `json:"reason,omitempty"`
+	Error   string                `json:"error,omitempty"`
+	// Filter is the expression that was evaluated. For optimization triggers
+	// this is the expression built from the dropdowns, which the user never sees
+	// otherwise.
+	Filter string `json:"filter,omitempty"`
 }
 
 // DryRunWorkflowRequest defines the input for a workflow dry-run.

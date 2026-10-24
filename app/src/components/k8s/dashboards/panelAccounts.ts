@@ -1,4 +1,5 @@
 import type { AccountOption, Panel } from '@api1/dashboards';
+import { isDisabledAccount } from './panelProviders';
 
 /** The account-scope half of a panel — what the editor commits on save. */
 export type PanelScope = Pick<Panel, 'account_type' | 'account_ids'>;
@@ -58,6 +59,41 @@ export function panelScope(accountType: string, accountIds: string[]): PanelScop
 }
 
 /** Every account belonging to any of these providers, in account-list order. */
+/** One row of the editor's Accounts picker. */
+export interface AccountPickerOption {
+  label: string;
+  value: string;
+  /** The provider its section is headed by, when the picker spans more than one. */
+  group: string;
+}
+
+/**
+ * The Accounts picker's rows for the chosen provider types.
+ *
+ * Sectioned by provider rather than suffixed with it: "aws-demo (AWS)" repeated
+ * down a mixed list makes the reader parse the same word on every row to find
+ * the two that differ, and the provider is the first thing you filter by when a
+ * panel spans two of them. The section header carries it once, so the row is
+ * back to being just the account's name.
+ *
+ * Sorted by provider then name so the sections have a stable order and the rows
+ * inside one are scannable; the picker re-sorts selected rows to the top of
+ * their own section on open.
+ *
+ * A disabled account stays listed and says so. It is a legitimate thing to leave
+ * on a saved panel while it is temporarily off, and a genuinely disabled OPTION
+ * in a multi-select cannot be deselected once chosen.
+ */
+export function accountPickerOptions(types: string[], accounts: AccountOption[]): AccountPickerOption[] {
+  return accountsOfTypes(types, accounts)
+    .map((o) => ({
+      label: isDisabledAccount(o) ? `${o.label} — disabled` : o.label,
+      value: o.value,
+      group: o.cloud_provider,
+    }))
+    .sort((a, b) => a.group.localeCompare(b.group) || a.label.localeCompare(b.label));
+}
+
 export function accountsOfTypes(types: string[], accounts: AccountOption[]): AccountOption[] {
   const wanted = new Set(types.filter(Boolean));
   return accounts.filter((a) => wanted.has(a.cloud_provider));
@@ -101,22 +137,6 @@ export function deriveAccountTypes(panel: PanelScope, accounts: AccountOption[])
 }
 
 /**
- * Whether a panel names EVERY account of the providers it spans.
- *
- * That is what `panelScopeFromTypes` writes for a multi-provider choice, and it
- * has to be told apart from a genuine hand-picked subset: the first should
- * reopen as "these providers, all accounts" with the account picker empty, the
- * second as the exact accounts that were ticked.
- */
-export function coversAllOfTypes(panel: PanelScope, accounts: AccountOption[]): boolean {
-  if (panel.account_type) return true;
-  const ids = new Set((panel.account_ids || []).filter(Boolean));
-  if (ids.size === 0) return false;
-  const inTypes = accountsOfTypes(deriveAccountTypes(panel, accounts), accounts);
-  return inTypes.length > 0 && inTypes.every((a) => ids.has(a.value));
-}
-
-/**
  * Labels describing what a panel is scoped to, one per chip: the provider for a
  * type-scoped panel, or every account name for an id-scoped one. Empty when
  * nothing resolves.
@@ -150,8 +170,13 @@ export function applyAccountFilter(resolved: AccountOption[], filterIds?: string
  * So a selection that no longer resolves is dropped rather than kept, and the
  * panel falls back to the same default it had before anyone picked anything.
  */
-export function effectiveFilterAccount(selected: string, scoped: AccountOption[]): string {
+export function effectiveFilterAccount(selected: string, scoped: AccountOption[], allAccounts = false): string {
   if (selected && scoped.some((a) => a.value === selected)) return selected;
+  // `allAccounts` panels have somewhere better to fall back to than the first
+  // account: all of them. Leaving the picker empty is what makes "no account
+  // selected" mean every account rather than a silent pick of one — and it is
+  // what a viewer clearing the picker gets back to.
+  if (allAccounts) return '';
   return scoped[0]?.value || '';
 }
 
@@ -171,21 +196,29 @@ export interface PanelQueryAccounts {
  * render (Datadog bills per call), and waiting for a choice left the panel
  * showing nothing at all, which reads as broken.
  *
- * `singleCall` is the exception, and it is the query engine: it takes an
- * account_id LIST and answers in one request, so the two reasons for the rule —
- * cost per call, and a chart with N series of the same line — do not apply.
- * Slicing there is not a safeguard but a silent wrong answer: a "spend by
- * account" table scoped to five accounts would show one account's spend under a
- * title that claims all five. Rollup widgets are the whole point of the summary
- * dashboards, so they must see every account they were scoped to.
+ * `allAccounts` is the exception, and two panel kinds take it.
+ *
+ * The query engine takes an account_id LIST and answers in ONE request, so the
+ * two reasons for the rule — cost per call, and a chart with N series of the
+ * same line — do not apply. Slicing there is not a safeguard but a silent wrong
+ * answer: a "spend by account" table scoped to five accounts would show one
+ * account's spend under a title that claims all five. Rollup widgets are the
+ * whole point of the summary dashboards, so they must see every account.
+ *
+ * A stat panel renders one NUMBER per account rather than one line per account,
+ * so "unreadable chart" does not apply either — four numbers in a card is the
+ * answer, and slicing showed one account's number captioned with that account's
+ * name while silently discarding the other three. It still costs one request
+ * per account, which is why this stays a per-type opt-in rather than the rule:
+ * a stat is a handful of instant queries, a timeseries is not.
  *
  * `filterIds` is a list even though the panel picker is single-select, so the
  * multi-account fan-out in usePanelData stays exercised by a one-account panel
  * and this rule does not have to change if the picker ever gains multi-select.
  */
-export function panelQueryAccounts(scoped: AccountOption[], filterIds?: string[], singleCall = false): PanelQueryAccounts {
+export function panelQueryAccounts(scoped: AccountOption[], filterIds?: string[], allAccounts = false): PanelQueryAccounts {
   if (!filterIds || filterIds.length === 0) {
-    if (singleCall) return { accounts: scoped, autoSelected: false };
+    if (allAccounts) return { accounts: scoped, autoSelected: false };
     // Authoring order, so every viewer of the dashboard auto-lands on the same
     // account rather than on whichever one the account list happened to sort
     // first.

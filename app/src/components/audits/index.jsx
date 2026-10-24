@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { ListingLayout } from '@ui/ListingLayout';
 import FilterDropdown from '@ui/FilterDropdown';
 import CustomDateTimeRangePicker from '@shared/widgets/CustomDateTimeRangePicker';
@@ -28,7 +28,7 @@ import { Link } from '@ui/Link';
 import CodeMirrorDiffViewer from '@shared/viewers/DiffViewer';
 import { CategoryListing, EventListing } from './common';
 import { toast as snackbar } from '@ui/Toast';
-import WidgetCard from '@ui/WidgetCard';
+import { Card } from '@ui/Card';
 
 const headers = [
   'User',
@@ -75,9 +75,9 @@ const CommandTab = (option, query, _row) => {
   }
 
   return (
-    <WidgetCard sx={{ mt: 0 }}>
+    <Card sx={{ padding: 'var(--ds-space-4) var(--ds-space-5)' }}>
       <CommandExecutionDetail commands={Array.isArray(attr.commands) ? attr.commands : []} status={query.data?.event_status} />
-    </WidgetCard>
+    </Card>
   );
 };
 
@@ -98,7 +98,7 @@ const DiffTab = (option, query, _row) => {
   const prevStateString = formatStateForDiff(query.data.event_prev_state);
 
   return (
-    <WidgetCard sx={{ mt: 0 }}>
+    <Card sx={{ padding: 'var(--ds-space-4) var(--ds-space-5)' }}>
       <CodeMirrorDiffViewer
         originalCode={prevStateString}
         newCode={currentStateString}
@@ -115,7 +115,7 @@ const DiffTab = (option, query, _row) => {
           </>
         }
       />
-    </WidgetCard>
+    </Card>
   );
 };
 
@@ -212,7 +212,7 @@ export const AuditsTable = () => {
       );
     } else if (item.event_category == 'GROUPS') {
       return (
-        <Link href={`/user-management?groupId=${item.event_target}#groups`}>
+        <Link href={`/user-management?groupId=${item.event_target}#access-users/groups`}>
           <Text sx={{ color: 'inherit' }} value={item.event_target} showAutoEllipsis />
         </Link>
       );
@@ -282,7 +282,7 @@ export const AuditsTable = () => {
     } else if (item.event_type == 'NOTIFICATION_SLACK_CONFIGURATION_CREATE') {
       return <Text value={`New Slack Configuration Created`} showAutoEllipsis />;
     } else if (item.event_type == 'NOTIFICATION_MS_TEAMS_CONFIGURATION_CREATE') {
-      return <Text value={`New Ms Teams Configuration Created`} showAutoEllipsis />;
+      return <Text value={`New Microsoft Teams Configuration Created`} showAutoEllipsis />;
     } else if (item.event_type == 'NOTIFICATION_GOOGLE_CHAT_CONFIGURATION_CREATE') {
       return <Text value={`Google Chat Configuration Created`} showAutoEllipsis />;
     } else if (item.event_type == 'ROLE_USER_CREATE') {
@@ -346,7 +346,7 @@ export const AuditsTable = () => {
     } else if (item.event_type == 'NOTIFICATION_SLACK_CONFIGURATION_CREATE') {
       return <Text value={`Slack Configuration Updated`} showAutoEllipsis />;
     } else if (item.event_type == 'NOTIFICATION_MS_TEAMS_CONFIGURATION_CREATE') {
-      return <Text value={`Ms Teams Configuration Updated`} showAutoEllipsis />;
+      return <Text value={`Microsoft Teams Configuration Updated`} showAutoEllipsis />;
     } else if (item.event_type == 'NOTIFICATION_GOOGLE_CHAT_CONFIGURATION_CREATE') {
       return <Text value={`Google Chat Configuration Updated`} showAutoEllipsis />;
     } else if (item.event_type == 'ROLE_USER_UPDATE') {
@@ -611,14 +611,16 @@ export const AuditsTable = () => {
     });
   }
 
-  const statusOptions = ['SUCCESS', 'FAILURE'].map((v) => ({ value: v, label: capitalize(v) }));
-  const categoryOptions = [...CategoryListing]
-    .sort((a, b) => a.localeCompare(b))
-    .map((v) => ({ value: v, label: capitalize(v.replaceAll('_', ' ')) }));
-  const eventTypeOptions = [...EventListing]
-    .sort((a, b) => a.localeCompare(b))
-    .map((v) => ({ value: v, label: convertToReadableFormat(v.replaceAll('_', ' ')) }));
-  const actionOptions = ['CREATE', 'UPDATE', 'DELETE', 'READ', 'EXECUTE'].map((v) => ({ value: v, label: capitalize(v) }));
+  const statusOptions = useMemo(() => ['SUCCESS', 'FAILURE'].map((v) => ({ value: v, label: capitalize(v) })), []);
+  const categoryOptions = useMemo(
+    () => [...CategoryListing].sort((a, b) => a.localeCompare(b)).map((v) => ({ value: v, label: capitalize(v.replaceAll('_', ' ')) })),
+    []
+  );
+  const eventTypeOptions = useMemo(
+    () => [...EventListing].sort((a, b) => a.localeCompare(b)).map((v) => ({ value: v, label: convertToReadableFormat(v.replaceAll('_', ' ')) })),
+    []
+  );
+  const actionOptions = useMemo(() => ['CREATE', 'UPDATE', 'DELETE', 'READ', 'EXECUTE'].map((v) => ({ value: v, label: capitalize(v) })), []);
 
   const findOption = (options, value) => (value ? options.find((o) => o.value === value) ?? null : null);
 

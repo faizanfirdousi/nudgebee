@@ -1,6 +1,6 @@
 import * as React from 'react';
 import { useState, useMemo, useEffect, useRef } from 'react';
-import { useTenantBranding, DEFAULT_LOGO, DEFAULT_FAVICON } from '@hooks/useTenantBranding';
+import { useTenantBranding } from '@hooks/useTenantBranding';
 import Box from '@mui/material/Box';
 import { Button, Container, Typography, Menu, MenuItem, IconButton, Popover } from '@mui/material';
 import { useRouter } from 'next/router';
@@ -35,12 +35,16 @@ import {
   AllEventsIcon,
   SearchBlueIcon,
   ServiceMapsIcon,
+  GroupedEventsIcon,
   AutomateBlue,
   dashboardIcon1,
+  SummaryIconBlue,
   PlayCircleIcon,
   OptimizeSummaryIcon,
-  RecommendationIcon,
+  DollarIcon,
   RecommendationResolutionIcon,
+  SecuritytoolsBlue,
+  ToolIconBlue,
   LLMConsumptionIcon,
   IntegrationsIcon,
   CloudAccountIcon,
@@ -48,22 +52,22 @@ import {
   TicketBlueIcon,
   UserIconOutline,
   User1,
-  UserGroupIcon,
-  AuditIcon,
   NotificationIcon1,
   ApplicationsIcon,
+  SettingsIcon,
+  AgentIcon,
 } from '@assets';
 import Header1 from '@shared/header/Header1';
 import ErrorBoundary from '@shared/ErrorBoundary';
 import SafeIcon from '@shared/icons/SafeIcon';
 import FirstLoginTour from '@components/onboarding/FirstLoginTour';
+import PendingAgentInstallBanner from '@components/integrations/PendingAgentInstallBanner';
 import SectionFirstVisitTour from '@components/onboarding/SectionFirstVisitTour';
 import Tooltip from '@ui/Tooltip';
-import TenantSettings from '@shared/settings/TenantSettings';
 import ApiTokens from '@shared/settings/ApiTokens';
-import { toast as snackbar } from '@ui/Toast';
 import { tenantSwitcher } from '@lib/tenantSwitcherService';
 import { useData } from '@context/DataContext';
+import { useSetupGate, SETUP_ROUTE } from '@context/SetupGateContext';
 import { createGetMenuItem, generateMenuItems } from './UserMenuItems';
 import NubiBrainNav from './NubiBrainNav';
 import { ds } from 'src/utils/colors';
@@ -157,11 +161,20 @@ const resolveNavPath = (path, router) => (path.includes('#') ? path : getDynamic
 /**
  * Navigating out of Troubleshoot's Knowledge Graph tab with next/router is
  * blocked by the heavy elkjs layout running inside it, so leave that tab with a
- * full document load instead.
+ * full document load instead — but only when the target is a genuinely
+ * different page. A same-page target (another /troubleshoot hash, e.g. the
+ * sidebar's own Investigations/Analytics/All Events sub-items) is a
+ * hash-only URL: `location.assign` does a fragment navigation for those, not
+ * a load, so the address bar updates but next/router (and the tab effect in
+ * pages/troubleshoot/index.jsx keyed on router.asPath) never sees it, leaving
+ * Knowledge Graph on screen until a second click (#38250). Those targets
+ * already unmount Knowledge Graph via ordinary React state, so router.push is
+ * safe for them.
  */
 const navigateTo = (router, targetPath) => {
   const onKnowledgeGraphTab = router.pathname === '/troubleshoot' && typeof window !== 'undefined' && window.location.hash === '#kg';
-  if (onKnowledgeGraphTab) {
+  const leavingPage = targetPath.split('#')[0].split('?')[0] !== router.pathname;
+  if (onKnowledgeGraphTab && leavingPage) {
     window.location.assign(targetPath);
     return;
   }
@@ -309,11 +322,14 @@ const SideDrawerButton = ({ item = {}, isFlyoutOpen = false, onHoverOpen, onHove
 
 const PageLayout = ({ children }) => {
   const router = useRouter();
+  // A tenant with no cloud accounts is held on the Setup Center — see
+  // SetupGateContext. Dimming the rail is the visible half; the redirect in
+  // that provider is what actually enforces it.
+  const { locked: navLocked } = useSetupGate();
 
   // State
   const [anchorElUser, setAnchorElUser] = useState(null);
   const [openSwitchAccount, setOpenSwitchAccount] = useState(false);
-  const [openSettings, setOpenSettings] = useState(false);
   const [openApiTokens, setOpenApiTokens] = useState(false);
   // Which nav item's sub-section flyout is open, and the rail button it hangs
   // off. One flyout for the whole rail, re-anchored per item.
@@ -342,15 +358,17 @@ const PageLayout = ({ children }) => {
   const { selectedCluster } = useData();
   const { baseTitle, logoUrl: brandingLogoUrl, faviconUrl: brandingFaviconUrl, loading: brandingLoading } = useTenantBranding();
 
-  // Logo: derived inline from branding. The `!brandingLoading` gate on the <img> below holds the
-  // render until the config resolves, so logoSrc is only ever read with the final value — branded
-  // logo when set, DEFAULT_LOGO only for the default tenant (empty logoUrl). No mirrored state
-  // (which lagged a render and flashed the default logo) and no onError fallback to DEFAULT_LOGO
-  // (on a branded tenant that would leak the Nudgebee logo; a broken URL should surface, not swap).
-  const logoSrc = brandingLogoUrl || DEFAULT_LOGO;
-
-  // Favicon from config, fallback to default
-  const favicon = brandingFaviconUrl || DEFAULT_FAVICON;
+  // Logo and favicon come from the branding config, with no house-brand fallback.
+  // The `!brandingLoading` gates below hold both until the config resolves, so
+  // these are only ever read with the final value; when the config resolves
+  // without one, nothing renders rather than the Nudgebee asset. Every
+  // theme.json — including branding/default — supplies both, so a configured
+  // deployment always has a value here; a blank means the config genuinely has
+  // none, and painting Nudgebee over that is how a partner's favicon silently
+  // became the house one. Also no onError fallback, for the same reason: a
+  // broken URL should surface, not swap to another brand.
+  const logoSrc = brandingLogoUrl;
+  const favicon = brandingFaviconUrl;
 
   const avatarSubMenu = useMemo(() => {
     return generateMenuItems(session?.hasMultipleTenantAccess || false);
@@ -385,11 +403,25 @@ const PageLayout = ({ children }) => {
     const optimizeSections = [
       { text: 'Summary', path: '/optimise#summary', id: 'sidenav-optimise-summary', module: 'recommendations', icon: OptimizeSummaryIcon },
       {
-        text: 'Recommendations',
-        path: '/optimise#recommendations',
+        text: 'Cost',
+        path: '/optimise#cost',
         id: 'sidenav-optimise-recommendations',
         module: 'recommendations',
-        icon: RecommendationIcon,
+        icon: DollarIcon,
+      },
+      {
+        text: 'Configuration',
+        path: '/optimise#configuration',
+        id: 'sidenav-optimise-configuration',
+        module: 'recommendations',
+        icon: ToolIconBlue,
+      },
+      {
+        text: 'Security',
+        path: '/optimise#security',
+        id: 'sidenav-optimise-security',
+        module: 'recommendations',
+        icon: SecuritytoolsBlue,
       },
       {
         text: 'Resolutions',
@@ -400,7 +432,7 @@ const PageLayout = ({ children }) => {
       },
       { text: 'Auto Optimize', path: '/optimise#auto-optimize', id: 'sidenav-optimise-auto-optimize', module: 'autooptimize', icon: AutomateBlue },
       ...(llmAnalyserEnabled && canReadAccount
-        ? [{ text: 'LLM Analyser', path: '/optimise#cost-analyser', id: 'sidenav-optimise-cost-analyser', icon: LLMConsumptionIcon }]
+        ? [{ text: 'LLM Analyser', path: '/optimise#llm-analyser', id: 'sidenav-optimise-cost-analyser', icon: LLMConsumptionIcon }]
         : []),
       // `llm` is a TENANT-scoped module (@lib/permissionCatalog): the gateway usage
       // API resolves the tenant from the session and takes no account, so the
@@ -468,7 +500,14 @@ const PageLayout = ({ children }) => {
         subItems: [
           { text: 'All Events', path: '/troubleshoot#all-events', id: 'sidenav-troubleshoot-all-events', icon: AllEventsIcon },
           { text: 'Investigations', path: '/troubleshoot#investigations', id: 'sidenav-troubleshoot-investigations', icon: SearchBlueIcon },
+          {
+            text: 'Event Resolutions',
+            path: '/troubleshoot#event-resolutions',
+            id: 'sidenav-troubleshoot-event-resolutions',
+            icon: RecommendationResolutionIcon,
+          },
           { text: 'Knowledge Graph', path: '/troubleshoot#kg', id: 'sidenav-troubleshoot-kg', icon: ServiceMapsIcon },
+          { text: 'Analytics', path: '/troubleshoot#analytics', id: 'sidenav-troubleshoot-analytics', icon: GroupedEventsIcon },
         ],
       },
       {
@@ -536,15 +575,26 @@ const PageLayout = ({ children }) => {
         text: 'Admin',
         id: 'admin-sidenav',
         subItems: [
-          { text: 'Users', path: '/user-management#users', id: 'sidenav-admin-users', module: 'users', icon: User1 },
-          { text: 'Groups', path: '/user-management#groups', id: 'sidenav-admin-groups', module: 'usergroups', icon: UserGroupIcon },
-          { text: 'Audits', path: '/user-management#audits', id: 'sidenav-admin-audits', module: 'audits', icon: AuditIcon },
+          // The admin landing dashboard — first here and first in the page's tab
+          // strip, so it is the default at /user-management. No `module`: it is
+          // visible to anyone who can see the Admin nav item at all.
           {
-            text: 'Notifications',
-            path: '/user-management#notifications',
-            id: 'sidenav-admin-notifications',
-            module: 'notifications',
-            icon: NotificationIcon1,
+            text: 'Overview',
+            path: '/user-management#overview',
+            id: 'sidenav-admin-overview',
+            icon: SummaryIconBlue,
+          },
+          // Users, Groups, Ownership, Roles and Audit Log all live under this one
+          // Access & Users tab as sub-tabs (#access-users, #access-users/groups,
+          // #access-users/ownership, #access-users/roles, #access-users/audit-log)
+          // — this flyout carries only top-level tabs (see "Keeping Global Search
+          // in sync" in app/CLAUDE.md), so they get one row, not five.
+          {
+            text: 'Access & Users',
+            path: '/user-management#access-users',
+            id: 'sidenav-admin-access-users',
+            modules: ['users', 'usergroups', 'ownership', 'audits'],
+            icon: User1,
           },
           {
             text: 'Integrations',
@@ -553,24 +603,50 @@ const PageLayout = ({ children }) => {
             module: 'integrations',
             icon: IntegrationsIcon,
           },
-          { text: 'Ownership', path: '/user-management#ownership', id: 'sidenav-admin-ownership', module: 'ownership', icon: UserGroupIcon },
-          // Admin sections registered by extensions (Roles & Permissions, Billing)
-          // rather than hardcoded above. Read from the SAME registry the
-          // /user-management page builds its tabs from, in the same order, so the
-          // flyout cannot drift from the tab list — the Roles tab had existed for
-          // a while with no way to reach it from the sidebar.
+          {
+            text: 'Notification Rules',
+            path: '/user-management#notification-rules',
+            id: 'sidenav-admin-notifications',
+            module: 'notifications',
+            icon: NotificationIcon1,
+          },
+          // Agents, Tools & MCP, Functions, Providers, Gateway, Egress Filter,
+          // Budgets & Limits, Memory Policy and RCA Format all live under this
+          // one AI & Tools tab as sub-tabs (docs/ia-consolidation-plan.md, PR 3)
+          // — same "one row, not nine" rule as Access & Users above.
+          {
+            text: 'AI & Tools',
+            path: '/user-management#ai-tools',
+            id: 'sidenav-admin-ai-tools',
+            modules: ['ai', 'integrations', 'llm', 'egressfilter'],
+            icon: AgentIcon,
+          },
+          {
+            text: 'Tenant Settings',
+            path: '/user-management#tenant-settings',
+            id: 'sidenav-admin-tenant-settings',
+            module: 'tenants',
+            icon: SettingsIcon,
+          },
+          // Admin sections registered by extensions (Billing) rather than
+          // hardcoded above. Read from the SAME registry the /user-management
+          // page builds its tabs from, so the flyout cannot drift from the tab
+          // list for anything that's still top-level. Roles is excluded — it
+          // merges into Access & Users as a sub-tab (see filterOptions in
+          // user-management/index.jsx), same reason Ownership isn't listed here
+          // either.
           //
           // No `module` is set on purpose: these self-gate via their own
           // shouldShow(session) and are HIDDEN when it fails, whereas the base
-          // sections above always exist and render disabled-with-a-tooltip. Roles
-          // has no meaningful disabled state — a tenant without the CUSTOM_ROLES
-          // feature has nothing to administer there at all.
-          ...userManagementFilters(session).map((f) => ({
-            text: f.name,
-            path: `/user-management#${f.fragment}`,
-            id: `sidenav-admin-${f.fragment}`,
-            icon: f.icon,
-          })),
+          // sections above always exist and render disabled-with-a-tooltip.
+          ...userManagementFilters(session)
+            .filter((f) => f.fragment !== 'roles')
+            .map((f) => ({
+              text: f.name,
+              path: `/user-management#${f.fragment}`,
+              id: `sidenav-admin-${f.fragment}`,
+              icon: f.icon,
+            })),
         ],
       });
     }
@@ -670,7 +746,6 @@ const PageLayout = ({ children }) => {
   const getMenuItem = createGetMenuItem({
     setAnchorElUser,
     setOpenSwitchAccount,
-    setOpenSettings,
     setOpenApiTokens,
     handleSubMenuClick,
   });
@@ -680,8 +755,16 @@ const PageLayout = ({ children }) => {
       {isPlainLayout ? (
         <>
           <Head>
-            {!brandingLoading && <link rel='icon' href={favicon} />}
-            <title>{baseTitle}</title>
+            {!brandingLoading && favicon && <link rel='icon' href={favicon} />}
+            {
+              /* Gated like the favicon and the logo above. Ungated, this painted
+                DEFAULT_TITLE ("Nudgebee") for the frames before the branding
+                config resolved, so a partner deployment visibly flashed the
+                Nudgebee name in the browser tab on every page load. No title
+                until it resolves is the intended trade — the tab shows the URL
+                for an instant instead of the wrong brand. */
+              !brandingLoading && <title>{baseTitle}</title>
+            }
           </Head>
           {/* Mounted here too so the AccountGuard "Switch Tenant" CTA works
               on plain-layout pages (e.g. ask-nudgebee). */}
@@ -691,8 +774,8 @@ const PageLayout = ({ children }) => {
       ) : (
         <>
           <Head>
-            {!brandingLoading && <link rel='icon' href={favicon} />}
-            <title>{baseTitle}</title>
+            {!brandingLoading && favicon && <link rel='icon' href={favicon} />}
+            {/* Gated for the same reason as the plain-layout branch above. */ !brandingLoading && <title>{baseTitle}</title>}
           </Head>
           {/* Rendered outside <Head> — next/head only walks immediate children
               for tag extraction, so a slot returning a wrapper Component (vs.
@@ -700,16 +783,6 @@ const PageLayout = ({ children }) => {
               afterInteractive strategy injects itself regardless of position. */}
           {renderSlot('LayoutHeadExtras')}
 
-          <TenantSettings
-            open={openSettings}
-            title={'Tenant Settings'}
-            onClose={(_, msg) => {
-              setOpenSettings(false);
-              if (msg === 'show') {
-                snackbar.success('Tenant Settings saved successfully');
-              }
-            }}
-          />
           <ApiTokens open={openApiTokens} title={'API Tokens'} onClose={() => setOpenApiTokens(false)} />
           <LayoutHeaderActionSlot open={openSwitchAccount} title={'Switch Tenant'} onClose={handleSwitchAccountClose} />
 
@@ -718,33 +791,57 @@ const PageLayout = ({ children }) => {
               <Box sx={{ width: COLLAPSED_WIDTH, ...styles.sideDrawer }}>
                 <Box className='inner-side-drawer'>
                   <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'center', marginTop: 'var(--ds-space-3)' }}>
-                    <Link href={homeUrl} passHref>
-                      {/* eslint-disable-next-line @next/next/no-img-element */}
-                      {/* oxlint-disable nextjs/no-img-element -- dynamic branding URL; next/image requires static domain allowlist */}
-                      {!brandingLoading && (
-                        <img
-                          src={logoSrc}
-                          alt={baseTitle}
-                          aria-label={baseTitle}
-                          width={50}
-                          height={40}
-                          style={{ maxWidth: ds.space.mul(0, 25), maxHeight: ds.space.mul(1, 10), objectFit: 'contain' }}
-                        />
-                      )}
-                      {/* oxlint-enable nextjs/no-img-element */}
-                    </Link>
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    {/* oxlint-disable nextjs/no-img-element -- dynamic branding URL; next/image requires static domain allowlist */}
+                    {!brandingLoading &&
+                      logoSrc &&
+                      (() => {
+                        const logo = (
+                          <img
+                            src={logoSrc}
+                            alt={baseTitle}
+                            aria-label={baseTitle}
+                            width={50}
+                            height={40}
+                            style={{ maxWidth: ds.space.mul(0, 25), maxHeight: ds.space.mul(1, 10), objectFit: 'contain' }}
+                          />
+                        );
+                        // While gated, the logo is a mark, not a link. It sat outside the
+                        // locked wrapper below, so clicking it started a navigation the
+                        // route guard then reversed — a visible flash, and the one place
+                        // "nothing is clickable" visibly wasn't true.
+                        //
+                        // Dropped rather than dimmed: the rail is greyed because those are
+                        // destinations you cannot reach yet, but a faded brand mark just
+                        // reads as a broken page.
+                        return navLocked ? (
+                          logo
+                        ) : (
+                          <Link href={homeUrl} passHref>
+                            {logo}
+                          </Link>
+                        );
+                      })()}
+                    {/* oxlint-enable nextjs/no-img-element */}
                   </Box>
                   <Box sx={styles.separator} />
 
                   {menuItems.map((item, idx) => (
                     <React.Fragment key={item.id || `${item.text}-${idx}`}>
+                      {/* A separator's own sx (styles.subSeparator/styles.separator) draws a
+                          `display: 'list-item'` rule with a fixed, left-aligned width — it needs
+                          to stay a direct child of .inner-side-drawer to render at that position.
+                          Wrapping the whole .map() output (separators included) in the dimming
+                          Box below used to push every separator to the left edge instead. */}
                       {['Troubleshoot', 'Infra', 'Tickets'].includes(item.text) && <Box sx={styles.subSeparator} />}
-                      <SideDrawerButton
-                        item={item}
-                        isFlyoutOpen={!!flyout && flyout.item.id === item.id}
-                        onHoverOpen={openFlyout}
-                        onHoverClose={scheduleFlyoutClose}
-                      />
+                      <Box sx={navLocked ? { pointerEvents: 'none', opacity: 0.35, filter: 'grayscale(1)' } : undefined}>
+                        <SideDrawerButton
+                          item={item}
+                          isFlyoutOpen={!!flyout && flyout.item.id === item.id}
+                          onHoverOpen={navLocked ? undefined : openFlyout}
+                          onHoverClose={navLocked ? undefined : scheduleFlyoutClose}
+                        />
+                      </Box>
                     </React.Fragment>
                   ))}
 
@@ -757,13 +854,32 @@ const PageLayout = ({ children }) => {
                   />
 
                   {/* Auto-launches the first-login sidebar walkthrough once; renders nothing. */}
-                  <FirstLoginTour />
+                  {/* Both tours point at rail items — pointless while the rail is
+                      `pointer-events: none` at 35% opacity, and worse than pointless if a
+                      tour library still manages to focus/scroll to a target a user cannot
+                      click. Held until the rail is live.
+
+                      `pathname !== SETUP_ROUTE` too, not just `!navLocked` — the same gap
+                      PendingAgentInstallBanner below is guarded against: SetupCenter's own
+                      account-create callback can flip navLocked false while the user is
+                      still on /setup mid-wizard (see that banner's comment for the exact
+                      mechanism). Without the route check, the welcome card can pop up over
+                      the Setup Center's own "waiting for agent" panel — and since
+                      PREFERENCE_APP_TOUR_SEEN latches the instant the user clicks "Let's go"
+                      (FirstLoginTour.jsx), clicking through there burns the one-shot flag
+                      before the user ever reaches a finished dashboard. */}
+                  {!navLocked && router.pathname !== SETUP_ROUTE && <FirstLoginTour />}
 
                   {/* Offers a section's guided tour on first visit (Troubleshoot); renders nothing. */}
-                  <SectionFirstVisitTour />
+                  {!navLocked && router.pathname !== SETUP_ROUTE && <SectionFirstVisitTour />}
 
                   <Box sx={styles.userMenuContainer}>
-                    <Box sx={{ mb: 'var(--ds-space-3)' }}>
+                    {/* b-Cortex/AI & Tools opens a modal, not a navigation, so the
+                        route guard's redirect never catches a click here while
+                        gated — it needs its own lock, same treatment as the rail
+                        above. The account menu below stays reachable on purpose:
+                        signing out must work regardless of gate state. */}
+                    <Box sx={{ mb: 'var(--ds-space-3)', ...(navLocked ? { pointerEvents: 'none', opacity: 0.35, filter: 'grayscale(1)' } : {}) }}>
                       <NubiBrainNav surface='dark' />
                     </Box>
                     <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
@@ -859,6 +975,24 @@ const PageLayout = ({ children }) => {
                 }}
               >
                 <Container maxWidth={false} sx={{ maxWidth: ds.space.mul(0, 900) }} style={{ paddingInline: 0 }}>
+                  {/* Reminder for a Kubernetes account whose install command was never
+                      run. Lives here, not on one page: the add-cluster modal is reachable
+                      from the header everywhere, so the reminder has to follow the user.
+
+                      Suppressed on /setup specifically — not on `navLocked`, which is not
+                      the same condition. The K8s wizard's own account-create callback
+                      (`refreshReadiness` in SetupCenter) re-reads the gate the instant step
+                      1 submits, so `navLocked` flips false while the user is still on
+                      /setup watching step 2 (the install command, waiting for the agent).
+                      Gating on navLocked would let this banner render at exactly that
+                      moment, stacked on the card's own "waiting for agent" state for the
+                      same account. The route is the one thing that stays true for as long
+                      as the duplicate would. */}
+                  {router.pathname !== SETUP_ROUTE && (
+                    <ErrorBoundary resetKey={router.asPath}>
+                      <PendingAgentInstallBanner />
+                    </ErrorBoundary>
+                  )}
                   <ErrorBoundary resetKey={router.asPath}>{children}</ErrorBoundary>
                 </Container>
               </Box>

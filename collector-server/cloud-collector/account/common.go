@@ -23,6 +23,7 @@ func getAccount(ctx *security.RequestContext, accountId string) (providers.Accou
 	query := `
 		SELECT
 			assume_role,
+			external_id,
 			access_key,
 			access_secret,
 			region,
@@ -42,13 +43,13 @@ func getAccount(ctx *security.RequestContext, accountId string) (providers.Accou
 	}
 
 	var (
-		assumeRole, accessKey, accessSecret, region, cloudProvider, accountNumber, accountName *string
-		data                                                                                   sql.NullString
-		accountTenant                                                                          string
-		parentAccountId                                                                        sql.NullString
+		assumeRole, externalId, accessKey, accessSecret, region, cloudProvider, accountNumber, accountName *string
+		data                                                                                               sql.NullString
+		accountTenant                                                                                      string
+		parentAccountId                                                                                    sql.NullString
 	)
 
-	err = r.Scan(&assumeRole, &accessKey, &accessSecret, &region, &data, &cloudProvider, &accountNumber, &accountName, &accountTenant, &parentAccountId)
+	err = r.Scan(&assumeRole, &externalId, &accessKey, &accessSecret, &region, &data, &cloudProvider, &accountNumber, &accountName, &accountTenant, &parentAccountId)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return providers.Account{}, "", fmt.Errorf("account with id %s not found", accountId)
@@ -95,6 +96,7 @@ func getAccount(ctx *security.RequestContext, accountId string) (providers.Accou
 	acnt := providers.Account{
 		ID:              accountId,
 		AssumeRole:      assumeRole,
+		ExternalId:      externalId,
 		AccessKey:       accessKey,
 		AccessSecret:    accessSecret,
 		Region:          region,
@@ -169,7 +171,18 @@ func reconcileExternalResourceIds(tx common.DatabaseManagerTx, accountId string,
 	if len(erids) == 0 {
 		return nil
 	}
-	const reconcileQuery = `
+	reconcileQuery := reconcileExternalResourceIdsQuery(`SELECT * FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[])
+					AS t(resourse_id, type, region, service_name, erid)`)
+	_, err := tx.Exec(reconcileQuery, accountId,
+		pq.Array(rids), pq.Array(types), pq.Array(regions), pq.Array(services), pq.Array(erids))
+	return err
+}
+
+// reconcileExternalResourceIdsQuery returns the reconcile UPDATE (see
+// reconcileExternalResourceIds) over source, a query yielding the columns
+// (resourse_id, type, region, service_name, erid) with the account id as $1.
+func reconcileExternalResourceIdsQuery(source string) string {
+	return `
 		WITH candidates AS (
 			SELECT c.id, v.erid,
 				ROW_NUMBER() OVER (
@@ -178,8 +191,7 @@ func reconcileExternalResourceIds(tx common.DatabaseManagerTx, accountId string,
 				) AS rn
 			FROM cloud_resourses c
 			JOIN (
-				SELECT * FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[])
-					AS t(resourse_id, type, region, service_name, erid)
+				` + source + `
 			) v
 				ON c.account = $1
 				AND LOWER(c.resourse_id) = LOWER(v.resourse_id)
@@ -197,24 +209,48 @@ func reconcileExternalResourceIds(tx common.DatabaseManagerTx, accountId string,
 		FROM candidates
 		WHERE c.id = candidates.id
 			AND candidates.rn = 1`
-	_, err := tx.Exec(reconcileQuery, accountId,
-		pq.Array(rids), pq.Array(types), pq.Array(regions), pq.Array(services), pq.Array(erids))
-	return err
 }
 
 func getUsageDataInternal(ctx *security.RequestContext, accountId string, month time.Month, year int) (providers.GetUsageReportResponse, providers.Account, error) {
+	account, cloudProvider, err := resolveUsageProvider(ctx, accountId)
+	if err != nil {
+		return providers.GetUsageReportResponse{}, providers.Account{}, err
+	}
+	report, err := cloudProvider.GetUsageReport(ctx, account, month, year)
+	return report, account, err
+}
+
+func resolveUsageProvider(ctx *security.RequestContext, accountId string) (providers.Account, providers.CloudProvider, error) {
 	account, _, err := getAccount(ctx, accountId)
 	if err != nil {
 		ctx.GetLogger().Error("unable to fetch account", "error", err, "accountId", accountId)
-		return providers.GetUsageReportResponse{}, providers.Account{}, err
+		return providers.Account{}, nil, err
 	}
 	// Use lowercase provider name for provider registry lookup.
 	cloudProvider, ok := providers.GetProvider(strings.ToLower(account.CloudProvider))
 	if !ok {
-		return providers.GetUsageReportResponse{}, providers.Account{}, fmt.Errorf("provider not found")
+		return providers.Account{}, nil, fmt.Errorf("provider not found")
+	}
+	return account, cloudProvider, nil
+}
+
+// streamUsageReport hands the account's cost report for the month to emit in
+// batches. Providers that implement providers.UsageReportStreamer stream it;
+// the others return the report whole and it is handed over in batches.
+func streamUsageReport(ctx *security.RequestContext, cloudProvider providers.CloudProvider, account providers.Account, month time.Month, year int, emit func([]providers.UsageReportItem) error) error {
+	if streamer, ok := cloudProvider.(providers.UsageReportStreamer); ok {
+		return streamer.StreamUsageReport(ctx, account, month, year, emit)
 	}
 	report, err := cloudProvider.GetUsageReport(ctx, account, month, year)
-	return report, account, err
+	if err != nil {
+		return err
+	}
+	for start := 0; start < len(report.Items); start += providers.UsageReportBatchSize {
+		if err := emit(report.Items[start:min(start+providers.UsageReportBatchSize, len(report.Items))]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // normalizeCloudProviderName normalizes provider names to match cloud_provider_type enum values

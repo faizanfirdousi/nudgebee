@@ -42,7 +42,7 @@ func init() {
 // prompt (agent_gcp_lean). Every specialist (databases, kubectl, other clouds,
 // github, tickets, …) is dropped from context and reached on-demand via
 // search_tools + delegate_agent. Everything else — including the answer critique
-// — runs through the same ReAct3 planner under the standard gates.
+// — runs through the runtime-selected ReAct planner under the standard gates.
 type GcpOrchestratorAgent struct {
 	accountId string
 }
@@ -57,11 +57,11 @@ func newGcpOrchestratorAgent(accountId string) core.NBAgent {
 func (a *GcpOrchestratorAgent) GetName() string { return AgentGcpOrchestratorName }
 
 func (a *GcpOrchestratorAgent) GetNameAliases() []string {
-	return []string{"gcp debug", "google_cloud_debug", "gcp_debug"}
+	return []string{"GCP Troubleshooter", "gcp debug", "google_cloud_debug", "gcp_debug"}
 }
 
 func (a *GcpOrchestratorAgent) GetDescription() string {
-	return `Lean-loop GCP SRE/DevOps troubleshooting orchestrator: minimal principle-level prompt, direct gcloud_execute, specialists reached on-demand via search_tools + delegate_agent.`
+	return `Lean-loop GCP SRE/DevOps troubleshooting orchestrator: workspace-based GCP reads and local analysis, approval-aware direct GCP mutations, and specialists reached on-demand via search_tools + delegate_agent.`
 }
 
 func (a *GcpOrchestratorAgent) GetPlannerType() core.AgentPlannerType {
@@ -77,7 +77,7 @@ func (a *GcpOrchestratorAgent) IsWatchCapable() bool { return true }
 
 // NB: no CritiqueEnabled() method on purpose — the orchestrator does not
 // implement NBAgentReActPlannerCritiqueSupport, so critique is governed by the
-// standard gate (LlmServerReActCritiqueEnabled && top-level && investigation).
+// standard gate (top-level && investigation).
 
 func (a *GcpOrchestratorAgent) GetSupportedTools(ctx *security.RequestContext) []tocore.NBTool {
 	// Reduced cloud core (gcloud_execute + SDG + events + recommendations + delegate

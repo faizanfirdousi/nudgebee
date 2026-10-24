@@ -1,3 +1,9 @@
+{{- /* The API deployment. Serves HTTP for the services-server Service.
+
+       When .Values.worker.enabled is set it renders SERVER_ROLE=api, and the
+       RabbitMQ consumers plus the EE background goroutines move to
+       deployment-worker.yaml. Otherwise no SERVER_ROLE is rendered and this
+       single deployment does everything, as it always has. */}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -51,11 +57,24 @@ spec:
           envFrom:
             - secretRef:
                 name: {{ include "nudgebee.secretName" . | quote }}
+            {{- with .Values.extraEnvFromSecret }}
+            # Install-time bootstrap values (admin address, bundled-agent
+            # credential). Optional: absent on installs that use neither, and
+            # the pod must start regardless.
+            - secretRef:
+                name: {{ . | quote }}
+                optional: true
+            {{- end }}
           env:
             {{- range $key, $value := .Values.env }}
             - name: {{ $key }}
               value: {{ $value | quote }}
-            {{- end }}          
+            {{- end }}
+            {{- with (include "services-server.serverRole" (dict "ctx" . "role" "api")) }}
+            - name: SERVER_ROLE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- include "services-server.goMemLimitEnv" (dict "ctx" . "resources" .Values.resources) | nindent 12 }}
           ports:
             - name: http
               containerPort: {{ .Values.service.port }}

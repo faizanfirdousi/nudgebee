@@ -10,14 +10,11 @@ import (
 type nodeAllocatableAction struct{}
 
 func (a *nodeAllocatableAction) CanAutoExecute(ctx PlaybookActionContext) bool {
-	if ctx.GetEvent().AggregationKey != "node_not_ready" {
-		return false
-	}
-	return subjectNodeName(ctx.GetEvent()) != ""
+	return EventIsAboutNode(ctx.GetEvent())
 }
 
 func (a *nodeAllocatableAction) AutoExecute(ctx PlaybookActionContext) (PlaybookActionResponse, error) {
-	return a.Execute(ctx, map[string]any{"node_name": subjectNodeName(ctx.GetEvent())})
+	return a.Execute(ctx, map[string]any{"node_name": SubjectNodeName(ctx.GetEvent())})
 }
 
 func (a *nodeAllocatableAction) Execute(ctx PlaybookActionContext, rawParams map[string]any) (PlaybookActionResponse, error) {
@@ -36,7 +33,7 @@ func (a *nodeAllocatableAction) Execute(ctx PlaybookActionContext, rawParams map
 	if err != nil {
 		return nil, fmt.Errorf("node_allocatable_resources_enricher: %w", err)
 	}
-	node := firstResourceDict(data)
+	node := resourceDictNamed(data, nodeName, "")
 	if node == nil {
 		return nil, errors.New("node_allocatable_resources_enricher: node not found")
 	}

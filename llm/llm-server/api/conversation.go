@@ -7,9 +7,12 @@ import (
 	"net/http"
 	"nudgebee/llm/agents/core"
 	"nudgebee/llm/common"
+	"nudgebee/llm/config"
 	"nudgebee/llm/security"
+	toolcore "nudgebee/llm/tools/core"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -53,6 +56,12 @@ type ModelPricingDeleteApiRequest struct {
 	ModelName    string `json:"model_name"`
 }
 
+// AiCostReportScheduleUpsertApiRequest carries the UTC hour (0-23) a tenant
+// wants their AI Cost Daily Report dispatched at.
+type AiCostReportScheduleUpsertApiRequest struct {
+	SendHourUTC int `json:"send_hour_utc"`
+}
+
 type ConversationReferenceListApiRequest struct {
 	AccountId      string `json:"account_id" mapstructure:"required" validate:"required"`
 	ConversationId string `json:"conversation_id"`
@@ -67,6 +76,83 @@ type ConversationReferenceListApiRequest struct {
 
 func handleConversationApis(r *gin.Engine, tracer trace.Tracer, meter metric.Meter) {
 	groupV2 := r.Group("/v1/conversations")
+
+	// What the knowledge base did for one message: which documents were found,
+	// which one was used, and in the reader's words why the rest were not.
+	groupV2.POST("/ai_list_knowledge_activity", func(c *gin.Context) {
+		common.MetricsApiRequestsTotal("ai_list_knowledge_activity")
+
+		requestMap := make(map[string]any)
+		if err := c.ShouldBindJSON(&requestMap); err != nil {
+			slog.Error(errorBindingMessage, "error", err)
+			c.JSON(400, buildApiResponse(nil, []error{common.Error{Message: "api: " + err.Error()}}))
+			return
+		}
+		var actionRequest ActionRequest
+		if err := common.DecodeMapToStruct(requestMap, &actionRequest); err != nil {
+			slog.Error(errorBindingMessage, "error", err)
+			c.JSON(400, buildApiResponse(nil, []error{common.Error{Message: "api: " + err.Error()}}))
+			return
+		}
+
+		type knowledgeActivityRequest struct {
+			AccountId      string   `json:"account_id" mapstructure:"required" validate:"required"`
+			ConversationId string   `json:"conversation_id" mapstructure:"required" validate:"required"`
+			MessageIds     []string `json:"message_ids" mapstructure:"required" validate:"required"`
+		}
+		payload := actionRequest.Input
+		if payload["request"] != nil {
+			payload, _ = payload["request"].(map[string]any)
+		}
+		if payload == nil {
+			payload = requestMap
+		}
+		var request knowledgeActivityRequest
+		if err := common.DecodeMapToStruct(payload, &request); err != nil {
+			c.JSON(400, buildApiResponse(nil, []error{common.Error{Message: "api: " + err.Error()}}))
+			return
+		}
+		// Authenticate before validating the payload, as every sibling action
+		// does: reporting "these fields are required" to a caller we have not
+		// authenticated tells them which payloads are well-formed.
+		agentContext, err := buildContextFromPayload(c.Request.Context(), c, &actionRequest, tracer, meter, slog.Default())
+		if err != nil {
+			c.JSON(401, buildApiResponse(nil, []error{err}))
+			return
+		}
+		if request.AccountId == "" || request.ConversationId == "" || len(request.MessageIds) == 0 {
+			c.JSON(400, buildApiResponse(nil, []error{
+				errors.New("api: account_id, conversation_id and message_ids are required"),
+			}))
+			return
+		}
+		// Every id reaches Postgres as a uuid. A malformed one raises "invalid
+		// input syntax for type uuid" there, which surfaces as a 500 and a noisy
+		// error log for what is a caller mistake.
+		if _, err := uuid.Parse(request.ConversationId); err != nil {
+			c.JSON(400, buildApiResponse(nil, []error{errors.New("api: conversation_id is not a valid id")}))
+			return
+		}
+		for _, id := range request.MessageIds {
+			if _, err := uuid.Parse(id); err != nil {
+				c.JSON(400, buildApiResponse(nil, []error{errors.New("api: message_ids contains an invalid id")}))
+				return
+			}
+		}
+		if !agentContext.GetSecurityContext().CanReadAccountData(request.AccountId, "ai_conversations") {
+			c.JSON(403, buildApiResponse(nil, []error{errors.New(errorUserAccessMessage)}))
+			return
+		}
+
+		activity, err := toolcore.GetKnowledgeActivity(agentContext, request.AccountId, request.ConversationId, request.MessageIds)
+		if err != nil {
+			agentContext.GetLogger().Error("knowledge activity: lookup failed", "error", err,
+				"conversation_id", request.ConversationId)
+			c.JSON(500, buildApiResponse(nil, []error{common.Error{Message: err.Error()}}))
+			return
+		}
+		c.JSON(200, buildApiResponse(activity, nil))
+	})
 
 	// Get model configuration for a conversation
 	groupV2.POST("/ai_get_model_config", func(c *gin.Context) {
@@ -318,6 +404,69 @@ func handleConversationApis(r *gin.Engine, tracer trace.Tracer, meter metric.Met
 		c.JSON(200, buildApiResponse(map[string]any{"removed": removed}, nil))
 	})
 
+	// AI Cost Daily Report per-tenant send hour (UTC-only).
+	groupV2.POST("/ai_get_cost_report_schedule", func(c *gin.Context) {
+		common.MetricsApiRequestsTotal("ai_get_cost_report_schedule")
+		var request struct{}
+		agentContext, ok := bindPricingRequest(c, tracer, meter, &request)
+		if !ok {
+			return
+		}
+		sc := agentContext.GetSecurityContext()
+		// Read-only — seeing the configured hour is not privileged within a
+		// tenant, matching the read gate on ai_list_model_pricing.
+		if !sc.IsTenantAdmin() && !sc.IsTenantReadAdmin() && !sc.IsSuperAdmin() && !sc.IsSuperAdminReadonly() {
+			c.JSON(403, buildApiResponse(nil, []error{errors.New(errorUserAccessMessage)}))
+			return
+		}
+
+		dbManager, err := common.GetDatabaseManager(common.Metastore)
+		if err != nil {
+			c.JSON(500, buildApiResponse(nil, []error{common.Error{Message: err.Error()}}))
+			return
+		}
+		sendHourUTC, err := core.GetAiCostReportSchedule(dbManager, sc.GetTenantId())
+		if err != nil {
+			agentContext.GetLogger().Error("api: error reading cost report schedule", "error", err)
+			c.JSON(500, buildApiResponse(nil, []error{common.Error{Message: err.Error()}}))
+			return
+		}
+		c.JSON(200, buildApiResponse(map[string]any{"send_hour_utc": sendHourUTC}, nil))
+	})
+
+	groupV2.POST("/ai_upsert_cost_report_schedule", func(c *gin.Context) {
+		common.MetricsApiRequestsTotal("ai_upsert_cost_report_schedule")
+		var request AiCostReportScheduleUpsertApiRequest
+		agentContext, ok := bindPricingRequest(c, tracer, meter, &request)
+		if !ok {
+			return
+		}
+		// The report is published once per tenant (every account in it), so
+		// changing when it arrives is a tenant-admin action, same gate as
+		// model pricing — plus super admins, since the read handler below
+		// already grants them visibility and the frontend gear is shown to
+		// both roles.
+		sc := agentContext.GetSecurityContext()
+		if !sc.IsTenantAdmin() && !sc.IsSuperAdmin() {
+			c.JSON(403, buildApiResponse(nil, []error{errors.New("cost report schedule can only be changed by a tenant admin")}))
+			return
+		}
+
+		dbManager, err := common.GetDatabaseManager(common.Metastore)
+		if err != nil {
+			c.JSON(500, buildApiResponse(nil, []error{common.Error{Message: err.Error()}}))
+			return
+		}
+		if err := core.UpsertAiCostReportSchedule(dbManager, sc.GetTenantId(), sc.GetUserId(), request.SendHourUTC); err != nil {
+			agentContext.GetLogger().Error("api: error saving cost report schedule", "error", err)
+			// Validation failures (out-of-range hour) are the caller's fault —
+			// 400 with the message intact, not a blanket 500.
+			c.JSON(400, buildApiResponse(nil, []error{common.Error{Message: err.Error()}}))
+			return
+		}
+		c.JSON(200, buildApiResponse(map[string]any{"send_hour_utc": request.SendHourUTC}, nil))
+	})
+
 	groupV2.POST("/ai_list_models", func(c *gin.Context) {
 		common.MetricsApiRequestsTotal("ai_list_models")
 		requestMap := make(map[string]any)
@@ -405,6 +554,10 @@ func handleConversationApis(r *gin.Engine, tracer trace.Tracer, meter metric.Met
 			"default": map[string]string{
 				"provider": defaultProvider,
 				"model":    defaultModel,
+			},
+			"queue_support": map[string]any{
+				"enabled":      config.Config.QueuedMessagesEnabled,
+				"max_messages": config.Config.MaxQueuedMessagesPerConversation,
 			},
 			"image_support": map[string]any{
 				"enabled":            true,

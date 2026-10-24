@@ -200,28 +200,39 @@ func (toolSource) Observe(ctx *security.RequestContext, w Watch) (Observation, e
 		return Observation{}, fmt.Errorf("tool source: %q is an agent-style tool; watch sources must use a primitive *_execute tool (e.g. kubectl_execute, github_execute, shell_execute) — agent tools assume a parent message context that watch polls do not have", cfg.ToolName)
 	}
 
-	// Resolve which tool config the poll should use. The chat planner does
-	// this through followupForMultipleToolConfigs (which can prompt the
-	// user); the watch path runs unattended, so we use a deterministic
-	// rule:
-	//   1) If source_config.tool_config_name is set, use it verbatim.
-	//   2) If the tool implements NBToolConfig and exactly one enabled
-	//      config exists for the account, NewNbToolContext picks it
-	//      automatically (existing behaviour).
-	//   3) If multiple exist, pick the first by name and pass the name
-	//      via QueryConfig.ToolConfigs so NewNbToolContext binds it.
-	// Without this, tools like github_execute (35 tenant integrations,
-	// 3 enabled) leave ToolConfig empty and every poll fails with
-	// "no tool configs found".
+	// tool_config_name is VALIDATED not trusted -> nothing grounds it (LLM
+	// invents it, e.g. "github" vs real "nudgebee"). Unmatched -> auto-resolve, not FAILED.
 	queryConfig := toolcore.NBQueryConfig{}
-	if cfg.ToolConfigName != "" {
-		queryConfig.ToolConfigs = map[string]string{cfg.ToolName: cfg.ToolConfigName}
-	} else if _, isCfg := tool.(toolcore.NBToolConfig); isCfg {
+	if _, isCfg := tool.(toolcore.NBToolConfig); isCfg {
 		availableConfigs, err := toolcore.ListToolConfigs(ctx, w.AccountID.String(), tool)
-		if err == nil && len(availableConfigs) > 1 {
-			queryConfig.ToolConfigs = map[string]string{cfg.ToolName: availableConfigs[0].Name}
-			ctx.GetLogger().Info("watch.source: multiple tool configs available, picking first",
-				"tool", cfg.ToolName, "picked", availableConfigs[0].Name, "candidates", len(availableConfigs))
+		if err != nil {
+			// Can't validate/auto-pick -> leave ToolConfigs empty, tool self-resolves.
+			ctx.GetLogger().Warn("watch.source: unable to list tool configs; leaving config resolution to the tool",
+				"tool", cfg.ToolName, "error", err)
+		} else {
+			picked := ""
+			if cfg.ToolConfigName != "" {
+				for _, c := range availableConfigs {
+					if strings.EqualFold(c.Name, cfg.ToolConfigName) {
+						picked = c.Name // adopt the registered casing
+						break
+					}
+				}
+				if picked == "" {
+					ctx.GetLogger().Warn("watch.source: configured tool_config_name does not match any enabled config; falling back to auto-resolution",
+						"tool", cfg.ToolName, "requested", cfg.ToolConfigName, "candidates", len(availableConfigs))
+				}
+			}
+			// Bind only for a confirmed name or a multi-config tie-break.
+			// Single config -> leave empty, NewNbToolContext auto-binds it.
+			if picked == "" && len(availableConfigs) > 1 {
+				picked = availableConfigs[0].Name
+				ctx.GetLogger().Info("watch.source: multiple tool configs available, picking first",
+					"tool", cfg.ToolName, "picked", picked, "candidates", len(availableConfigs))
+			}
+			if picked != "" {
+				queryConfig.ToolConfigs = map[string]string{cfg.ToolName: picked}
+			}
 		}
 	}
 
@@ -289,7 +300,45 @@ func (toolSource) Observe(ctx *security.RequestContext, w Watch) (Observation, e
 	if resp.Status == toolcore.NBToolResponseStatusError {
 		return Observation{}, fmt.Errorf("tool source: tool %q returned error: %s", cfg.ToolName, truncate(resp.Data, 500))
 	}
-	return Observation{Data: resp.Data}, nil
+	return Observation{Data: normalizeToolObservation(resp.Data)}, nil
+}
+
+// normalizeToolObservation turns a tool response into the plain text a
+// predicate is written against.
+//
+// The *_execute tools do not agree on a wire shape: github_execute returns
+// raw stdout ("0\n"), while shell_execute and kubectl_execute wrap it in a
+// JSON envelope ({"stdout":"...","cluster":"..."}) whose newlines are
+// backslash-escaped. Agents are instructed to write predicates against the
+// command's output, so matching the envelope is never what they mean — an
+// anchored predicate such as "^0$" cannot match {"stdout":"...0\n"} under
+// any regex flags, which made every anchored kubectl/shell watch run to
+// EXPIRED.
+//
+// Unwrapping is conservative: only a JSON *object* carrying a string
+// "stdout" key is unwrapped, so raw output that merely happens to be JSON
+// (github_execute --json) is left exactly as-is. Trailing whitespace is
+// stripped last so "^0$" matches a newline-terminated "0".
+func normalizeToolObservation(data string) string {
+	// CRLF -> LF first: Go's (?m)$ matches before "\n" but not before "\r\n",
+	// so a CRLF-terminated line silently defeats every "^...$" predicate.
+	trimmed := strings.TrimSpace(strings.ReplaceAll(data, "\r\n", "\n"))
+	if !strings.HasPrefix(trimmed, "{") {
+		return trimmed
+	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(trimmed), &envelope); err != nil {
+		return trimmed
+	}
+	raw, ok := envelope["stdout"]
+	if !ok {
+		return trimmed
+	}
+	var stdout string
+	if err := json.Unmarshal(raw, &stdout); err != nil {
+		return trimmed
+	}
+	return strings.TrimSpace(strings.ReplaceAll(stdout, "\r\n", "\n"))
 }
 
 // ---------------------------------------------------------------------------
@@ -474,6 +523,19 @@ func userIDString(u *uuid.UUID) string {
 		return ""
 	}
 	return u.String()
+}
+
+// DescribeTarget returns the command a watch polls, for display; "" for sql sources.
+// Server-side so the UI can't re-derive it with precedence the poller doesn't use.
+func DescribeTarget(w Watch) string {
+	if w.SourceKind != SourceKindTool {
+		return ""
+	}
+	var cfg toolSourceConfig
+	if err := json.Unmarshal([]byte(w.SourceConfig), &cfg); err != nil {
+		return ""
+	}
+	return pickCommandFromConfig(&cfg)
 }
 
 // pickCommandFromConfig returns the most likely "command string" the

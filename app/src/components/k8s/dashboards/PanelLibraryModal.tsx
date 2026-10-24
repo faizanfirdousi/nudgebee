@@ -218,7 +218,7 @@ const PanelLibraryModal: React.FC<Props> = ({ open, existingPanels, accountOptio
                           data-testid={`widget-${widget.id}`}
                           sx={{
                             ...(selected?.id === widget.id
-                              ? { borderColor: ds.blue[300], background: ds.blue[100], boxShadow: '0 4px 8px rgba(0, 0, 0, 0.08)' }
+                              ? { borderColor: ds.blue[300], background: ds.blue[100], boxShadow: `0 4px 8px ${ds.gray.alpha[200]}` }
                               : {}),
                             ...(blocked ? { opacity: 0.55, cursor: 'not-allowed', background: ds.background[200] } : {}),
                             // Card's `interactive` hover always adds a lift shadow regardless of `elevation` — flat here means flat.
@@ -228,7 +228,12 @@ const PanelLibraryModal: React.FC<Props> = ({ open, existingPanels, accountOptio
                           <Stack direction='row' alignItems='center' gap={1.5}>
                             <Box sx={{ minWidth: 0, flex: 1 }}>
                               <Typography
-                                sx={{ fontFamily: 'var(--ds-font-display)', fontSize: 'var(--ds-text-body)', fontWeight: 600, color: ds.gray[700] }}
+                                sx={{
+                                  fontFamily: 'var(--ds-font-display)',
+                                  fontSize: 'var(--ds-text-body)',
+                                  fontWeight: ds.weight.semibold,
+                                  color: ds.gray[700],
+                                }}
                                 noWrap
                               >
                                 {widget.panel.title}
@@ -318,7 +323,7 @@ const PanelLibraryModal: React.FC<Props> = ({ open, existingPanels, accountOptio
                       sx={{
                         maxHeight: 140,
                         overflow: 'auto',
-                        fontFamily: 'monospace',
+                        fontFamily: ds.font.mono,
                         fontSize: 11.5,
                         color: ds.gray[600],
                         whiteSpace: 'pre-wrap',
@@ -356,7 +361,7 @@ const PanelLibraryModal: React.FC<Props> = ({ open, existingPanels, accountOptio
                 p: 2,
                 textAlign: 'center',
                 border: `1px dashed ${ds.gray[300]}`,
-                borderRadius: '8px',
+                borderRadius: ds.radius.lg,
                 background: ds.background[100],
               }}
               data-testid='panel-library-preview-empty'

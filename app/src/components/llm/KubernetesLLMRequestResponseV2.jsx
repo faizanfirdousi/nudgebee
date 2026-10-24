@@ -1,5 +1,6 @@
 import apiAskNudgebee from '@api1/ask-nudgebee';
 import { decisionsRecord } from '@api1/memory';
+import { isOSSDeploymentMode } from '@hooks/useBCortexEnabled';
 import { ShareIconBlue } from '@assets';
 import Chart from '@ui/Chart';
 import Text from '@shared/format/Text';
@@ -19,6 +20,7 @@ import SafeIcon from '@shared/icons/SafeIcon';
 import PropTypes from 'prop-types';
 import React, { useEffect, useState } from 'react';
 import { ds } from '@utils/colors';
+import { unwrapTypedValueString } from '@utils/common';
 import { convertToReadableFormat } from 'src/utils/common';
 import KubernetesTable from '@components/k8s/common/KubernetesTable';
 import { mapToTableData } from '@components/k8s/common/logTableMapper';
@@ -838,7 +840,7 @@ const KubernetesLLMRequestResponse = (props) => {
                 mb: ds.space.mul(0, 3),
                 '& p': { margin: 0 },
                 '& code': {
-                  fontFamily: 'ui-monospace, "SF Mono", Menlo, monospace',
+                  fontFamily: ds.font.mono,
                   fontSize: 'var(--ds-text-small)',
                   background: 'var(--ds-background-200)',
                   padding: `${ds.space[0]} ${ds.space[1]}`,
@@ -846,7 +848,7 @@ const KubernetesLLMRequestResponse = (props) => {
                 },
               }}
             >
-              <MarkDowns data={messageConfig.question} />
+              <MarkDowns data={unwrapTypedValueString(messageConfig.question)} />
             </Box>
           )}
           {isCompleted && displayResponse && (
@@ -877,7 +879,7 @@ const KubernetesLLMRequestResponse = (props) => {
                 title={
                   <Box
                     sx={{
-                      fontFamily: 'ui-monospace, "SF Mono", Menlo, monospace',
+                      fontFamily: ds.font.mono,
                       fontSize: 'var(--ds-text-caption)',
                       whiteSpace: 'pre-wrap',
                       wordBreak: 'break-word',
@@ -1081,7 +1083,7 @@ const KubernetesLLMRequestResponse = (props) => {
       // question instead recorded decisions like "hi: user thumbs-up on RCA".
       // Fire-and-forget — feedback is the user-facing success path.
       const isPositive = createFeedbackObject.type == 'thumbs_up';
-      if (props.toolCall?.id) {
+      if (props.toolCall?.id && !isOSSDeploymentMode()) {
         decisionsRecord({
           decisionType: isPositive ? 'root_cause_agreed' : 'root_cause_disagreed',
           rationale: isPositive ? 'user thumbs-up on RCA' : createFeedbackObject.message || 'user thumbs-down on RCA',
@@ -1103,14 +1105,14 @@ const KubernetesLLMRequestResponse = (props) => {
           item
           md={12}
           sx={{
-            fontFamily: '"Poppins", sans-serif',
+            fontFamily: ds.font.display,
             fontWeight: 'var(--ds-font-weight-medium)',
             lineHeight: '20px',
             color: 'var(--ds-gray-700)',
             wordBreak: 'break-word',
           }}
         >
-          <Box key={'index'} fontSize={'var(--ds-text-small)'} fontWeight={400} color={'var(--ds-gray-700)'}>
+          <Box key={'index'} fontSize={'var(--ds-text-small)'} fontWeight={ds.weight.regular} color={'var(--ds-gray-700)'}>
             <LLMAnswerRenderer
               toolCall={props.toolCall}
               messages={props.messages}
@@ -1119,7 +1121,7 @@ const KubernetesLLMRequestResponse = (props) => {
             />
           </Box>
           <Box display={'flex'} alignItems={'center'} justifyContent={'space-between'} mt={ds.space[3]}>
-            {props.toolCall.type == 'response' && (
+            {props.toolCall.type == 'response' && !props.isResponseInProgress && (
               <>
                 <Box display={'flex'} alignItems={'center'} gap={ds.space.mul(0, 5)}>
                   <Button
@@ -1173,7 +1175,7 @@ const KubernetesLLMRequestResponse = (props) => {
                             fontSize: 'var(--ds-text-body)',
                             fontWeight: 'var(--ds-font-weight-medium)',
                             color: 'var(--ds-blue-500)',
-                            fontFamily: '"Poppins", sans-serif',
+                            fontFamily: ds.font.display,
                           }}
                         >
                           {getUniqueReferencesCount(parsedReferences)} source
@@ -1205,7 +1207,7 @@ const KubernetesLLMRequestResponse = (props) => {
                   <Divider
                     style='dashed'
                     color='var(--ds-gray-300)'
-                    sx={{ mt: ds.space[1], mb: ds.space.mul(1, 5), maxWidth: ds.space.mul(0, 427) }}
+                    sx={{ mt: ds.space[1], mb: ds.space.mul(1, 5), mx: 'auto', maxWidth: ds.space.mul(0, 427) }}
                   />
                 )}
                 <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
@@ -1255,7 +1257,7 @@ const KubernetesLLMRequestResponse = (props) => {
                             fontSize: 'var(--ds-text-body)',
                             fontWeight: 'var(--ds-font-weight-medium)',
                             color: 'var(--ds-blue-500)',
-                            fontFamily: '"Poppins", sans-serif',
+                            fontFamily: ds.font.display,
                           }}
                         >
                           {getUniqueReferencesCount(parsedReferences)} source
@@ -1348,7 +1350,7 @@ const KubernetesLLMRequestResponse = (props) => {
                 fontSize: 'var(--ds-text-small)',
                 lineHeight: '22px',
                 color: 'var(--ds-blue-700)',
-                fontFamily: '"Poppins", sans-serif',
+                fontFamily: ds.font.display,
               },
             }}
           >
@@ -1388,6 +1390,7 @@ const KubernetesLLMRequestResponse = (props) => {
 
 KubernetesLLMRequestResponse.propTypes = {
   toolCall: PropTypes.object,
+  isResponseInProgress: PropTypes.bool,
   generateQuestionText: PropTypes.string,
   accountId: PropTypes.string,
   handleShare: PropTypes.func,

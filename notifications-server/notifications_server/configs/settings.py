@@ -9,7 +9,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 _branding_logger = logging.getLogger(__name__)
 
 # Bundled branding file shipped in the image — mirrors app/public/branding/default/theme.json.
-# Keep the two files in sync; partners override at runtime via TENANT_BRANDING_FILE.
+# Keep the two files in sync. It is the fallback only: a deployment is branded by the
+# tenant_branding_override row for its BASE_URL host (configs/branding_overrides.py).
 _BUNDLED_BRANDING_FILE = str(Path(__file__).resolve().parents[1] / "branding" / "default" / "theme.json")
 
 
@@ -22,11 +23,14 @@ class URLRoutes:
     # Events routes
     EVENTS = "/events"
 
+    # Troubleshoot routes (cross-account events page)
+    TROUBLESHOOT = "/troubleshoot"
+
     # Auto Pilot routes
     AUTO_PILOT_TASK = "/auto-pilot/task/{auto_pilot_id}"
 
     # Workflow / Automation routes
-    WORKFLOW = "/workflow/{workflow_id}"
+    WORKFLOW = "/automation/{workflow_id}"
 
     # Cloud Account routes
     CLOUD_ACCOUNT_DETAILS = "/cloud-account/details/{account_id}"
@@ -63,6 +67,9 @@ class URLRoutes:
         # Monitoring
         MONITORING_SLO = "monitoring/slo"
 
+        # Troubleshoot -> All Events -> Events sub-tab
+        TROUBLESHOOT_EVENTS = "all-events/all"
+
     # ==================== UTM Source Parameters ====================
     class UTMSource:
         SLACK = "slack"
@@ -85,17 +92,12 @@ class URLSettings(BaseSettings):
     # Optional Calendly (or equivalent) URL surfaced in invite emails. Empty hides the P.S. block.
     calendly_url: str = Field("", validation_alias=AliasChoices("CALENDLY_URL", "calendly_url"))
 
-    # Path to theme.json — same env var name and JSON shape as the Next.js app's TENANT_BRANDING_FILE.
-    # Defaults to the bundled file shipped in the image (kept in sync with app/public/branding/default/theme.json).
-    tenant_branding_file: str = Field(
-        _BUNDLED_BRANDING_FILE,
-        validation_alias=AliasChoices("TENANT_BRANDING_FILE", "tenant_branding_file"),
-    )
-
     # Branding fields populated from theme.json by load_branding_from_theme_file().
-    # Operators provide values via TENANT_BRANDING_FILE; support_email is intentionally empty by default
+    # Fallback values from the bundled theme file; the BASE_URL host's database row is applied on top at
+    # runtime (configs/branding_overrides.py). support_email is intentionally empty by default
     # so OSS deployments don't leak the upstream Nudgebee support mailbox.
     branding_name: str = "Nudgebee"
+    assistant_name: str = "Nubi"
     branding_logo_url: str = "/branding/default/logo.png"
     branding_support_email: str = ""
     branding_primary_color: str = "#3470e9"
@@ -110,10 +112,10 @@ class URLSettings(BaseSettings):
     @model_validator(mode="after")
     def load_branding_from_theme_file(self):
         """Populate branding_* fields from theme.json; silently fall back to defaults if the file is missing."""
-        path = Path(self.tenant_branding_file)
+        path = Path(_BUNDLED_BRANDING_FILE)
         if not path.is_file():
             _branding_logger.info(
-                "Branding theme file not found at %s; using hardcoded defaults", self.tenant_branding_file
+                "Branding theme file not found at %s; using hardcoded defaults", _BUNDLED_BRANDING_FILE
             )
             return self
         try:
@@ -121,13 +123,15 @@ class URLSettings(BaseSettings):
         except (OSError, json.JSONDecodeError) as exc:
             _branding_logger.warning(
                 "Failed to load branding theme from %s: %s; using hardcoded defaults",
-                self.tenant_branding_file,
+                _BUNDLED_BRANDING_FILE,
                 exc,
             )
             return self
 
         if isinstance(theme.get("title"), str):
             self.branding_name = theme["title"]
+        if isinstance(theme.get("assistantName"), str):
+            self.assistant_name = theme["assistantName"]
         email = theme.get("email") or {}
         for json_key, attr in (
             ("logoUrl", "branding_logo_url"),
@@ -239,6 +243,35 @@ class URLSettings(BaseSettings):
             URLRoutes.EVENTS,
             query_params={"accountId": account_id},
             utm_source=utm_source,
+        )
+
+    def troubleshoot_url(
+        self,
+        account_ids: List[str],
+        sources: Optional[List[str]] = None,
+        start_time_ms: Optional[int] = None,
+        end_time_ms: Optional[int] = None,
+        utm_source: Optional[str] = None,
+    ) -> str:
+        """Build URL for the cross-account Troubleshoot Events page. Pass
+        start_time_ms/end_time_ms when known -- without them the page falls
+        back to a persisted date range, which can exclude the linked events."""
+        query_params: Dict[str, str] = {}
+        ids = [a for a in account_ids if a]
+        if ids:
+            query_params["accountIds"] = ",".join(ids)
+        src = [s for s in (sources or []) if s]
+        if src:
+            query_params["source"] = ",".join(src)
+        if start_time_ms is not None and end_time_ms is not None:
+            query_params["start_time"] = str(start_time_ms)
+            query_params["end_time"] = str(end_time_ms)
+
+        return self._build_url(
+            URLRoutes.TROUBLESHOOT,
+            query_params=query_params if query_params else None,
+            utm_source=utm_source,
+            anchor=URLRoutes.Anchors.TROUBLESHOOT_EVENTS,
         )
 
     def auto_pilot_task_url(
@@ -434,6 +467,26 @@ class SlackSettings(BaseSettings):
     thinking_steps_max_pollers: int = Field(
         50, validation_alias=AliasChoices("SLACK_THINKING_STEPS_MAX_POLLERS", "slack_thinking_steps_max_pollers")
     )
+    # "Ask Nubi to Analyse!" poller: re-polls /v1/analyze/event (idempotent
+    # with regenerate=False) until the detailed synthesis stage completes.
+    event_analysis_poll_seconds: float = Field(
+        10.0, validation_alias=AliasChoices("SLACK_EVENT_ANALYSIS_POLL_SECONDS", "slack_event_analysis_poll_seconds")
+    )
+    event_analysis_max_minutes: int = Field(
+        20, validation_alias=AliasChoices("SLACK_EVENT_ANALYSIS_MAX_MINUTES", "slack_event_analysis_max_minutes")
+    )
+    # A poll tick just reads current state, unlike the kickoff call -- must not share its 20min timeout.
+    event_analysis_poll_timeout_seconds: float = Field(
+        30.0,
+        validation_alias=AliasChoices(
+            "SLACK_EVENT_ANALYSIS_POLL_TIMEOUT_SECONDS", "slack_event_analysis_poll_timeout_seconds"
+        ),
+    )
+    # Per-process ceiling on concurrent event-analysis pollers; beyond it a new
+    # click gets its ack but no progressive updates rather than queueing.
+    event_analysis_max_pollers: int = Field(
+        50, validation_alias=AliasChoices("SLACK_EVENT_ANALYSIS_MAX_POLLERS", "slack_event_analysis_max_pollers")
+    )
 
     model_config = SettingsConfigDict(env_prefix="", env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
@@ -541,6 +594,9 @@ class EmailSettings(BaseSettings):
     server_user: str = Field("", validation_alias=AliasChoices("EMAIL_SERVER_USER", "email_server_user"))
     server_password: str = Field("", validation_alias=AliasChoices("EMAIL_SERVER_PASSWORD", "email_server_password"))
     from_address: str = Field("", validation_alias=AliasChoices("EMAIL_FROM", "email_from"))
+    from_name: str = Field("", validation_alias=AliasChoices("EMAIL_FROM_NAME", "email_from_name"))
+    # auto | ssl | starttls | none. "auto" picks SSL for 465 and STARTTLS for 587.
+    server_tls: str = Field("auto", validation_alias=AliasChoices("EMAIL_SERVER_TLS", "email_server_tls"))
     max_concurrent_sends: int = Field(
         10, validation_alias=AliasChoices("EMAIL_MAX_CONCURRENT_SENDS", "email_max_concurrent_sends")
     )
@@ -549,8 +605,8 @@ class EmailSettings(BaseSettings):
 
     @property
     def is_configured(self) -> bool:
-        """Check if SMTP is configured."""
-        return bool(self.server_host and self.server_user and self.server_password and self.from_address)
+        """Check if SMTP is configured. Credentials are optional for relays that don't require auth."""
+        return bool(self.server_host and self.from_address)
 
     def get_smtp_params(self) -> Optional[List[str]]:
         """Return SMTP params in legacy format for backward compatibility."""
@@ -677,7 +733,7 @@ class NotificationSettings(BaseSettings):
     )
     task_retry_count: int = Field(5, validation_alias=AliasChoices("TASK_RETRY_COUNT", "task_retry_count"))
     slow_task_threshold_seconds: int = Field(
-        10, validation_alias=AliasChoices("SLOW_TASK_THRESHOLD_SECONDS", "slow_task_threshold_seconds")
+        30, validation_alias=AliasChoices("SLOW_TASK_THRESHOLD_SECONDS", "slow_task_threshold_seconds")
     )
     grouped_flush_delay_seconds: int = Field(
         3600, validation_alias=AliasChoices("GROUPED_FLUSH_DELAY_SECONDS", "grouped_flush_delay_seconds")

@@ -2,6 +2,8 @@ package observability
 
 import (
 	"encoding/json"
+	"nudgebee/services/common"
+	"nudgebee/services/integrations/core"
 	"nudgebee/services/query"
 	"strconv"
 )
@@ -34,6 +36,14 @@ type FetchLogRequest struct {
 	// Off by default so existing callers keep the plain empty-result behavior;
 	// opt-in callers (notably the LLM agent) enable it to self-correct.
 	ValidateRequest bool `json:"validate_request"`
+	// RecordHistory opts this call into a user_history row. Set ONLY by the
+	// browser's Run button: /rpc/logs is shared by the UI, llm-server,
+	// runbook-server and cost-server behind one X-ACTION-TOKEN, and polling,
+	// dashboard panels and drilldowns all reach the same action, so recording is
+	// opt-in rather than inferred. Deliberately a typed top-level field and not
+	// a key in Request — that map is provider-parameter space that LLM tools
+	// populate freely, which would make this flag agent-settable.
+	RecordHistory bool `json:"record_history"`
 }
 
 type OutputLog struct {
@@ -80,6 +90,20 @@ type FetchLogLabelRequest struct {
 	// queryable fields. See FetchLogLabelsOrIndexFields — it used to mean the
 	// opposite.
 	FetchIndex bool `json:"fetch_index"`
+	// IntegrationConfigValues asks for the fields of the configuration DESCRIBED HERE
+	// rather than the one saved for this account, so the integration form can list a
+	// backend's fields before the integration exists. Optional: absent (the normal
+	// case, and every in-process caller) behaves exactly as before.
+	//
+	// PRIVILEGED. Honouring it makes the server connect to a caller-supplied endpoint,
+	// so handle_actions_logs accepts it only from a tenant admin — the same tier that
+	// may create an integration — and rejects it otherwise. It is transport only: the
+	// handler turns it into a scoped config override and never passes it further down.
+	IntegrationConfigValues []core.IntegrationConfigValue `json:"integration_config_values,omitempty"`
+	// IntegrationId names the saved integration being edited. Required when any of
+	// IntegrationConfigValues is flagged is_encrypted (a secret the user left masked):
+	// the saved value is looked up on this integration — see core.ResolveKeptSecrets.
+	IntegrationId string `json:"integration_id,omitempty"`
 }
 
 type OutputLogLabel struct {
@@ -156,6 +180,18 @@ type FetchMetricsRequest struct {
 	Labels               map[string]string    `json:"labels"`         // eq-only; used by internal callers
 	LabelMatchers        []LabelMatcher       `json:"label_matchers"` // synthesized per-item by GetMetricsQuery; not sent from UI
 	QueryItems           map[string]QueryItem `json:"query_items"`    // BUILDER per-key shape: {key: {metric, label_matchers}}
+	// RecordHistory opts this call into a user_history row; see the identically
+	// named field on FetchLogRequest for why this is opt-in and top-level.
+	RecordHistory bool `json:"record_history"`
+
+	// RetryBudgetSeconds is how long this caller will spend, in total, retrying a
+	// rate-limited or failing provider. Zero means the short default.
+	//
+	// It belongs to the caller because the same keys serve opposite needs: a UI chart
+	// would rather show an error than hang, while an hourly anomaly or rightsizing run
+	// can afford to wait a rate limit out. The layer clamps it so a caller cannot pin a
+	// connection indefinitely.
+	RetryBudgetSeconds int `json:"retry_budget_seconds"`
 }
 
 type FetchMetricLabelsRequest struct {
@@ -235,6 +271,34 @@ type GetUtilisationTrendRequest struct {
 	StartTime            int64          `json:"start_time"`
 	EndTime              int64          `json:"end_time"`
 	Request              map[string]any `json:"request"`
+
+	// StepInterval is the resolution in seconds. Zero leaves the choice to
+	// getStepDuration, which spreads ~60 points across the range with a 60s floor
+	// — right for a picker-driven chart, too coarse for an evidence card drawn
+	// over a ten-minute incident window, where it halves the points.
+	StepInterval int `json:"step_interval,omitempty"`
+
+	// Aggregate collapses each series the requested keys define to ONE point over
+	// the window: avg, sum, max, min, count, or p1..p99. Empty leaves every key
+	// exactly as it behaves today, which is what keeps the UI byte-identical.
+	// See metrics_aggregate_spec.go for why this is the only parameterised axis.
+	Aggregate string `json:"aggregate,omitempty"`
+
+	// PodNames scopes a query to an exact set of pods instead of the workload's name
+	// prefix. Rightsizing needs it twice over: it resolves pods through the owner
+	// chain so it knows pods that no longer exist, and the prefix form is wrong for
+	// it — "services-server" renders as pod=~"services-server-.*", which also matches
+	// services-server-worker, so a workload can be sized on another's pods.
+	//
+	// Absent (nil) means fall back to the prefix. Present but EMPTY means the caller
+	// resolved the pod list and it is empty, so the honest answer is no data — not
+	// every pod in the namespace.
+	PodNames []string `json:"pod_names,omitempty"`
+
+	// Step is the bucket width in seconds, overriding the one promAggWindow derives
+	// from the range. The rightsizing strategy samples at 75s, and a percentile taken
+	// over 5-minute averages is not the same number.
+	Step int `json:"step,omitempty"`
 }
 
 // OutputMetricQuery represents the response structure for metric and log group queries.
@@ -286,6 +350,16 @@ type Result struct {
 	Metric     map[string]string `json:"metric"`     // Label key-value pairs
 	Timestamps []int64           `json:"timestamps"` // Unix epoch milliseconds
 	Values     []float64         `json:"values"`     // Metric/count values
+
+	// NonFinite counts samples this series could not carry as a number, keyed by
+	// what they actually were: "nan", "+inf", "-inf", "unparseable". Those samples
+	// are sent as JSON `null` — the position is preserved, so Values and Timestamps
+	// stay index-aligned and a chart shows a gap at the right point in time — and
+	// this map is what lets a caller say *why* the gap is there instead of showing
+	// an unexplained hole. Populated at marshal time (see Result.MarshalJSON in
+	// metrics_sanitize.go); a parser may pre-set "unparseable" for values it could
+	// not read at all. Omitted when the series is entirely finite.
+	NonFinite map[string]int `json:"non_finite,omitempty"`
 }
 
 type DefaultProvider struct {
@@ -310,6 +384,13 @@ type ProviderCapabilities struct {
 	SupportsLogGroups              bool `json:"supports_log_groups"`
 	// Interface-derived at runtime (optional interface — not all providers implement it)
 	SupportsAutoQuery bool `json:"supports_auto_query"`
+	// Whether Create Alert can write a rule for this provider + account. Decided
+	// for the two Prometheus transports (the agent must be connected to land a
+	// PrometheusRule CR; a direct Prometheus must declare a ruler); every other
+	// provider answers true and fails, if at all, at its own API. AlertRulesReason
+	// carries the operator-facing explanation when false.
+	SupportsAlertRules bool   `json:"supports_alert_rules"`
+	AlertRulesReason   string `json:"alert_rules_reason,omitempty"`
 	// Runtime-detected from source. SupportedOperatorDescriptors carries the
 	// backend-authoritative display metadata (chip/line labels, kinds); the UI
 	// migrates from SupportedOperators to SupportedOperatorDescriptors and the
@@ -355,6 +436,53 @@ type ListProviderCapabilitiesRequest struct {
 	AccountId string `json:"account_id" mapstructure:"account_id" validate:"required"`
 }
 
+// GetLabelMappingRequest is the request for observability_get_label_mapping.
+type GetLabelMappingRequest struct {
+	AccountId string `json:"account_id" mapstructure:"account_id" validate:"required"`
+	// ProviderType is accepted (and today must be "logs" or empty) so the trace
+	// mirror becomes an additive change rather than a contract break.
+	ProviderType string `json:"provider_type" mapstructure:"provider_type"`
+	// Provider / ProviderSource pin the resolution to one integration. Empty means
+	// "the account's default log provider" — the Advanced Settings form always sends
+	// them, so the panel describes the integration being edited rather than whichever
+	// one happens to be the default.
+	ProviderSource string `json:"provider_source" mapstructure:"provider_source"`
+	Provider       string `json:"provider" mapstructure:"provider"`
+	// DraftMappings carries the rows the operator has typed but not yet saved, and
+	// DraftSet says whether to use them at all. They are resolved server-side, on
+	// purpose: overlaying them in the browser would put a second copy of the merge in
+	// the frontend, which no Go test can see and which would drift from execution.
+	//
+	// DraftSet with no rows means "every row was deleted, so the integration tier
+	// contributes nothing" — different from omitting DraftSet, which reads what is
+	// saved.
+	DraftMappings map[string]string `json:"draft_mappings" mapstructure:"draft_mappings"`
+	DraftSet      bool              `json:"draft_set" mapstructure:"draft_set"`
+}
+
+// LabelMappingResponse is the response for observability_get_label_mapping: the
+// canonical → provider field mapping in effect for one account on one provider,
+// with the tier each value came from.
+type LabelMappingResponse struct {
+	AccountId      string `json:"account_id"`
+	Provider       string `json:"provider"`
+	ProviderSource string `json:"provider_source"`
+	ProviderType   string `json:"provider_type"`
+	// IntegrationSaved is false while the integration is still being created. The
+	// lower tiers are resolved and returned anyway — "what am I inheriting?" is the
+	// useful answer at that point.
+	IntegrationSaved bool `json:"integration_saved"`
+	// DraftApplied reports whether the integration tier came from DraftMappings, so
+	// the UI can label those rows as not yet live.
+	DraftApplied bool `json:"draft_applied"`
+	// TierOrder is the precedence, lowest → highest. Shipped so the UI derives its
+	// column order instead of re-declaring it.
+	TierOrder []LabelMappingTier  `json:"tier_order"`
+	Fields    []LabelMappingField `json:"fields"`
+	// Effective is the same map queries are rewritten with.
+	Effective map[string]string `json:"effective"`
+}
+
 // ProviderCapabilityEntry is one flat entry in the list_provider_capabilities response.
 type ProviderCapabilityEntry struct {
 	Provider     string               `json:"provider"`
@@ -390,6 +518,12 @@ type TracesV3Request struct {
 	// the labels the trace provider exposes and fails with an actionable error if any
 	// are unknown. Off by default; opt-in callers (notably the LLM agent) enable it.
 	ValidateRequest bool `json:"validate_request" mapstructure:"validate_request"`
+	// IncludeExecutedQuery asks GetTraces to resolve the provider query it ran and return
+	// it on TracesResult, so the caller can record what was actually asked (the enrichers
+	// stamp it onto evidence as `executed_query`). Off by default because resolving it
+	// costs an extra GetQuery round trip on some providers, and the hot read paths — the
+	// traces UI listing and the service map — have no use for it.
+	IncludeExecutedQuery bool `json:"include_executed_query" mapstructure:"include_executed_query"`
 }
 
 // RawTraceResult carries an arbitrary ClickHouse result set with column order and types preserved.
@@ -407,6 +541,30 @@ type RawTraceResult struct {
 // (e.g. a non-clickhouse provider, or a structured query).
 type TracesQueryResult struct {
 	Result *RawTraceResult `json:"result,omitempty"`
+}
+
+// TracesResult is the internal result of a trace query: the spans, plus the actionable
+// diagnosis produced when ValidateRequest is set and the query came back empty. Mirrors
+// FetchLogsResult.
+//
+// Suggestion is populated alongside an EMPTY Traces and a nil error — a 200, not a 400 — so
+// the diagnosis reads as "successfully determined what to fix" rather than a request failure.
+// The HTTP layer only serializes the envelope when the caller asked for validation; every
+// other caller (the traces UI) keeps receiving the bare span array, exactly as the
+// IncludeRawResult path already varies its shape by request flag.
+type TracesResult struct {
+	Traces     []common.OpenTelemetryTrace `json:"traces"`
+	Suggestion string                      `json:"suggestion,omitempty"`
+	// Query is the provider query that produced Traces, resolved only when the caller sets
+	// IncludeExecutedQuery. It is the provider-native string when the source exposes one
+	// (ClickHouse SQL, KQL, NRQL, ES DSL); for sources that consume the where clause
+	// natively and emit no query string (Datadog, Jaeger, Chronosphere), it falls back to
+	// the canonical where-clause JSON — already in provider space, so it is what the source
+	// was handed. Mirrors FetchLogsResult.Query.
+	Query string `json:"query,omitempty"`
+	// Provider is the trace provider the query ran against, e.g. `clickhouse`. Resolved
+	// whenever provider resolution succeeded, including on the empty and error paths.
+	Provider string `json:"provider,omitempty"`
 }
 
 type TracesHeatMapRequest struct {

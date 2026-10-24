@@ -3,7 +3,7 @@ import { useRouter } from 'next/router';
 import { Box, Stack, Typography } from '@mui/material';
 import Tooltip from '@ui/Tooltip';
 import SafeIcon from '@shared/icons/SafeIcon';
-import { DeleteIconRed as deleteIcon, downloadIcon, K8sIcon, writeIconLight } from '@assets';
+import { DeleteIconRed as deleteIcon, downloadIcon, EditIcon, K8sIcon } from '@assets';
 import { ListingLayout } from '@ui/ListingLayout';
 import { Button } from '@ui/Button';
 import { DropdownMenu } from '@ui/DropdownMenu';
@@ -23,6 +23,7 @@ import { ds } from '@utils/colors';
 import { downloadJsonFile, filenameSlug } from '@utils/fileDownload';
 import apiDashboards, { type AccountOption, type Dashboard, type DashboardBinding } from '@api1/dashboards';
 import DashboardView from './DashboardView';
+import { PANEL_PARAM } from './panelLink';
 import DashboardSkeleton from './DashboardSkeleton';
 import ImportDashboardModal from './ImportDashboardModal';
 import TemplateGalleryModal from './TemplateGalleryModal';
@@ -71,7 +72,16 @@ const CustomDashboards: React.FC = () => {
         .filter((c: any) => !c.account_type || QUERYABLE_ACCOUNT_TYPES.has(c.account_type))
         // `kind` is what lets the template gallery pre-select a scope per panel: a PromQL widget needs a
         // kubernetes account, and only this field says which of the connected accounts is one.
-        .map((c: any) => ({ label: c.label || c.value, value: c.value, cloud_provider: c.cloud_provider || '', kind: c.account_type || '' })),
+        // `status` rides along so the panel editor can say a saved account has
+        // been disabled — nothing downstream filters on it, so without this a
+        // disabled account is indistinguishable from a live one.
+        .map((c: any) => ({
+          label: c.label || c.value,
+          value: c.value,
+          cloud_provider: c.cloud_provider || '',
+          kind: c.account_type || '',
+          status: c.status || '',
+        })),
     [allCluster]
   );
 
@@ -118,6 +128,8 @@ const CustomDashboards: React.FC = () => {
       const params = new URLSearchParams(queryString);
       if (id) params.set(DASHBOARD_PARAM, id);
       else params.delete(DASHBOARD_PARAM);
+      // A panel belongs to the dashboard it was linked on; the next one opens at its top.
+      params.delete(PANEL_PARAM);
       const query = params.toString();
       router.push(`${path}${query ? `?${query}` : ''}${hash ? `#${hash}` : ''}`, undefined, { shallow: true });
     },
@@ -389,6 +401,10 @@ const CustomDashboards: React.FC = () => {
   if (mode.name === 'view' && selected) {
     return (
       <DashboardView
+        // Keyed on the dashboard: the route can swap the dashboard IN PLACE (the header search opens another
+        // one while this is showing), and the view's account filter, time range and drafts belong to the one
+        // they were set on. A remount is what drops them, rather than each piece of state resetting itself.
+        key={selected.dashboard.id}
         dashboard={selected.dashboard}
         accounts={accountOptions}
         canEdit={canWrite && !selected.dashboard.is_builtin}
@@ -425,7 +441,7 @@ const CustomDashboards: React.FC = () => {
       value: d.title,
       component: (
         <Box sx={{ cursor: 'pointer', minWidth: 0 }} onClick={() => setRouteId(d.id)} data-testid={`open-dashboard-${d.id}`}>
-          <Typography sx={{ fontSize: 13, fontWeight: 600, color: ds.blue[500], overflowWrap: 'anywhere' }}>{d.title}</Typography>
+          <Typography sx={{ fontSize: 13, fontWeight: ds.weight.semibold, color: ds.blue[500], overflowWrap: 'anywhere' }}>{d.title}</Typography>
           {d.description && (
             <Tooltip title={d.description}>
               <Typography
@@ -484,7 +500,7 @@ const CustomDashboards: React.FC = () => {
                   tone='ghost'
                   composition='icon-only'
                   aria-label='Edit dashboard'
-                  icon={<SafeIcon src={writeIconLight} alt='edit' width={18} height={18} />}
+                  icon={<SafeIcon src={EditIcon} alt='edit' width={18} height={18} />}
                   onClick={() => openForEdit(d.id)}
                   id={`edit-dashboard-${d.id}`}
                 />
@@ -609,6 +625,7 @@ const CustomDashboards: React.FC = () => {
         handleClose={deleting ? undefined : () => setPendingDelete(null)}
         title='Delete dashboard?'
         confirmText='Delete'
+        confirmTone='danger'
         onConfirm={confirmDelete}
         loader={deleting}
         backdropClickClose={false}

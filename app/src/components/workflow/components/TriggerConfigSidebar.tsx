@@ -1,6 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Box, Typography } from '@mui/material';
 import { Button } from '@ui/Button';
+import { CodeBlock } from '@ui/CodeBlock';
+import { Link } from '@ui/Link';
+import { Callout } from '@ui/Callout';
 import CheckIcon from '@mui/icons-material/Check';
 import { FormCard, FormField } from '@shared/forms/FormComponents';
 import type { Node } from 'reactflow';
@@ -9,12 +12,33 @@ import CloseIcon from '@mui/icons-material/Close';
 import k8sApi from '@api1/kubernetes';
 import apiKubernetes1 from '@api1/kubernetes1';
 import apiIntegrations from '@api1/integrations';
-import homeApi from '@api1/home';
 import recommendationApi from '@api1/recommendation';
 import { formatRuleName } from '@components/optimise-new/utils';
 import { titleCaseForAggregationKey } from 'src/utils/common';
 import CopyButton from '@shared/buttons/CopyButton';
-import { STRUCTURED_FILTER_FIELDS, buildFilterExpression, parseFilterExpression } from '../utils/eventFilter';
+import {
+  STRUCTURED_FILTER_FIELDS,
+  buildFilterExpression,
+  parseFilterExpression,
+  mergeLegacyEventType,
+  migrateLegacyAccountFilter,
+  structuredCoversFilter,
+  type FilterValues,
+} from '../utils/eventFilter';
+import { EVENT_ACCOUNT_TEMPLATE, accessibleAccountOptions, triggerListenAccounts } from '../utils/listenAccounts';
+import {
+  type AccountFilterValues,
+  type FilterValuesByAccount,
+  type ScopeAccount,
+  accountsSilencedByFilter,
+  mergeFilterOptions,
+  namespaceFieldCopy,
+  silencedAccountsMessage,
+} from '../utils/eventFilterOptions';
+import { useAccountOptions } from '../hooks/useAccountOptions';
+import { DEFAULT_LIFECYCLE_PHASE, buildTriggerMock, eventAccountOverrides } from '../utils/triggerPayloadMock';
+import { useFilterLiveValidation } from '../hooks/useFilterLiveValidation';
+import TriggerSimulatorPanel from './TriggerSimulatorPanel';
 import { DOCS_BASE_URL, docsUrl } from '@lib/externalUrls';
 import { validateCron } from '@utils/cron';
 import ScheduleBuilder from './ScheduleBuilder';
@@ -54,38 +78,21 @@ interface TriggerConfigSidebarProps {
   // open and then cleared by parent.
   pendingConfig?: { type: string; params: any } | null;
   onPendingConfigConsumed?: () => void;
+  // Runs the automation as a dry run against a payload the user assembled in the
+  // trigger simulator. Omitted when the host has no run surface.
+  onSimulateRun?: (inputs: Record<string, any>) => void;
 }
 
-// Migrate legacy params.event_type (scalar or array) into a Jinja filter clause
-// so old workflows can be edited via the structured-filter UI.
-const legacyEventTypeToFilter = (rawEventType: unknown): string => {
-  if (typeof rawEventType === 'string' && rawEventType !== '') {
-    return `event.event_type == "${rawEventType.replace(/"/g, "'")}"`;
-  }
-  if (Array.isArray(rawEventType)) {
-    const items = rawEventType.filter((v): v is string => typeof v === 'string' && v !== '');
-    if (items.length > 0) {
-      const sanitized = items.map((v) => v.replace(/"/g, "'"));
-      return sanitized.map((v) => `event.event_type == "${v}"`).join(' or ');
-    }
-  }
-  return '';
-};
-
-const mergeLegacyEventType = (rawEventType: unknown, existingFilter: string): string => {
-  const legacy = legacyEventTypeToFilter(rawEventType);
-  if (!legacy) {
-    return existingFilter || '';
-  }
-  if (!existingFilter) {
-    return `{{ ${legacy} }}`;
-  }
-  // Strip outer {{ }} from existing, AND with legacy clause, re-wrap.
-  const inner = existingFilter
-    .trim()
-    .replace(/^\{\{\s*/, '')
-    .replace(/\s*\}\}$/, '');
-  return `{{ ${legacy} and ${inner} }}`;
+// Params as an event trigger saves them. Listening to only the workflow's own account is the
+// default, so `accounts` is left out then. The UI doesn't edit `on`, so a saved phase is kept.
+const buildEventParams = (
+  filter: string,
+  accounts: string[],
+  ownAccountId: string,
+  on?: string
+): { filter: string; accounts?: string[]; on?: string } => {
+  const isDefault = accounts.length === 0 || (accounts.length === 1 && accounts[0] === ownAccountId);
+  return { ...(on ? { on } : {}), filter, ...(isDefault ? {} : { accounts }) };
 };
 
 const WORKFLOW_WEBHOOK_INTEGRATIONS_URL = '/accounts/account-form?cloudProvider=workflow_webhook';
@@ -97,19 +104,6 @@ const PRIORITY_OPTIONS = [
   { label: 'INFO', value: 'INFO' },
   { label: 'DEBUG', value: 'DEBUG' },
 ];
-
-// Generic, source-agnostic example payload shown in the event-trigger helper.
-// Keep in sync with runbook-server/services/service/model_event.go (Event struct).
-const EVENT_PAYLOAD_SAMPLE = {
-  event_type: 'KubePodCrashLooping',
-  source: 'k8s-collector',
-  cluster: 'prod-us-east-1',
-  subject_namespace: 'payments',
-  subject_name: 'checkout-api-7d9c',
-  priority: 'HIGH',
-  status: 'FIRING',
-  labels: { team: 'payments' },
-};
 
 const EVENT_FILTER_EXAMPLE = '{{ event.event_type == "KubePodCrashLooping" and event.cluster == "prod-us-east-1" }}';
 
@@ -177,6 +171,9 @@ const validateIntegrationName = (name: string, setError: (msg: string) => void):
   return true;
 };
 
+// Accounts whose filter values load at once.
+const FILTER_VALUES_CONCURRENCY = 4;
+
 const filterValuesToOptions = (filters: any[], filterType: string): { label: string; value: string }[] => {
   const result = filters.find((f: any) => f.filter_type === filterType);
   const values = result?.values || [];
@@ -214,6 +211,7 @@ const TriggerConfigSidebar: React.FC<TriggerConfigSidebarProps> = ({
   onRequestCloseWithUnsaved,
   pendingConfig,
   onPendingConfigConsumed,
+  onSimulateRun,
 }) => {
   const [cronExpression, setCronExpression] = useState('');
   const [cronError, setCronError] = useState('');
@@ -225,16 +223,18 @@ const TriggerConfigSidebar: React.FC<TriggerConfigSidebarProps> = ({
   const [integrationNameError, setIntegrationNameError] = useState('');
   const [eventFilter, setEventFilter] = useState('');
   const [eventFilterError, setEventFilterError] = useState('');
-  const [aggregationKeyOptions, setAggregationKeyOptions] = useState<{ label: string; value: string }[]>([]);
+  // Event type, namespace/service and source values seen per listened account, merged for the pickers.
+  const [filterValuesByAccount, setFilterValuesByAccount] = useState<FilterValuesByAccount>({});
   const [isLoadingEventTypes, setIsLoadingEventTypes] = useState(false);
-  const [filterEventType, setFilterEventType] = useState('');
-  const [filterNamespace, setFilterNamespace] = useState('');
-  const [filterSource, setFilterSource] = useState('');
-  const [filterPriority, setFilterPriority] = useState('');
-  const [filterCluster, setFilterCluster] = useState('');
+  const [filterEventType, setFilterEventType] = useState<string[]>([]);
+  const [filterNamespace, setFilterNamespace] = useState<string[]>([]);
+  const [filterSource, setFilterSource] = useState<string[]>([]);
+  const [filterPriority, setFilterPriority] = useState<string[]>([]);
+  // Accounts the event trigger listens to, as saved: empty means the workflow's own account.
+  const [listenAccounts, setListenAccounts] = useState<string[]>([]);
   const [isAdvancedFilter, setIsAdvancedFilter] = useState(false);
-  const [namespaceOptions, setNamespaceOptions] = useState<{ label: string; value: string }[]>([]);
-  const [sourceOptions, setSourceOptions] = useState<{ label: string; value: string }[]>([]);
+  // Set when the user asks for the pickers but the expression is more than they can show.
+  const [confirmClearExpression, setConfirmClearExpression] = useState(false);
   const [manualInputs, setManualInputs] = useState<string>('');
   const [manualInputsError, setManualInputsError] = useState('');
   const [webhookIntegrationInfo, setWebhookIntegrationInfo] = useState<WebhookIntegrationInfo | null>(null);
@@ -249,8 +249,6 @@ const TriggerConfigSidebar: React.FC<TriggerConfigSidebarProps> = ({
   const [optimizationCategories, setOptimizationCategories] = useState<string[]>([]);
   const [optimizationRuleNames, setOptimizationRuleNames] = useState<string[]>([]);
   const [optimizationClusters, setOptimizationClusters] = useState<string[]>([]);
-  const [k8sClusterOptions, setK8sClusterOptions] = useState<{ label: string; value: string }[]>([]);
-  const [isLoadingK8sClusters, setIsLoadingK8sClusters] = useState(false);
   // Distinct (category, rule_name) pairs sourced from the tenant's actual optimization
   // recommendations, so the Rule Name dropdown always matches what Optimize Recommendations shows.
   const [optimizationRulePairs, setOptimizationRulePairs] = useState<{ category: string; rule_name: string }[]>([]);
@@ -270,16 +268,97 @@ const TriggerConfigSidebar: React.FC<TriggerConfigSidebarProps> = ({
   const triggerType = selectedNode?.data?.trigger?.type;
   const workflowId = workflowData?.id;
 
-  const filterStateMap: Record<string, { value: string; setter: (v: string) => void }> = {
+  const {
+    options: accountOptions,
+    isLoading: isLoadingAccounts,
+    providerOf,
+  } = useAccountOptions(open && (triggerType === 'event' || triggerType === 'optimization'));
+
+  // Last-resort account fallback, read after mount rather than during render: the render pass
+  // also runs on the server, where localStorage doesn't exist and a value read on the client
+  // would produce a hydration mismatch. Storage can also throw when the browser blocks it.
+  const [storedAccountId, setStoredAccountId] = useState('');
+  useEffect(() => {
+    try {
+      setStoredAccountId(localStorage.getItem('selectedAccountId') || '');
+    } catch (error) {
+      console.error('Failed to read selectedAccountId from localStorage:', error);
+    }
+  }, []);
+
+  // Use the passed accountId prop first, then fall back to other sources.
+  const workflowAccountId = accountId || selectedNode?.data?.accountId || selectedNode?.data?.account_id || storedAccountId;
+  // What the picker shows: with nothing saved the trigger listens to the workflow's own account.
+  const shownListenAccounts = listenAccounts.length > 0 ? listenAccounts : workflowAccountId ? [workflowAccountId] : [];
+  // Only accounts the user can access are offered. One already saved but out of reach stays
+  // visible so it can be removed — the server refuses to save it.
+  const listenAccountOptions = useMemo(() => {
+    const accessible = accessibleAccountOptions(accountOptions);
+    const unreachable = shownListenAccounts
+      .filter((id) => id !== workflowAccountId && !accessible.some((o) => o.value === id))
+      .map((id) => ({ label: id, value: id, cloud_provider: '', group: 'No access' }));
+    const own = accountOptions.find((o) => o.value === workflowAccountId);
+    return [...(own && !accessible.includes(own) ? [own] : []), ...accessible, ...unreachable];
+  }, [accountOptions, shownListenAccounts.join(','), workflowAccountId]);
+  // Filter options come from every listened account the user can reach. Without an account list
+  // there is nothing to check reach against, so every listened account counts.
+  const filterScopeAccounts: ScopeAccount[] = useMemo(() => {
+    if (isLoadingAccounts) return [];
+    const known = accountOptions.length > 0 ? shownListenAccounts.filter((id) => accountOptions.some((o) => o.value === id)) : shownListenAccounts;
+    const ids = known.length > 0 ? known : workflowAccountId ? [workflowAccountId] : [];
+    return ids.map((id) => ({ id, label: accountOptions.find((o) => o.value === id)?.label || id }));
+  }, [shownListenAccounts.join(','), accountOptions, workflowAccountId, isLoadingAccounts]);
+  const filterScopeKey = filterScopeAccounts.map((a) => a.id).join(',');
+  const namespaceCopy = namespaceFieldCopy(filterScopeAccounts.map((a) => providerOf(a.id) || ''));
+  const mergedFilterOptions = useMemo(
+    () => ({
+      event_type: mergeFilterOptions('event_type', filterScopeAccounts, filterValuesByAccount, filterEventType, titleCaseForAggregationKey),
+      namespace: mergeFilterOptions('namespace', filterScopeAccounts, filterValuesByAccount, filterNamespace),
+      source: mergeFilterOptions('source', filterScopeAccounts, filterValuesByAccount, filterSource),
+    }),
+    [filterScopeAccounts, filterValuesByAccount, filterEventType, filterNamespace, filterSource]
+  );
+  // The filter applies to every listened account, so a pick no event of an account carries
+  // quietly stops that account from triggering anything.
+  const silencedAccounts =
+    filterScopeAccounts.length > 1
+      ? accountsSilencedByFilter(
+          { event_type: filterEventType, namespace: filterNamespace, source: filterSource },
+          filterScopeAccounts,
+          filterValuesByAccount
+        )
+      : [];
+
+  // Lifecycle phase this event trigger fires at. The builder doesn't set params.on
+  // yet, so UI-built triggers are all event.created; YAML-authored ones may declare
+  // another phase, and the simulated payload has to match whichever it is.
+  const lifecyclePhase: string = selectedNode?.data?.trigger?.params?.on || DEFAULT_LIFECYCLE_PHASE;
+
+  // A sample event from a listened account at this phase, so the live check reaches the filter
+  // instead of stopping at the account or phase gate. Memoized: the mock stamps fresh timestamps.
+  const filterSampleAccount = shownListenAccounts[0] || '';
+  const filterSamplePayload = useMemo(
+    () => buildTriggerMock('event', lifecyclePhase, eventAccountOverrides(filterSampleAccount, accountOptions)),
+    [lifecyclePhase, filterSampleAccount, accountOptions]
+  );
+  const { error: liveFilterError } = useFilterLiveValidation({
+    enabled: open && triggerType === 'event' && isAdvancedFilter,
+    filter: eventFilter,
+    accountId,
+    triggerType: 'event',
+    params: { on: lifecyclePhase, accounts: listenAccounts },
+    samplePayload: filterSamplePayload,
+  });
+
+  const filterStateMap: Record<string, { value: string[]; setter: (v: string[]) => void }> = {
     event_type: { value: filterEventType, setter: setFilterEventType },
     namespace: { value: filterNamespace, setter: setFilterNamespace },
     source: { value: filterSource, setter: setFilterSource },
     priority: { value: filterPriority, setter: setFilterPriority },
-    cluster: { value: filterCluster, setter: setFilterCluster },
   };
 
-  const getFilterValues = (): Record<string, string> => {
-    const values: Record<string, string> = {};
+  const getFilterValues = (): FilterValues => {
+    const values: FilterValues = {};
     for (const field of STRUCTURED_FILTER_FIELDS) {
       values[field.filterType] = filterStateMap[field.filterType].value;
     }
@@ -330,26 +409,28 @@ const TriggerConfigSidebar: React.FC<TriggerConfigSidebarProps> = ({
     setWebhookFilter(triggerType === 'webhook' ? params.filter || '' : '');
 
     // Event trigger fields — fold legacy params.event_type into the filter expression so it
-    // surfaces inside the structured-filter UI alongside cluster/namespace/source/priority.
-    const mergedFilter = mergeLegacyEventType(params.event_type, params.filter || '');
+    // surfaces inside the structured-filter UI alongside namespace/source/priority, and move
+    // a legacy account clause out of the filter into the listened accounts.
+    const savedListenAccounts = triggerListenAccounts({ type: 'event', params });
+    const legacyAccounts = migrateLegacyAccountFilter(
+      mergeLegacyEventType(params.event_type, params.filter || ''),
+      savedListenAccounts,
+      workflowAccountId
+    );
+    const mergedFilter = legacyAccounts.filter;
     setEventFilter(mergedFilter);
+    setListenAccounts(legacyAccounts.accounts);
 
     // Parse existing filter expression into structured fields
     const parsed = parseFilterExpression(mergedFilter);
-    setFilterEventType(parsed.event_type || '');
-    setFilterNamespace(parsed.namespace || '');
-    setFilterSource(parsed.source || '');
-    setFilterPriority(parsed.priority || '');
-    setFilterCluster(parsed.cluster || '');
+    setFilterEventType(parsed.event_type || []);
+    setFilterNamespace(parsed.namespace || []);
+    setFilterSource(parsed.source || []);
+    setFilterPriority(parsed.priority || []);
 
     // If the filter has content that can't be fully represented by structured dropdowns, use advanced mode
-    const existingFilter = mergedFilter.trim();
-    if (existingFilter) {
-      const reconstructed = buildFilterExpression(parsed).trim();
-      setIsAdvancedFilter(existingFilter !== reconstructed);
-    } else {
-      setIsAdvancedFilter(false);
-    }
+    setIsAdvancedFilter(!!mergedFilter.trim() && !structuredCoversFilter(mergedFilter, parsed));
+    setConfirmClearExpression(false);
 
     // Optimization trigger fields
     setOptimizationCategories(Array.isArray(params.categories) ? params.categories : []);
@@ -384,8 +465,13 @@ const TriggerConfigSidebar: React.FC<TriggerConfigSidebarProps> = ({
       type: triggerType || '',
       params: { ...(selectedNode?.data?.trigger?.params || {}) },
     };
-    setPendingTriggerConfig(baseConfig);
     setCommittedSnapshot(JSON.stringify(baseConfig));
+    // A migrated legacy filter is a real change to what gets saved, so it shows as unsaved.
+    setPendingTriggerConfig(
+      triggerType === 'event' && legacyAccounts.migrated
+        ? { type: 'event', params: buildEventParams(mergedFilter, legacyAccounts.accounts, workflowAccountId, params.on) }
+        : baseConfig
+    );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedNode, workflowData]);
 
@@ -430,80 +516,56 @@ const TriggerConfigSidebar: React.FC<TriggerConfigSidebarProps> = ({
     onRequestCloseWithUnsaved?.(pendingTriggerConfig);
   }, [isDirty, onClose, onRequestCloseWithUnsaved, pendingTriggerConfig]);
 
-  const fetchEventFilterOptions = async () => {
-    // Use the passed accountId prop first, then fall back to other sources
-    const currentAccountId =
-      accountId || selectedNode?.data?.accountId || selectedNode?.data?.account_id || localStorage.getItem('selectedAccountId');
+  // Values cached per account for the sidebar's lifetime, so adding an account fetches only that one.
+  const fetchedFilterAccountsRef = useRef<Set<string>>(new Set());
+  const pendingFilterFetchesRef = useRef(0);
 
-    if (!currentAccountId || currentAccountId === 'demo') {
-      setAggregationKeyOptions([]);
-      setNamespaceOptions([]);
-      setSourceOptions([]);
-      return;
-    }
-
-    setIsLoadingEventTypes(true);
-    const filterValuesPromise = k8sApi
-      .getEventFilterValues({
-        accountId: currentAccountId,
-        filterTypes: ['namespace', 'source'],
-      })
-      .then((response: any) => {
-        const filters = response?.data?.filters || [];
-        setNamespaceOptions(filterValuesToOptions(filters, 'namespace'));
-        setSourceOptions(filterValuesToOptions(filters, 'source'));
-      })
-      .catch((error) => {
-        console.error('Failed to fetch event filter values:', error);
-        setNamespaceOptions([]);
-        setSourceOptions([]);
-      });
-
-    const eventRulesPromise = apiKubernetes1
-      .getAllEventRuleNames({ accountId: currentAccountId })
-      .then((response: any) => {
-        const rows = response?.data?.event_rules || [];
-        const seen = new Set<string>();
-        const options: { label: string; value: string }[] = [];
-        for (const row of rows) {
-          const alert = typeof row?.alert === 'string' ? row.alert : '';
-          if (!alert || seen.has(alert)) continue;
-          seen.add(alert);
-          options.push({ label: titleCaseForAggregationKey(alert), value: alert });
-        }
-        options.sort((a, b) => a.label.localeCompare(b.label));
-        setAggregationKeyOptions(options);
-      })
-      .catch((error) => {
-        console.error('Failed to fetch event rule names:', error);
-        setAggregationKeyOptions([]);
-      });
-
+  const fetchAccountFilterValues = async (id: string): Promise<AccountFilterValues | null> => {
     try {
-      await Promise.all([filterValuesPromise, eventRulesPromise]);
-    } finally {
-      setIsLoadingEventTypes(false);
+      const [filterValues, eventRules]: any[] = await Promise.all([
+        k8sApi.getEventFilterValues({ accountId: id, filterTypes: ['namespace', 'source'] }),
+        apiKubernetes1.getAllEventRuleNames({ accountId: id }),
+      ]);
+      // getAllEventRuleNames returns [] on failure instead of throwing. A half-loaded account would
+      // look like it has no event types, so it counts as not loaded.
+      if (!eventRules?.data) throw new Error('event rule names unavailable');
+      const filters = filterValues?.data?.filters || [];
+      const rows = eventRules.data.event_rules || [];
+      return {
+        event_type: Array.from(new Set<string>(rows.map((r: any) => r?.alert).filter((a: any) => typeof a === 'string' && a))),
+        namespace: filterValuesToOptions(filters, 'namespace').map((o) => o.value),
+        source: filterValuesToOptions(filters, 'source').map((o) => o.value),
+      };
+    } catch (error) {
+      console.error(`Failed to fetch event filter values for account ${id}:`, error);
+      return null;
     }
   };
 
-  const fetchK8sClusterOptions = async () => {
-    setIsLoadingK8sClusters(true);
+  const fetchEventFilterOptions = async () => {
+    const missing = filterScopeAccounts.map((a) => a.id).filter((id) => id !== 'demo' && !fetchedFilterAccountsRef.current.has(id));
+    if (missing.length === 0) return;
+    missing.forEach((id) => fetchedFilterAccountsRef.current.add(id));
+    pendingFilterFetchesRef.current += 1;
+    setIsLoadingEventTypes(true);
     try {
-      const accounts = await homeApi.getCloudAccounts('');
-      const options = (accounts || [])
-        .filter((a: any) => a.id !== 'demo')
-        .map((a: any) => ({
-          label: a.account_name,
-          value: a.id,
-          cloud_provider: a.cloud_provider,
-          group: a.cloud_provider || 'Other',
-        }));
-      setK8sClusterOptions(options);
-    } catch (error) {
-      console.error('Failed to fetch K8s cluster options:', error);
-      setK8sClusterOptions([]);
+      // A few accounts at a time, so "select all" on a large tenant doesn't fire every request at once.
+      for (let i = 0; i < missing.length; i += FILTER_VALUES_CONCURRENCY) {
+        const batch = missing.slice(i, i + FILTER_VALUES_CONCURRENCY);
+        const results = await Promise.all(batch.map(fetchAccountFilterValues));
+        setFilterValuesByAccount((prev) => {
+          const next = { ...prev };
+          batch.forEach((id, j) => {
+            const values = results[j];
+            if (values) next[id] = values;
+            else fetchedFilterAccountsRef.current.delete(id);
+          });
+          return next;
+        });
+      }
     } finally {
-      setIsLoadingK8sClusters(false);
+      pendingFilterFetchesRef.current -= 1;
+      if (pendingFilterFetchesRef.current === 0) setIsLoadingEventTypes(false);
     }
   };
 
@@ -524,13 +586,10 @@ const TriggerConfigSidebar: React.FC<TriggerConfigSidebarProps> = ({
     if (open && triggerType === 'event') {
       fetchEventFilterOptions();
     }
-    if (open && (triggerType === 'event' || triggerType === 'optimization')) {
-      fetchK8sClusterOptions();
-    }
     if (open && triggerType === 'optimization') {
       fetchOptimizationRuleOptions();
     }
-  }, [open, triggerType, accountId]);
+  }, [open, triggerType, filterScopeKey]);
 
   const fetchWebhookIntegrationInfo = async () => {
     if (!workflowId) {
@@ -756,28 +815,8 @@ const TriggerConfigSidebar: React.FC<TriggerConfigSidebarProps> = ({
           }}
         >
           The matched event is available as <strong>Inputs.event.*</strong> in your tasks and as <strong>event.*</strong> in filter expressions. A
-          trigger needs at least one Event Type selected, or a filter expression. Example payload:
+          trigger needs at least one Event Type selected, or a filter expression. See the simulator below for the full payload.
         </Typography>
-        <Box
-          component='pre'
-          sx={{
-            margin: 0,
-            mb: 1,
-            padding: 'var(--ds-space-2) var(--ds-space-3)',
-            backgroundColor: ds.background[100],
-            border: `1px solid ${ds.brand[200]}`,
-            borderRadius: 'var(--ds-radius-sm)',
-            fontSize: 'var(--ds-text-caption)',
-            lineHeight: 1.4,
-            fontFamily: 'monospace',
-            whiteSpace: 'pre-wrap',
-            wordBreak: 'break-word',
-            overflowX: 'auto',
-            color: ds.gray[700],
-          }}
-        >
-          {JSON.stringify(EVENT_PAYLOAD_SAMPLE, null, 2)}
-        </Box>
         <Typography
           sx={{
             fontSize: 'var(--ds-text-small)',
@@ -787,7 +826,7 @@ const TriggerConfigSidebar: React.FC<TriggerConfigSidebarProps> = ({
           }}
         >
           Filter example:{' '}
-          <Box component='span' sx={{ fontFamily: 'monospace', fontSize: 'var(--ds-text-caption)', wordBreak: 'break-all' }}>
+          <Box component='span' sx={{ fontFamily: ds.font.mono, fontSize: 'var(--ds-text-caption)', wordBreak: 'break-all' }}>
             {EVENT_FILTER_EXAMPLE}
           </Box>
         </Typography>
@@ -888,33 +927,80 @@ const TriggerConfigSidebar: React.FC<TriggerConfigSidebarProps> = ({
     }
   };
 
-  const AT_LEAST_ONE_FILTER_MSG = 'Set at least one filter (event type, cluster, namespace, source, priority, or advanced expression)';
+  const AT_LEAST_ONE_FILTER_MSG = `Set at least one filter (event type, ${namespaceCopy.label.toLowerCase()}, source, priority, or advanced expression), or listen to another account`;
 
-  const saveEventTrigger = (filter: string): boolean => {
+  const saveEventTrigger = (filter: string, accounts: string[] = listenAccounts): boolean => {
     const trimmedFilter = filter?.trim() || '';
-    if (!trimmedFilter) {
+    const params = buildEventParams(trimmedFilter, accounts, workflowAccountId, selectedNode?.data?.trigger?.params?.on);
+    if (!trimmedFilter && !params.accounts) {
       setEventFilterError(AT_LEAST_ONE_FILTER_MSG);
       return false;
     }
     setEventFilterError('');
-    commitTriggerConfig({ type: 'event', params: { filter: trimmedFilter } });
+    commitTriggerConfig({ type: 'event', params });
     return true;
+  };
+
+  const handleListenAccountsChange = (picked: string[]) => {
+    // Picking only the workflow's own account (or nothing) is the default, so nothing is saved.
+    const next = picked.length === 1 && picked[0] === workflowAccountId ? [] : picked;
+    setListenAccounts(next);
+    if (triggerType !== 'event') return;
+    // Picks are kept: one no account has seen shows as "not seen" rather than vanishing.
+    // A half-typed advanced expression was never committed; don't commit it now either.
+    if (validateEventFilter(eventFilter, setEventFilterError)) {
+      saveEventTrigger(eventFilter, next);
+    }
   };
 
   const handleEventFilterChange = (value: string) => {
     const safeValue = value || '';
     setEventFilter(safeValue);
     setEventFilterError('');
+    setConfirmClearExpression(false);
 
     if (triggerType === 'event' && validateEventFilter(safeValue, setEventFilterError)) {
       saveEventTrigger(safeValue);
     }
   };
 
-  const handleStructuredFilterChange = (filterType: string, value: string) => {
+  // The pickers show exactly what gets saved: they load the expression when they can represent
+  // it, and otherwise switching waits for the user to agree to clear it.
+  const switchToStructuredFilter = () => {
+    const parsed = parseFilterExpression(eventFilter);
+    if (eventFilter.trim() && !structuredCoversFilter(eventFilter, parsed)) {
+      setConfirmClearExpression(true);
+      return;
+    }
+    for (const field of STRUCTURED_FILTER_FIELDS) {
+      filterStateMap[field.filterType].setter(parsed[field.filterType] || []);
+    }
+    setIsAdvancedFilter(false);
+  };
+
+  const clearExpressionAndSwitch = () => {
+    for (const field of STRUCTURED_FILTER_FIELDS) {
+      filterStateMap[field.filterType].setter([]);
+    }
+    setEventFilter('');
+    setConfirmClearExpression(false);
+    setIsAdvancedFilter(false);
+    // An empty filter is only valid with other accounts; commit it anyway so the buffer matches the screen.
+    if (!saveEventTrigger('')) {
+      commitTriggerConfig({
+        type: 'event',
+        params: buildEventParams('', listenAccounts, workflowAccountId, selectedNode?.data?.trigger?.params?.on),
+      });
+    }
+  };
+
+  const toggleFilterMode = () => (isAdvancedFilter ? switchToStructuredFilter() : setIsAdvancedFilter(true));
+
+  const handleStructuredFilterChange = (filterType: string, value: string[]) => {
     filterStateMap[filterType].setter(value);
 
-    const newFilter = buildFilterExpression(getFilterValues(), { [filterType]: value });
+    const overrides: FilterValues = { [filterType]: value };
+    const newFilter = buildFilterExpression(getFilterValues(), overrides);
     setEventFilter(newFilter);
 
     if (triggerType === 'event') {
@@ -932,25 +1018,30 @@ const TriggerConfigSidebar: React.FC<TriggerConfigSidebarProps> = ({
     { label: 'Spot Instance', value: 'K8sSpotRecommendation' },
   ];
 
-  const updateOptimizationTrigger = (updates: Partial<{ categories: string[]; rule_names: string[]; clusters: string[] }>) => {
-    const newCategories = updates.categories ?? optimizationCategories;
-    const newRuleNames = updates.rule_names ?? optimizationRuleNames;
-    const newClusters = updates.clusters ?? optimizationClusters;
-
+  // Params as they are persisted on the trigger. Shared with the simulator, which
+  // has to check the payload against exactly what will be saved.
+  const buildOptimizationParams = (categories: string[], ruleNames: string[], clusters: string[]): Record<string, string[]> => {
     const params: Record<string, string[]> = {};
-    if (newCategories.length > 0) {
-      params.categories = newCategories;
+    if (categories.length > 0) {
+      params.categories = categories;
     }
-    if (newRuleNames.length > 0) {
-      params.rule_names = newRuleNames;
+    if (ruleNames.length > 0) {
+      params.rule_names = ruleNames;
     }
-    if (newClusters.length > 0) {
-      params.clusters = newClusters;
+    if (clusters.length > 0) {
+      params.clusters = clusters;
     }
+    return params;
+  };
 
+  const updateOptimizationTrigger = (updates: Partial<{ categories: string[]; rule_names: string[]; clusters: string[] }>) => {
     const triggerConfig = {
       type: 'optimization',
-      params,
+      params: buildOptimizationParams(
+        updates.categories ?? optimizationCategories,
+        updates.rule_names ?? optimizationRuleNames,
+        updates.clusters ?? optimizationClusters
+      ),
     };
     commitTriggerConfig(triggerConfig);
   };
@@ -965,7 +1056,7 @@ const TriggerConfigSidebar: React.FC<TriggerConfigSidebarProps> = ({
     >
       <FormField
         label='Cluster'
-        description='Filter by Kubernetes cluster (optional)'
+        description='Filter by cluster or cloud account (optional)'
         value={optimizationClusters[0] || ''}
         onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
           const value = e.target.value || '';
@@ -977,7 +1068,7 @@ const TriggerConfigSidebar: React.FC<TriggerConfigSidebarProps> = ({
         required={false}
         error=''
         fieldType='select'
-        options={k8sClusterOptions}
+        options={accountOptions}
         grouped
         groupIcon={renderAccountGroupIcon}
         onSelect={() => {}}
@@ -987,7 +1078,7 @@ const TriggerConfigSidebar: React.FC<TriggerConfigSidebarProps> = ({
         maxRows={1}
         minRows={1}
         maxLength={200}
-        isOptionsLoading={isLoadingK8sClusters}
+        isOptionsLoading={isLoadingAccounts}
       />
 
       <FormField
@@ -1071,13 +1162,25 @@ const TriggerConfigSidebar: React.FC<TriggerConfigSidebarProps> = ({
         >
           • This workflow triggers when a new optimization recommendation is created
           <br />• Use the filters above to narrow which recommendations trigger this workflow
-          <br />• The recommendation data is available in the workflow as{' '}
-          <code style={{ backgroundColor: ds.background[100], padding: 'var(--ds-space-1) var(--ds-space-1)', borderRadius: 'var(--ds-radius-sm)' }}>
-            event
-          </code>
+          <br />• The recommendation data is available in the workflow as <CodeBlock inline code='event' />
           <br />• Leave all filters empty to trigger on any recommendation
         </Typography>
       </Box>
+
+      <TriggerSimulatorPanel
+        // Remount per trigger node so an edited payload doesn't follow the user
+        // to a different trigger.
+        key={selectedNode?.id}
+        triggerType='optimization'
+        optimizationOverrides={{
+          category: optimizationCategories[0],
+          rule_name: optimizationRuleNames[0],
+          cloud_account_id: optimizationClusters[0],
+        }}
+        accountId={accountId}
+        triggerParams={buildOptimizationParams(optimizationCategories, optimizationRuleNames, optimizationClusters)}
+        onSimulateRun={onSimulateRun}
+      />
     </FormCard>
   );
 
@@ -1299,14 +1402,9 @@ const TriggerConfigSidebar: React.FC<TriggerConfigSidebarProps> = ({
             >
               <Typography sx={{ fontSize: 'var(--ds-text-small)', color: ds.gray[400], lineHeight: 1.5 }}>
                 Need a new webhook? Create one in the{' '}
-                <a
-                  href={WORKFLOW_WEBHOOK_INTEGRATIONS_URL}
-                  target='_blank'
-                  rel='noopener noreferrer'
-                  style={{ color: ds.blue[500], fontWeight: 'var(--ds-font-weight-medium)', textDecoration: 'none' }}
-                >
-                  Integrations tab → Workflow Webhook ↗
-                </a>
+                <Link href={WORKFLOW_WEBHOOK_INTEGRATIONS_URL} openInNew>
+                  Integrations tab → Workflow Webhook
+                </Link>
               </Typography>
             </Box>
           </FormCard>
@@ -1318,19 +1416,67 @@ const TriggerConfigSidebar: React.FC<TriggerConfigSidebarProps> = ({
             number={1}
             columns={1}
           >
+            <FormField
+              id='wf-trigger-cfg-listen-accounts'
+              label='Listen to accounts'
+              description='Events from these clusters and cloud accounts trigger this automation'
+              value={shownListenAccounts}
+              onChange={(e: React.ChangeEvent<HTMLInputElement>) => handleListenAccountsChange((e.target.value as unknown as string[]) || [])}
+              placeholder='Select accounts'
+              required={false}
+              error=''
+              fieldType='select'
+              multiple
+              options={listenAccountOptions}
+              grouped
+              groupIcon={renderAccountGroupIcon}
+              onSelect={() => {}}
+              customRender={null}
+              limitTags={0}
+              minWidth='100%'
+              maxRows={1}
+              minRows={1}
+              maxLength={200}
+              isOptionsLoading={isLoadingAccounts}
+            />
+            {shownListenAccounts.length > 1 && (
+              <Callout
+                tone='info'
+                data-testid='wf-trigger-cfg-multi-account-hint'
+                message={
+                  <>
+                    Events now come from several accounts. Every step that acts on infrastructure must name its target account — set its account to{' '}
+                    <CodeBlock inline code={EVENT_ACCOUNT_TEMPLATE} /> to act on the account the event came from.
+                  </>
+                }
+              />
+            )}
+
             {!isAdvancedFilter ? (
               <>
-                <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 'var(--ds-space-4)' }}>
+                {/* minWidth 0 lets a long picked value truncate instead of widening its column; narrow
+                    sidebars drop to one column. */}
+                <Box
+                  sx={{
+                    display: 'grid',
+                    gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 240px), 1fr))',
+                    gap: 'var(--ds-space-4)',
+                    '& > *': { minWidth: 0 },
+                  }}
+                >
                   <FormField
                     label='Event Type'
                     description='Aggregation key from the event rules catalog'
                     value={filterEventType}
-                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => handleStructuredFilterChange('event_type', e.target.value || '')}
+                    onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                      handleStructuredFilterChange('event_type', (e.target.value as unknown as string[]) || [])
+                    }
+                    multiple
                     placeholder='Select event type'
                     required={false}
                     error={eventFilterError}
                     fieldType='select'
-                    options={aggregationKeyOptions}
+                    options={mergedFilterOptions.event_type}
                     onSelect={() => {}}
                     customRender={null}
                     limitTags={0}
@@ -1342,37 +1488,18 @@ const TriggerConfigSidebar: React.FC<TriggerConfigSidebarProps> = ({
                   />
 
                   <FormField
-                    label='Cluster'
-                    description='Kubernetes cluster'
-                    value={filterCluster}
-                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => handleStructuredFilterChange('cluster', e.target.value || '')}
-                    placeholder='Select cluster'
-                    required={false}
-                    error=''
-                    fieldType='select'
-                    options={k8sClusterOptions}
-                    grouped
-                    groupIcon={renderAccountGroupIcon}
-                    onSelect={() => {}}
-                    customRender={null}
-                    limitTags={0}
-                    minWidth='100%'
-                    maxRows={1}
-                    minRows={1}
-                    maxLength={200}
-                    isOptionsLoading={isLoadingK8sClusters}
-                  />
-
-                  <FormField
-                    label='Namespace'
-                    description='Kubernetes namespace'
+                    label={namespaceCopy.label}
+                    description={namespaceCopy.description}
                     value={filterNamespace}
-                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => handleStructuredFilterChange('namespace', e.target.value || '')}
-                    placeholder='Select namespace'
+                    onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                      handleStructuredFilterChange('namespace', (e.target.value as unknown as string[]) || [])
+                    }
+                    multiple
+                    placeholder={`Select ${namespaceCopy.label.toLowerCase()}`}
                     required={false}
                     error=''
                     fieldType='select'
-                    options={namespaceOptions}
+                    options={mergedFilterOptions.namespace}
                     onSelect={() => {}}
                     customRender={null}
                     limitTags={0}
@@ -1387,12 +1514,15 @@ const TriggerConfigSidebar: React.FC<TriggerConfigSidebarProps> = ({
                     label='Source'
                     description='Event source system'
                     value={filterSource}
-                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => handleStructuredFilterChange('source', e.target.value || '')}
+                    onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                      handleStructuredFilterChange('source', (e.target.value as unknown as string[]) || [])
+                    }
+                    multiple
                     placeholder='Select source'
                     required={false}
                     error=''
                     fieldType='select'
-                    options={sourceOptions}
+                    options={mergedFilterOptions.source}
                     onSelect={() => {}}
                     customRender={null}
                     limitTags={0}
@@ -1407,7 +1537,10 @@ const TriggerConfigSidebar: React.FC<TriggerConfigSidebarProps> = ({
                     label='Priority'
                     description='Severity level'
                     value={filterPriority}
-                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => handleStructuredFilterChange('priority', e.target.value || '')}
+                    onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                      handleStructuredFilterChange('priority', (e.target.value as unknown as string[]) || [])
+                    }
+                    multiple
                     placeholder='Select priority'
                     required={false}
                     error=''
@@ -1423,20 +1556,14 @@ const TriggerConfigSidebar: React.FC<TriggerConfigSidebarProps> = ({
                   />
                 </Box>
 
-                {eventFilter && (
-                  <Box
-                    sx={{
-                      mt: 1,
-                      p: 1.5,
-                      backgroundColor: ds.background[100],
-                      borderRadius: ds.radius.sm,
-                      border: `1px solid ${ds.brand[200]}`,
-                    }}
-                  >
-                    <Typography sx={{ fontSize: 'var(--ds-text-caption)', color: ds.gray[400], fontFamily: 'monospace', wordBreak: 'break-all' }}>
-                      {eventFilter}
-                    </Typography>
-                  </Box>
+                {silencedAccounts.length > 0 && (
+                  <Callout
+                    tone='warning'
+                    data-testid='wf-trigger-cfg-silenced-accounts'
+                    message={silencedAccountsMessage(silencedAccounts, filterScopeAccounts.length, (type) =>
+                      type === 'namespace' ? namespaceCopy.label : type === 'event_type' ? 'Event Type' : 'Source'
+                    )}
+                  />
                 )}
               </>
             ) : (
@@ -1447,7 +1574,7 @@ const TriggerConfigSidebar: React.FC<TriggerConfigSidebarProps> = ({
                 onChange={(e: React.ChangeEvent<HTMLInputElement>) => handleEventFilterChange(e.target.value)}
                 placeholder='{{ event.source == "my-source" }}'
                 required={false}
-                error={eventFilterError}
+                error={eventFilterError || (liveFilterError ? `This expression can't be evaluated: ${liveFilterError}` : '')}
                 fieldType='textarea'
                 maxRows={3}
                 minRows={2}
@@ -1459,15 +1586,24 @@ const TriggerConfigSidebar: React.FC<TriggerConfigSidebarProps> = ({
               />
             )}
 
+            {isAdvancedFilter && confirmClearExpression && (
+              <Callout
+                tone='warning'
+                data-testid='wf-trigger-cfg-clear-expression-confirm'
+                message='The simple filters can’t show this expression. Switching clears it.'
+                action={{ label: 'Clear expression and switch', onClick: clearExpressionAndSwitch, id: 'wf-trigger-cfg-clear-expression-btn' }}
+              />
+            )}
+
             <Typography
               id='wf-trigger-cfg-filter-mode-toggle-btn'
               role='button'
               tabIndex={0}
-              onClick={() => setIsAdvancedFilter(!isAdvancedFilter)}
+              onClick={toggleFilterMode}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' || e.key === ' ') {
                   e.preventDefault();
-                  setIsAdvancedFilter(!isAdvancedFilter);
+                  toggleFilterMode();
                 }
               }}
               sx={{
@@ -1482,6 +1618,38 @@ const TriggerConfigSidebar: React.FC<TriggerConfigSidebarProps> = ({
             </Typography>
 
             {renderEventInfoSection()}
+
+            <TriggerSimulatorPanel
+              // Remount per trigger node so an edited payload doesn't follow the
+              // user to a different trigger.
+              key={selectedNode?.id}
+              triggerType='event'
+              lifecyclePhase={lifecyclePhase}
+              // Only structured values are trustworthy — parseFilterExpression recovers
+              // simple equality clauses only, so in advanced mode they can contradict
+              // what the user wrote. The match verdict covers that case instead.
+              // The sample comes from a listened account, so by default it passes the account gate.
+              eventOverrides={
+                isAdvancedFilter
+                  ? eventAccountOverrides(shownListenAccounts[0] || '', accountOptions)
+                  : {
+                      event_type: filterEventType[0],
+                      ...eventAccountOverrides(shownListenAccounts[0] || '', accountOptions),
+                      subject_namespace: filterNamespace[0],
+                      source: filterSource[0],
+                      priority: filterPriority[0],
+                    }
+              }
+              accountId={accountId}
+              triggerParams={{
+                filter: eventFilter,
+                on: lifecyclePhase,
+                event_type: selectedNode?.data?.trigger?.params?.event_type,
+                // The server gates on the accounts the trigger listens to, so the check must see them.
+                accounts: listenAccounts,
+              }}
+              onSimulateRun={onSimulateRun}
+            />
           </FormCard>
         ) : triggerType === 'optimization' ? (
           renderOptimizationConfig()
@@ -1540,25 +1708,8 @@ const TriggerConfigSidebar: React.FC<TriggerConfigSidebarProps> = ({
               >
                 • Define JSON inputs that will be passed to the workflow when triggered manually
                 <br />• These inputs will be available to workflow tasks as variables
-                <br />• Example:{' '}
-                <code
-                  style={{
-                    backgroundColor: ds.background[100],
-                    padding: 'var(--ds-space-1) var(--ds-space-1)',
-                    borderRadius: 'var(--ds-radius-sm)',
-                  }}
-                >
-                  {`{"param": "value", "count": 10}`}
-                </code>
-                <br />• Leave empty{' '}
-                <code
-                  style={{
-                    backgroundColor: ds.background[100],
-                    padding: 'var(--ds-space-1) var(--ds-space-1)',
-                    borderRadius: 'var(--ds-radius-sm)',
-                  }}
-                >{`{}`}</code>{' '}
-                for no inputs
+                <br />• Example: <CodeBlock inline code={`{"param": "value", "count": 10}`} />
+                <br />• Leave empty <CodeBlock inline code='{}' /> for no inputs
               </Typography>
             </Box>
           </FormCard>

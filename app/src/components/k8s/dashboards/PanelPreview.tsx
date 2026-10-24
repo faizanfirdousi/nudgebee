@@ -100,8 +100,10 @@ const PanelPreview: React.FC<Props> = ({ panel, accountOptions, variables, start
       description: panel.description,
       content: panel.content,
       unit: panel.unit,
+      // Thresholds and how the accounts combine are judged on the fetched data, not part of the fetch.
+      options: panel.options,
     }),
-    [settled, panel.title, panel.description, panel.content, panel.unit]
+    [settled, panel.title, panel.description, panel.content, panel.unit, panel.options]
   );
 
   const liveRunnable = !forceSample && isRunnable(panel);
@@ -171,8 +173,8 @@ const PanelPreview: React.FC<Props> = ({ panel, accountOptions, variables, start
           display: 'flex',
           minHeight: panelMinHeight(panel),
           opacity: sample ? 0.72 : 1,
-          p: '4px',
-          borderRadius: '12px',
+          p: ds.space[1],
+          borderRadius: ds.radius.xl,
           border: `1px solid ${ds.purple[300]}`,
           background: ds.purple[100],
           boxShadow: '0 4px 18px rgba(0, 0, 0, 0.15)',

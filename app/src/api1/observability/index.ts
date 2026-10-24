@@ -15,6 +15,7 @@ query FetchLogs(
   $step_interval: Int
   $query_request: jsonb
   $request: jsonb
+  $record_history: Boolean
 ) {
   logs_list(request: {
     account_id: $account_id
@@ -29,6 +30,7 @@ query FetchLogs(
     step_interval: $step_interval
     query_request: $query_request
     request: $request
+    record_history: $record_history
   }) {
     logs {
       timestamp
@@ -52,6 +54,27 @@ query FetchLogLabels {
 }
 `;
 
+const GET_LABEL_MAPPING = `
+query GetLabelMapping {
+  observability_get_label_mapping(request: __WHERE__) {
+    account_id
+    provider
+    provider_source
+    provider_type
+    integration_saved
+    draft_applied
+    tier_order
+    fields {
+      canonical
+      effective
+      winning_tier
+      contributions
+    }
+    effective
+  }
+}
+`;
+
 const FETCH_LOG_LABEL_VALUES = `
 query FetchLogLabelValues {
   logs_list_label_values(request: __WHERE__) {
@@ -61,16 +84,8 @@ query FetchLogLabelValues {
 }
 `;
 
-const USER_HISTORY = `
-mutation UserHistory {
-  users_create_history(request: __WHERE__) {
-    status
-  }
-}
-`;
-
 const observability = {
-  async fetchLogs(data: any) {
+  async fetchLogs(data: any, signal?: AbortSignal) {
     try {
       if (data.account_id === 'demo') {
         return {
@@ -81,20 +96,27 @@ const observability = {
           },
         };
       }
-      const response = await queryGraphQL(FETCH_LOGS, 'FetchLogs', {
-        account_id: data.account_id,
-        query: data.query,
-        start_time: data.start_time,
-        end_time: data.end_time,
-        limit: data.limit,
-        offset: data.offset,
-        log_provider: data.log_provider,
-        log_provider_source: data.log_provider_source,
-        sort_fields: data.sort_fields,
-        step_interval: data.step_interval,
-        query_request: data.query_request,
-        request: data.request,
-      });
+      const response = await queryGraphQL(
+        FETCH_LOGS,
+        'FetchLogs',
+        {
+          account_id: data.account_id,
+          query: data.query,
+          start_time: data.start_time,
+          end_time: data.end_time,
+          limit: data.limit,
+          offset: data.offset,
+          log_provider: data.log_provider,
+          log_provider_source: data.log_provider_source,
+          sort_fields: data.sort_fields,
+          step_interval: data.step_interval,
+          query_request: data.query_request,
+          request: data.request,
+          record_history: data.record_history,
+        },
+        undefined,
+        signal
+      );
       return response;
     } catch (error) {
       console.log('failed to fetch logs-', error);
@@ -102,6 +124,11 @@ const observability = {
     }
   },
 
+  // `data.integration_config_values` is optional and PRIVILEGED: supplying it lists the
+  // fields of the configuration described in the request rather than the one saved for
+  // the account, so the integration form can offer real field names before the
+  // integration exists. The backend accepts it from tenant admins only. Omit it and this
+  // behaves exactly as it always has.
   async fetchLogLabels(data: any) {
     if (data?.account_id === 'demo') {
       const mockData: any = await getMockData('k8s-log-labels');
@@ -116,6 +143,23 @@ const observability = {
     }
   },
 
+  // Resolves which provider field each canonical log field maps to for one account,
+  // and which layer decided it (integration > provider config > account > tenant >
+  // provider default). Drafts are sent to the server rather than merged here on
+  // purpose: a second copy of the precedence rule in the browser would drift from the
+  // one queries actually run through.
+  async getLabelMapping(data: {
+    account_id: string;
+    provider?: string;
+    provider_source?: string;
+    provider_type?: string;
+    draft_mappings?: Record<string, string>;
+    draft_set?: boolean;
+  }) {
+    const response = await queryGraphQL(GET_LABEL_MAPPING.replaceAll('__WHERE__', gqlStringify(data)), 'GetLabelMapping');
+    return response?.data?.data?.observability_get_label_mapping ?? null;
+  },
+
   async fetchLogLabelValues(data: any) {
     try {
       const response = await queryGraphQL(FETCH_LOG_LABEL_VALUES.replaceAll('__WHERE__', gqlStringify(data)), 'FetchLogLabelValues');
@@ -124,14 +168,6 @@ const observability = {
       console.log('failed to fetch log label values-', error);
       throw error;
     }
-  },
-
-  async createUserHistory(data: any) {
-    if (!data.data) {
-      return;
-    }
-    const response = await queryGraphQL(USER_HISTORY.replace('__WHERE__', gqlStringify(data)), 'UserHistory');
-    return response;
   },
 
   async metricsList(accountId: string, options?: { metricProvider?: string; metricProviderSource?: string; serviceName?: string }) {
@@ -165,21 +201,28 @@ const observability = {
     }
   },
 
-  async metricsLabelList(accountId: string, metricName: string) {
+  // `metricProvider` pins the provider the labels are read from. Without it the
+  // backend answers from the account default, so an ES index selected while the
+  // account defaults to Prometheus came back with Prometheus's `__name__`.
+  async metricsLabelList(accountId: string, metricName: string, options?: { metricProvider?: string }) {
     if (accountId === 'demo') return null;
     const METRICS_LABEL_LIST = `
-    query MetricsLabelList($accountId: String!, $metricName: String!) {
-      metrics_list_labels(request: {account_id: $accountId, metric: $metricName}) {
+    query MetricsLabelList($accountId: String!, $metricName: String!, $metricProvider: String) {
+      metrics_list_labels(request: {account_id: $accountId, metric: $metricName, metric_provider: $metricProvider}) {
         label
         attributes
       }
     }
     `;
     try {
-      const response = await queryGraphQL(METRICS_LABEL_LIST, 'MetricsLabelList', {
+      const variables: Record<string, any> = {
         accountId,
         metricName: metricName,
-      });
+      };
+      if (options?.metricProvider) {
+        variables.metricProvider = options.metricProvider;
+      }
+      const response = await queryGraphQL(METRICS_LABEL_LIST, 'MetricsLabelList', variables);
       return response;
     } catch (err) {
       console.error('Failed to fetch metrics labels:', err);
@@ -216,22 +259,27 @@ const observability = {
     });
   },
 
-  async metricsLabelValueList(accountId: string, labelName: string, request: Record<string, string>) {
+  // `metricProvider` pins the provider, same reason as metricsLabelList above.
+  async metricsLabelValueList(accountId: string, labelName: string, request: Record<string, string>, options?: { metricProvider?: string }) {
     if (accountId === 'demo') return null;
     const METRICS_LABEL_VALUE_LIST = `
-    query MetricsLabelValueList($accountId: String!, $labelName: String!, $request: jsonb) {
-      metrics_list_label_values(request: {account_id: $accountId, label: $labelName, request: $request}) {
+    query MetricsLabelValueList($accountId: String!, $labelName: String!, $request: jsonb, $metricProvider: String) {
+      metrics_list_label_values(request: {account_id: $accountId, label: $labelName, request: $request, metric_provider: $metricProvider}) {
         value
         attributes
       }
     }
     `;
     try {
-      const response = await queryGraphQL(METRICS_LABEL_VALUE_LIST, 'MetricsLabelValueList', {
+      const variables: Record<string, any> = {
         accountId,
         labelName: labelName,
         request: request,
-      });
+      };
+      if (options?.metricProvider) {
+        variables.metricProvider = options.metricProvider;
+      }
+      const response = await queryGraphQL(METRICS_LABEL_VALUE_LIST, 'MetricsLabelValueList', variables);
       return response;
     } catch (err) {
       console.error('Failed to fetch metrics label values:', err);
@@ -239,7 +287,8 @@ const observability = {
     }
   },
 
-  async metricsQuery(data: any) {
+  /** `signal` aborts the request — a dashboard panel gives up after its own deadline. */
+  async metricsQuery(data: any, signal?: AbortSignal) {
     const METRICS_QUERY = `
     query MetricsQuery(
       $account_id: String!
@@ -250,6 +299,8 @@ const observability = {
       $request: jsonb
       $metric_provider: String
       $metric_provider_source: String
+      $record_history: Boolean
+      $step_interval: Int
     ) {
       metrics_list(
         request: {
@@ -261,6 +312,8 @@ const observability = {
           request: $request
           metric_provider: $metric_provider
           metric_provider_source: $metric_provider_source
+          record_history: $record_history
+          step_interval: $step_interval
         }
       ) {
         results
@@ -279,16 +332,26 @@ const observability = {
           },
         };
       }
-      const response = await queryGraphQL(METRICS_QUERY, 'MetricsQuery', {
-        account_id: data.account_id,
-        queries: data.queries,
-        start_time: data.start_time,
-        end_time: data.end_time,
-        instant: data.instant || false,
-        request: data.request,
-        metric_provider: data.metric_provider,
-        metric_provider_source: data.metric_provider_source,
-      });
+      const response = await queryGraphQL(
+        METRICS_QUERY,
+        'MetricsQuery',
+        {
+          account_id: data.account_id,
+          queries: data.queries,
+          start_time: data.start_time,
+          end_time: data.end_time,
+          instant: data.instant || false,
+          request: data.request,
+          metric_provider: data.metric_provider,
+          metric_provider_source: data.metric_provider_source,
+          record_history: data.record_history,
+          // Range step in seconds. Omitted, the agent picks 60s whatever the
+          // range — a week is then 10k points per series.
+          step_interval: data.step_interval,
+        },
+        undefined,
+        signal
+      );
       return response;
     } catch (err) {
       console.error('Failed to fetch metrics query:', err);

@@ -15,6 +15,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"syscall"
@@ -39,32 +40,35 @@ func main() {
 		os.Exit(1)
 	}
 
-	// When enabled, start the in-process Prometheus shim that OpenCost is pointed
-	// at (see opencostengine.engine.go). It translates OpenCost's Prometheus
-	// queries into services-server observability metrics_query calls.
-	var shimSrv *http.Server
-	if opencostengine.UseObservabilityMetrics() {
-		shim, err := opencostengine.NewPrometheusShim()
-		if err != nil {
-			logger.Error("cost-server: prometheus shim init failed", "error", err)
+	// Start the in-process Prometheus shim that OpenCost is pointed at (see
+	// opencostengine.engine.go). By default it proxies to relay-server's
+	// /prometheus-v2 passthrough; with observability-backed metrics enabled it
+	// answers instant and range queries from services-server instead.
+	shim, err := opencostengine.NewPrometheusShim()
+	if err != nil {
+		logger.Error("cost-server: prometheus shim init failed", "error", err)
+		os.Exit(1)
+	}
+	shimAddr := opencostengine.GetPrometheusShimAddr()
+	shimSrv := &http.Server{
+		Addr:              shimAddr,
+		Handler:           shim.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	go func() {
+		logger.Info("cost-server prometheus shim listening", "addr", shimAddr)
+		if err := shimSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("cost-server: prometheus shim listen failed", "error", err)
 			os.Exit(1)
 		}
-		shimAddr := opencostengine.GetPrometheusShimAddr()
-		shimSrv = &http.Server{
-			Addr:              shimAddr,
-			Handler:           shim.Handler(),
-			ReadHeaderTimeout: 10 * time.Second,
-		}
-		go func() {
-			logger.Info("cost-server prometheus shim listening", "addr", shimAddr)
-			if err := shimSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				logger.Error("cost-server: prometheus shim listen failed", "error", err)
-				os.Exit(1)
-			}
-		}()
-	}
+	}()
 
 	mux := http.NewServeMux()
+	// Heap and goroutine profiles. Registered unconditionally, like
+	// api-server/services does — this is a ClusterIP service with no ingress, and
+	// an OOM you cannot profile is an OOM you argue about instead of fix.
+	// `kubectl port-forward` then `go tool pprof http://:9003/debug/pprof/heap`.
+	registerPprof(mux)
 	mux.HandleFunc("GET /allocation/compute", opencostengine.AllocationHandler)
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -95,9 +99,21 @@ func main() {
 	if err := srv.Shutdown(ctx); err != nil {
 		logger.Error("cost-server: graceful shutdown failed", "error", err)
 	}
-	if shimSrv != nil {
-		if err := shimSrv.Shutdown(ctx); err != nil {
-			logger.Error("cost-server: prometheus shim shutdown failed", "error", err)
-		}
+	if err := shimSrv.Shutdown(ctx); err != nil {
+		logger.Error("cost-server: prometheus shim shutdown failed", "error", err)
 	}
+}
+
+// registerPprof wires net/http/pprof onto our own mux.
+//
+// The package registers itself on http.DefaultServeMux in init(), which this
+// server does not use, so the handlers have to be attached by hand. Index
+// covers /debug/pprof/heap, /goroutine, /allocs and the rest; the four named
+// below are the ones Index cannot serve itself.
+func registerPprof(mux *http.ServeMux) {
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 }

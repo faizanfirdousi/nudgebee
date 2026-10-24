@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/lib/pq"
 	"github.com/prometheus/prometheus/promql/parser"
 )
 
@@ -431,6 +432,73 @@ func isClusterScopedAlert(sc *security.RequestContext, accountId string, labels 
 	return false
 }
 
+// webhookSubjectMappingAttrKeys are the per-source attr_key values that
+// integrations.LearnSubjectMapping writes learned title→service mappings under.
+// They are re-declared here rather than imported because the consts live in the
+// parent integrations package, which imports this one. A key missing from this
+// list costs a short-circuit — the alert falls through to the agent — never a
+// wrong answer.
+var webhookSubjectMappingAttrKeys = []string{
+	"DATADOG_INCIDENT_TITLE_SERVICE_MAPPING",
+	"PAGERDUTY_INCIDENT_TITLE_SERVICE_MAPPING",
+	"ZENDUTY_INCIDENT_TITLE_SERVICE_MAPPING",
+}
+
+// lookupLearnedSubject returns the service that this exact alert title has
+// already resolved to across every webhook source, or "" when the title is
+// unknown or its learned mappings name more than one service. Matching is
+// case-insensitive on title, mirroring the unique index the mappings are
+// upserted against.
+func lookupLearnedSubject(sc *security.RequestContext, title string) string {
+	if strings.TrimSpace(title) == "" {
+		return ""
+	}
+	tenantId := sc.GetSecurityContext().GetTenantId()
+	if tenantId == "" {
+		sc.GetLogger().Warn("subject_resolution: tenantId is empty")
+		return ""
+	}
+	dbms, err := database.GetDatabaseManager(database.Metastore)
+	if err != nil {
+		sc.GetLogger().Warn("subject_resolution: failed to get database manager for learned-mapping lookup", "error", err)
+		return ""
+	}
+	var serviceLists []string
+	if err := dbms.Db.Select(&serviceLists,
+		`SELECT services FROM webhook_subject_mappings
+		 WHERE tenant_id = $1 AND attr_key = ANY($2) AND lower(title) = lower($3)`,
+		tenantId, pq.Array(webhookSubjectMappingAttrKeys), title,
+	); err != nil {
+		sc.GetLogger().Error("subject_resolution: learned-mapping lookup failed", "error", err)
+		return ""
+	}
+	return singleLearnedService(serviceLists)
+}
+
+// singleLearnedService collapses the comma-separated services columns of the rows
+// learned for one title into a single service name, or "" when they disagree. A
+// title that has legitimately fired for several services carries no answer on its
+// own, so it is left to the agent.
+func singleLearnedService(serviceLists []string) string {
+	var only string
+	for _, list := range serviceLists {
+		for _, svc := range strings.Split(list, ",") {
+			svc = strings.TrimSpace(svc)
+			if svc == "" {
+				continue
+			}
+			if only == "" {
+				only = svc
+				continue
+			}
+			if svc != only {
+				return ""
+			}
+		}
+	}
+	return only
+}
+
 // ResolveSubjectNameViaAgent asks the webhook_subject_name_extractor agent to map
 // an alert to a single running-service name. The agent owns the running-services
 // inventory and the historical title→service patterns (fetched and cached
@@ -442,7 +510,8 @@ func isClusterScopedAlert(sc *security.RequestContext, accountId string, labels 
 //
 // Every exit records nb_llm_match, so an absent label means only one thing: the
 // agent was never asked. The values are the matched service name, "not_found"
-// (agent declined), "skipped_cluster_scoped" (alert names no object), "error"
+// (agent declined), "skipped_cluster_scoped" (alert names no object),
+// "skipped_learned_mapping" (this exact title has resolved before), "error"
 // (the call failed) and "empty" (the call returned nothing). They are diagnostic
 // — nothing parses them; the sole reader is the presence check in
 // enrichEventsWithSubjectResolution.
@@ -461,6 +530,23 @@ func ResolveSubjectNameViaAgent(sc *security.RequestContext, accountId, title, d
 		labels["nb_llm_match"] = "skipped_cluster_scoped"
 		labels["nb_subject_resolution"] = "cluster-scoped"
 		return ""
+	}
+
+	// Skip the LLM when this exact title has already been resolved and every mapping
+	// learned for it agrees on one service. For a repeat title the agent's entire job
+	// is to find that same line in the "Historical Title -> Service Patterns" block of
+	// its own prompt — a call carrying the whole running-service inventory and the
+	// learned history just to hand back a row we already hold. The answer still goes
+	// through the caller's workload validation, so a mapping that has gone stale is
+	// caught exactly as an LLM pick would be. Titles whose history disagrees fall
+	// through on purpose: choosing between them is what the agent is for.
+	if learned := lookupLearnedSubject(sc, title); learned != "" {
+		labels["nb_llm_match"] = "skipped_learned_mapping"
+		labels["nb_subject_resolution"] = "learned-mapping"
+		if labels["service"] == "" {
+			labels["service"] = learned
+		}
+		return learned
 	}
 
 	payload, _ := json.Marshal(map[string]any{
@@ -497,16 +583,66 @@ func ResolveSubjectNameViaAgent(sc *security.RequestContext, accountId, title, d
 		return ""
 	}
 
-	name := strings.TrimSpace(response.Response[0])
-	if name == "" || strings.EqualFold(name, webhookSubjectAgentNotFound) {
+	answer := strings.TrimSpace(response.Response[0])
+	if answer == "" {
 		labels["nb_llm_match"] = "not_found"
 		return ""
 	}
-	labels["nb_llm_match"] = name
-	if labels["service"] == "" {
-		labels["service"] = name
+	// Check the sentinel against the primary name, not the raw answer: a malformed
+	// reply like "Not Found, cart-service" doesn't equal "Not Found" whole, but its
+	// primary name is the sentinel, which must not be treated as a real subject.
+	primary := primarySubjectName(answer)
+	if strings.EqualFold(primary, webhookSubjectAgentNotFound) {
+		labels["nb_llm_match"] = "not_found"
+		return ""
 	}
-	return name
+	// Guards against a pipeline error (e.g. an expired Google AI CachedContent
+	// slot's 403) landing as response text instead of a Go error.
+	if !looksLikePlausibleSubject(answer) {
+		sc.GetLogger().Warn("subject_resolution: rejecting implausible extractor answer", "answer", answer)
+		labels["nb_llm_match"] = "not_found"
+		return ""
+	}
+	labels["nb_llm_match"] = answer
+	// The full answer goes on the `service` label so an alert spanning several
+	// services records all of them; only the primary one becomes the subject below.
+	if labels["service"] == "" {
+		labels["service"] = answer
+	}
+	return primary
+}
+
+// primarySubjectName reduces the extractor's answer to the single name that becomes
+// the event's subject. The agent may answer with several comma-separated services,
+// most relevant first (see AllowsMultipleOptions in llm-server), but subject_name is
+// one column with workload matching bolted to it: the comma-joined string matches no
+// workload, so the event would land with no namespace, kind or cloud_resource_id and
+// enrichers would query a workload that does not exist. Taking the first name keeps
+// the subject matchable while the `service` label retains the full list.
+//
+// Single-name answers — every answer before multi-select, and still the normal case —
+// contain no comma, and strings.Cut returns them whole.
+func primarySubjectName(answer string) string {
+	primary, _, _ := strings.Cut(answer, ",")
+	return strings.TrimSpace(primary)
+}
+
+// implausibleSubjectNameChars matches characters no real k8s name has but prose does.
+var implausibleSubjectNameChars = regexp.MustCompile(`[\s:\[\]]`)
+
+// looksLikePlausibleSubject checks per-token, not the raw string — the multi-match
+// separator (", ") itself contains a space.
+func looksLikePlausibleSubject(answer string) bool {
+	for _, tok := range strings.Split(answer, ",") {
+		tok = strings.TrimSpace(tok)
+		if tok == "" {
+			continue // a trailing/stray comma, same as primarySubjectName tolerates
+		}
+		if implausibleSubjectNameChars.MatchString(tok) {
+			return false
+		}
+	}
+	return true
 }
 
 // ResolveSubjectViaLLM resolves an event's subject via the
@@ -639,6 +775,86 @@ func ResolveSubjectFromTitlePodName(sc *security.RequestContext, e *EventIncomin
 	return false
 }
 
+// lookupPodOwnerInOnlyNamespace is lookupPodOwnerByName for a pod whose namespace
+// is unknown. A name present in more than one namespace of the account ("redis-0")
+// is a miss: picking the most recently seen one would link the alert to a workload
+// in a namespace the alert never named.
+func lookupPodOwnerInOnlyNamespace(sc *security.RequestContext, dbms *database.DatabaseManager, tenantId, accountId, podName string) (ownerName, ownerKind, ns string, ok bool) {
+	var rows []struct {
+		WorkloadName string  `db:"workload_name"`
+		WorkloadType *string `db:"workload_type"`
+		Namespace    string  `db:"namespace"`
+	}
+	query := `
+		SELECT DISTINCT ON (namespace) workload_name, workload_type, namespace
+		FROM k8s_pods
+		WHERE tenant_id = $1
+		  AND cloud_account_id = $2
+		  AND name = $3
+		  AND workload_name IS NOT NULL AND workload_name <> ''
+		ORDER BY namespace, last_seen DESC NULLS LAST
+		LIMIT 2`
+	if err := dbms.Db.Select(&rows, query, tenantId, accountId, podName); err != nil {
+		sc.GetLogger().Error("subject_resolution: pod-candidate owner lookup failed", "error", err, "pod", podName)
+		return "", "", "", false
+	}
+	if len(rows) != 1 {
+		return "", "", "", false
+	}
+	var workloadType string
+	if rows[0].WorkloadType != nil {
+		workloadType = *rows[0].WorkloadType
+	}
+	return rows[0].WorkloadName, strings.ToLower(workloadType), rows[0].Namespace, true
+}
+
+// ResolveSubjectFromPodCandidates resolves the subject from e.PodNameCandidates:
+// the first candidate that is a pod in the inventory names the alert's pod, and its
+// owning workload becomes the subject, as ResolveSubjectFromTitlePodName does for a
+// pod named in the title. A candidate is matched by exact name, so a value that is
+// not a pod (a container or service name in the same group id) is simply a miss.
+// Returns true on a match.
+func ResolveSubjectFromPodCandidates(sc *security.RequestContext, e *EventIncomingWebhook, accountId string) bool {
+	if sc == nil || sc.GetSecurityContext() == nil || e == nil || len(e.PodNameCandidates) == 0 || accountId == "" {
+		return false
+	}
+	dbms, err := database.GetDatabaseManager(database.Metastore)
+	if err != nil {
+		sc.GetLogger().Error("subject_resolution: failed to get database manager", "error", err)
+		return false
+	}
+	tenantId := sc.GetSecurityContext().GetTenantId()
+
+	for _, pod := range e.PodNameCandidates {
+		if pod == "" {
+			continue
+		}
+		var owner, kind, ns string
+		var ok bool
+		if e.EventSubjectNamespace != "" {
+			owner, kind, ns, ok = lookupPodOwnerByName(sc, dbms, tenantId, accountId, e.EventSubjectNamespace, pod)
+		} else {
+			owner, kind, ns, ok = lookupPodOwnerInOnlyNamespace(sc, dbms, tenantId, accountId, pod)
+		}
+		if !ok {
+			continue
+		}
+		if e.Investigation.Labels == nil {
+			e.Investigation.Labels = map[string]string{}
+		}
+		e.Investigation.Labels["pod"] = pod
+		e.Investigation.Labels["nb_subject_resolution"] = "pod_candidate"
+		e.EventSubjectName = owner
+		e.EventSubjectKind = kind
+		if e.EventSubjectNamespace == "" {
+			e.EventSubjectNamespace = ns
+		}
+		MatchWorkloadAndEnrich(sc, e, accountId)
+		return true
+	}
+	return false
+}
+
 // hasWorkloadValidationInput reports whether an event carries anything the
 // k8s_workloads inventory can be asked about: a subject the webhook resolved
 // itself, or candidate names it offered via nb_workload_candidates (e.g. the
@@ -668,6 +884,12 @@ func enrichEventsWithSubjectResolution(sc *security.RequestContext, events []Eve
 		}
 		if events[i].Investigation.Labels == nil {
 			events[i].Investigation.Labels = map[string]string{}
+		}
+		// Pod candidates go first: a pod names its workload and namespace exactly,
+		// and resolving it here keeps the pod on the event. Only parsers that set
+		// PodNameCandidates take this path.
+		if ResolveSubjectFromPodCandidates(sc, &events[i], accountId) {
+			continue
 		}
 		if hasWorkloadValidationInput(&events[i]) {
 			MatchWorkloadAndEnrich(sc, &events[i], accountId)

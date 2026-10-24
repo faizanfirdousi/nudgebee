@@ -34,6 +34,11 @@ query list_k8_recommendation_summary($limit:Int, $offset:Int) {
       updated_at
     }
   }
+  recommendation_aggregate: recommendation_groupings_v2(where: __WHERE__){
+    rows{
+      count
+    }
+  }
 }`;
 
 const OPTIMISE_SUMMARY_RECS_CACHE_KEY = 'optimise_summary_recommendations';
@@ -71,6 +76,10 @@ export function invalidateOptimisationSummaryRecommendations() {
   cache.delWithSuffix(OPTIMISE_SUMMARY_RECS_CACHE_KEY);
 }
 
+// severity_weight must stay in the selection even though no consumer renders
+// it: the query engine resolves an order_by column against the SELECT list, so
+// callers ordering by severity_weight get an error - and an empty table - the
+// moment it is dropped.
 export const LIST_k8_RECOMMENDATIONS = `
 query list_k8_recommendation($limit:Int, $offset:Int) {
   recommendation: recommendations_list(where: __WHERE__, limit: $limit, offset:$offset,order_by: __ORDER_BY__) {
@@ -79,9 +88,11 @@ query list_k8_recommendation($limit:Int, $offset:Int) {
       resource_meta
       resource_name
       resource_type
+      resource_region
       resource_id
       resource_cloud_service
       severity
+      severity_weight
       category
       rule_name
       recommendation
@@ -141,8 +152,21 @@ query k8s_recommendation_summary {
       sum_estimated_savings
       rule_name
       category
-      resource_cloud_service
       severity
+    }
+  }
+}`;
+
+// Tenant-wide (not capped to any curated list) spend-by-account ranking — used
+// to find the single account carrying the most $ at stake, decoupled from
+// whatever subset of recommendations a curated list happens to have pulled.
+export const LIST_k8_RECOMMENDATION_SUMMARY_BY_ACCOUNT = `
+query k8s_recommendation_summary_by_account($limit: Int) {
+  recommendation_aggregate: recommendation_groupings_v2(where: __WHERE__, group_by: ["account_id"], order_by: [{column: "sum_estimated_savings", order: desc}], limit: $limit) {
+    rows {
+      account_id
+      sum_estimated_savings
+      count
     }
   }
 }`;
@@ -153,6 +177,7 @@ query k8s_recommendation_safety_groups {
     rows{
       count
       safety_band
+      sum_estimated_savings
     }
   }
 }`;
@@ -161,13 +186,15 @@ export const LIST_k8_SECURITY_RECOMMENDATIONS = `
 query list_k8_recommendation($limit:Int, $offset:Int) {
   recommendation: recommendation_security_v2(where: __WHERE__, limit: $limit, offset:$offset,order_by: [{column:"severity_weight", order: desc}]) {
     rows{
+      account_id
       severity
       recommendation
       image
       created_at
-      id      
+      id
       namespace
       workload_name
+      workload_type
       package_id
     }
   }
@@ -177,6 +204,21 @@ query list_k8_recommendation($limit:Int, $offset:Int) {
     }
   }
 }`;
+
+export const getCisTicketReferenceId = (accountId: string, ruleId: string) => `${accountId}:Security:k8s-cis-1.23:${ruleId}`;
+
+// account_id clause accepting one id or a list — the cross-account Security tab
+// on /optimise always sends the explicit list of visible accounts so the
+// account-first indexes keep serving the security queries.
+const accountIdClause = (accountId: string | string[]) => (Array.isArray(accountId) ? { _in: accountId } : { _eq: accountId });
+
+/**
+ * Security rules that belong to a Kubernetes or VM sub-tab rather than to cloud
+ * posture. `CIS` is kube-bench (KubeBenchRuleName in parser_stubs.go — uppercase,
+ * and unrelated to the cloud `CIS…` families), so it is excluded here even though
+ * the CIS Scan tab does not surface it yet.
+ */
+export const K8S_SECURITY_RULE_NAMES = ['image_scan', 'image_scan_summary', 'k8s-cis-1.23', 'CIS', 'vm_package_vulnerability'];
 
 export const LIST_k8_SECURITY_CIS_RECOMMENDATIONS = `
 query list_k8_recommendation($limit:Int, $offset:Int) {
@@ -311,6 +353,102 @@ query get_security_recommendation {
     }
   }
 }`;
+
+// Every other place this CVE appears — the blast radius shown in the finding
+// panel's "Also affects" tab. Grouped by the resource that carries it, so one
+// row is one image on one workload.
+export const GET_SECURITY_FINDINGS_BY_VULNERABILITY = `
+query get_security_recommendation($limit: Int) {
+  recommendation_security_groupings_v2(where:__WHERE__, group_by: ["account_id", "namespace", "workload_name", "image"], order_by: [{column: "count", order: desc}], limit: $limit) {
+    rows {
+      account_id
+      namespace
+      workload_name
+      image
+      count
+    }
+  }
+}
+`;
+
+// The same CIS rule on every other cluster in scope — the rule-level analogue of
+// a CVE's blast radius, and the reason a cross-account Security tab can answer
+// "is this one cluster or all of them?".
+export const GET_CIS_RULE_ACROSS_ACCOUNTS = `
+query list_k8_recommendation {
+  recommendation: recommendation_security_cis_groupings_v2(where: __WHERE__, group_by: ["account_id"], order_by: [{column: "count", order: desc}]) {
+    rows {
+      account_id
+      count
+    }
+  }
+}
+`;
+
+// Cloud posture checks rolled up by rule. The cloud page lists these flat, one
+// row per resource; across accounts that is thousands of rows for ~99 distinct
+// checks, so the cross-account view groups and drills down instead.
+/**
+ * Open Security findings per rule, for the sub-tab count badges.
+ *
+ * One grouped aggregate rather than four aliased ones: `rule_name` already
+ * determines which sub-tab a finding belongs to, so a single group_by answers
+ * all four counts and the caller buckets the ~100 rows locally. Four separate
+ * COUNTs would make the query engine scan the same rows four times to produce
+ * strictly less information.
+ */
+export const GET_SECURITY_TAB_COUNTS = `
+query security_tab_counts {
+  recommendation: recommendation_groupings_v2(where: __WHERE__, group_by: ["rule_name"]) {
+    rows {
+      rule_name
+      count
+    }
+  }
+}
+`;
+
+export const GET_CLOUD_POSTURE_RULES = `
+query cloud_posture_rules {
+  recommendation: recommendation_groupings_v2(where: __WHERE__, group_by: ["rule_name", "severity", "account_id"]) {
+    rows {
+      rule_name
+      severity
+      account_id
+      count
+    }
+  }
+}
+`;
+
+// The resources failing one cloud posture check, across the accounts in view.
+//
+// severity_weight is selected as well as ordered on, and must be: the query
+// engine emits the bare column name in ORDER BY, which Postgres resolves
+// against the SELECT alias — ordering by an unselected column fails the whole
+// statement. Same reason api1/vm selects it.
+export const GET_CLOUD_POSTURE_RESOURCES = `
+query cloud_posture_resources($limit: Int, $offset: Int) {
+  recommendation: recommendations_list(where: __WHERE__, limit: $limit, offset: $offset, order_by: [{column: "severity_weight", order: desc}]) {
+    rows {
+      id
+      account_id
+      severity
+      severity_weight
+      status
+      resource_name
+      resource_id
+      recommendation
+      updated_at
+    }
+  }
+  recommendation_aggregate: recommendation_groupings_v2(where: __WHERE__) {
+    rows {
+      count
+    }
+  }
+}
+`;
 
 export const GET_SECURITY_SEVERITY_GROUPING = `
 query get_security_severity_groupings {
@@ -599,6 +737,7 @@ const apiRecommendations = {
     resourceWorkloadType,
     resourceWorkloadName,
     accountObjectId,
+    search,
     recommendation,
     resourceMeta,
     orderBy = 'estimated_savings',
@@ -626,6 +765,10 @@ const apiRecommendations = {
     resourceWorkloadType?: string;
     resourceWorkloadName?: string;
     accountObjectId?: string;
+    /** Free-text search: matches account_object_id OR resource_name. Configuration
+     *  findings key account_object_id on opaque ids (CIS test numbers, cert ids),
+     *  so matching only that field misses the name the table displays. */
+    search?: string;
     recommendation?: any;
     resourceMeta?: any;
     orderBy?: any;
@@ -666,6 +809,12 @@ const apiRecommendations = {
       }
       if (accountObjectId) {
         gqlQuery['account_object_id'] = { _ilike: '%' + accountObjectId + '%' };
+      }
+      if (search && search.trim()) {
+        // Top-level _or is AND-ed with the sibling filters by the query engine.
+        // Trimmed so a whitespace-only term doesn't become a near-wildcard '%  %' match.
+        const pattern = { _ilike: '%' + search.trim() + '%' };
+        gqlQuery['_or'] = [{ account_object_id: pattern }, { resource_name: pattern }];
       }
       if (Array.isArray(category)) {
         gqlQuery['category'] = { _in: category };
@@ -855,7 +1004,12 @@ const apiRecommendations = {
           if (parsed) item.recommendation = parsed;
         }
       });
-      const result = { data: { recommendation: rows } };
+      // True count across the full `where` match, independent of `limit` — the
+      // Summary tab's curated list only ever pulls the top N rows, so callers
+      // that need "N of TOTAL" framing (e.g. the headline briefing) can't infer
+      // the total from rows.length once the result set exceeds `limit`.
+      const totalCount = response?.data?.data?.recommendation_aggregate?.rows?.[0]?.count ?? rows.length;
+      const result = { data: { recommendation: rows, recommendation_aggregate: { aggregate: { count: totalCount } } } };
       cache.setWithSuffix(OPTIMISE_SUMMARY_RECS_CACHE_KEY, result, cacheSuffix, OPTIMISE_SUMMARY_RECS_TTL_SEC);
       return result;
     } catch (error) {
@@ -1018,6 +1172,7 @@ const apiRecommendations = {
   async getK8sRecommendationSummaryByRuleName({
     accountId,
     accountObjectId,
+    search,
     category,
     ruleName,
     excludeRuleName,
@@ -1037,6 +1192,8 @@ const apiRecommendations = {
   }: {
     accountId: string | string[];
     accountObjectId?: string;
+    /** Free-text search: matches account_object_id OR resource_name (see getK8sRecommendation). */
+    search?: string;
     category?: string;
     ruleName?: string | string[];
     excludeRuleName?: string[];
@@ -1071,6 +1228,11 @@ const apiRecommendations = {
       }
       if (accountObjectId) {
         gqlQuery['account_object_id'] = { _ilike: '%' + accountObjectId + '%' };
+      }
+      if (search && search.trim()) {
+        // Trimmed so a whitespace-only term doesn't become a near-wildcard '%  %' match.
+        const pattern = { _ilike: '%' + search.trim() + '%' };
+        gqlQuery['_or'] = [{ account_object_id: pattern }, { resource_name: pattern }];
       }
       if (Array.isArray(category)) {
         gqlQuery['category'] = { _in: category };
@@ -1139,12 +1301,59 @@ const apiRecommendations = {
     }
   },
 
+  // Tenant-wide $-at-stake ranking by account, for a cross-account "worst
+  // account" callout. Deliberately takes no accountId — call it only when
+  // viewing all accounts; once a single account is selected there is nothing
+  // to rank against.
+  async getK8sRecommendationSummaryByAccount({
+    accountId,
+    category,
+    excludeRuleName,
+    status = ['Open', 'Assigned'],
+    limit = 1,
+  }: {
+    /** Narrows the ranking to a subset of accounts — mirrors the `_in` scoping
+     *  on getK8sRecommendationSummaryByRuleName. Omitted ⇒ every account. */
+    accountId?: string | string[];
+    category?: string | string[];
+    excludeRuleName?: string[];
+    status?: string[];
+    limit?: number;
+  }): Promise<{ account_id: string; sum_estimated_savings: number; count: number }[]> {
+    try {
+      const gqlQuery: any = {};
+      if (Array.isArray(accountId)) {
+        gqlQuery['account_id'] = { _in: accountId };
+      } else if (accountId) {
+        gqlQuery['account_id'] = { _eq: accountId };
+      }
+      if (Array.isArray(category)) {
+        gqlQuery['category'] = { _in: category };
+      } else if (category) {
+        gqlQuery['category'] = { _eq: category };
+      }
+      if (excludeRuleName && excludeRuleName.length > 0) {
+        gqlQuery['rule_name'] = { _not_in: excludeRuleName };
+      }
+      if (status && status.length > 0) {
+        gqlQuery['status'] = { _in: status };
+      }
+      const query = LIST_k8_RECOMMENDATION_SUMMARY_BY_ACCOUNT.replace('__WHERE__', gqlStringify(gqlQuery));
+      const response = await queryGraphQL(query, 'k8s_recommendation_summary_by_account', { limit });
+      return response?.data?.data?.recommendation_aggregate?.rows || [];
+    } catch (error) {
+      console.error('getK8sRecommendationSummaryByAccount error', error);
+      return [];
+    }
+  },
+
   // Per-safety-band counts for the Safety filter chips. Same scoping params as
   // the rule-name summary above, minus safetyBand itself (a facet's own counts
   // must not shrink when that facet is selected).
   async getK8sRecommendationSafetyGroups({
     accountId,
     accountObjectId,
+    search,
     category,
     ruleName,
     excludeRuleName,
@@ -1157,12 +1366,14 @@ const apiRecommendations = {
   }: {
     accountId: string | string[];
     accountObjectId?: string;
+    /** Free-text search: matches account_object_id OR resource_name (see getK8sRecommendation). */
+    search?: string;
     category?: string | string[];
     ruleName?: string | string[];
     excludeRuleName?: string[];
     severity?: string | string[];
     status?: string[];
-  } & Omit<RecommendationFacetFilters, 'safetyBand'>): Promise<{ count: number; safety_band: string | null }[]> {
+  } & Omit<RecommendationFacetFilters, 'safetyBand'>): Promise<{ count: number; safety_band: string | null; sum_estimated_savings: number }[]> {
     if (accountId === 'demo') {
       return [];
     }
@@ -1175,6 +1386,11 @@ const apiRecommendations = {
       }
       if (accountObjectId) {
         gqlQuery['account_object_id'] = { _ilike: '%' + accountObjectId + '%' };
+      }
+      if (search && search.trim()) {
+        // Trimmed so a whitespace-only term doesn't become a near-wildcard '%  %' match.
+        const pattern = { _ilike: '%' + search.trim() + '%' };
+        gqlQuery['_or'] = [{ account_object_id: pattern }, { resource_name: pattern }];
       }
       if (Array.isArray(category)) {
         gqlQuery['category'] = { _in: category };
@@ -1216,12 +1432,14 @@ const apiRecommendations = {
     orderBy = 'severity_weight',
     orderAsc = false,
     status = '',
+    fetchTicket = false,
   }: {
-    accountId?: string;
+    accountId?: string | string[];
     severity?: string;
     orderBy?: string;
     orderAsc?: boolean;
     status?: string;
+    fetchTicket?: boolean;
   }) {
     try {
       if (accountId === 'demo') {
@@ -1241,8 +1459,8 @@ const apiRecommendations = {
       }
 
       const gqlQuery: any = {};
-      if (accountId) {
-        gqlQuery['account_id'] = { _eq: accountId };
+      if (accountId?.length) {
+        gqlQuery['account_id'] = accountIdClause(accountId);
       }
       if (severity) {
         gqlQuery['severity'] = { _eq: severity };
@@ -1257,9 +1475,23 @@ const apiRecommendations = {
         offset: 0,
       });
 
+      const rows = response?.data?.data?.recommendation?.rows ?? [];
+
+      if (fetchTicket && rows.length > 0) {
+        const referenceIds = rows.map((item: any) => getCisTicketReferenceId(item.account_id, item.rule_id));
+        const tickets: any = await ticketsApi.listTicketsSummary({ reference_id: referenceIds });
+        const ticketReferenceMap = new Map();
+        tickets?.data?.tickets?.forEach((element: any) => {
+          ticketReferenceMap.set(element.reference_id, element);
+        });
+        rows.forEach((item: any) => {
+          item.ticket = ticketReferenceMap.get(getCisTicketReferenceId(item.account_id, item.rule_id));
+        });
+      }
+
       return {
         data: {
-          recommendation: response?.data?.data?.recommendation?.rows,
+          recommendation: rows,
         },
       };
     } catch (error) {
@@ -1284,7 +1516,7 @@ const apiRecommendations = {
     vulnerabilityId,
     package_id,
   }: {
-    accountId?: string;
+    accountId?: string | string[];
     severity?: string | string[];
     status?: string[];
     ruleName?: string | string[];
@@ -1317,8 +1549,8 @@ const apiRecommendations = {
       }
 
       const gqlQuery: any = {};
-      if (accountId) {
-        gqlQuery['account_id'] = { _eq: accountId };
+      if (accountId?.length) {
+        gqlQuery['account_id'] = accountIdClause(accountId);
       }
       if (image) {
         gqlQuery['image'] = { _like: '%' + image + '%' };
@@ -1681,6 +1913,7 @@ const apiRecommendations = {
             status_message
             type_reference_id
             resolver_type
+            resolver_display_name
             created_at
             updated_at
           }
@@ -1748,6 +1981,12 @@ const apiRecommendations = {
     if (data.resolverType) {
       where.resolver_type = { _eq: data.resolverType };
       whereAgg.resolver_type = { _eq: data.resolverType };
+    }
+    // rec_severity exists on BOTH the listing view and the aggregate — narrowing
+    // one without the other would page over a total the filter never applied to.
+    if (data.severity?.length) {
+      where.rec_severity = { _in: data.severity };
+      whereAgg.rec_severity = { _in: data.severity };
     }
     const response = await queryGraphQL(GET_ALL_EVENT_RESOLUTIONS, 'AllEventResolutions', {
       where,
@@ -1932,13 +2171,13 @@ const apiRecommendations = {
       return new Map();
     }
   },
-  async listAppSecurityRecommendation(accountId: string, query: any) {
+  async listAppSecurityRecommendation(accountId: string | string[], query: any) {
     if (accountId == 'demo') {
       const recommendationDemo = await getMockData('recommendations');
       return recommendationDemo.K8sSecurity.app;
     }
     const where: any = {};
-    where.account_id = { _eq: accountId };
+    where.account_id = accountIdClause(accountId);
     if (query.namespace) {
       where.namespace = { _eq: query.namespace };
     }
@@ -1957,13 +2196,13 @@ const apiRecommendations = {
     );
     return response?.data?.data;
   },
-  async listImageSecurityRecommendation(accountId: string, query: any) {
+  async listImageSecurityRecommendation(accountId: string | string[], query: any) {
     if (accountId == 'demo') {
       const recommendationDemo = await getMockData('recommendations');
       return recommendationDemo.K8sSecurity.images;
     }
     const where: any = {};
-    where.account_id = { _eq: accountId };
+    where.account_id = accountIdClause(accountId);
 
     if (query.namespace) {
       where.namespace = { _eq: query.namespace };
@@ -1992,13 +2231,13 @@ const apiRecommendations = {
     );
     return response?.data?.data;
   },
-  async listCVESecurityRecommendation(accountId: string, query: any) {
+  async listCVESecurityRecommendation(accountId: string | string[], query: any) {
     if (accountId == 'demo') {
       const recommendationDemo = await getMockData('recommendations');
       return recommendationDemo.K8sSecurity.CVE;
     }
     const where: any = {};
-    where.account_id = { _eq: accountId };
+    where.account_id = accountIdClause(accountId);
 
     if (query.namespace) {
       where.namespace = { _eq: query.namespace };
@@ -2019,13 +2258,197 @@ const apiRecommendations = {
     );
     return response?.data?.data;
   },
+  /**
+   * Other images/workloads carrying the same CVE. Scoped to the accounts already
+   * in view so the query keeps using the account-first security indexes, and
+   * capped — the panel shows a blast radius, not a full inventory.
+   */
+  async listFindingsByVulnerability({
+    accountId,
+    vulnerabilityId,
+    status = 'Open',
+    limit = 50,
+  }: {
+    accountId: string | string[];
+    vulnerabilityId: string;
+    status?: string;
+    limit?: number;
+  }) {
+    if (!vulnerabilityId || accountId === 'demo') {
+      return [];
+    }
+    const where: any = {
+      account_id: accountIdClause(accountId),
+      vulnerability_id: { _eq: vulnerabilityId },
+      status: { _eq: status },
+    };
+    const response = await queryGraphQL(
+      GET_SECURITY_FINDINGS_BY_VULNERABILITY.replaceAll('__WHERE__', gqlStringify(where)),
+      'get_security_recommendation',
+      { limit }
+    );
+    return response?.data?.data?.recommendation_security_groupings_v2?.rows || [];
+  },
+
+  /**
+   * Per-account failure counts for one CIS rule. Scoped to the accounts already
+   * in view, so it inherits the CIS listing's cost rather than scanning wider.
+   */
+  async listCisRuleAcrossAccounts({ accountId, ruleId, status = 'Open' }: { accountId: string | string[]; ruleId: string; status?: string }) {
+    if (!ruleId || accountId === 'demo') {
+      return [];
+    }
+    const where: any = { account_id: accountIdClause(accountId), rule_id: { _eq: ruleId } };
+    if (status) {
+      where.status = { _eq: status };
+    }
+    const response = await queryGraphQL(GET_CIS_RULE_ACROSS_ACCOUNTS.replaceAll('__WHERE__', gqlStringify(where)), 'list_k8_recommendation', {});
+    return response?.data?.data?.recommendation?.rows || [];
+  },
+
+  /**
+   * Findings in one category, grouped into (rule, severity, account) rows for a
+   * rule-level rollup. Callers fold these into one row per rule.
+   *
+   * The aggregate is covered by the (tenant_id, status, category, rule_name)
+   * index, so a category whose flat list runs to thousands of rows still costs
+   * one grouped query.
+   */
+  async listRecommendationRuleRollup({
+    accountId,
+    category,
+    status = ['Open', 'InProgress'],
+    excludeRuleNames,
+    safetyBand,
+    updatedAtGte,
+    updatedAtLt,
+  }: {
+    accountId: string | string[];
+    category: string;
+    status?: string[];
+    excludeRuleNames?: string[];
+    safetyBand?: string[];
+    updatedAtGte?: string;
+    updatedAtLt?: string;
+  }) {
+    if (!accountId || (Array.isArray(accountId) && accountId.length === 0) || accountId === 'demo') {
+      return [];
+    }
+    const where: any = {
+      account_id: accountIdClause(accountId),
+      category: { _eq: category },
+      status: { _in: status },
+    };
+    if (excludeRuleNames?.length) {
+      where.rule_name = { _not_in: excludeRuleNames };
+    }
+    applyFacetFilters(where, { safetyBand, updatedAtGte, updatedAtLt });
+    const response = await queryGraphQL(GET_CLOUD_POSTURE_RULES.replaceAll('__WHERE__', gqlStringify(where)), 'cloud_posture_rules', {});
+    return response?.data?.data?.recommendation?.rows || [];
+  },
+
+  /**
+   * Open-finding counts for the four Security sub-tabs.
+   *
+   * Scoped to every account the caller can see rather than to one type per
+   * sub-tab: `rule_name` already separates the surfaces (only k8s accounts carry
+   * `image_scan`, only VM accounts carry `vm_package_vulnerability`), so the
+   * account list is doing permission work, not routing work. Keeping it means
+   * the badges never count findings in an account a custom role cannot open.
+   */
+  async getSecurityTabCounts({
+    accountIds,
+    status = ['Open', 'InProgress'],
+  }: {
+    accountIds: string[];
+    status?: string[];
+  }): Promise<{ imageScan: number; cisScan: number; vmVulnerabilities: number; cloudPosture: number }> {
+    const counts = { imageScan: 0, cisScan: 0, vmVulnerabilities: 0, cloudPosture: 0 };
+    if (!accountIds.length) return counts;
+
+    const where = { account_id: accountIdClause(accountIds), category: { _eq: 'Security' }, status: { _in: status } };
+
+    try {
+      const response = await queryGraphQL(GET_SECURITY_TAB_COUNTS.replaceAll('__WHERE__', gqlStringify(where)), 'security_tab_counts', {});
+      for (const row of response?.data?.data?.recommendation?.rows || []) {
+        const rule = row?.rule_name;
+        const n = Number(row?.count) || 0;
+        // Only the CVE rows. `image_scan_summary` is a different grain — one row
+        // per image carrying its scan outcome — so adding it would count each
+        // scanned image once more on top of its own findings.
+        if (rule === 'image_scan') counts.imageScan += n;
+        else if (rule === 'k8s-cis-1.23' || rule === 'CIS') counts.cisScan += n;
+        else if (rule === 'vm_package_vulnerability') counts.vmVulnerabilities += n;
+        // Everything else is cloud posture — the same "not a k8s/vm scanner"
+        // rule listCloudPostureRules uses, because the cloud vocabulary is
+        // open-ended and an allowlist would silently drop new providers.
+        else if (!K8S_SECURITY_RULE_NAMES.includes(rule)) counts.cloudPosture += n;
+      }
+      return counts;
+    } catch (error) {
+      // A missing badge is better than a broken tab strip.
+      console.error('Failed to fetch security tab counts:', error);
+      return counts;
+    }
+  },
+
+  /**
+   * Cloud security posture checks for the accounts in view, grouped by rule.
+   *
+   * Excludes the Kubernetes scanners, which have their own sub-tabs, by naming
+   * them rather than by guessing from the rule prefix — the cloud vocabulary is
+   * open-ended (21 rules are `azure_defender_assessment_<uuid>`), so a prefix
+   * allowlist would silently drop whole providers as they are added.
+   */
+  async listCloudPostureRules({ accountId, status = ['Open', 'InProgress'] }: { accountId: string | string[]; status?: string[] }) {
+    return apiRecommendations.listRecommendationRuleRollup({
+      accountId,
+      category: 'Security',
+      status,
+      excludeRuleNames: K8S_SECURITY_RULE_NAMES,
+    });
+  },
+
+  /** Resources failing one cloud posture check, for the panel's resource tab. */
+  async listCloudPostureResources({
+    accountId,
+    ruleName,
+    status = ['Open', 'InProgress'],
+    limit = 10,
+    offset = 0,
+  }: {
+    accountId: string | string[];
+    ruleName: string;
+    status?: string[];
+    limit?: number;
+    offset?: number;
+  }) {
+    if (!ruleName || !accountId || accountId === 'demo') {
+      return { rows: [], total: 0 };
+    }
+    const where: any = {
+      account_id: accountIdClause(accountId),
+      category: { _eq: 'Security' },
+      rule_name: { _eq: ruleName },
+      status: { _in: status },
+    };
+    const response = await queryGraphQL(GET_CLOUD_POSTURE_RESOURCES.replaceAll('__WHERE__', gqlStringify(where)), 'cloud_posture_resources', {
+      limit,
+      offset,
+    });
+    return {
+      rows: response?.data?.data?.recommendation?.rows || [],
+      total: response?.data?.data?.recommendation_aggregate?.rows?.[0]?.count || 0,
+    };
+  },
+
   async getSecuritySeverityGrouping(query: any) {
     if (query.accountId == 'demo') {
       const recommendationDemo = await getMockData('recommendations');
       return recommendationDemo.K8sSecurity.infographics;
     }
     const where: any = {};
-    where.account_id = { _eq: query.accountId };
+    where.account_id = accountIdClause(query.accountId);
 
     if (query.status) {
       where.status = { _eq: query.status };
@@ -2275,6 +2698,10 @@ const apiRecommendations = {
           rec_estimated_savings
           rec_resource_name
           rec_resource_meta
+          rec_status
+          rec_category
+          rec_recommendation_action
+          created_at
           updated_at
           type
         }
@@ -2348,6 +2775,12 @@ const apiRecommendations = {
               rule_name: r.rec_rule_name,
               severity: r.rec_severity,
               estimated_savings: r.rec_estimated_savings,
+              // The recommendation's OWN status, distinct from the resolution's.
+              // A Success resolution sitting on a still-Open recommendation is the
+              // disconnect in #35490, and is invisible unless both are carried.
+              status: r.rec_status,
+              category: r.rec_category,
+              recommendation_action: r.rec_recommendation_action,
               cloud_resourse: {
                 name: r.rec_resource_name,
                 meta: typeof r.rec_resource_meta === 'string' ? safeJSONParse(r.rec_resource_meta) : r.rec_resource_meta,
@@ -2358,6 +2791,75 @@ const apiRecommendations = {
         },
       },
     };
+  },
+  /**
+   * Resolution counts per lifecycle status, for the Resolutions tab's stat cards.
+   *
+   * Deliberately ignores the status filter the listing applies: the cards show
+   * the split across every status and are how a reader discovers there are
+   * failures at all, so narrowing by the selected one would collapse them to a
+   * single card restating the row count. One grouped query on the same aggregate
+   * the listing already counts with.
+   */
+  async getRecommendationResolutionStatusCounts({
+    accountId,
+    type,
+    resolverType,
+    recommendationId,
+    severity,
+  }: {
+    accountId?: string | string[];
+    type?: string;
+    resolverType?: string;
+    recommendationId?: string;
+    severity?: string[];
+  } = {}): Promise<Record<string, number>> {
+    if (accountId === 'demo') {
+      return {};
+    }
+    const query = `
+    query RecommendationResolutionStatusCounts($where: RecommendationResolutionGroupingsWhereRequest) {
+      recommendation_resolution: recommendation_resolution_groupings_v2(where: $where, group_by: ["status"]) {
+        rows {
+          status
+          count
+        }
+      }
+    }
+    `;
+    const where: any = {};
+    // Mirrors getRecommendationResolution's scoping: an array of ids on the
+    // cross-account tab, a single id per-account, omitted ⇒ every account.
+    if (Array.isArray(accountId)) {
+      if (accountId.length > 0) {
+        where.account_id = { _in: accountId };
+      }
+    } else if (accountId) {
+      where.account_id = { _eq: accountId };
+    }
+    if (type) {
+      where.type = { _eq: type };
+    }
+    if (resolverType) {
+      where.resolver_type = { _eq: resolverType };
+    }
+    if (recommendationId) {
+      where.recommendation_id = { _eq: recommendationId };
+    }
+    // Severity scopes the cards too — they describe the listing's scope minus
+    // the one dimension they exist to split.
+    if (severity?.length) {
+      where.rec_severity = { _in: severity };
+    }
+
+    const response = await queryGraphQL(query, 'RecommendationResolutionStatusCounts', { where });
+    const rows = response?.data?.data?.recommendation_resolution?.rows || [];
+    return rows.reduce((counts: Record<string, number>, row: any) => {
+      if (row?.status) {
+        counts[row.status] = (counts[row.status] || 0) + (Number(row.count) || 0);
+      }
+      return counts;
+    }, {});
   },
   async getDistinctResolverTypes(filter = 'resolver_type') {
     const query = `

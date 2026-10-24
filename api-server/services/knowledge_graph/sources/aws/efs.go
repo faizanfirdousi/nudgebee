@@ -40,6 +40,16 @@ var efsFileSystemSchema = core.SpecificTypeSchema{
 
 func init() { core.RegisterSpecificTypeSchema(efsFileSystemSchema) }
 
+// extractEFSFileSystemMetadata is what an EFS row's metadata extraction is:
+// the S3 extractor and then the EFS one. EFS file systems shared the Storage
+// arm of the old central dispatch with S3 buckets, so a row whose meta carries
+// a Name still gets bucket_name; that is kept here deliberately rather than
+// silently dropped.
+func (s *AWSSource) extractEFSFileSystemMetadata(properties map[string]interface{}, metaMap map[string]interface{}) {
+	s.extractS3Metadata(properties, metaMap)
+	s.extractEFSMetadata(properties, metaMap)
+}
+
 // extractEFSMetadata extracts essential fields for EFS file systems
 func (s *AWSSource) extractEFSMetadata(properties map[string]interface{}, metaMap map[string]interface{}) {
 	// File system ID (fs-xxxxx)
@@ -103,14 +113,34 @@ func (s *AWSSource) extractEFSMetadata(properties map[string]interface{}, metaMa
 	}
 }
 
+// buildDescribeMountTargetsCommand returns the CLI command describing an EFS file
+// system's mount targets. File system ids are region-scoped, so --region is always
+// present: without it the AWS CLI resolves against the collector's AWS_DEFAULT_REGION
+// and reports file systems in other regions as non-existent (#36573).
+func buildDescribeMountTargetsCommand(fileSystemID, region string) string {
+	return fmt.Sprintf("aws efs describe-mount-targets --file-system-id %s --region %s --output json", fileSystemID, region)
+}
+
 // fetchEFSMountTargetsFromAWS fetches EFS mount target data from AWS using cloud collector CLI
-func (s *AWSSource) fetchEFSMountTargetsFromAWS(reqCtx *security.RequestContext, req *core.SourceBuildRequest, accountID string, fileSystemID string) ([]EFSMountTargetData, error) {
-	// Build AWS CLI command to describe mount targets for an EFS file system
-	cmd := fmt.Sprintf("aws efs describe-mount-targets --file-system-id %s --output json", fileSystemID)
+func (s *AWSSource) fetchEFSMountTargetsFromAWS(reqCtx *security.RequestContext, accountID string, region string, fileSystemID string) ([]EFSMountTargetData, error) {
+	// Validate inputs to prevent command injection: fileSystemID can fall back to
+	// the node's customer-controlled name, and region must be a real region.
+	if err := validateAWSResourceID(fileSystemID); err != nil {
+		return nil, fmt.Errorf("invalid EFS file system id: %w", err)
+	}
+	if region == "" {
+		return nil, fmt.Errorf("region is required to look up file system %s", fileSystemID)
+	}
+	if err := validateAWSRegion(region); err != nil {
+		return nil, fmt.Errorf("invalid region: %w", err)
+	}
+
+	cmd := buildDescribeMountTargetsCommand(fileSystemID, region)
 
 	s.logger.Info("Fetching EFS mount targets from AWS",
 		"file_system_id", fileSystemID,
 		"account_id", accountID,
+		"region", region,
 		"command", cmd)
 
 	// Execute AWS CLI command via cloud collector
@@ -177,13 +207,25 @@ func (s *AWSSource) createEFSEdges(reqCtx *security.RequestContext, nodes []*cor
 			}
 		}
 
+		// describe-mount-targets is region-scoped; without the file system's own
+		// region the call resolves to the collector's default region and reports it
+		// as non-existent. Skip rather than issue a doomed call (#36573).
+		region := nodeRegion(node)
+		if region == "" {
+			s.logger.Warn("EFS file system has no region, skipping mount target lookup",
+				"file_system_id", fileSystemID,
+				"node_id", node.ID)
+			continue
+		}
+
 		// Fetch mount targets from AWS CLI
 		var mountTargets []EFSMountTargetData
 		if fileSystemID != "" && req.CloudAccountID != "" {
-			targets, err := s.fetchEFSMountTargetsFromAWS(reqCtx, req, req.CloudAccountID, fileSystemID)
+			targets, err := s.fetchEFSMountTargetsFromAWS(reqCtx, req.CloudAccountID, region, fileSystemID)
 			if err != nil {
 				s.logger.Error("Failed to fetch EFS mount targets from AWS",
 					"file_system_id", fileSystemID,
+					"region", region,
 					"error", err)
 			} else {
 				mountTargets = targets
@@ -248,4 +290,26 @@ func (s *AWSSource) createEFSEdges(reqCtx *security.RequestContext, nodes []*cor
 	}
 
 	return edges
+}
+
+// The inventory rows this file's resources claim: what each row's node
+// type, concrete label and metadata extraction are (see kinds.go).
+func init() {
+	eFSRows := resourceKind{
+		Service:      "AmazonEFS",
+		NodeType:     core.NodeTypeStorage,
+		SpecificType: "EFSFileSystem",
+		Extract:      (*AWSSource).extractEFSFileSystemMetadata,
+	}
+	registerKind(eFSRows)
+	registerKind(eFSRows.withTypes("filesystem", "file-system"))
+}
+
+// The edges the account build asks this file's resources for (see dispatch.go).
+func init() {
+	// EFS file systems connect to VPCs, subnets and ENIs via mount targets.
+	registerEdgeStep(edgeStep{NodeType: core.NodeTypeStorage, Name: "efs",
+		Build: func(s *AWSSource, reqCtx *security.RequestContext, nodes []*core.DbNode, lookup *sources.NodeLookup, req *core.SourceBuildRequest) ([]*core.DbEdge, []*core.DbNode) {
+			return s.createEFSEdges(reqCtx, nodes, lookup, req), nil
+		}})
 }

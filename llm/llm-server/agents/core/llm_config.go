@@ -11,6 +11,16 @@ package core
 // 6. ENV tier-specific (e.g., LLM_TIER_PROVIDER_REASONING).
 // 7. ENV Global (e.g., LLM_PROVIDER).
 //
+// Escape hatch: setting LLM_CONFIG_IGNORE_DB=true drops layers 2-4 entirely, so
+// the ENV layers decide. Off by default; intended for local runs against a DB
+// whose tenant config points at models the operator has no credentials for.
+// It covers layers 2-4 only, by short-circuiting getLLMIntegrationConfig. Layer
+// 1 still reads the DB through two paths that fetch independently of it:
+// GetConversationOverride (reads llm_conversations) and integrationConfigForPin
+// (a pinned llm_config_source=db:<uuid>, via getLLMIntegrationsForAccount). So
+// resuming a stored conversation still resolves that conversation's model even
+// with the flag set.
+//
 // **DB always beats ENV at any specificity.** Rationale: multi-tenant clients
 // onboard via UI, which writes to integration_config_values. ENV is the
 // operator process-level default. When DB has a value it is the tenant's
@@ -50,8 +60,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
 	"github.com/tmc/langchaingo/llms"
-	"github.com/tmc/langchaingo/llms/anthropic"
-	"github.com/tmc/langchaingo/llms/openai"
+	"nudgebee/llm/llms/anthropic"
+	"nudgebee/llm/llms/openai"
 )
 
 const llmProviderFormat = "llm_provider_%s"
@@ -79,6 +89,14 @@ const llmModelFallbackFormat = "llm_model_fallbacks_%s"
 // SECONDS override, the global config.Config.LlmProviderTTFTTimeoutSeconds is used.
 const llmProviderTTFTTimeoutEnabledFormat = "llm_provider_ttft_timeout_enabled_%s"
 const llmProviderTTFTTimeoutSecondsFormat = "llm_provider_ttft_timeout_seconds_%s"
+
+// Per-provider sustained-generation timeout controls — same enable/override
+// shape as the TTFT keys above, but this watchdog bounds TOTAL call duration
+// (armed for the whole call, not just the pre-first-token gap), so it catches
+// a call that starts streaming normally and then keeps generating far past
+// what a ReAct decision step should ever take.
+const llmProviderSustainedGenTimeoutEnabledFormat = "llm_provider_sustained_gen_timeout_enabled_%s"
+const llmProviderSustainedGenTimeoutSecondsFormat = "llm_provider_sustained_gen_timeout_seconds_%s"
 
 // Category-tier config keys. A tier (reasoning / retrieval / summary)
 // is configured like an agent but in its own namespace so it cannot collide
@@ -140,6 +158,12 @@ func resolveCredsFingerprint(accountId, provider, agentName string, appendAgentN
 		extraHeaders = append(extraHeaders, k+"="+v)
 	}
 	sort.Strings(extraHeaders)
+	// llm_disable_thinking is serialized into the client at construction time
+	// (getOpenAILLM's WithChatTemplateKwargs), same as the auth settings above —
+	// without it here, toggling the flag doesn't evict the cached client, so
+	// whichever call happened to build it first (with or without the kwarg)
+	// keeps serving every later call for this account+model until the cache
+	// TTL lapses, regardless of what the flag says now.
 	return credsFingerprint(
 		getLLMApiKey(accountId, provider, agentName, appendAgentName, resolution...),
 		getLLMApiEndpoint(accountId, provider, agentName, appendAgentName, resolution...),
@@ -154,6 +178,7 @@ func resolveCredsFingerprint(accountId, provider, agentName string, appendAgentN
 		auth.OAuth.ClientSecret,
 		auth.OAuth.Scope,
 		strings.Join(extraHeaders, ","),
+		strconv.FormatBool(getLLMDisableThinking(accountId, res)),
 	)
 }
 
@@ -276,13 +301,14 @@ func GetLLMModel(provider string, modelName string, agentName string, appendAgen
 // pod's global secret-env fallback. It deliberately carries only what the
 // code-analysis llm.Client consumes.
 type ForwardedLLMConfig struct {
-	Provider    string `json:"provider,omitempty"`
-	Model       string `json:"model,omitempty"`
-	ApiKey      string `json:"api_key,omitempty"`
-	ApiEndpoint string `json:"endpoint,omitempty"`
-	ApiVersion  string `json:"api_version,omitempty"`
-	ApiType     string `json:"api_type,omitempty"`
-	Region      string `json:"region,omitempty"`
+	Provider     string `json:"provider,omitempty"`
+	Model        string `json:"model,omitempty"`
+	ApiKey       string `json:"api_key,omitempty"`
+	ApiEndpoint  string `json:"endpoint,omitempty"`
+	ApiVersion   string `json:"api_version,omitempty"`
+	ApiType      string `json:"api_type,omitempty"`
+	Region       string `json:"region,omitempty"`
+	ExtraHeaders string `json:"extra_headers,omitempty"`
 	// AccessKey/SecretKey/SessionToken are the AWS static credentials for
 	// Bedrock, whose "API key" is a SigV4 credential triple rather than a single
 	// token. Without them a forwarded provider=bedrock reaches the code-analysis
@@ -306,9 +332,11 @@ type ForwardedLLMConfig struct {
 // ResolveLLMConfigForForwarding resolves the full, decrypted LLM config for the
 // given account/agent in one call, reusing the canonical resolvers (which apply
 // the DB-beats-ENV precedence and decrypt secrets). It returns nil (no error)
-// only when no provider resolves at all, in which case the caller omits the
-// block and the pod falls back to its global LLM_* secret env. The returned
-// ApiKey is plaintext and MUST NOT be logged.
+// only when no provider resolves at all. The workspace pod carries no
+// LLM_PROVIDER_API_KEY fallback (#38009), so both current callers
+// (agents/agent_code2.go, via resolveLLMConfigForDispatch) treat a nil result
+// the same as an error: dispatch is aborted rather than silently proceeding.
+// The returned ApiKey is plaintext and MUST NOT be logged.
 //
 // A missing API key is NOT a reason to skip forwarding. Keyless providers are
 // legitimate — Bedrock authenticates through the AWS credential chain, not an
@@ -320,8 +348,8 @@ type ForwardedLLMConfig struct {
 // let the pod fail on the real problem instead.
 func ResolveLLMConfigForForwarding(ctx *security.RequestContext, accountId, agentName, conversationId string) (*ForwardedLLMConfig, error) {
 	// Fail-safe: without a tenant/account scope there is nothing tenant-specific
-	// to forward (and we must never run an unscoped tenant lookup). Skip
-	// forwarding so the pod uses its global LLM_* fallback.
+	// to forward (and we must never run an unscoped tenant lookup). Callers
+	// treat this nil result as fatal (#38009), not as a signal to fall back.
 	if accountId == "" {
 		return nil, nil
 	}
@@ -360,6 +388,14 @@ func ResolveLLMConfigForForwarding(ctx *security.RequestContext, accountId, agen
 		ApiVersion:  getLLMApiVersion(accountId, provider, agentName, appendAgentName, res),
 		ApiType:     getLLMApiType(accountId, provider, agentName, appendAgentName, res),
 		Region:      getLLMRegion(accountId, provider, agentName, appendAgentName, res),
+		ExtraHeaders: func() string {
+			headers := resolveLLMAuthSettings(accountId, res).ExtraHeaders
+			if len(headers) == 0 {
+				return ""
+			}
+			encoded, _ := json.Marshal(headers)
+			return string(encoded)
+		}(),
 		// The AWS credential triple is the Bedrock equivalent of ApiKey. Only
 		// forwarded as a complete pair: the AWS SDK treats a half-set static
 		// provider as a hard error rather than falling through to the next
@@ -930,6 +966,30 @@ func getLLMApiVersion(accountId, provider, agentName string, appendAgentName boo
 	return apiVersion
 }
 
+// getLLMDisableThinking reports whether the resolved LLM config asks for
+// model-side thinking to be disabled (integration config key
+// "llm_disable_thinking" = "true"). Serialized for OpenAI-compatible servers
+// as chat_template_kwargs {"enable_thinking": false} — the vLLM/Qwen3 switch.
+// Config-driven on purpose: which models ramble is a property of the deployed
+// model, not something to hardcode per model family.
+func getLLMDisableThinking(accountId string, resolution *LLMConfigResolution) bool {
+	if resolution != nil && resolution.PinnedConfigSource != "" {
+		return resolution.PinnedDisableThinking
+	}
+	var dbConfig map[string]string
+	if resolution != nil {
+		dbConfig = resolution.dbConfig
+	}
+	if accountId == "" {
+		return false
+	}
+	cfg, err := getLLMIntegrationConfig(nil, accountId, dbConfig)
+	if err != nil || cfg == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(cfg["llm_disable_thinking"]), "true")
+}
+
 func getLLMApiType(accountId, provider, agentName string, appendAgentName bool, resolution ...*LLMConfigResolution) string {
 	slog.Debug("Getting LLM API type", "accountId", accountId, "provider", provider, "agentName", agentName, "appendAgentName", appendAgentName)
 
@@ -1214,8 +1274,42 @@ func getLLMTTFTTimeout(provider string) (enabled bool, seconds int) {
 	if !config.Config.GetBool(fmt.Sprintf(llmProviderTTFTTimeoutEnabledFormat, p), ttftTimeoutDefaultEnabled(p)) {
 		return false, 0
 	}
-	seconds = config.Config.LlmProviderTTFTTimeoutSeconds
+	return true, resolveTTFTFlatSeconds(provider)
+}
+
+// resolveTTFTFlatSeconds returns the flat (pre-thinking-adjustment) TTFT
+// deadline configured for a provider — the per-provider override
+// (LLM_PROVIDER_TTFT_TIMEOUT_SECONDS_<PROVIDER>) if set, otherwise the global
+// default (LlmProviderTTFTTimeoutSeconds). Split out from getLLMTTFTTimeout so
+// the sustained-gen watchdog can derive its own deadline from this value (see
+// sustainedGenDeadlineSeconds in llm_common.go) even on a call where TTFT
+// itself is not armed for the provider.
+func resolveTTFTFlatSeconds(provider string) int {
+	p := strings.ToLower(provider)
+	seconds := config.Config.LlmProviderTTFTTimeoutSeconds
 	if v := config.Config.GetInt(fmt.Sprintf(llmProviderTTFTTimeoutSecondsFormat, p), 0); v > 0 {
+		seconds = v
+	}
+	return seconds
+}
+
+// getLLMSustainedGenTimeout returns whether the sustained-generation timeout
+// should fire for calls to the given provider, and the deadline in seconds.
+// Enable is per-provider — callers get (false, 0) unless
+// LLM_PROVIDER_SUSTAINED_GEN_TIMEOUT_ENABLED_<PROVIDER>=true is explicitly
+// set. When enabled, the seconds value is the provider-specific override
+// (LLM_PROVIDER_SUSTAINED_GEN_TIMEOUT_SECONDS_<PROVIDER>) if set, otherwise
+// the global default (config.Config.LlmProviderSustainedGenTimeoutSeconds).
+func getLLMSustainedGenTimeout(provider string) (enabled bool, seconds int) {
+	if provider == "" {
+		return false, 0
+	}
+	p := strings.ToLower(provider)
+	if !config.Config.GetBool(fmt.Sprintf(llmProviderSustainedGenTimeoutEnabledFormat, p), false) {
+		return false, 0
+	}
+	seconds = config.Config.LlmProviderSustainedGenTimeoutSeconds
+	if v := config.Config.GetInt(fmt.Sprintf(llmProviderSustainedGenTimeoutSecondsFormat, p), 0); v > 0 {
 		seconds = v
 	}
 	return true, seconds
@@ -1242,27 +1336,21 @@ func GetLlmModelWithProvider(provider string, agentName string, appendAgentName 
 	return GetLLMModel(provider, modelName, agentName, appendAgentName, accountId)
 }
 
-// Anthropic prompt-caching fix (regression from PR #36318).
+// Anthropic system-prompt caching for calls that skip AnthropicCacheProvider.
 //
-// The multi-breakpoint layout places its primary cache breakpoint on the
-// SYSTEM message, but langchaingo v0.1.14's handleSystemMessage unwraps
-// llms.CachedContent and serializes `system` as a plain string — silently
-// dropping the cache_control block. Anthropic only caches a system prompt
-// when `system` is sent as a content-block array. Result: zero cache
-// creation/reads on the anthropic provider since 2026-08-16 (worked in March
-// when the old single breakpoint landed on a Human message, which the client
-// serializes correctly).
-//
-// Until the client is patched/upgraded, this transport restores the intended
-// behavior at the wire: when a /v1/messages body carries `system` as a
-// non-empty string (and caching is enabled), it is rewritten to
+// Anthropic only caches a system prompt sent as a content-block array. When
+// AnthropicCacheProvider marks the system prompt, the in-repo adapter
+// (llms/anthropic) already sends it as blocks with cache_control and this
+// transport leaves the body alone. Calls that never reach the provider (no
+// conversation ID) send `system` as a plain string; for those, when a
+// /v1/messages body carries `system` as a non-empty string (and caching is
+// enabled), it is rewritten to
 //
 //	"system": [{"type":"text","text":<s>,"cache_control":{"type":"ephemeral"}}]
 //
 // which is the documented cacheable form. Prompts below Anthropic's minimum
 // cacheable size are simply not cached by the API — the form is valid either
-// way. Human-message breakpoints are unaffected (they serialize correctly).
-// Composes with the temperature sanitizer (http_sanitizer.go) as its base.
+// way. Composes with the temperature sanitizer (http_sanitizer.go) as its base.
 type anthropicSystemCacheTransport struct {
 	base http.RoundTripper
 }
@@ -1699,6 +1787,12 @@ func getOpenAILLM(provider, modelName, agentName string, appendagentName bool, a
 			slog.Debug("Using Azure deployment name for URL with body model rewrite", "deployment", deployment, "model", modelName)
 		}
 	}
+	if getLLMDisableThinking(accountId, res) {
+		// vLLM extension; strict OpenAI-compatible servers that don't know the
+		// field simply ignore unknown request keys.
+		opts = append(opts, openai.WithChatTemplateKwargs(map[string]any{"enable_thinking": false}))
+		slog.Debug("Disabling model-side thinking via chat_template_kwargs", "provider", provider, "model", modelName, "agentName", agentName)
+	}
 	opts = append(opts, openai.WithHTTPClient(newOpenAIHTTPClient(authClient)))
 	llm, err := openai.New(opts...)
 	if err != nil {
@@ -1844,6 +1938,7 @@ type LLMConfigResolution struct {
 	AgentName    string            `json:"agent_name,omitempty"`
 	Tier         ModelTier         `json:"tier,omitempty"`        // Category the call opted into (empty when no tier was selected)
 	MaxContext   int               `json:"max_context,omitempty"` // User-configured context window (tokens); 0 = not set → fall back to the model map
+	AccountId    string            `json:"-"`                     // Account the resolution ran for; lets downstream catalog lookups see tenant rows
 	Hierarchy    []LLMConfigLayer  `json:"hierarchy"`             // Full resolution chain
 	dbConfig     map[string]string // unexported cache for optimized downstream lookups
 
@@ -1858,6 +1953,11 @@ type LLMConfigResolution struct {
 	PinnedApiType      string `json:"-"`
 	PinnedApiVersion   string `json:"-"`
 	PinnedRegion       string `json:"-"`
+	// PinnedDisableThinking mirrors the integration's llm_disable_thinking flag
+	// through the pinned path, which bypasses the layered walk entirely (the
+	// MaxContext gap taught us a pinned field that is not carried here is
+	// silently lost).
+	PinnedDisableThinking bool `json:"-"`
 	// AWS-style credentials and the adapter id complete the destination. Without
 	// them a pinned bedrock/sagemaker slot would still resolve its identity via
 	// the layered walk, so the pin wouldn't actually pin.
@@ -1995,11 +2095,20 @@ func resolveModelContextMap(dbConfig map[string]string) map[string]int {
 }
 
 // ResolveModelMaxContext returns the usable context window (tokens) for a model:
-// the user-configured value (UI/config) if set, else the hardcoded model map /
-// 32k default via GetLlmMaxTokenLength.
+// the user-configured value (UI/config) if set, else the pricing-catalog row
+// (llm_model_pricing.max_context_tokens, tenant row over built-in), else the
+// hardcoded model map / 32k default via GetLlmMaxTokenLength.
 func ResolveModelMaxContext(resolution *LLMConfigResolution, model string) int {
 	if resolution != nil && resolution.MaxContext > 0 {
 		return resolution.MaxContext
+	}
+	provider, accountId := "", ""
+	if resolution != nil {
+		provider = resolution.Provider
+		accountId = resolution.AccountId
+	}
+	if l, ok := lookupModelTokenLimits(accountId, provider, model); ok && l.MaxContext > 0 {
+		return l.MaxContext
 	}
 	return GetLlmMaxTokenLength(model)
 }
@@ -2132,6 +2241,7 @@ func ResolveLLMConfig(ctx *security.RequestContext, accountId, agentName string,
 	result := &LLMConfigResolution{
 		AgentName:    agentName,
 		Tier:         tier,
+		AccountId:    accountId,
 		IsOverridden: false,
 		Hierarchy:    []LLMConfigLayer{},
 	}
@@ -2719,6 +2829,54 @@ func IsOpenAIModelWithoutStopSupport(provider, model string) bool {
 	return false
 }
 
+// ModelSupportsTemperature checks if the model supports the 'temperature' parameter.
+// Anthropic reasoning models (claude-sonnet-5, claude-opus-5, claude-5 series) and OpenAI
+// reasoning model families (o1, o3, gpt-5) reject explicit / non-default temperature on the wire.
+func ModelSupportsTemperature(provider, model string) bool {
+	modelLower := strings.ToLower(strings.TrimSpace(model))
+	pLower := strings.ToLower(strings.TrimSpace(provider))
+
+	// Check Anthropic reasoning models
+	if pLower == "anthropic" || strings.Contains(modelLower, "claude") {
+		if strings.Contains(modelLower, "claude-sonnet-5") ||
+			strings.Contains(modelLower, "claude-opus-5") ||
+			strings.Contains(modelLower, "claude-5") {
+			return false
+		}
+	}
+
+	// Check OpenAI reasoning models across any provider, including namespaced proxy/deployment IDs.
+	if isOpenAIReasoningModel(modelLower) {
+		return false
+	}
+
+	return true
+}
+
+func isOpenAIReasoningModel(model string) bool {
+	for _, family := range []string{"o1", "o3", "gpt-5"} {
+		for offset := 0; offset < len(model); {
+			index := strings.Index(model[offset:], family)
+			if index < 0 {
+				break
+			}
+			index += offset
+			beforeFamily := index == 0 || isModelNamespaceSeparator(model[index-1])
+			afterIndex := index + len(family)
+			afterFamily := afterIndex == len(model) || isModelNamespaceSeparator(model[afterIndex])
+			if beforeFamily && afterFamily {
+				return true
+			}
+			offset = index + len(family)
+		}
+	}
+	return false
+}
+
+func isModelNamespaceSeparator(char byte) bool {
+	return char == ':' || char == '/' || char == '.' || char == '_' || char == '-'
+}
+
 // ─── Pinned-source resolution ──────────────────────────────────────────────
 //
 // A pinned source is a request-level override that skips the normal layered
@@ -2898,6 +3056,7 @@ func resolveFromPinnedSource(ctx *security.RequestContext, sourceId, accountId, 
 
 	res := &LLMConfigResolution{
 		Source:             "pinned:" + sourceId,
+		AccountId:          accountId,
 		IsOverridden:       true,
 		PinnedConfigSource: sourceId,
 		Hierarchy: []LLMConfigLayer{{
@@ -3045,50 +3204,6 @@ func containsString(xs []string, s string) bool {
 	return false
 }
 
-// ModelSupportsTemperature checks if the model supports the 'temperature' parameter.
-// Anthropic reasoning models (claude-sonnet-5, claude-opus-5, claude-5 series) and OpenAI
-// reasoning model families (o1, o3, gpt-5) reject explicit / non-default temperature on the wire.
-func ModelSupportsTemperature(provider, model string) bool {
-	modelLower := strings.ToLower(strings.TrimSpace(model))
-	pLower := strings.ToLower(strings.TrimSpace(provider))
-
-	// Check Anthropic reasoning models
-	if pLower == "anthropic" || strings.Contains(modelLower, "claude") {
-		if strings.Contains(modelLower, "claude-sonnet-5") ||
-			strings.Contains(modelLower, "claude-opus-5") ||
-			strings.Contains(modelLower, "claude-5") {
-			return false
-		}
-	}
-
-	// Check OpenAI reasoning models across any provider, including namespaced proxy/deployment IDs.
-	if isOpenAIReasoningModel(modelLower) {
-		return false
-	}
-
-	return true
-}
-
-func isOpenAIReasoningModel(model string) bool {
-	for _, family := range []string{"o1", "o3", "gpt-5"} {
-		for offset := 0; offset < len(model); {
-			index := strings.Index(model[offset:], family)
-			if index < 0 {
-				break
-			}
-			index += offset
-			beforeFamily := index == 0 || isModelNamespaceSeparator(model[index-1])
-			afterIndex := index + len(family)
-			afterFamily := afterIndex == len(model) || isModelNamespaceSeparator(model[afterIndex])
-			if beforeFamily && afterFamily {
-				return true
-			}
-			offset = index + len(family)
-		}
-	}
-	return false
-}
-
 // readEnvSlotInto populates res with credentials read from an env: slot and
 // returns the slot's fallback model list (empty if none configured). The caller
 // has already parsed sourceId; this function only touches ENV.
@@ -3199,6 +3314,10 @@ func readDbSlotInto(res *LLMConfigResolution, cfg map[string]string, p *parsedCo
 	default:
 		return nil, fmt.Errorf("readDbSlotInto: unknown scope %q", p.Scope)
 	}
+
+	// llm_disable_thinking is integration-global: it describes the model
+	// server's chat template, not a per-tier/per-agent choice.
+	res.PinnedDisableThinking = strings.EqualFold(strings.TrimSpace(cfg["llm_disable_thinking"]), "true")
 
 	// OAuth + extra headers (#36556): tier slots may override, everything else
 	// inherits the integration's global values. Per-agent OAuth keys do not
@@ -3521,10 +3640,6 @@ func ConfigNameFor(sourceId, integrationName string) string {
 		return fmt.Sprintf("%s · Agent: %s", owner, p.Name)
 	}
 	return sourceId
-}
-
-func isModelNamespaceSeparator(char byte) bool {
-	return char == ':' || char == '/' || char == '.' || char == '_' || char == '-'
 }
 
 // Azure-shaped gateway support for the custom provider (#36556).

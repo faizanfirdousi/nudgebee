@@ -4,11 +4,12 @@ import logging
 import asyncio
 import os
 from datetime import datetime, timedelta
-from typing import Dict, Any, Iterable
+from typing import Dict, Any, Iterable, Optional
 from concurrent.futures import ThreadPoolExecutor
 
 from server.recommendation.vertical_rightsizing.models.config import Config
 from server.recommendation.vertical_rightsizing.models.objects import K8sObjectData, PodData
+from server.recommendation.vertical_rightsizing.models.replicas import ReplicaStats, replica_stats_from_running_series
 from server.recommendation.vertical_rightsizing.strategy.strategies import BaseStrategy
 
 from server.recommendation.vertical_rightsizing.models.result import PodsTimeData
@@ -20,21 +21,55 @@ from server.metrics.prometheus_metrics import Prometheus
 
 # from prometheus_api_client import PrometheusConnect
 
-logger = logging.getLogger("krr")
+logger = logging.getLogger("rightsizing")
 
+
+def _tuning_env(name: str, legacy_name: str, default: str) -> str:
+    """Read a tuning knob, still honouring the name it had before the rename.
+
+    Neither knob is documented or set anywhere in this repo, but the chart renders
+    `.Values.env` verbatim, so an install can set either name from a values file we do
+    not control. Without this, renaming would silently drop an operator's override back
+    to the default. Remove the legacy lookup once no install predates the rename.
+    """
+    value = os.environ.get(name)
+    if value is not None:
+        return value
+    legacy_value = os.environ.get(legacy_name)
+    if legacy_value is not None:
+        logger.warning(f"{legacy_name} is deprecated and will be removed; use {name} instead")
+        return legacy_value
+    return default
+
+
+# Resolved once at import. Neither knob can change at runtime, and reading them per call would
+# repeat the deprecation warning for every workload of every scan.
 # Global semaphore to limit concurrent relay server requests
 # This prevents overwhelming the relay/agent when multiple ML server replicas are running
-MAX_CONCURRENT_RELAY_REQUESTS = int(os.environ.get("KRR_MAX_CONCURRENT_RELAY_REQUESTS", "10"))
-_relay_semaphore: asyncio.Semaphore | None = None
+MAX_CONCURRENT_METRICS_REQUESTS = int(
+    _tuning_env("RIGHTSIZING_MAX_CONCURRENT_RELAY_REQUESTS", "KRR_MAX_CONCURRENT_RELAY_REQUESTS", "10")
+)
+# Concurrency cap for metric queries. Named for the relay for backward compatibility:
+# the queries now go through api-server, but an operator's existing override should keep
+# working rather than silently reverting to the default.
+# How many pod owners are packed into a single Prometheus query by load_pods
+OWNER_BATCH_SIZE = int(_tuning_env("RIGHTSIZING_OWNER_BATCH_SIZE", "KRR_OWNER_BATCH_SIZE", "100"))
+# Keyed by limit: one process can serve accounts on different transports, and a single
+# cached semaphore would pin every later account to whichever limit was created first.
+_metrics_semaphores: dict[int, asyncio.Semaphore] = {}
 
 
-def _get_relay_semaphore() -> asyncio.Semaphore:
-    """Get or create the global relay semaphore for the current event loop."""
-    global _relay_semaphore
-    if _relay_semaphore is None:
-        _relay_semaphore = asyncio.Semaphore(MAX_CONCURRENT_RELAY_REQUESTS)
-        logger.info(f"Initialized relay semaphore with max {MAX_CONCURRENT_RELAY_REQUESTS} concurrent requests")
-    return _relay_semaphore
+def _get_relay_semaphore(limit: int | None = None) -> asyncio.Semaphore:
+    """Get or create the metrics semaphore for this concurrency limit."""
+    # Clamped: Semaphore(0) blocks forever and a negative value raises, so a mistyped
+    # override would hang every scan rather than fail at startup.
+    resolved = max(1, MAX_CONCURRENT_METRICS_REQUESTS if limit is None else limit)
+    semaphore = _metrics_semaphores.get(resolved)
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(resolved)
+        _metrics_semaphores[resolved] = semaphore
+        logger.info(f"Initialized metrics semaphore with max {resolved} concurrent requests")
+    return semaphore
 
 
 class PrometheusMetricsService(MetricsService):
@@ -42,9 +77,9 @@ class PrometheusMetricsService(MetricsService):
     A class for fetching metrics from Prometheus.
     """
 
-    def __init__(self, config: Config, account_id: str, executor: ThreadPoolExecutor) -> None:
+    def __init__(self, config: Config, account_id: str, executor: ThreadPoolExecutor, tenant_id: str = "") -> None:
         super().__init__(config, account_id, executor)
-        self.prometheus = Prometheus(deployment_name="", namespace_name="", account_id=account_id)
+        self.prometheus = Prometheus(deployment_name="", namespace_name="", account_id=account_id, tenant_id=tenant_id)
         # self.prometheus = PrometheusConnect(url="http://127.0.0.1:8429", disable_ssl=True)
 
     def check_connection(self):
@@ -127,7 +162,7 @@ class PrometheusMetricsService(MetricsService):
         period: timedelta,
         *,
         step: timedelta = timedelta(minutes=30),
-    ) -> PodsTimeData:
+    ) -> Dict[str, PodsTimeData]:
         """
         Gathers data from Prometheus for a specified object and resource.
 
@@ -167,65 +202,6 @@ class PrometheusMetricsService(MetricsService):
                 *[self._gather_data(object, loader, period, step) for loader in metric_loaders]
             )
             return {loader.__name__: result for loader, result in zip(metric_loaders, results)}
-
-    async def query_and_validate(self, prom_query) -> Any:
-        result = await self.query(prom_query)
-        if len(result) == 0:
-            logger.debug("No results from Prometheus query (cluster summary)")
-            return None
-
-        if len(result) > 1:
-            logger.debug(f"Multiple results ({len(result)}) from Prometheus query, using first")
-
-        result_value = result[0].get("value")
-
-        # Verify that the "value" list has exactly two elements (timestamp and value)
-        if not result_value:
-            logger.debug("Missing value in Prometheus result (cluster summary)")
-            return None
-
-        if len(result_value) != 2:
-            logger.debug(f"Prometheus result values unexpected size: {len(result_value)}")
-            return None
-
-        return result_value[1]
-
-    async def get_cluster_summary(self) -> Dict[str, Any]:
-        cluster_label = self.get_prometheus_cluster_label()
-
-        # use this for queries with no labels. turn ', cluster="xxx"' to 'cluster="xxx"'
-        single_cluster_label = cluster_label.replace(",", "")
-        memory_query = f"""
-            sum(max by (instance) (machine_memory_bytes{{ {single_cluster_label} }}))
-            or sum(max by (instance) (node_resources_memory_total_bytes{{ endpoint=\"http\", {cluster_label} }}))
-        """
-        cpu_query = f"""
-            sum(max by (instance) (machine_cpu_cores{{ {single_cluster_label} }}))
-            or sum(max by (instance)(node_resources_cpu_logical_cores{{endpoint=\"http\", {cluster_label} }}))
-        """
-        kube_system_requests_mem = f"""
-        sum(max(kube_pod_container_resource_requests{{ namespace='kube-system', resource='memory', {cluster_label} }})
-            by (job, pod, container) )
-        """
-        kube_system_requests_cpu = f"""
-            sum(max(kube_pod_container_resource_requests{{ namespace='kube-system', resource='cpu', {cluster_label} }})
-            by (job, pod, container) )
-        """
-        try:
-            cluster_memory_result = await self.query_and_validate(memory_query)
-            cluster_cpu_result = await self.query_and_validate(cpu_query)
-            kube_system_mem_result = await self.query_and_validate(kube_system_requests_mem)
-            kube_system_cpu_result = await self.query_and_validate(kube_system_requests_cpu)
-            return {
-                "cluster_memory": float(cluster_memory_result) if cluster_memory_result else 0,
-                "cluster_cpu": float(cluster_cpu_result) if cluster_cpu_result else 0,
-                "kube_system_mem_req": float(kube_system_mem_result) if kube_system_mem_result else 0,
-                "kube_system_cpu_req": float(kube_system_cpu_result) if kube_system_cpu_result else 0,
-            }
-
-        except Exception as e:
-            logger.error(f"Exception occurred while getting cluster summary: {e}")
-            return {}
 
     async def load_pods(self, object: K8sObjectData, period: timedelta) -> list[PodData]:
         """
@@ -298,7 +274,7 @@ class PrometheusMetricsService(MetricsService):
             pod_owner_kind = object.kind
 
         related_pods_result = []
-        batch_size = int(os.environ.get("KRR_OWNER_BATCH_SIZE", 100))
+        batch_size = OWNER_BATCH_SIZE
         for owner_group in batched(pod_owners, batch_size):
             owners_regex = "|".join(owner_group)
             related_pods_result_item = await self.query_range(
@@ -324,21 +300,84 @@ class PrometheusMetricsService(MetricsService):
         current_pods_set = set()
         del related_pods_result
 
-        for pod_group in batched(related_pods, 100):
-            group_regex = "|".join(pod_group)
-            pods_status_result = await self.query_range(
-                f"""
+        # "Currently running" must be an INSTANT check. The previous query_range
+        # over the whole history period marked every pod that was Running at ANY
+        # step in the window as not-deleted, so current_pods_count counted every
+        # pod incarnation from every deploy/restart in the last N days — and the
+        # estimated-savings replica multiplier scaled by dozens instead of the
+        # live replica count (a 2-replica deployment with daily rollouts
+        # reported ~45 "replicas" and a ~22x inflated saving).
+        # Batches are independent and the relay semaphore already bounds
+        # concurrency, so they run in parallel.
+        def liveness_query(group_regex: str) -> str:
+            return f"""
                     kube_pod_status_phase{{
                         phase="Running",
                         pod=~"{group_regex}",
                         namespace="{object.namespace}",
                         {cluster_label}
                     }} == 1
+                """
+
+        async def instant_batch(pod_group: Iterable[str]) -> set[str]:
+            result = await self.query(liveness_query("|".join(pod_group)))
+            return {pod["metric"]["pod"] for pod in result}
+
+        for batch_pods in await asyncio.gather(*(instant_batch(g) for g in batched(related_pods, 100))):
+            current_pods_set |= batch_pods
+
+        # A transient scrape gap can make the instant vector empty even though
+        # pods are running; fall back to the last hour so a momentary gap
+        # degrades to slightly-stale liveness rather than zero live pods.
+        if not current_pods_set and related_pods:
+            now = datetime.now()
+
+            async def range_batch(pod_group: Iterable[str]) -> set[str]:
+                result = await self.query_range(
+                    liveness_query("|".join(pod_group)),
+                    start=now - timedelta(hours=1),
+                    end=now,
+                    step=timedelta(minutes=15),
+                )
+                return {pod["metric"]["pod"] for pod in result}
+
+            for batch_pods in await asyncio.gather(*(range_batch(g) for g in batched(related_pods, 100))):
+                current_pods_set |= batch_pods
+
+        return list({PodData(name=pod, deleted=pod not in current_pods_set) for pod in related_pods})
+
+    async def load_replica_stats(self, object: K8sObjectData, period: timedelta) -> Optional[ReplicaStats]:
+        """Time-weighted replica count over the window, from the pods load_pods discovered.
+
+        Hourly samples of the Running phase per pod; a timestamp with no running
+        pod carries no sample, so a workload younger than the window averages
+        over its own lifetime. Returns None on an empty result so the caller
+        falls back to the instant count.
+        """
+        pods = [pod.name for pod in object.pods]
+        if not pods:
+            return None
+        cluster_label = self.get_prometheus_cluster_label()
+        now = datetime.now()
+
+        async def range_batch(pod_group: Iterable[str]) -> Any:
+            # query_range is annotated dict but yields the list of series the
+            # liveness check above iterates the same way.
+            return await self.query_range(
+                f"""
+                    kube_pod_status_phase{{
+                        phase="Running",
+                        pod=~"{'|'.join(pod_group)}",
+                        namespace="{object.namespace}",
+                        {cluster_label}
+                    }} == 1
                 """,
-                start=datetime.now() - period,
-                end=datetime.now(),
+                start=now - period,
+                end=now,
                 step=timedelta(hours=1),
             )
-            current_pods_set |= {pod["metric"]["pod"] for pod in pods_status_result}
-            del pods_status_result
-        return list({PodData(name=pod, deleted=pod not in current_pods_set) for pod in related_pods})
+
+        series: list = []
+        for batch in await asyncio.gather(*(range_batch(g) for g in batched(pods, 100))):
+            series.extend(batch)
+        return replica_stats_from_running_series(series, period)

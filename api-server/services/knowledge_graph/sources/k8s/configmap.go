@@ -58,7 +58,7 @@ func (s *K8sSource) fetchK8sConfigMapsFromRelay(ctx context.Context, req *core.S
 
 	relayResponse, err := relay.Execute(relayRequest)
 	if err != nil {
-		s.logger.Error("failed to execute relay request for ConfigMaps", "error", err)
+		// Soft failure: BuildGraph logs this at WARN and continues without it.
 		return nil, fmt.Errorf("failed to execute relay request for ConfigMaps: %w", err)
 	}
 
@@ -194,4 +194,25 @@ func (s *K8sSource) convertK8sConfigMapsToGraph(cms []K8sConfigMapFromRelay, wor
 	}
 
 	return nodes, edges, byKey
+}
+
+// extractConfigDataFields keeps how many keys a ConfigMap or Secret holds, never the values.
+func (s *K8sSource) extractConfigDataFields(properties, spec, metaMap map[string]interface{}) {
+	// Just count of keys (don't store actual data)
+	if data, ok := spec["data"].(map[string]interface{}); ok {
+		properties["key_count"] = len(data)
+	}
+}
+
+// The workload kinds a config row builds (see kinds.go). ConfigMaps and
+// Secrets reach the graph through the relay; a row is only seen when a caller
+// widens the queried kinds, and then it keeps its key count, never its values.
+func init() {
+	for _, kind := range []string{"ConfigMap", "Secret"} {
+		registerWorkloadKind(workloadKind{
+			Kind:     kind,
+			NodeType: core.NodeTypeWorkload,
+			Extract:  (*K8sSource).extractConfigDataFields,
+		})
+	}
 }

@@ -136,6 +136,8 @@ type EventInfo struct {
 	ID             string
 	Fingerprint    string
 	AggregationKey string
+	// Freshness anchor for IsAnalysisStaleForEvent. Zero if the row had none.
+	CreatedAt time.Time
 }
 
 // EventAnalysis represents an event analysis record from the database.
@@ -157,9 +159,70 @@ type EventAnalysis struct {
 	UpdatedAt time.Time
 }
 
+type EventAnalysisEventVersion struct {
+	EventID          string    `db:"event_id"`
+	RelatedEventID   string    `db:"related_event_id"`
+	VersionRank      int       `db:"version_rank"`
+	GeneratedAt      time.Time `db:"generated_at"`
+	Summary          string    `db:"summary"`
+	Investigation    string    `db:"investigation"`
+	Analysis         string    `db:"analysis"`
+	DetailedResponse string    `db:"detailed_response"`
+}
+
+const eventAnalysisHistoryLimit = 5
+
+// ListCompletedEventAnalysisVersions assembles full historical versions from
+// the rows already retained in event_log_analysis. Ranking within each
+// (event, analysis type) aligns the four stages from the same generation while
+// leaving event_analysis_mapping free to keep pointing at only the live rows.
+func (r *EventAnalysisRepository) ListCompletedEventAnalysisVersions(ctx *security.RequestContext, fingerprint, accountID, aggKey string) ([]EventAnalysisEventVersion, error) {
+	var versions []EventAnalysisEventVersion
+	err := r.dbManager.Db.Select(&versions, `
+		WITH ranked AS (
+			SELECT
+				a.*,
+				ROW_NUMBER() OVER (
+					PARTITION BY a.event_id, a.analysis_type
+					ORDER BY COALESCE(a.updated_at, a.recorded_at) DESC, a.id DESC
+				) AS version_rank
+			FROM event_log_analysis a
+			WHERE a.event_fingerprint = $1
+			  AND a.cloud_account_id = $2
+			  AND a.event_aggregation_key = $3
+			  AND a.analysis_type IN ($4, $5, $6, $7)
+			  AND a.status = $8
+			  AND a.event_id IS NOT NULL
+		)
+		SELECT
+			a.event_id,
+			a.event_id::text AS related_event_id,
+			a.version_rank,
+			MAX(COALESCE(a.updated_at, a.recorded_at)) AS generated_at,
+			COALESCE(MAX(a.summary) FILTER (WHERE a.analysis_type = $4), '') AS summary,
+			COALESCE(MAX(a.summary) FILTER (WHERE a.analysis_type = $5), '') AS investigation,
+			COALESCE(MAX(a.analysis) FILTER (WHERE a.analysis_type = $6), '') AS analysis,
+			COALESCE(MAX(a.summary) FILTER (WHERE a.analysis_type = $7), '') AS detailed_response
+		FROM ranked a
+		GROUP BY a.event_id, a.version_rank
+		HAVING COUNT(DISTINCT a.analysis_type) = 4
+		ORDER BY generated_at DESC
+		LIMIT $9`, fingerprint, accountID, aggKey,
+		AnalysisTypeSummary, AnalysisTypeInvestigation, AnalysisTypeLog, AnalysisTypeDetailedResponse,
+		AnalysisStatusCompleted, eventAnalysisHistoryLimit)
+	if err != nil {
+		ctx.GetLogger().Warn("analyzer: failed to list mapped analysis versions", "error", err, "event_fingerprint", fingerprint)
+		return nil, fmt.Errorf("ListCompletedEventAnalysisVersions: %w", err)
+	}
+	return versions, nil
+}
+
+// ErrEventNotFound distinguishes a missing event from a retryable database error.
+var ErrEventNotFound = errors.New("analyzer: event not found")
+
 // GetEventInfo fetches basic event details (ID, fingerprint, aggregation key) from the database.
 func (r *EventAnalysisRepository) GetEventInfo(ctx *security.RequestContext, eventId string, accountId string) (*EventInfo, error) {
-	eventSqlQuery := `SELECT id, fingerprint, aggregation_key FROM events WHERE id = $1 and cloud_account_id = $2;`
+	eventSqlQuery := `SELECT id, fingerprint, aggregation_key, created_at FROM events WHERE id = $1 and cloud_account_id = $2;`
 	rows, err := r.dbManager.Db.Queryx(eventSqlQuery, eventId, accountId)
 	if err != nil {
 		ctx.GetLogger().Warn("analyzer: failed to get event from database", "error", err, "event_id", eventId)
@@ -172,25 +235,27 @@ func (r *EventAnalysisRepository) GetEventInfo(ctx *security.RequestContext, eve
 	}()
 
 	var dbEventId, dbEventFingerprint, dbEventAggregationKey sql.NullString
+	var dbEventCreatedAt sql.NullTime
 	if rows.Next() {
-		if err := rows.Scan(&dbEventId, &dbEventFingerprint, &dbEventAggregationKey); err != nil {
+		if err := rows.Scan(&dbEventId, &dbEventFingerprint, &dbEventAggregationKey, &dbEventCreatedAt); err != nil {
 			ctx.GetLogger().Warn("analyzer: failed to scan event from database", "error", err, "event_id", eventId)
 			return nil, err
 		}
 		if dbEventId.String == "" {
-			return nil, common.Error{Message: "analyzer: event not found - " + eventId}
+			return nil, fmt.Errorf("%w - %s", ErrEventNotFound, eventId)
 		}
 		return &EventInfo{
 			ID:             dbEventId.String,
 			Fingerprint:    dbEventFingerprint.String,
 			AggregationKey: dbEventAggregationKey.String,
+			CreatedAt:      dbEventCreatedAt.Time,
 		}, nil
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
-	return nil, common.Error{Message: "analyzer: event not found - " + eventId}
+	return nil, fmt.Errorf("%w - %s", ErrEventNotFound, eventId)
 }
 
 // GetAnalysisIdFromMapping returns the analysis_id for a given (event_id, analysis_type) pair.
@@ -234,6 +299,26 @@ func (r *EventAnalysisRepository) GetAnalysisIdFromMapping(ctx *security.Request
 // fingerprint is fully analysed and days old.
 func (r *EventAnalysisRepository) IsAnalysisStale(writtenAt time.Time) bool {
 	return r.analysisFreshness > 0 && !writtenAt.IsZero() && time.Since(writtenAt) > r.analysisFreshness
+}
+
+// IsAnalysisStaleForEvent measures the analysis age against when the event
+// fired rather than against now, so "already investigated" can't lapse on a
+// wall-clock timer. Only executeEventInvestigation uses it; every other gate
+// keeps the now-based IsAnalysisStale.
+//
+// This does not reopen the dispatch-but-skip loop the IsAnalysisStale comment
+// warns about: a per-step cache skips only when the stage is inside the window
+// relative to now, which (an event can't fire in the future) means it is also
+// inside the window relative to eventCreatedAt -- so this gate would not have
+// dispatched. Falls back to the now-based bound when eventCreatedAt is zero.
+func (r *EventAnalysisRepository) IsAnalysisStaleForEvent(writtenAt, eventCreatedAt time.Time) bool {
+	if r.analysisFreshness <= 0 || writtenAt.IsZero() {
+		return false
+	}
+	if eventCreatedAt.IsZero() {
+		return time.Since(writtenAt) > r.analysisFreshness
+	}
+	return eventCreatedAt.Sub(writtenAt) > r.analysisFreshness
 }
 
 // GetEventAnalysis fetches an existing analysis from the database.
@@ -530,57 +615,45 @@ func (r *EventAnalysisRepository) ClaimEventAnalysis(ctx *security.RequestContex
 	return true, nil
 }
 
-// SaveEventRCAAnalysis saves the final RCA analysis result.
-func (r *EventAnalysisRepository) SaveEventRCAAnalysis(ctx *security.RequestContext, eventId, fingerprint, accountId, aggKey, analysisResult string) error {
+// SaveEventRCAAnalysis completes legacy fingerprint-session work during recovery.
+// New dispatches use ClaimRCAAttempt/FinishRCAAttempt with an explicit attempt ID.
+func (r *EventAnalysisRepository) SaveEventRCAAnalysis(ctx *security.RequestContext, legacyID, eventId, fingerprint, accountId, aggKey, analysisResult string) error {
+	if eventId == "" {
+		return errors.New("event ID is required to retain RCA history")
+	}
 	tx, err := r.dbManager.Db.Beginx()
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-
-	existingId, err := findCurrentAnalysisID(tx, eventId, fingerprint, accountId, aggKey, AnalysisTypeRCA)
-	if err != nil {
+	if err = lockRCAEvent(tx, accountId, eventId); err != nil {
 		return err
 	}
-
-	if existingId != "" {
-		if eventId != "" {
-			_, err = tx.Exec(
-				`UPDATE event_log_analysis SET analysis=$2, status=$3, status_reason=NULL, event_id=$4, updated_at=NOW() WHERE id=$1`,
-				existingId, analysisResult, AnalysisStatusCompleted, eventId,
-			)
-		} else {
-			_, err = tx.Exec(
-				`UPDATE event_log_analysis SET analysis=$2, status=$3, status_reason=NULL, updated_at=NOW() WHERE id=$1`,
-				existingId, analysisResult, AnalysisStatusCompleted,
-			)
-		}
-		if err != nil {
-			ctx.GetLogger().Warn("analyzer: failed to update rca analysis row", "error", err, "analysis_id", existingId)
-			return err
-		}
+	var status string
+	if err = tx.Get(&status, `SELECT status FROM event_log_analysis WHERE id=$1 AND event_id=$2 AND cloud_account_id=$3 AND analysis_type='rca_analysis' FOR UPDATE`, legacyID, eventId, accountId); err != nil {
+		return err
+	}
+	if status != string(AnalysisStatusInProgress) {
 		return tx.Commit()
 	}
-
-	var dbEventId any = eventId
-	if eventId == "" {
-		dbEventId = nil
-	}
-
-	insertQuery := `INSERT INTO event_log_analysis (event_id, analysis, status, event_fingerprint, cloud_account_id, event_aggregation_key, analysis_type) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`
-	var analysisId string
-	err = tx.QueryRowx(insertQuery, dbEventId, analysisResult, AnalysisStatusCompleted, fingerprint, accountId, aggKey, AnalysisTypeRCA).Scan(&analysisId)
-	if err != nil {
-		ctx.GetLogger().Warn("analyzer: failed to insert rca analysis into database", "error", err, "event_id", eventId)
+	if err = preserveSharedRCAReport(tx, eventId, accountId); err != nil {
 		return err
 	}
-
-	if eventId != "" {
-		if _, err = upsertAnalysisMapping(tx, eventId, analysisId, AnalysisTypeRCA, true); err != nil {
-			return err
-		}
+	// Retire legacy in-flight status without discarding any retained report text.
+	if _, err = tx.Exec(`UPDATE event_log_analysis SET status='FAILED',status_reason='superseded by recovered RCA' WHERE id=$1 AND cloud_account_id=$2 AND analysis_type='rca_analysis' AND status='IN_PROGRESS'`, legacyID, accountId); err != nil {
+		return err
 	}
-
+	var id string
+	err = tx.QueryRowx(`INSERT INTO event_log_analysis (event_id,analysis,status,event_fingerprint,cloud_account_id,event_aggregation_key,analysis_type,updated_at) VALUES ($1,$2,'COMPLETED',$3,$4,$5,'rca_analysis',NOW()) RETURNING id`, eventId, analysisResult, fingerprint, accountId, aggKey).Scan(&id)
+	if err != nil {
+		return err
+	}
+	if _, err = upsertAnalysisMapping(tx, eventId, id, AnalysisTypeRCA, true); err != nil {
+		return err
+	}
+	if err = pruneRCAReports(tx, eventId, accountId); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -605,9 +678,22 @@ func (r *EventAnalysisRepository) GetLatestAnalysisUpdatedAt(ctx *security.Reque
 	return latest.Time, nil
 }
 
+// eventRuleDefinitionQuery picks one event_rules row for an alert. Rows are
+// unique per source, so one alert can have several: a rule synced from the
+// provider (prometheus, AWS_CloudWatch_Alarm, GCP_Metric_Alert) next to a stub
+// created when the alert first arrived by webhook (AWS_EventBridge,
+// prometheus_alertmanager_webhook), whose expr is empty or a one-line summary.
+// Without an ORDER BY the stub could win and the investigation prompt got a
+// blank Event Definition, so prefer a populated expr, then the fullest one,
+// then the most recently updated.
+const eventRuleDefinitionQuery = `select expr, annotations::jsonb from event_rules er
+	where er.account_id = $1 and er.alert = $2
+	order by (er.expr <> '') desc, length(er.expr) desc, er.updated_at desc nulls last
+	limit 1`
+
 // GetEventRuleDefinition fetches the rule definition and annotations for a given aggregation key.
 func (r *EventAnalysisRepository) GetEventRuleDefinition(ctx *security.RequestContext, accountId string, aggregationKey string) (string, map[string]any, error) {
-	rows, err := r.dbManager.Db.Query("select expr, annotations::jsonb from event_rules er where er.account_id = $1 and er.alert  = $2", accountId, aggregationKey)
+	rows, err := r.dbManager.Db.Query(eventRuleDefinitionQuery, accountId, aggregationKey)
 	if err != nil {
 		return "", nil, err
 	}
@@ -633,6 +719,42 @@ func (r *EventAnalysisRepository) GetEventRuleDefinition(ctx *security.RequestCo
 		return "", nil, err
 	}
 	return "", nil, nil
+}
+
+// Bounds on how far a duplicate chain may widen an incident window around the
+// event's own start: a long-lived chain (a daily alarm on occurrence 50) must not
+// stretch one investigation across days.
+const (
+	duplicateChainLookback  = 6 * time.Hour
+	duplicateChainLookahead = time.Hour
+)
+
+// GetDuplicateChainSpan returns the earliest and latest starts_at of the events in
+// eventId's duplicate chain that fall near around (see duplicateChainLookback /
+// duplicateChainLookahead). Both are nil when the event has no chain row.
+func (r *EventAnalysisRepository) GetDuplicateChainSpan(ctx *security.RequestContext, accountId, eventId string, around time.Time) (*time.Time, *time.Time, error) {
+	var first, last sql.NullTime
+	err := r.dbManager.Db.QueryRow(`select min(e.starts_at), max(e.starts_at)
+		from event_duplicates d
+		join events e on e.id = d.event_id
+		where d.cloud_account_id = $1
+		  and d.first_event_id = (select first_event_id from event_duplicates where event_id = $2 and cloud_account_id = $1)
+		  and e.starts_at between $3 and $4`,
+		accountId, eventId, around.Add(-duplicateChainLookback), around.Add(duplicateChainLookahead)).Scan(&first, &last)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil, nil
+		}
+		return nil, nil, fmt.Errorf("GetDuplicateChainSpan: %w", err)
+	}
+	var f, l *time.Time
+	if first.Valid {
+		f = &first.Time
+	}
+	if last.Valid {
+		l = &last.Time
+	}
+	return f, l, nil
 }
 
 // GetEventRuleActionDefinitions fetches action definitions for a given alert rule.
@@ -712,7 +834,37 @@ func (r *EventAnalysisRepository) UpdateEventAnalysisStatus(ctx *security.Reques
 // (a missing label, no logs), so it holds for every event sharing the
 // fingerprint; resolving through the mapping instead would insert a fresh row for
 // each unmapped event, which is the duplication this exists to stop.
-func (r *EventAnalysisRepository) UpsertEventAnalysisStatus(ctx *security.RequestContext, eventId, eventFingerprint, cloudAccountId, aggregationKey, status, statusReason string, analysisType EventAnalysisType) error {
+//
+// ClearedAnalysisDoc is what a terminal-skip writes into a log_analysis row's
+// analysis column in place of a real result. It is a parseable empty result
+// rather than "" so the Raise-PR consumer (api-server ApplyEventResolution)
+// reports "no proposed code fix is stored" instead of failing to parse "".
+//
+// It carries no findings, so anything that treats a stored analysis as CONTENT
+// — notably the RCA and synthesis prompt builders — must test with
+// HasStoredAnalysisContent, not `!= ""`.
+const ClearedAnalysisDoc = `{"source_updates":{}}`
+
+// HasStoredAnalysisContent reports whether a stored analysis string holds a
+// real result, as opposed to being absent or the cleared placeholder above.
+// Prompt builders must use this: feeding the placeholder to an LLM under a
+// "## Log Analysis" heading presents `{"source_updates":{}}` as findings.
+func HasStoredAnalysisContent(analysis string) bool {
+	trimmed := strings.TrimSpace(analysis)
+	return trimmed != "" && trimmed != ClearedAnalysisDoc
+}
+
+// clearPayload controls whether a pre-existing row's stored analysis is reset.
+// The log stage passes true: a prior run may have stored a code-change plan or
+// diff, and a re-run concluding no change must clear it so a stale fix isn't
+// reachable behind "Raise PR" (#37005 §4). It is reset to a minimal valid result
+// doc ({"source_updates":{}}) rather than "" so the Raise-PR consumer parses it
+// and reports "no proposed code fix is stored" instead of an empty-string parse
+// error. The investigation debug-skip passes false: re-analysing after
+// EVENT_DEBUG_ANALYSIS_DISABLED is turned on (or a Datadog event re-firing
+// without a service label) must not erase a previously stored investigation
+// summary, which still feeds finalResponse.Investigation and the RCA input.
+func (r *EventAnalysisRepository) UpsertEventAnalysisStatus(ctx *security.RequestContext, eventId, eventFingerprint, cloudAccountId, aggregationKey, status, statusReason string, analysisType EventAnalysisType, clearPayload bool) error {
 	ctx.GetLogger().Info("analyzer: recording event analysis stage status", "event_fingerprint", eventFingerprint, "account_id", cloudAccountId, "event_aggregation_key", aggregationKey, "analysis_type", analysisType, "status", status)
 
 	tx, err := r.dbManager.Db.Beginx()
@@ -728,11 +880,25 @@ func (r *EventAnalysisRepository) UpsertEventAnalysisStatus(ctx *security.Reques
 		return err
 	}
 
+	// When clearPayload wipes a stored plan/diff, leave a minimal valid result
+	// document rather than "" so the Raise-PR consumer
+	// (api-server ApplyEventResolution) parses it and reports "no proposed code
+	// fix is stored" instead of failing on an empty-string JSON parse.
+	clearedAnalysis := ""
+	if clearPayload {
+		clearedAnalysis = ClearedAnalysisDoc
+	}
+
 	if existingId != "" {
-		if _, err = tx.Exec(
-			`UPDATE event_log_analysis SET status=$2, status_reason=$3, updated_at=NOW() WHERE id=$1`,
-			existingId, status, statusReason,
-		); err != nil {
+		updateQuery := `UPDATE event_log_analysis SET status=$2, status_reason=$3, updated_at=NOW() WHERE id=$1`
+		if clearPayload {
+			updateQuery = `UPDATE event_log_analysis SET analysis=$4, summary='', status=$2, status_reason=$3, updated_at=NOW() WHERE id=$1`
+		}
+		args := []any{existingId, status, statusReason}
+		if clearPayload {
+			args = append(args, clearedAnalysis)
+		}
+		if _, err = tx.Exec(updateQuery, args...); err != nil {
 			ctx.GetLogger().Warn("analyzer: failed to update analysis status in database", "error", err, "analysis_id", existingId)
 			return err
 		}
@@ -746,8 +912,8 @@ func (r *EventAnalysisRepository) UpsertEventAnalysisStatus(ctx *security.Reques
 
 	var analysisId string
 	if err = tx.QueryRowx(
-		`INSERT INTO event_log_analysis (event_id, event_fingerprint, analysis, summary, status, status_reason, cloud_account_id, event_aggregation_key, analysis_type) VALUES ($1, $2, '', '', $3, $4, $5, $6, $7) RETURNING id`,
-		dbEventId, eventFingerprint, status, statusReason, cloudAccountId, aggregationKey, analysisType,
+		`INSERT INTO event_log_analysis (event_id, event_fingerprint, analysis, summary, status, status_reason, cloud_account_id, event_aggregation_key, analysis_type) VALUES ($1, $2, $8, '', $3, $4, $5, $6, $7) RETURNING id`,
+		dbEventId, eventFingerprint, status, statusReason, cloudAccountId, aggregationKey, analysisType, clearedAnalysis,
 	).Scan(&analysisId); err != nil {
 		ctx.GetLogger().Warn("analyzer: failed to insert skipped analysis stage", "error", err, "event_fingerprint", eventFingerprint, "analysis_type", analysisType)
 		return err
@@ -901,6 +1067,43 @@ func (r *EventAnalysisRepository) GetKnowledgebase(ctx *security.RequestContext,
 // InsertRemediationExecution records that a remediation command was run against the event's cluster,
 // so the panel can show "already applied" on reload. type=CommandExecution, resolver NBLLM (attributed
 // to the acting user via resolver_id); type_reference_id is the command so the UI can match it to an action.
+// RecordRemediationVerification merges a verify result into the execute attempt it checked, under
+// data.verify. It updates the newest matching attempt rather than inserting a row: a verify is a
+// fact about an attempt, not an attempt of its own, and filing it separately counted one remediation
+// three times and listed a rollback as though it had resolved the event.
+//
+// jsonb_set on the existing data keeps every key the execute run wrote (command, exit_code,
+// success, exit_code_reported) — this is additive, so no migration.
+func (r *EventAnalysisRepository) RecordRemediationVerification(ctx *security.RequestContext, eventId, executeCommand string, verify map[string]any) error {
+	verifyJSON, err := json.Marshal(verify)
+	if err != nil {
+		return fmt.Errorf("RecordRemediationVerification: marshal: %w", err)
+	}
+	// type_reference_id holds the execute command, which is how an attempt is identified. Scoped to
+	// CommandExecution so a same-named reference on another resolution type cannot be hit.
+	res, err := r.dbManager.Db.Exec(
+		`UPDATE event_resolution
+		    SET data = jsonb_set(COALESCE(data, '{}'::jsonb), '{verify}', $3::jsonb, true),
+		        updated_at = NOW()
+		  WHERE id = (
+		        SELECT id FROM event_resolution
+		         WHERE event_id = $1 AND type = 'CommandExecution' AND type_reference_id = $2
+		         ORDER BY created_at DESC
+		         LIMIT 1
+		  )`,
+		eventId, executeCommand, string(verifyJSON))
+	if err != nil {
+		return fmt.Errorf("RecordRemediationVerification: %w", err)
+	}
+	// No matching attempt is not an error: the execute may have failed before it was recorded, or a
+	// verify may have been run on its own. Nothing to annotate, nothing to report.
+	if affected, err := res.RowsAffected(); err == nil && affected == 0 {
+		ctx.GetLogger().Info("remediation: no execute attempt to attach verification to",
+			"event_id", eventId, "execute_command", executeCommand)
+	}
+	return nil
+}
+
 func (r *EventAnalysisRepository) InsertRemediationExecution(ctx *security.RequestContext, eventId, userId, command string, dataJSON string, statusMessage string, success bool) error {
 	status := "Success"
 	if !success {

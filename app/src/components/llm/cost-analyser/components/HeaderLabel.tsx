@@ -5,18 +5,37 @@
  */
 import * as React from 'react';
 import { Box } from '@mui/material';
+import { ds } from '@utils/colors';
 import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined';
 import Tooltip from '@ui/Tooltip';
 
-export function HeaderLabel({ label, info, secondary }: { label: string; info: string; secondary?: string }) {
+export function HeaderLabel({
+  label,
+  info,
+  secondary,
+  alignRight,
+}: {
+  label: string;
+  info: string;
+  secondary?: string;
+  /** Right-aligned numeric column: keep the info icon left of the label so the label's own
+   *  right edge — not the icon's — sits flush with the column's right edge, matching the
+   *  values below it (#35789). */
+  alignRight?: boolean;
+}) {
   return (
-    <Box component='span' sx={{ display: 'inline-flex', alignItems: 'center', gap: '4px', whiteSpace: 'nowrap' }}>
-      {label}
-      {secondary && (
-        <Box component='span' sx={{ color: 'var(--ds-gray-500)', fontWeight: 'var(--ds-font-weight-regular)', fontSize: 'var(--ds-text-small)' }}>
-          {secondary}
-        </Box>
-      )}
+    <Box
+      component='span'
+      sx={{ display: 'inline-flex', alignItems: 'center', gap: ds.space[1], whiteSpace: 'nowrap', flexDirection: alignRight ? 'row-reverse' : 'row' }}
+    >
+      <Box component='span' sx={{ display: 'inline-flex', alignItems: 'center', gap: ds.space[1] }}>
+        {label}
+        {secondary && (
+          <Box component='span' sx={{ color: 'var(--ds-gray-500)', fontWeight: 'var(--ds-font-weight-regular)', fontSize: 'var(--ds-text-small)' }}>
+            {secondary}
+          </Box>
+        )}
+      </Box>
       <Tooltip title={info}>
         <Box component='span' onClick={(e) => e.stopPropagation()} sx={{ display: 'inline-flex', alignItems: 'center', color: 'var(--ds-gray-400)' }}>
           <InfoOutlinedIcon sx={{ fontSize: 13 }} />

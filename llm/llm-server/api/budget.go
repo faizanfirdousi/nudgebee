@@ -3,20 +3,121 @@ package api
 import (
 	"log/slog"
 	"strings"
+	"time"
 
+	"nudgebee/llm/audit"
 	"nudgebee/llm/budget"
 	"nudgebee/llm/common"
 	"nudgebee/llm/security"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 )
 
+// budgetActionToEventType maps a budget.ChangeAction to its audit EventType.
+var budgetActionToEventType = map[string]audit.EventType{
+	budget.ChangeActionCreate:   audit.EventTypeBudgetConfigCreate,
+	budget.ChangeActionDelete:   audit.EventTypeBudgetConfigDelete,
+	budget.ChangeActionIncrease: audit.EventTypeBudgetConfigIncrease,
+	budget.ChangeActionDecrease: audit.EventTypeBudgetConfigDecrease,
+	budget.ChangeActionEnable:   audit.EventTypeBudgetConfigEnable,
+	budget.ChangeActionDisable:  audit.EventTypeBudgetConfigDisable,
+}
+
+// budgetActionToEventAction maps a budget.ChangeAction to the coarse
+// CRUD-style EventAction the existing Audit Log action filter understands.
+var budgetActionToEventAction = map[string]audit.EventAction{
+	budget.ChangeActionCreate:   audit.EventActionCreate,
+	budget.ChangeActionDelete:   audit.EventActionDelete,
+	budget.ChangeActionIncrease: audit.EventActionUpdate,
+	budget.ChangeActionDecrease: audit.EventActionUpdate,
+	budget.ChangeActionEnable:   audit.EventActionUpdate,
+	budget.ChangeActionDisable:  audit.EventActionUpdate,
+}
+
+// emitBudgetHistoryAudit diffs before/after budget config rows and batches one
+// audit entry per changed budget type into a single relay call. Audit failures
+// are logged, not returned — the config write already succeeded, so a history
+// recording hiccup must not surface to the caller as a failed save.
+func emitBudgetHistoryAudit(ctx *security.RequestContext, before, after *budget.BudgetConfig, entityType, entityID, tenantId, module, userId string, logger *slog.Logger) {
+	changes := budget.DiffBudgetConfig(before, after)
+	if len(changes) == 0 {
+		return
+	}
+
+	accountId := ""
+	if entityType == budget.EntityTypeAccount {
+		accountId = entityID
+	}
+
+	now := time.Now().UTC()
+	entries := make([]audit.Audit, 0, len(changes))
+	for _, change := range changes {
+		// EventState is required by the ingest endpoint; a Delete has no new
+		// value, so substitute the same placeholder used elsewhere for
+		// delete-type audits (e.g. chat conversation delete).
+		newValue := any(change.NewValue)
+		if change.NewValue == nil {
+			newValue = map[string]any{"deleted": true}
+		}
+		entries = append(entries, audit.Audit{
+			UserId:         userId,
+			TenantId:       tenantId,
+			AccountId:      accountId,
+			EventTime:      now,
+			EventCategory:  audit.EventCategoryBudget,
+			EventType:      budgetActionToEventType[change.Action],
+			EventPrevState: change.PrevValue,
+			EventState:     newValue,
+			EventActor:     audit.EventActorUiService,
+			EventTarget:    entityID,
+			EventAction:    budgetActionToEventAction[change.Action],
+			EventStatus:    audit.EventStatusSuccess,
+			EventAttr:      map[string]any{"budget_type": change.BudgetType, "module": module},
+		})
+	}
+
+	if err := audit.CreateAudit(ctx, &audit.AuditRequest{Audits: entries}); err != nil {
+		logger.Error("api: failed to record budget change history", "error", err, "entity_type", entityType, "entity_id", entityID)
+	}
+}
+
 // actionError returns an error response in the format RPC action webhooks expect: { "message": "..." }
 func actionError(c *gin.Context, code int, msg string) {
 	c.JSON(code, gin.H{"message": msg})
+}
+
+// requireBudgetAdminTenant gates the three budget-config endpoints and returns
+// the tenant they must operate inside, or "" after writing the error response.
+//
+// The tenant scope binds EVERY caller, super admins included. A super-admin
+// session still carries the tenant it is viewing (x-tenant-id / session
+// variables), and the Usage & Limits screen these endpoints serve is
+// single-tenant: it labels every row with the session tenant's name and reads
+// usage back for the session tenant only. Letting a super admin see or write
+// another tenant's rows both leaked those rows and made an edit land on a row
+// the usage panel never reads — the config showed the new value while the
+// usage section kept the old one (#37020).
+func requireBudgetAdminTenant(c *gin.Context, sc *security.SecurityContext) string {
+	if !sc.IsSuperAdmin() && !sc.IsTenantAdmin() {
+		actionError(c, 403, "api: admin access required")
+		return ""
+	}
+	tenantId := sc.GetTenantId()
+	if tenantId == "" {
+		actionError(c, 400, "api: unable to identify tenant")
+		return ""
+	}
+	return tenantId
+}
+
+// canAccessAccountBudget reports whether the caller may act on accountId's
+// budget config. HasAccountAccess alone is not enough: it returns true for ANY
+// account id once the caller is a super admin, so the tenant-membership check
+// is what keeps a super-admin session inside the tenant it is viewing.
+func canAccessAccountBudget(sc *security.SecurityContext, tenantId, accountId string, access security.SecurityAccessType) bool {
+	return security.IsAccountInTenant(accountId, tenantId) && sc.HasAccountAccess(accountId, access)
 }
 
 // handleBudgetStatusApi registers all budget endpoints (all POST for RPC action compatibility)
@@ -116,8 +217,8 @@ func handleBudgetStatusApi(r *gin.Engine, tracer trace.Tracer, meter metric.Mete
 		}
 
 		sc := agentContext.GetSecurityContext()
-		if !sc.IsSuperAdmin() && !sc.IsTenantAdmin() {
-			actionError(c, 403, "api: admin access required")
+		tenantId := requireBudgetAdminTenant(c, sc)
+		if tenantId == "" {
 			return
 		}
 
@@ -128,27 +229,24 @@ func handleBudgetStatusApi(r *gin.Engine, tracer trace.Tracer, meter metric.Mete
 		entityID := listReq.EntityID
 		module := listReq.Module
 
-		// Non-super-admins: enforce tenant scoping
-		if !sc.IsSuperAdmin() {
-			switch entityType {
-			case budget.EntityTypeTenant:
-				tenantId := sc.GetTenantId()
-				if entityID != "" && entityID != tenantId {
-					actionError(c, 403, errorUserAccessMessage)
-					return
-				}
-				entityID = tenantId
-			case budget.EntityTypeAccount:
-				if entityID != "" && !sc.HasAccountAccess(entityID, security.SecurityAccessTypeRead) {
-					actionError(c, 403, errorUserAccessMessage)
-					return
-				}
-				// entityID="" means list all account configs — filter handled below
-			default:
-				// No entity_type specified — show tenant configs for the caller's tenant
-				entityType = budget.EntityTypeTenant
-				entityID = sc.GetTenantId()
+		switch entityType {
+		case budget.EntityTypeTenant:
+			if entityID != "" && entityID != tenantId {
+				actionError(c, 403, errorUserAccessMessage)
+				return
 			}
+			entityID = tenantId
+		case budget.EntityTypeAccount:
+			if entityID != "" && !canAccessAccountBudget(sc, tenantId, entityID, security.SecurityAccessTypeRead) {
+				actionError(c, 403, errorUserAccessMessage)
+				return
+			}
+			// entityID="" means list every account config IN THIS TENANT — the
+			// tenant filter is pushed into SQL below.
+		default:
+			// No entity_type specified — show tenant configs for the caller's tenant
+			entityType = budget.EntityTypeTenant
+			entityID = tenantId
 		}
 
 		dbManager, err := common.GetDatabaseManager(common.Metastore)
@@ -157,17 +255,24 @@ func handleBudgetStatusApi(r *gin.Engine, tracer trace.Tracer, meter metric.Mete
 			return
 		}
 
-		configs, err := budget.ListBudgetConfigs(dbManager, entityType, entityID, module)
+		listAllTenantAccounts := entityType == budget.EntityTypeAccount && entityID == ""
+
+		var configs []budget.BudgetConfig
+		if listAllTenantAccounts {
+			configs, err = budget.ListAccountBudgetConfigsForTenant(dbManager, tenantId, module)
+		} else {
+			configs, err = budget.ListBudgetConfigs(dbManager, entityType, entityID, module)
+		}
 		if err != nil {
 			slog.Error("api: failed to list budget configs", "error", err)
 			actionError(c, 500, "api: failed to list budget configs")
 			return
 		}
 
-		// For non-super-admins listing account configs without specific entityID,
-		// filter to only accounts they have access to
-		if !sc.IsSuperAdmin() && entityType == budget.EntityTypeAccount && entityID == "" {
-			filtered := make([]budget.BudgetConfig, 0)
+		// Narrow the tenant's account configs to the accounts this caller may
+		// actually read (a scoped account admin sees only their own).
+		if listAllTenantAccounts {
+			filtered := make([]budget.BudgetConfig, 0, len(configs))
 			for _, cfg := range configs {
 				if sc.HasAccountAccess(cfg.EntityID, security.SecurityAccessTypeRead) {
 					filtered = append(filtered, cfg)
@@ -229,8 +334,8 @@ func handleBudgetStatusApi(r *gin.Engine, tracer trace.Tracer, meter metric.Mete
 			return
 		}
 
-		if !sc.IsSuperAdmin() && !sc.IsTenantAdmin() {
-			actionError(c, 403, "api: admin access required")
+		tenantId := requireBudgetAdminTenant(c, sc)
+		if tenantId == "" {
 			return
 		}
 
@@ -247,33 +352,37 @@ func handleBudgetStatusApi(r *gin.Engine, tracer trace.Tracer, meter metric.Mete
 			request.BudgetDisabled = &disabled
 		}
 
-		// Non-super-admin access check.
-		// For tenant-scoped upserts, the caller's own tenant is the only valid target —
-		// take it from the security context (matches /config/list behaviour at
-		// line 138,148 and the rest of the llm-server API surface, e.g.
-		// functions.go:161,182).
-		if !sc.IsSuperAdmin() {
-			if request.EntityType == budget.EntityTypeTenant {
-				request.EntityID = sc.GetTenantId()
-				logger = logger.With("entity_id", request.EntityID)
-			}
-			if request.EntityType == budget.EntityTypeAccount && !sc.HasAccountAccess(request.EntityID, security.SecurityAccessTypeCreate) {
-				actionError(c, 403, errorUserAccessMessage)
-				return
-			}
-		}
-
+		// The caller's own tenant is the only valid target for a tenant-scoped
+		// upsert, whatever entity_id the form posted (the Add-Budget form posts
+		// the tenant NAME, not its id). Matches /config/list behaviour and the
+		// rest of the llm-server API surface, e.g. functions.go:161,182.
 		if request.EntityType == budget.EntityTypeTenant {
-			if _, err := uuid.Parse(request.EntityID); err != nil {
-				request.EntityID = sc.GetTenantId()
-				logger = logger.With("entity_id", request.EntityID)
-			}
+			request.EntityID = tenantId
+			logger = logger.With("entity_id", request.EntityID)
+		}
+		if request.EntityType == budget.EntityTypeAccount &&
+			!canAccessAccountBudget(sc, tenantId, request.EntityID, security.SecurityAccessTypeCreate) {
+			actionError(c, 403, errorUserAccessMessage)
+			return
 		}
 
 		dbManager, err := common.GetDatabaseManager(common.Metastore)
 		if err != nil {
 			actionError(c, 500, "api: database error")
 			return
+		}
+
+		// Snapshot the pre-write row for change history (nil when this call
+		// creates a new row). UpsertBudgetConfig does its own equivalent fetch
+		// internally to decide insert-vs-update; this is a second, harmless
+		// read kept local to the handler so UpsertBudgetConfig's signature and
+		// behavior stay unchanged. A fetch error here must not be treated as
+		// "row doesn't exist" — that would misrecord an update to an existing
+		// row as a Create with a blank previous value — so skip history for
+		// this save rather than guess.
+		before, beforeErr := budget.GetBudgetConfig(dbManager, request.EntityType, request.EntityID, request.Module)
+		if beforeErr != nil {
+			logger.Error("api: failed to fetch pre-write budget config; skipping change-history recording for this save", "error", beforeErr)
 		}
 
 		updatedBy := sc.GetUserId()
@@ -286,6 +395,10 @@ func handleBudgetStatusApi(r *gin.Engine, tracer trace.Tracer, meter metric.Mete
 			}
 			actionError(c, statusCode, err.Error())
 			return
+		}
+
+		if beforeErr == nil {
+			emitBudgetHistoryAudit(agentContext, before, result, request.EntityType, request.EntityID, tenantId, request.Module, updatedBy, logger)
 		}
 
 		c.JSON(200, gin.H{"data": result})
@@ -319,8 +432,8 @@ func handleBudgetStatusApi(r *gin.Engine, tracer trace.Tracer, meter metric.Mete
 		}
 
 		sc := agentContext.GetSecurityContext()
-		if !sc.IsSuperAdmin() && !sc.IsTenantAdmin() {
-			actionError(c, 403, "api: admin access required")
+		tenantId := requireBudgetAdminTenant(c, sc)
+		if tenantId == "" {
 			return
 		}
 
@@ -352,16 +465,15 @@ func handleBudgetStatusApi(r *gin.Engine, tracer trace.Tracer, meter metric.Mete
 			return
 		}
 
-		// Non-super-admin: verify ownership
-		if !sc.IsSuperAdmin() {
-			if cfg.EntityType == budget.EntityTypeTenant && cfg.EntityID != sc.GetTenantId() {
-				actionError(c, 403, errorUserAccessMessage)
-				return
-			}
-			if cfg.EntityType == budget.EntityTypeAccount && !sc.HasAccountAccess(cfg.EntityID, security.SecurityAccessTypeCreate) {
-				actionError(c, 403, errorUserAccessMessage)
-				return
-			}
+		// Verify ownership — the row must belong to the caller's tenant.
+		if cfg.EntityType == budget.EntityTypeTenant && cfg.EntityID != tenantId {
+			actionError(c, 403, errorUserAccessMessage)
+			return
+		}
+		if cfg.EntityType == budget.EntityTypeAccount &&
+			!canAccessAccountBudget(sc, tenantId, cfg.EntityID, security.SecurityAccessTypeCreate) {
+			actionError(c, 403, errorUserAccessMessage)
+			return
 		}
 
 		err = budget.DeleteBudgetConfig(dbManager, req.ID)
@@ -370,6 +482,8 @@ func handleBudgetStatusApi(r *gin.Engine, tracer trace.Tracer, meter metric.Mete
 			actionError(c, 500, err.Error())
 			return
 		}
+
+		emitBudgetHistoryAudit(agentContext, cfg, nil, cfg.EntityType, cfg.EntityID, tenantId, cfg.Module, sc.GetUserId(), logger)
 
 		c.JSON(200, gin.H{"data": gin.H{"deleted": req.ID}})
 	})

@@ -1,4 +1,5 @@
-import { Box, Typography, LinearProgress } from '@mui/material';
+import { Box, Typography } from '@mui/material';
+import { ProgressBar } from '@ui/ProgressBar';
 import { ds } from 'src/utils/colors';
 import { SavingsFooter, SectionTitle, MetricRow } from './evidencePrimitives';
 import WarningAmberIcon from '@mui/icons-material/WarningAmber';
@@ -121,19 +122,11 @@ const AbandonedResourceEvidence = ({ recommendation, estimatedSavings, cloudReso
                     {trafficPct.toFixed(1)}%
                   </Typography>
                 </Box>
-                <LinearProgress
-                  variant='determinate'
-                  value={Math.min(trafficPct, 100)}
-                  sx={{
-                    height: '6px',
-                    borderRadius: ds.radius.sm,
-                    backgroundColor: ds.gray[200],
-                    '& .MuiLinearProgress-bar': {
-                      borderRadius: ds.radius.sm,
-                      backgroundColor: trafficPct < 10 ? ds.red[600] : ds.amber[500],
-                    },
-                  }}
-                />
+                {/*
+                  Low traffic is the *bad* end here — that's what makes the resource abandoned —
+                  so the tone can't be derived from `thresholds`, which read high as bad.
+                */}
+                <ProgressBar value={Math.min(trafficPct, 100)} size='md' tone={trafficPct < 10 ? 'critical' : 'warning'} showValue={false} />
               </Box>
             )}
           </Box>
@@ -156,7 +149,7 @@ const AbandonedResourceEvidence = ({ recommendation, estimatedSavings, cloudReso
                 }}
               >
                 <Typography sx={{ fontSize: ds.text.caption, color: ds.gray[500], mb: ds.space[0] }}>CPU</Typography>
-                <Typography sx={{ fontSize: ds.text.body, fontWeight: ds.weight.semibold, color: ds.gray[700], fontFamily: 'monospace' }}>
+                <Typography sx={{ fontSize: ds.text.body, fontWeight: ds.weight.semibold, color: ds.gray[700], fontFamily: ds.font.mono }}>
                   {Number(cpu).toFixed(3)} cores
                 </Typography>
               </Box>
@@ -172,7 +165,7 @@ const AbandonedResourceEvidence = ({ recommendation, estimatedSavings, cloudReso
                 }}
               >
                 <Typography sx={{ fontSize: ds.text.caption, color: ds.gray[500], mb: ds.space[0] }}>Memory</Typography>
-                <Typography sx={{ fontSize: ds.text.body, fontWeight: ds.weight.semibold, color: ds.gray[700], fontFamily: 'monospace' }}>
+                <Typography sx={{ fontSize: ds.text.body, fontWeight: ds.weight.semibold, color: ds.gray[700], fontFamily: ds.font.mono }}>
                   {Number(memory).toFixed(0)} Mi
                 </Typography>
               </Box>

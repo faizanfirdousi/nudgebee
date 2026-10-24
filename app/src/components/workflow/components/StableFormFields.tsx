@@ -29,6 +29,8 @@ interface StableTextFieldProps {
   onDrop?: (e: React.DragEvent) => void;
   onDragOver?: (e: React.DragEvent) => void;
   onDragLeave?: () => void;
+  /** Optional guidance row (help tooltip / example chips) rendered below the input. */
+  guidance?: React.ReactNode;
 }
 
 /**
@@ -50,6 +52,7 @@ export const StableTextField = memo(function StableTextField({
   onDrop,
   onDragOver,
   onDragLeave,
+  guidance,
 }: StableTextFieldProps) {
   const [localValue, setLocalValue] = useState(value);
   const isUserTypingRef = useRef(false);
@@ -114,6 +117,7 @@ export const StableTextField = memo(function StableTextField({
             fieldType='textfield'
             required={isRequired}
           />
+          {guidance}
         </Box>
       </Box>
     </Box>
@@ -334,19 +338,23 @@ export const StableNumberField = memo(function StableNumberField({
           error={error || undefined}
           size='sm'
         />
-        {description && !error && (
-          <Typography
-            sx={{
-              fontSize: 'var(--ds-text-caption)',
-              color: colors.text.secondaryDark,
-              fontWeight: 'var(--ds-font-weight-regular)',
-              mt: 0.5,
-            }}
-          >
-            {description}
-          </Typography>
-        )}
       </Box>
+      {/* Beside the 80px input rather than under it, where it wrapped one word per line */}
+      {description && !error && (
+        <Typography
+          data-testid={`number-field-${fieldName}-description`}
+          sx={{
+            flex: '1 1 180px',
+            minWidth: 0,
+            fontSize: 'var(--ds-text-caption)',
+            color: 'var(--ds-gray-400)',
+            fontWeight: 'var(--ds-font-weight-regular)',
+            lineHeight: 1.4,
+          }}
+        >
+          {description}
+        </Typography>
+      )}
     </Box>
   );
 });

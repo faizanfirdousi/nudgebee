@@ -13,12 +13,14 @@ import (
 	"nudgebee/llm/config"
 	"nudgebee/llm/security"
 	"nudgebee/llm/services_server"
+	"nudgebee/llm/tools"
 	toolcore "nudgebee/llm/tools/core"
 	"nudgebee/llm/utils"
 	"nudgebee/llm/workspace"
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -35,20 +37,6 @@ const AgentCodeAnalyzer = "code_analyzer"
 // @agent_code_2 invocations, and api-server's hardcoded prompt prefix keep
 // resolving across deploys. Do not use in new code.
 const agentCodeAnalyzerLegacyName = "agent_code_2"
-
-// sanitizeWorkspacePathID maps an ID to the workspace's safe path charset
-// ([A-Za-z0-9_-]; everything else becomes '_') — the SAME mapping the workspace
-// analyze handler applies when naming its temp directories. Slack session IDs
-// contain a '.', so passing them raw both fails the workspace's conversation-id
-// validation and misses the sanitized directory names.
-func sanitizeWorkspacePathID(id string) string {
-	return strings.Map(func(r rune) rune {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
-			return r
-		}
-		return '_'
-	}, id)
-}
 
 // Mode constants mirror llm/code-analysis. Kept inline (not imported) because
 // llm-server doesn't take a Go-module dependency on llm/code-analysis.
@@ -85,11 +73,72 @@ const codeAgentFailuresCacheNS = "code_agent_conv_failures"
 // present, so no diff and no PR were produced. It is a SUCCESS, not a failure.
 const codeAnalysisNoOpStatus = "no_op"
 
+// A no-op carries the reason it happened. Mirrors NoOpBasisKey in
+// llm/code-analysis (orchestrator_agent.go): only a specialist verdict is a
+// finding about the file, so only it may be read back as "already present".
+const (
+	CodeAnalysisNoOpBasisKey        = "no_op_basis"
+	CodeAnalysisNoOpBasisSpecialist = "specialist_verdict"
+)
+
 // noopGuardPrefix tags a cached no-op terminal answer in codeAgentFailuresCacheNS,
 // distinguishing it from a failure-guard entry. A re-dispatch within the same
 // message replays this answer as a success instead of re-running the analysis,
 // which is what previously drove a re-dispatch loop and a duplicate PR.
 const noopGuardPrefix = "NOOP:"
+
+// sanitizeWorkspacePathID maps an ID to the workspace's safe path charset.
+// It is retained as the shared naming rule for workspace cleanup tests and
+// any callers that need to address a conversation execution directory.
+func sanitizeWorkspacePathID(id string) string {
+	return strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			return r
+		}
+		return '_'
+	}, id)
+}
+
+var activeCodeAnalyses = struct {
+	sync.Mutex
+	cancel map[string]func()
+}{cancel: make(map[string]func())}
+
+func registerActiveCodeAnalysis(key string, cancel func()) {
+	if key == "" || cancel == nil {
+		return
+	}
+	activeCodeAnalyses.Lock()
+	activeCodeAnalyses.cancel[key] = cancel
+	activeCodeAnalyses.Unlock()
+}
+
+func unregisterActiveCodeAnalysis(key string) {
+	activeCodeAnalyses.Lock()
+	delete(activeCodeAnalyses.cancel, key)
+	activeCodeAnalyses.Unlock()
+}
+
+// CancelActiveCodeAnalyses is called during llm-server shutdown. Workspace
+// pods are shared and must remain alive, so only the analyses owned by this
+// process are cancelled.
+func CancelActiveCodeAnalyses() {
+	activeCodeAnalyses.Lock()
+	cancellations := make([]func(), 0, len(activeCodeAnalyses.cancel))
+	for _, cancel := range activeCodeAnalyses.cancel {
+		cancellations = append(cancellations, cancel)
+	}
+	activeCodeAnalyses.Unlock()
+	var wg sync.WaitGroup
+	for _, cancel := range cancellations {
+		wg.Add(1)
+		go func(cancel func()) {
+			defer wg.Done()
+			cancel()
+		}(cancel)
+	}
+	wg.Wait()
+}
 
 func init() {
 	common.CacheCreateNamespace(codeAgentFailuresCacheNS, common.CacheNamespaceWithExpiration(24*time.Hour))
@@ -122,13 +171,13 @@ Each call runs a full (expensive) analysis — decide the intended outcome first
 	codeAnalyzerFactory := func(accountId string) (core.NBAgent, error) {
 		return newCodeAgent(accountId), nil
 	}
-	core.RegisterNBAgentFactoryAndTool(AgentCodeAnalyzer, codeAnalyzerFactory, toolDescription, toolInput, toolOutput)
 	// Back-compat: keep the pre-rename "agent_code_2" name resolving as an agent.
 	// getSystemAgent does a direct registry lookup and does not honor
 	// GetNameAliases, so the legacy name must be a real factory key. Registered
-	// agent-only (not as a tool) so it is never re-offered to the model as a
-	// second tool — new tool callers use AgentCodeAnalyzer.
-	core.RegisterNBAgentFactory(agentCodeAnalyzerLegacyName, codeAnalyzerFactory)
+	// as an alias so it is never re-offered to the model as a second tool and
+	// ListAgents does not show it as a second picker entry — new tool callers
+	// use AgentCodeAnalyzer.
+	core.RegisterNBAgentFactoryAndToolWithAliases(AgentCodeAnalyzer, codeAnalyzerFactory, toolDescription, toolInput, toolOutput, agentCodeAnalyzerLegacyName)
 }
 
 func forwardedLLMConfigToMap(c *core.ForwardedLLMConfig) map[string]any {
@@ -150,6 +199,9 @@ func forwardedLLMConfigToMap(c *core.ForwardedLLMConfig) map[string]any {
 	}
 	if c.Region != "" {
 		m["region"] = c.Region
+	}
+	if c.ExtraHeaders != "" {
+		m["extra_headers"] = c.ExtraHeaders
 	}
 	// Bedrock's credential triple. Sent as a unit — ResolveLLMConfigForForwarding
 	// already blanks all three unless the access/secret pair is complete, and a
@@ -175,6 +227,23 @@ func forwardedLLMConfigToMap(c *core.ForwardedLLMConfig) map[string]any {
 		m["tiers"] = tiers
 	}
 	return m
+}
+
+// resolveLLMConfigForDispatch resolves the tenant's forwarded LLM config and
+// enforces mandatory forwarding: the workspace pod no longer carries an
+// LLM_PROVIDER_API_KEY fallback (#38009), so a nil or errored resolution must
+// block dispatch instead of silently proceeding — the pod would otherwise run
+// with no usable credentials at all. logPrefix matches each call site's
+// existing "code"/"code followup" log prefix convention.
+func resolveLLMConfigForDispatch(ctx *security.RequestContext, accountId, agentName, conversationId, logPrefix string) (*core.ForwardedLLMConfig, error) {
+	llmCfg, err := core.ResolveLLMConfigForForwarding(ctx, accountId, agentName, conversationId)
+	if err != nil {
+		return nil, fmt.Errorf("%s: failed to resolve LLM config for forwarding: %w", logPrefix, err)
+	}
+	if llmCfg == nil {
+		return nil, fmt.Errorf("%s: no LLM config resolved for account %s; refusing to dispatch without forwarded credentials", logPrefix, accountId)
+	}
+	return llmCfg, nil
 }
 
 // instead of launching a new pod per request.
@@ -241,22 +310,46 @@ func evaluateCodeUsingWorkspace(ctx *security.RequestContext, agentRequest core.
 		}
 	}
 
-	// Resolve operator-authored skills mapped to the code agent and forward them to
-	// the stateless code-analysis service, which has no skills DB of its own. Unlike
-	// the in-process ReAct planners — which lazily load_skills mid-loop and so
-	// only pull a skill body when the task needs it — code-analysis receives skill
-	// bodies up front over HTTP. Forwarding every mapped skill would bloat every
-	// downstream code-analysis prompt and dilute relevance, so we always run
-	// question-aware top-K selection here and forward only the skills relevant to the
-	// user's question (own and inherited alike). LlmServerSkillSelectionTopK overrides
-	// the default K when an operator has tuned it. Failures degrade gracefully —
-	// analysis must never be blocked on skills.
+	// Reuse account-wide discovery and exact loading. Keep large documents out
+	// of every analysis prompt; the workspace resolves the reference manifest.
 	skillsBlock := ""
-	{
+	var knowledgeFiles []tools.KnowledgeFileReference
+	if core.AutomaticKnowledgeAllowed(agentRequest) && config.Config.LlmServerKnowledgeWorkspaceEnabled {
+		prepCtx, cancel := context.WithTimeout(ctx.GetContext(), 90*time.Second)
+		knowledgeCtx := security.NewRequestContext(prepCtx, ctx.GetSecurityContext(), ctx.GetLogger(), ctx.GetTracer(), ctx.GetMeter())
+		candidates := core.DiscoverKnowledgeCandidates(knowledgeCtx, agentRequest, CodeAgent2{})
+		topK := config.Config.LlmServerSkillSelectionTopK
+		if topK <= 0 || topK > defaultForwardedSkillTopK {
+			topK = defaultForwardedSkillTopK
+		}
+		for _, candidate := range candidates[:min(len(candidates), topK)] {
+			toolCtx := toolcore.NbToolContext{Ctx: knowledgeCtx, AccountId: agentRequest.AccountId, UserId: agentRequest.UserId, ConversationId: agentRequest.ConversationId, MessageId: agentRequest.MessageId, Query: agentRequest.Query}
+			inline, ref, err := tools.PrepareKnowledgeForAnalysis(toolCtx, candidate)
+			if err != nil {
+				logger.Warn("code: knowledge preparation unavailable", "candidate", candidate.ID, "error", err)
+				skillsBlock += "\n[Knowledge unavailable: " + candidate.ID + "; do not claim its complete content was read.]\n"
+				continue
+			}
+			if ref != nil {
+				knowledgeFiles = append(knowledgeFiles, *ref)
+				continue
+			}
+			if len(skillsBlock)+len(inline)+1 <= maxForwardedSkillBytes {
+				skillsBlock += inline + "\n"
+			}
+		}
+		cancel()
+	}
+
+	// Preserve the existing inline path when workspace knowledge is explicitly disabled.
+	if core.AutomaticKnowledgeAllowed(agentRequest) && !config.Config.LlmServerKnowledgeWorkspaceEnabled {
 		// Include the legacy name so knowledge bases mapped to "agent_code_2" in
 		// llm_kb_agent_mappings before the rename are still inherited (the lookup
 		// UNIONs both names and dedupes by kb id).
-		skillAgentNames := append([]string{AgentCodeAnalyzer, agentCodeAnalyzerLegacyName}, agentRequest.InheritSkillsFromAgents...)
+		// The wildcard sentinel carries KBs mapped to "All agents" (see
+		// toolcore.KBAgentWildcard); without it, code-analysis would be the one
+		// agent an all-agents skill never reached.
+		skillAgentNames := toolcore.WithKBAgentWildcard(append([]string{AgentCodeAnalyzer, agentCodeAnalyzerLegacyName}, agentRequest.InheritSkillsFromAgents...))
 		skillQuery := agentRequest.OriginalQuery
 		if skillQuery == "" {
 			skillQuery = request.Query
@@ -291,6 +384,29 @@ func evaluateCodeUsingWorkspace(ctx *security.RequestContext, agentRequest core.
 		}
 	}
 
+	// Analyse the revision the workload was actually running, when we know it.
+	//
+	// GitCommit comes from the deployed artifact (workloads.nudgebee.com/git.hash
+	// / CodeRepoCommitHash). Without it the clone lands on the branch tip, so an
+	// incident gets diagnosed against code that shipped after it — which reads as
+	// a confident "already fixed" on a bug that is still live, with nothing
+	// indicating the wrong revision was read.
+	//
+	// Deliberately NOT sent when a PR is wanted. A fix branch cut from an old
+	// commit would revert everything merged since, so code-analysis refuses that
+	// combination outright; raising a PR means fixing against the branch tip.
+	// Explore and propose (raise_pr=false) are where pinning belongs.
+	gitRepository := map[string]any{
+		"url":      request.GitRepo,
+		"branch":   branch,
+		"provider": provider,
+	}
+	if !request.RaisePr && request.GitCommit != "" {
+		gitRepository["commit"] = request.GitCommit
+		logger.Info("code: pinning analysis to the deployed revision",
+			"commit", request.GitCommit, "branch", branch)
+	}
+
 	analyzeRequest := map[string]any{
 		"cloud_account_id":   request.AccountId,
 		"tenant":             tenantId,
@@ -299,19 +415,15 @@ func evaluateCodeUsingWorkspace(ctx *security.RequestContext, agentRequest core.
 		"workload_kind":      "Deployment",
 		"logs":               logs,
 		"prompt":             request.Query,
-		"git_repository": map[string]any{
-			"url":      request.GitRepo,
-			"branch":   branch,
-			"provider": provider,
-		},
-		"mode":              mode,
-		"raise_pr":          request.RaisePr,
-		"event_id":          request.EventId,
-		"recommendation_id": request.RecommendationId,
-		"workflow_id":       request.WorkflowId,
-		"account_id":        request.AccountId,
-		"conversation_id":   agentRequest.SessionId,
-		"message_id":        agentRequest.MessageId,
+		"git_repository":     gitRepository,
+		"mode":               mode,
+		"raise_pr":           request.RaisePr,
+		"event_id":           request.EventId,
+		"recommendation_id":  request.RecommendationId,
+		"workflow_id":        request.WorkflowId,
+		"account_id":         request.AccountId,
+		"conversation_id":    agentRequest.SessionId,
+		"message_id":         agentRequest.MessageId,
 	}
 
 	if request.Agent != "" {
@@ -324,6 +436,9 @@ func evaluateCodeUsingWorkspace(ctx *security.RequestContext, agentRequest core.
 		analyzeRequest["base_diff"] = core.TruncateMiddle(baseDiff, 48*1024, 16*1024)
 	}
 
+	if len(knowledgeFiles) > 0 {
+		analyzeRequest["knowledge_files"] = knowledgeFiles
+	}
 	if skillsBlock != "" {
 		analyzeRequest["skills"] = skillsBlock
 	}
@@ -339,15 +454,17 @@ func evaluateCodeUsingWorkspace(ctx *security.RequestContext, agentRequest core.
 	// Forward the resolved, decrypted LLM config so the stateless code-analysis
 	// service runs on the tenant's own LLM integration — or, absent one, on the
 	// same default llm-server itself resolved — instead of whatever its startup
-	// env happens to name. Degrade gracefully: on any failure, or when no
-	// provider resolves at all, omit the block and let the pod use its
-	// fallback. The API key is plaintext — never log it.
-	if llmCfg, lerr := core.ResolveLLMConfigForForwarding(ctx, agentRequest.AccountId, AgentCodeAnalyzer, agentRequest.ConversationId); lerr != nil {
-		logger.Warn("code: failed to resolve LLM config for forwarding; using pod fallback", "error", lerr)
-	} else if llmCfg != nil {
-		analyzeRequest["llm_config"] = forwardedLLMConfigToMap(llmCfg)
-		logger.Info("code: forwarding resolved LLM config to workspace analysis", "provider", llmCfg.Provider, "model", llmCfg.Model, "has_api_key", llmCfg.ApiKey != "")
+	// env happens to name. Forwarding is mandatory (#38009): the workspace pod
+	// carries no LLM_* API-key fallback, so any resolution failure, or a
+	// resolution that finds no provider, aborts dispatch instead of silently
+	// running the pod without usable credentials. The API key is plaintext —
+	// never log it.
+	llmCfg, err := resolveLLMConfigForDispatch(ctx, agentRequest.AccountId, AgentCodeAnalyzer, agentRequest.ConversationId, "code")
+	if err != nil {
+		return codeAnalysisResult{}, err
 	}
+	analyzeRequest["llm_config"] = forwardedLLMConfigToMap(llmCfg)
+	logger.Info("code: forwarding resolved LLM config to workspace analysis", "provider", llmCfg.Provider, "model", llmCfg.Model, "has_api_key", llmCfg.ApiKey != "")
 
 	// Pre-flight: verify workspace pod is reachable before dispatching analysis
 	healthWm := workspace.NewWorkspaceManagerWithTimeout(10 * time.Second)
@@ -390,6 +507,11 @@ func evaluateCodeUsingWorkspace(ctx *security.RequestContext, agentRequest core.
 	if analysisID == "" || status != "running" {
 		return codeAnalysisResult{}, fmt.Errorf("unexpected workspace /analyze response: status=%q analysis_id=%q", status, analysisID)
 	}
+	analysisKey := agentRequest.AccountId + ":" + analysisID
+	registerActiveCodeAnalysis(analysisKey, func() {
+		cancelWorkspaceAnalysis(ctx, agentRequest.AccountId, analysisID)
+	})
+	defer unregisterActiveCodeAnalysis(analysisKey)
 
 	// Step 2: Poll /status/{id} every 5s until completed or failed
 	logger.Info("code: analysis accepted, polling for progress", "analysis_id", analysisID)
@@ -410,11 +532,24 @@ func evaluateCodeUsingWorkspace(ctx *security.RequestContext, agentRequest core.
 	for {
 		select {
 		case <-ctx.GetContext().Done():
+			cancelWorkspaceAnalysis(ctx, agentRequest.AccountId, analysisID)
 			return codeAnalysisResult{}, fmt.Errorf("analysis timed out while polling for results")
 		case <-time.After(5 * time.Second):
 		}
 
+		// The normal planner termination path updates the message in PostgreSQL,
+		// but this external analysis has its own context. Propagate Stop to the
+		// workspace before returning so the remote agent does not keep running.
+		if agentRequest.MessageId != "" {
+			isTerminated, messageErr := core.CheckMessageTerminationStatus(agentRequest.MessageId, agentRequest.AccountId, agentRequest.ConversationId)
+			if messageErr == nil && isTerminated {
+				cancelWorkspaceAnalysis(ctx, agentRequest.AccountId, analysisID)
+				return codeAnalysisResult{}, fmt.Errorf("code analysis cancelled because the conversation was terminated")
+			}
+		}
+
 		if time.Now().After(pollDeadline) {
+			cancelWorkspaceAnalysis(ctx, agentRequest.AccountId, analysisID)
 			return codeAnalysisResult{}, fmt.Errorf("analysis polling exceeded maximum duration of %v", maxPollDuration)
 		}
 
@@ -424,6 +559,7 @@ func evaluateCodeUsingWorkspace(ctx *security.RequestContext, agentRequest core.
 			logger.Warn("code: failed to poll analysis status", "error", err, "analysis_id", analysisID,
 				"consecutive_errors", consecutiveErrors, "max_consecutive_errors", maxConsecutiveErrors)
 			if consecutiveErrors >= maxConsecutiveErrors {
+				cancelWorkspaceAnalysis(ctx, agentRequest.AccountId, analysisID)
 				return codeAnalysisResult{}, fmt.Errorf("analysis polling abandoned after %d consecutive errors: %w", consecutiveErrors, err)
 			}
 			continue
@@ -466,41 +602,37 @@ func evaluateCodeUsingWorkspace(ctx *security.RequestContext, agentRequest core.
 			}
 			logger.Info("code: analysis completed", "analysis_id", analysisID)
 
-			// Fire-and-forget cleanup of cloned repos
-			go func() {
-				cleanupCtx := security.NewRequestContext(
-					context.Background(),
-					ctx.GetSecurityContext(),
-					ctx.GetLogger(),
-					ctx.GetTracer(),
-					ctx.GetMeter(),
-				)
-				// Sanitize with the SAME character mapping the workspace analyze
-				// handler uses for its temp dirs (anything outside [A-Za-z0-9_-]
-				// becomes '_'). Slack session IDs contain a '.', so the raw ID both
-				// failed the workspace's conversation-id validation AND wouldn't
-				// have matched the sanitized directory names — every Slack-origin
-				// analysis leaked its clone until the pod was replaced.
-				cleanID := sanitizeWorkspacePathID(agentRequest.SessionId)
-				if cleanID == "" {
-					logger.Warn("code: workspace cleanup skipped — empty session id")
-					return
-				}
-				cleanupCmd := fmt.Sprintf("rm -rf /tmp/code-analysis-%s-*", cleanID)
-				// The sanitized ID is passed as the conversation_id arg: the
-				// workspace pod rejects empty conversation_id (validates non-empty
-				// + safe path charset) and would silently no-op the cleanup otherwise.
-				if _, cleanupErr := wm.ExecuteCommand(cleanupCtx, agentRequest.AccountId, cleanID, cleanupCmd, nil); cleanupErr != nil {
-					logger.Warn("code: workspace cleanup failed", "error", cleanupErr)
-				}
-			}()
-
 			return extractAgentResponseWithTokenUsage(resultBytes), nil
 		case "failed":
 			errMsg, _ := statusResp["error"].(string)
 			return codeAnalysisResult{}, fmt.Errorf("analysis failed: %s", errMsg)
+		case "cancelled":
+			return codeAnalysisResult{}, fmt.Errorf("analysis was cancelled")
 		}
 		// status == "running" → keep polling
+	}
+}
+
+// cancelWorkspaceAnalysis is best-effort and deliberately uses a detached
+// short-lived context: it is most often called because the caller context has
+// already been cancelled or the planner has been stopped.
+func cancelWorkspaceAnalysis(ctx *security.RequestContext, accountID, analysisID string) {
+	if accountID == "" || analysisID == "" {
+		return
+	}
+	requestCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx.GetContext()), 10*time.Second)
+	defer cancel()
+	detached := security.NewRequestContext(
+		requestCtx,
+		ctx.GetSecurityContext(),
+		ctx.GetLogger(),
+		ctx.GetTracer(),
+		ctx.GetMeter(),
+	)
+	wm := workspace.NewWorkspaceManagerWithTimeout(10 * time.Second)
+	endpoint := fmt.Sprintf("/cancel/%s", url.PathEscape(analysisID))
+	if _, err := wm.CallAPI(detached, accountID, "POST", endpoint, nil, nil); err != nil {
+		ctx.GetLogger().Warn("code: failed to cancel workspace analysis", "analysis_id", analysisID, "error", err)
 	}
 }
 
@@ -1095,7 +1227,7 @@ func (l CodeAgent2) GetName() string {
 }
 
 func (l CodeAgent2) GetNameAliases() []string {
-	return []string{agentCodeAnalyzerLegacyName, "code_debugger", "code_error_analyzer", "code_rca_agent"}
+	return []string{"Code Analyzer & Fixer", agentCodeAnalyzerLegacyName, "code_debugger", "code_error_analyzer", "code_rca_agent"}
 }
 
 func (l CodeAgent2) GetDescription() string {
@@ -1175,11 +1307,46 @@ type CodeAgent2Request struct {
 	Followup bool   `json:"followup"`
 	PRURL    string `json:"pr_url"`
 	PRBranch string `json:"pr_branch"`
+	// AddressedComments is the set of PR comments a previous followup already
+	// answered, read from pr_followup.addressed_comments by api-server and passed
+	// straight through to code-analysis (#36865). Kept as raw JSON because this
+	// hop only forwards it — llm-server never inspects the entries. Absent for an
+	// older api-server, which simply means no fallback skip set.
+	AddressedComments json.RawMessage `json:"addressed_comments,omitempty"`
+}
+
+// repoFromQueryConfig returns the repo a conversation has already settled on: one
+// the user picked from a followup, else the git_repo stored on the message config,
+// which a later message inherits from the one before it. Empty when there is none.
+func repoFromQueryConfig(cfg toolcore.NBQueryConfig) string {
+	if repo := cfg.ToolConfigs["git_repo"]; repo != "" {
+		return repo
+	}
+	return cfg.GitRepo
+}
+
+// rememberConversationRepo records the repo on the message's stored config so
+// later turns keep working on it instead of detecting one again and possibly
+// landing elsewhere. Best effort: a failed write only costs the next turn a
+// fresh detection.
+func rememberConversationRepo(ctx *security.RequestContext, messageId, repo string) {
+	if repo == "" {
+		return
+	}
+	dao := core.GetConversationDao()
+	if dao == nil {
+		return
+	}
+	if err := dao.UpdateConversationMessageGitRepo(messageId, repo); err != nil {
+		ctx.GetLogger().Warn("code: unable to remember git_repo for the conversation", "error", err, "repo", repo)
+	}
 }
 
 func (l CodeAgent2) GetPlannerType() core.AgentPlannerType {
 	return core.AgentPlannerTypeCustom
 }
+
+func (l CodeAgent2) UsesAutomaticKnowledge() bool { return true }
 
 func (l CodeAgent2) Execute(ctx *security.RequestContext, query core.NBAgentRequest) (core.NBAgentResponse, error) {
 	// Message-scoped retry guard: if a previous call in this message already failed
@@ -1254,18 +1421,13 @@ func (l CodeAgent2) Execute(ctx *security.RequestContext, query core.NBAgentRequ
 	// pure exploration question ("what is the default Postgres connection
 	// limit?") got promoted to fix-mode and produced a spurious PR.
 
-	// Check if user selected a repo via followup response
-	if codeAgentRequest.GitRepo == "" && query.QueryConfig.ToolConfigs != nil {
-		if selectedRepo, ok := query.QueryConfig.ToolConfigs["git_repo"]; ok && selectedRepo != "" {
-			codeAgentRequest.GitRepo = selectedRepo
-			ctx.GetLogger().Info("code: using git_repo from followup selection", "repo", selectedRepo)
+	// Reuse the repo the conversation already settled on (a followup selection, or
+	// the one stored on the message config) before auto-detecting one.
+	if codeAgentRequest.GitRepo == "" {
+		if repo := repoFromQueryConfig(query.QueryConfig); repo != "" {
+			codeAgentRequest.GitRepo = repo
+			ctx.GetLogger().Info("code: using git_repo from request config", "repo", repo)
 		}
-	}
-
-	// Check Config for explicit git_repo before auto-detecting
-	if codeAgentRequest.GitRepo == "" && query.QueryConfig.GitRepo != "" {
-		codeAgentRequest.GitRepo = query.QueryConfig.GitRepo
-		ctx.GetLogger().Info("code: using git_repo from request config", "repo", query.QueryConfig.GitRepo)
 	}
 
 	// When input is plain text, try to extract a git URL embedded in the text
@@ -1531,6 +1693,8 @@ func (l CodeAgent2) Execute(ctx *security.RequestContext, query core.NBAgentRequ
 
 	ctx.GetLogger().Info("code: using git provider", "provider", provider, "repo", repoUrl)
 
+	rememberConversationRepo(ctx, query.MessageId, codeAgentRequest.GitRepo)
+
 	// A second fix request in the same conversation is a retry, not a new bug.
 	// Amend the PR we already opened instead of cutting another branch and
 	// opening a duplicate. Routed through the followup path, which checks out
@@ -1554,14 +1718,27 @@ func (l CodeAgent2) Execute(ctx *security.RequestContext, query core.NBAgentRequ
 	latency := time.Since(startTime).Seconds()
 	if err != nil {
 		ctx.GetLogger().Error("code: failed to execute via workspace", "error", err.Error())
-		// Write the message-scoped guard on failure too. A poll timeout here
-		// usually means the analysis is STILL RUNNING server-side (the workspace
-		// pod does not cancel it when polling stops) — without the guard, the
-		// planner's natural "tool errored, retry" reaction dispatches a second
-		// /analyze and two full analyses run for one message.
-		if guardKey, ok := codeAgentGuardKey(query.ConversationId, query.MessageId); ok {
-			_ = common.CacheSet(codeAgentFailuresCacheNS, guardKey,
-				[]byte(fmt.Sprintf("previous attempt failed and may still be running server-side: %v", err)))
+		// Write the message-scoped guard on failure too. An ordinary poll
+		// timeout here usually means the analysis is STILL RUNNING
+		// server-side (the workspace pod does not cancel it when polling
+		// stops) — without the guard, the planner's natural "tool errored,
+		// retry" reaction dispatches a second /analyze and two full analyses
+		// run for one message.
+		//
+		// ErrWorkspaceRunLost is the one case where that assumption is known
+		// to be false: the pod that owned the analysis is confirmed gone
+		// (terminal k8s phase, or a fresh pod 404s the analysis id), so
+		// there is nothing left for a retry to collide with. Skipping the
+		// guard here lets the planner's existing, already-bounded retry
+		// redispatch against the replacement pod instead of the run being
+		// silently lost until the caller gives up on the whole message
+		// (#38994) — 80% of code-agent failures on 2026-09-21 were this
+		// exact case.
+		if !shouldSkipRetryGuard(err) {
+			if guardKey, ok := codeAgentGuardKey(query.ConversationId, query.MessageId); ok {
+				_ = common.CacheSet(codeAgentFailuresCacheNS, guardKey,
+					[]byte(fmt.Sprintf("previous attempt failed and may still be running server-side: %v", err)))
+			}
 		}
 		return core.NBAgentResponse{}, err
 	}
@@ -1590,6 +1767,12 @@ func (l CodeAgent2) Execute(ctx *security.RequestContext, query core.NBAgentRequ
 	}
 	responseStr := string(jsonResponse)
 	finalResponse := handleAnalysisResult(ctx, query.ConversationId, query.MessageId, responseStr)
+	// Logged synchronously (not inside the goroutine) so it survives even if the
+	// goroutine itself never gets to log anything — e.g. the pod is killed
+	// between this line and trackPRInResolution completing. A "dispatching" line
+	// with no matching "created"/"skipping"/"failed" line for the same
+	// conversation_id is the signature of that failure mode.
+	ctx.GetLogger().Info("code: dispatching PR resolution tracking", "conversation_id", query.ConversationId, "message_id", query.MessageId)
 	go trackPRInResolution(ctx, query, responseStr, codeAgentRequest.GitRepo, provider)
 	return core.NBAgentResponse{
 		Response: []string{finalResponse},
@@ -1628,6 +1811,18 @@ func handleAnalysisResult(ctx *security.RequestContext, conversationId, messageI
 		_ = common.CacheDelete(codeAgentFailuresCacheNS, guardKey)
 	}
 	return responseStr
+}
+
+// shouldSkipRetryGuard reports whether a workspace failure should NOT set the
+// message-scoped "may still be running" guard. Normally a poll failure is
+// ambiguous — the workspace pod could still be working on it — so the guard
+// blocks the planner from redispatching. workspace.ErrWorkspaceRunLost is the
+// one signal that removes the ambiguity: it is only returned when the pod
+// that owned the run is confirmed gone (terminal k8s phase, or a fresh pod
+// 404s the run's id), so a redispatch has nothing left to collide with
+// (#38994).
+func shouldSkipRetryGuard(err error) bool {
+	return errors.Is(err, workspace.ErrWorkspaceRunLost)
 }
 
 // codeAgentGuardKey builds the message-scoped guard cache key and reports whether
@@ -1670,7 +1865,14 @@ func noOpTerminalAnswer(responseStr string) (string, bool) {
 	// silent skip. Never hardcode a specific case — use the agent's own fields.
 	detail := firstNonEmptyField(resp, "pr_creation_reason", "description", "root_cause_analysis", "execution_summary")
 	var b strings.Builder
-	b.WriteString("No pull request was created — the requested change is already present in the repository, so no modifications were needed.")
+	// Say the change is already there only when the agent actually checked and
+	// said so. Otherwise the run simply proposed nothing, which tells the reader
+	// nothing about the file and must not read as if it did.
+	if basis, _ := resp[CodeAnalysisNoOpBasisKey].(string); basis == CodeAnalysisNoOpBasisSpecialist {
+		b.WriteString("No pull request was created — the requested change is already present in the repository, so no modifications were needed.")
+	} else {
+		b.WriteString("No pull request was created — the analysis finished without proposing a change. This does not mean the change is already present: the requested values were not confirmed against the target file.")
+	}
 	if detail != "" {
 		b.WriteString("\n\n")
 		b.WriteString(detail)
@@ -1711,20 +1913,36 @@ func trackPRInResolution(ctx *security.RequestContext, query core.NBAgentRequest
 
 	var response map[string]any
 	if err := json.Unmarshal([]byte(responseStr), &response); err != nil {
+		ctx.GetLogger().Warn("code: failed to unmarshal code-analysis response, skipping PR resolution tracking",
+			"error", err, "conversation_id", query.ConversationId)
 		return
 	}
 
 	prInfoRaw, ok := response["automated_fix_pr_info"]
 	if !ok || prInfoRaw == nil {
+		// Expected on every explore/propose call (raise_pr=false) and on a
+		// successful no_op (the change was already present, so no PR was
+		// raised) — only warn when a PR was actually requested and due.
+		var req CodeAgent2Request
+		_ = common.UnmarshalJson([]byte(query.Query), &req)
+		execStatus, _ := response["execution_status"].(string)
+		if req.RaisePr && execStatus != codeAnalysisNoOpStatus {
+			ctx.GetLogger().Warn("code: no automated_fix_pr_info in code-analysis response, skipping PR resolution tracking",
+				"conversation_id", query.ConversationId, "execution_status", execStatus)
+		}
 		return
 	}
 	prMap, ok := prInfoRaw.(map[string]any)
 	if !ok {
+		ctx.GetLogger().Warn("code: automated_fix_pr_info is not an object, skipping PR resolution tracking",
+			"conversation_id", query.ConversationId)
 		return
 	}
 
 	prURL, _ := prMap["url"].(string)
 	if prURL == "" {
+		ctx.GetLogger().Warn("code: automated_fix_pr_info missing a url, skipping PR resolution tracking",
+			"conversation_id", query.ConversationId)
 		return
 	}
 
@@ -2086,7 +2304,7 @@ func resolveGitToken(ctx *security.RequestContext, creds []GitCredentials, repoU
 				} else {
 					token, err := utils.GetGithubAppInstallationToken(ctx.GetContext(), cred.Url, installationID)
 					if err != nil {
-						logger.Warn("code: failed to mint github app installation token; clone will be unauthenticated", "error", err)
+						logger.Warn("code: failed to mint github app installation token; clone will be unauthenticated", "error", err, "installation_id", installationID)
 					} else {
 						gitToken = token
 					}
@@ -2954,6 +3172,16 @@ func (l CodeAgent2) executeFollowup(ctx *security.RequestContext, query core.NBA
 		"pr_branch": request.PRBranch,
 	}
 
+	// Forward the already-addressed comment set (#36865) so code-analysis can use
+	// it as a fallback skip source. Omitted when empty so the payload is
+	// unchanged for a PR with no followup history. Trimmed before comparing:
+	// the value is always compact JSON from encoding/json in practice, but the
+	// comparison itself costs nothing extra and shouldn't depend on that.
+	trimmedComments := strings.TrimSpace(string(request.AddressedComments))
+	if trimmedComments != "" && trimmedComments != "[]" && trimmedComments != "null" {
+		analyzeRequest["addressed_comments"] = request.AddressedComments
+	}
+
 	if gitToken != "" {
 		analyzeRequest["git_credentials"] = map[string]any{
 			"type":  "token",
@@ -2962,17 +3190,16 @@ func (l CodeAgent2) executeFollowup(ctx *security.RequestContext, query core.NBA
 	}
 
 	// Forward the resolved LLM config, exactly as the main analysis path does.
-	// Without this the workspace pod falls back to its global LLM_* secret env,
-	// which is not guaranteed to name a provider code-analysis supports — every
-	// followup then fails at client construction before doing any work. Degrade
-	// gracefully: on any failure, or when no provider resolves at all, omit the
-	// block. The API key is plaintext — never log it.
-	if llmCfg, lerr := core.ResolveLLMConfigForForwarding(ctx, query.AccountId, AgentCodeAnalyzer, query.ConversationId); lerr != nil {
-		logger.Warn("code followup: failed to resolve LLM config for forwarding; using pod fallback", "error", lerr)
-	} else if llmCfg != nil {
-		analyzeRequest["llm_config"] = forwardedLLMConfigToMap(llmCfg)
-		logger.Info("code followup: forwarding resolved LLM config to workspace analysis", "provider", llmCfg.Provider, "model", llmCfg.Model, "has_api_key", llmCfg.ApiKey != "")
+	// Forwarding is mandatory (#38009): the workspace pod carries no LLM_*
+	// API-key fallback, so any resolution failure, or a resolution that finds
+	// no provider, aborts dispatch instead of silently running the pod without
+	// usable credentials. The API key is plaintext — never log it.
+	llmCfg, err := resolveLLMConfigForDispatch(ctx, query.AccountId, AgentCodeAnalyzer, query.ConversationId, "code followup")
+	if err != nil {
+		return core.NBAgentResponse{}, err
 	}
+	analyzeRequest["llm_config"] = forwardedLLMConfigToMap(llmCfg)
+	logger.Info("code followup: forwarding resolved LLM config to workspace analysis", "provider", llmCfg.Provider, "model", llmCfg.Model, "has_api_key", llmCfg.ApiKey != "")
 
 	// Pre-flight: verify workspace pod is reachable
 	healthWm := workspace.NewWorkspaceManagerWithTimeout(10 * time.Second)

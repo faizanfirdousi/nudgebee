@@ -14,9 +14,12 @@ import (
 	"nudgebee/services/security"
 	"reflect"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/nudgebee/logparser"
 	"github.com/samber/lo"
@@ -30,86 +33,10 @@ func init() {
 
 // Get top 2 error logs based on severity
 const actionLogMaxInsightErrors = 10
-const logSummaryMaxPatterns = 10
 
-// computeLogSummary runs Drain3 pattern clustering and level detection on log data.
-// Returns a map suitable for additional_info containing level_breakdown and log_patterns.
-// Expects logs as []map[string]any with "body" and optional "severity_text" keys.
-func computeLogSummary(logs []map[string]any) map[string]any {
-	if len(logs) == 0 {
-		return nil
-	}
-
-	// Collect message bodies
-	var allBodies []string
-	for _, logData := range logs {
-		body, _ := logData["body"].(string)
-		if body != "" {
-			allBodies = append(allBodies, body)
-		}
-	}
-
-	if len(allBodies) == 0 {
-		return nil
-	}
-
-	// Level breakdown
-	levelCounts := map[string]int{}
-	for _, logData := range logs {
-		// Use severity_text if available
-		if severity, ok := logData["severity_text"].(string); ok && severity != "" {
-			levelCounts[strings.ToLower(severity)]++
-			continue
-		}
-		// Fall back to logparser level detection
-		body, _ := logData["body"].(string)
-		if body != "" {
-			level := logparser.GuessLevel(body)
-			if level != logparser.LevelUnknown {
-				levelCounts[level.String()]++
-			} else {
-				levelCounts["unknown"]++
-			}
-		}
-	}
-
-	// Extract top patterns using Drain3
-	patterns := logparser.ExtractPatterns(allBodies, logSummaryMaxPatterns)
-	patternList := make([]map[string]any, 0, len(patterns))
-	for _, p := range patterns {
-		patternList = append(patternList, map[string]any{
-			"template":   p.Template,
-			"count":      p.Count,
-			"percentage": p.Percentage,
-			"example":    p.Example,
-		})
-	}
-
-	summary := map[string]any{
-		"total_lines":     len(allBodies),
-		"level_breakdown": levelCounts,
-		"log_patterns":    patternList,
-	}
-
-	return summary
-}
-
-// computeLogSummaryFromText is a convenience wrapper that converts raw text (newline-separated)
-// into the []map[string]any format expected by computeLogSummary.
-func computeLogSummaryFromText(text string) map[string]any {
-	lines := strings.Split(text, "\n")
-	if len(lines) == 0 {
-		return nil
-	}
-	logs := make([]map[string]any, 0, len(lines))
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			logs = append(logs, map[string]any{"body": line})
-		}
-	}
-	return computeLogSummary(logs)
-}
+// actionLogMaxGroupInsights is how many grouped highlights a log card gets when the
+// source provided none of its own.
+const actionLogMaxGroupInsights = 3
 
 // firstStringField returns the first key in obj that holds a non-empty value, coerced to a
 // string. Structured logs sometimes encode time/level/severity numerically (epoch timestamp
@@ -134,6 +61,20 @@ func firstStringField(obj map[string]any, keys ...string) string {
 	return ""
 }
 
+// splitLeadingRFC3339 splits a "<rfc3339> <rest>" line into its timestamp and remainder.
+// Returns ("", line) unchanged when the first token is not a timestamp, so lines from
+// sources that do not stamp them are left alone. A line that is nothing but a timestamp
+// (what `--timestamps` makes of a blank log line) yields an empty remainder, which the
+// caller drops.
+func splitLeadingRFC3339(line string) (string, string) {
+	head, rest, _ := strings.Cut(line, " ")
+	ts, err := time.Parse(time.RFC3339Nano, head)
+	if err != nil {
+		return "", line
+	}
+	return ts.UTC().Format(time.RFC3339Nano), strings.TrimSpace(rest)
+}
+
 // parseLogTextToOutputLogs converts raw newline-separated log text (e.g. kubectl / agent
 // logs_enricher stdout) into structured OutputLog entries.
 //
@@ -154,11 +95,21 @@ func parseLogTextToOutputLogs(text string) []OutputLog {
 		if line == "" {
 			continue
 		}
-		entry := OutputLog{Message: line}
+		// `kubectl logs --timestamps` prefixes every line with an RFC3339Nano stamp; lift
+		// it off before parsing so it neither pollutes the message body (and with it the
+		// Drain3 pattern templates) nor leaves the entry timestamp-less.
+		streamTimestamp, line := splitLeadingRFC3339(line)
+		if line == "" {
+			continue
+		}
+
+		entry := OutputLog{Message: line, Timestamp: streamTimestamp}
 		var obj map[string]any
 		if strings.HasPrefix(line, "{") && json.Unmarshal([]byte(line), &obj) == nil {
 			entry.Labels = obj
-			entry.Timestamp = firstStringField(obj, "time", "timestamp", "ts", "@timestamp")
+			if ts := firstStringField(obj, "time", "timestamp", "ts", "@timestamp"); ts != "" {
+				entry.Timestamp = ts
+			}
 			if msg := firstStringField(obj, "msg", "message", "body", "log"); msg != "" {
 				entry.Message = msg
 			}
@@ -470,7 +421,7 @@ func actionLogExtractErrorPatterns(logs []map[string]any, maxErrors int) []playb
 // every provider renders through the same frontend cards.
 
 // outputLogsToInsightMaps converts canonical logs to the {"body","severity_text",
-// "labels"} map shape that computeLogSummary / actionLogExtractErrorPatterns consume.
+// "labels"} map shape that playbooks.ComputeLogSummary / actionLogExtractErrorPatterns consume.
 func outputLogsToInsightMaps(logs []OutputLog) []map[string]any {
 	return lo.Map(logs, func(item OutputLog, _ int) map[string]any {
 		return map[string]any{
@@ -479,6 +430,26 @@ func outputLogsToInsightMaps(logs []OutputLog) []map[string]any {
 			"labels":        item.Labels,
 		}
 	})
+}
+
+// summarizeOutputLogs groups provider log rows the way pod log files are grouped, so
+// every log card can show what the lines say instead of every line.
+func summarizeOutputLogs(logs []OutputLog, maxInsights int) playbooks.LogLinesDigest {
+	entries := make([]playbooks.LogEntry, len(logs))
+	for i, l := range logs {
+		entries[i] = playbooks.LogEntry{Line: l.Message, Level: l.Severity, Timestamp: l.Timestamp}
+	}
+	return playbooks.SummarizeLogEntries(entries, maxInsights)
+}
+
+// putLogGroups stores the grouped view the log cards render, under the keys the
+// pod-log action uses.
+func putLogGroups(additionalInfo map[string]any, digest playbooks.LogLinesDigest) {
+	if len(digest.Groups) == 0 {
+		return
+	}
+	additionalInfo["log_groups"] = digest.Groups
+	additionalInfo["log_total_lines"] = digest.TotalLines
 }
 
 // extractLogLabelsFromOutputLogs applies regex + label extractors across a slice
@@ -513,14 +484,17 @@ func extractLogLabelsFromOutputLogs(logs []OutputLog, extractors []RegexLabelExt
 // keyword/5xx pattern extractor when no severity-tagged errors are present.
 func extractLogInsights(logs []OutputLog, maxErrors int) []playbooks.PlaybookActionResponseInsight {
 	var insights []playbooks.PlaybookActionResponseInsight
+	seen := map[string]bool{}
 	for _, l := range logs {
 		if len(insights) >= maxErrors {
 			break
 		}
 		sev := strings.ToUpper(l.Severity)
-		if (sev == "ERROR" || sev == "FATAL") && l.Message != "" {
+		// The same error logged three times read as three identical highlights.
+		if (sev == "ERROR" || sev == "FATAL") && l.Message != "" && !seen[l.Message] {
+			seen[l.Message] = true
 			insights = append(insights, playbooks.PlaybookActionResponseInsight{
-				Message:  fmt.Sprintf("%s: %s", sev, l.Message),
+				Message:  prefixSeverity(sev, l.Message),
 				Severity: "Critical",
 			})
 		}
@@ -529,6 +503,20 @@ func extractLogInsights(logs []OutputLog, maxErrors int) []playbooks.PlaybookAct
 		insights = actionLogExtractErrorPatterns(outputLogsToInsightMaps(logs), maxErrors)
 	}
 	return insights
+}
+
+// prefixSeverity labels a message with its severity unless the message already opens
+// with it — "ERROR: report generation failed" otherwise became "ERROR: ERROR: …".
+func prefixSeverity(sev, message string) string {
+	upper := strings.ToUpper(strings.TrimSpace(message))
+	// Only a whole word counts: "Errors occurred" does not already carry "ERROR".
+	if rest, ok := strings.CutPrefix(upper, sev); ok {
+		next, _ := utf8.DecodeRuneInString(rest)
+		if rest == "" || !unicode.IsLetter(next) && !unicode.IsDigit(next) {
+			return message
+		}
+	}
+	return fmt.Sprintf("%s: %s", sev, message)
 }
 
 // buildLogsActionResponse assembles the standard LogsActionResponse from canonical
@@ -553,8 +541,20 @@ func buildLogsActionResponse(logs []OutputLog, title string, additionalInfo map[
 	if title != "" {
 		additionalInfo["title"] = title
 	}
-	if summary := computeLogSummary(outputLogsToInsightMaps(logs)); summary != nil {
+	if summary := playbooks.ComputeLogSummary(outputLogsToInsightMaps(logs)); summary != nil {
 		additionalInfo["log_summary"] = summary
+	}
+	digest := summarizeOutputLogs(logs, 0)
+	putLogGroups(additionalInfo, digest)
+	// What window these lines actually cover, which is not the window that was
+	// asked for: the provider returns its most recent N inside the range, so a
+	// 60-minute request routinely comes back as the last ~8 minutes, and a
+	// long-lived event re-enriched later gets lines from hours after it started.
+	// The pod-log path stamps the same keys; without them here, the majority of
+	// log evidence still cannot say what it is evidence of.
+	if digest.FirstSeen != "" {
+		additionalInfo["log_window_start"] = digest.FirstSeen
+		additionalInfo["log_window_end"] = digest.LastSeen
 	}
 	insight := extractLogInsights(logs, maxInsights)
 	metadata := map[string]any{
@@ -724,17 +724,30 @@ func (a *signozLogsAction) AutoExecute(ctx playbooks.PlaybookActionContext) (pla
 		}
 	} else if ctx.GetEvent().SubjectName != "" && namespace != "" {
 		workloadName := getEventWorkload(ctx.GetEvent())
+		nameItem := map[string]any{
+			"value": workloadName,
+			"op":    "contains",
+			"key": map[string]any{
+				"key": "k8s.deployment.name",
+			},
+		}
+		title := "Workload Logs For - " + workloadName
+		// A pod event reads that pod's logs, not its owner's: see eventPodSubject.
+		if pod := eventPodSubject(ctx.GetEvent()); pod != "" {
+			nameItem = map[string]any{
+				"value": pod,
+				"op":    "=",
+				"key": map[string]any{
+					"key": "k8s.pod.name",
+				},
+			}
+			title = "Pod Logs For - " + pod
+		}
 		params = map[string]any{
 			"query": map[string]any{
 				"op": "AND",
 				"items": []map[string]any{
-					{
-						"value": workloadName,
-						"op":    "contains",
-						"key": map[string]any{
-							"key": "k8s.deployment.name",
-						},
-					},
+					nameItem,
 					{
 						"value": namespace,
 						"op":    "=",
@@ -744,7 +757,7 @@ func (a *signozLogsAction) AutoExecute(ctx playbooks.PlaybookActionContext) (pla
 					},
 				},
 			},
-			"title": "Workload Logs For - " + workloadName,
+			"title": title,
 		}
 	}
 	return a.Execute(ctx, params)
@@ -1071,6 +1084,131 @@ var signozOpToCanonical = map[string]query.BinaryWhereClauseType{
 	"nexists":   NotExist,
 	"regex":     RegEx,
 	"nregex":    NotRegEx,
+	"ilike":     ILike,
+	">":         Gt,
+	">=":        Gte,
+	"<":         Lt,
+	"<=":        Lte,
+}
+
+// signozRawQueryToWhereClause converts a raw_query (a SigNoz composite query, e.g.
+// from an alert's related-logs link) into a canonical where-clause, so it runs
+// through FetchLogs on whichever SigNoz source the account uses. Only plain log
+// lists convert: each enabled builder query must be a noop logs query whose
+// filter items are ANDed; several queries are ORed. Anything else reports false
+// and stays on the agent-relay path.
+func signozRawQueryToWhereClause(raw map[string]any) (query.QueryWhereClause, bool) {
+	composite, _ := raw["compositeQuery"].(map[string]any)
+	if composite == nil {
+		return query.QueryWhereClause{}, false
+	}
+	if panel, _ := composite["panelType"].(string); panel != "" && panel != "list" {
+		return query.QueryWhereClause{}, false
+	}
+	builderQueries, _ := composite["builderQueries"].(map[string]any)
+	names := make([]string, 0, len(builderQueries))
+	for name := range builderQueries {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var clauses []query.QueryWhereClause
+	for _, name := range names {
+		q, ok := builderQueries[name].(map[string]any)
+		if !ok {
+			return query.QueryWhereClause{}, false
+		}
+		if disabled, _ := q["disabled"].(bool); disabled {
+			continue
+		}
+		if ds, _ := q["dataSource"].(string); ds != "" && ds != "logs" {
+			return query.QueryWhereClause{}, false
+		}
+		if agg, _ := q["aggregateOperator"].(string); agg != "" && agg != "noop" {
+			return query.QueryWhereClause{}, false
+		}
+		filters, _ := q["filters"].(map[string]any)
+		if op, _ := filters["op"].(string); op != "" && !strings.EqualFold(op, "AND") {
+			return query.QueryWhereClause{}, false
+		}
+		if !signozRawItemsConvertible(filters["items"]) {
+			return query.QueryWhereClause{}, false
+		}
+		where, err := signozFilterItemsToWhereClause(filters)
+		if err != nil {
+			return query.QueryWhereClause{}, false
+		}
+		clauses = append(clauses, where)
+	}
+	switch len(clauses) {
+	case 0:
+		return query.QueryWhereClause{}, false
+	case 1:
+		return clauses[0], true
+	}
+	return query.QueryWhereClause{Or: clauses}, true
+}
+
+// signozRawItemsConvertible reports whether every filter item converts without
+// losing meaning. The where-clause carries only the key name, so an item typed
+// as non-string (e.g. a float64 status code, compared numerically by SigNoz) or
+// one that cannot be read keeps the agent-relay path, which sends items verbatim.
+func signozRawItemsConvertible(raw any) bool {
+	items, ok := raw.([]any)
+	if !ok {
+		return false
+	}
+	for _, it := range items {
+		item, ok := it.(map[string]any)
+		if !ok {
+			return false
+		}
+		key, ok := item["key"].(map[string]any)
+		if !ok {
+			return false
+		}
+		if name, _ := key["key"].(string); name == "" {
+			return false
+		}
+		if dt, _ := key["dataType"].(string); dt != "" && dt != "string" {
+			return false
+		}
+	}
+	return true
+}
+
+// signozRawQueryWindow reads a raw_query's own start/end (Unix ms), falling back
+// to the given window for whichever is absent.
+func signozRawQueryWindow(raw map[string]any, start, end time.Time) (time.Time, time.Time) {
+	ms := func(v any) (time.Time, bool) {
+		var n float64
+		switch x := v.(type) {
+		case float64:
+			n = x
+		case int64:
+			n = float64(x)
+		case int:
+			n = float64(x)
+		case string:
+			f, err := strconv.ParseFloat(x, 64)
+			if err != nil {
+				return time.Time{}, false
+			}
+			n = f
+		default:
+			return time.Time{}, false
+		}
+		if n <= 0 {
+			return time.Time{}, false
+		}
+		return time.UnixMilli(int64(n)), true
+	}
+	if t, ok := ms(raw["start"]); ok {
+		start = t
+	}
+	if t, ok := ms(raw["end"]); ok {
+		end = t
+	}
+	return start, end
 }
 
 // signozFilterItemsToWhereClause converts SigNoz filter items (the "query" playbook
@@ -1206,14 +1344,20 @@ func (a *signozLogsAction) Execute(ctx playbooks.PlaybookActionContext, rawParam
 	}
 	startTime, endTime := a.resolveTimeWindow(ctx, params)
 
-	// raw_query / relatedLogsParams carry an opaque SigNoz composite query that
-	// cannot round-trip through the canonical where-clause — keep the legacy
-	// direct-relay path for those inputs only.
+	title, _ := rawParams["title"].(string)
+
+	// raw_query / relatedLogsParams carry a SigNoz composite query. A plain log
+	// list converts to a where-clause and runs through FetchLogs, which reaches a
+	// URL-connected SigNoz as well as one behind the agent; only shapes that cannot
+	// convert (aggregates, OR-ed filter items) keep the agent-relay path.
 	if params.RawQuery != nil {
+		if where, ok := signozRawQueryToWhereClause(params.RawQuery); ok {
+			start, end := signozRawQueryWindow(params.RawQuery, startTime, endTime)
+			return a.runSignozFetch(ctx, where, title, start, end, rawParams, params.RegexExtractors, params.LabelExtractors)
+		}
 		return a.executeRawQueryLegacy(ctx, rawParams, params, startTime, endTime)
 	}
 
-	title, _ := rawParams["title"].(string)
 	where, err := signozFilterItemsToWhereClause(params.Query)
 	if err != nil {
 		return nil, err
@@ -1360,9 +1504,10 @@ func (a *signozLogsAction) executeRawQueryLegacy(ctx playbooks.PlaybookActionCon
 
 	// Add log summary (level breakdown + pattern grouping)
 	logEntries := a.extractLogEntries(data)
-	if summary := computeLogSummary(logEntries); summary != nil {
+	if summary := playbooks.ComputeLogSummary(logEntries); summary != nil {
 		additionalInfo["log_summary"] = summary
 	}
+	putLogGroups(additionalInfo, playbooks.SummarizeLogEntries(signozLogEntries(logEntries), 0))
 
 	// Generate SigNoz logs explorer URL
 	baseURL := getSignozBaseURL(ctx.GetAccountId())
@@ -1474,6 +1619,17 @@ func (a *signozLogsAction) extractLogEntries(data map[string]any) []map[string]a
 	return logEntries
 }
 
+// signozLogEntries maps SigNoz rows onto the fields the grouping reads.
+func signozLogEntries(rows []map[string]any) []playbooks.LogEntry {
+	entries := make([]playbooks.LogEntry, 0, len(rows))
+	for _, row := range rows {
+		body, _ := row["body"].(string)
+		severity, _ := row["severity_text"].(string)
+		entries = append(entries, playbooks.LogEntry{Line: body, Level: severity, Timestamp: firstStringField(row, "timestamp")})
+	}
+	return entries
+}
+
 func (a *signozLogsAction) extractTopErrorLogs(data map[string]any) []playbooks.PlaybookActionResponseInsight {
 	var insights []playbooks.PlaybookActionResponseInsight
 
@@ -1555,6 +1711,14 @@ type observabilityLogActionParams struct {
 	LabelExtractors []LabelExtractor      `json:"label_extractors,omitempty"`
 }
 
+// resolveLogQueryWindow returns the event's log query window in epoch milliseconds.
+// The floor/cap rules live on PlaybookEvent so the log, metric, and cloud-log
+// enrichers all derive their window the same way — see PlaybookEvent.ResolveQueryWindow.
+func resolveLogQueryWindow(event playbooks.PlaybookEvent, durationMinutes int) (int64, int64) {
+	start, end := event.ResolveQueryWindow(durationMinutes)
+	return start.UnixMilli(), end.UnixMilli()
+}
+
 // getEventNamespace returns the namespace for log collection from SubjectNamespace.
 // For webhook events this is populated from Labels["namespace"] during enrichment.
 // For agent events this is set directly from the k8s resource metadata.
@@ -1578,19 +1742,88 @@ func getEventNamespace(event playbooks.PlaybookEvent) string {
 // pre-date the upstream resolver (and any path that bypasses it) still
 // produce a best-effort query rather than nothing.
 func getEventWorkload(event playbooks.PlaybookEvent) string {
+	// A CronJob is the exception: its owner is one level too high. The subject
+	// `nightly-report-29836288` owned by CronJob `nightly-report` resolved to the
+	// CronJob, and LokiSource's generator turns that into `pod=~"nightly-report-.*"`
+	// — which matches every run the CronJob has ever made. 69 of 976 job_failure
+	// findings on dev in the week to 2026-09-23 were captioned with a *different*
+	// run's output that way. The run's own name is already workload-shaped (a Job
+	// name carries no ReplicaSet hash), so it needs no owner lookup.
+	if strings.EqualFold(event.SubjectOwnerKind, "cronjob") && event.SubjectName != "" {
+		return event.SubjectName
+	}
 	if event.SubjectOwner != "" {
 		return event.SubjectOwner
 	}
 	return event.SubjectName
 }
 
+// eventPodSubject returns the pod an event is about, or "" when its subject is
+// not a pod.
+//
+// Evidence for a pod event has to come from that pod. getEventWorkload resolves
+// to the owner, which is right for trace and service queries but wrong for logs
+// and metrics: a workload-scoped log query returns every replica's lines (and
+// `kubectl logs <kind>/<owner>` reads one arbitrary replica), and every
+// provider's utilisation query sums all the owner's pods into one series. On an
+// OOMKilled DaemonSet pod that put another node's logs and the whole fleet's
+// memory under the killed pod's finding.
+func eventPodSubject(event playbooks.PlaybookEvent) string {
+	if strings.EqualFold(event.SubjectType, "pod") {
+		return event.SubjectName
+	}
+	return ""
+}
+
+// Kubernetes object naming rules (RFC 1123). Namespaces are labels; workload and pod
+// names are subdomains, so they additionally allow dots.
+var (
+	k8sNamespacePattern  = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
+	k8sObjectNamePattern = regexp.MustCompile(`^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$`)
+)
+
+// isK8sLogTarget reports whether (workloadName, namespace) can name a real Kubernetes
+// object, and therefore whether asking the agent for its logs can ever succeed.
+//
+// Not every event with a "subject" has a K8s one. CI events carry a repository as the
+// namespace and a job as the workload ("nudgebee/nudgebee-enterprise" /
+// "label-prs #32334764400"), which the relay fallback happily turned into
+// `kubectl logs deployment/label-prs #32334764400 -n nudgebee/nudgebee-enterprise` —
+// a guaranteed failure, one relay round-trip per event, and a shell metacharacter in a
+// command string. Screening on the naming rules keeps those events out of the agent path
+// entirely; they still get whatever the configured log source can answer.
+func isK8sLogTarget(workloadName, namespace string) bool {
+	if namespace == "" || len(namespace) > 63 || !k8sNamespacePattern.MatchString(namespace) {
+		return false
+	}
+	return workloadName != "" && len(workloadName) <= 253 && k8sObjectNamePattern.MatchString(workloadName)
+}
+
+// noWorkloadLogAggKeys are event classes where a workload-scoped log query
+// cannot return the subject's logs, so whatever it does return is another pod's.
+//
+// An ImagePullBackOff pod never started a container and has no logs by
+// definition, but `logs` queries by workload, so it answered with the healthy
+// replicas still serving the old image. On dev, 130 of 133 such payloads
+// contained no reference to the failing pod at all, and 48 carried error lines
+// from unrelated work — rendered under the failing pod's finding. The image
+// name, the pull error and the pod events are the evidence here, and
+// pod_enricher plus resource_events_enricher already collect them.
+var noWorkloadLogAggKeys = map[string]bool{
+	"image_pull_backoff_reporter": true,
+}
+
 func (a *observabilityLogAction) CanAutoExecute(ctx playbooks.PlaybookActionContext) bool {
+	if noWorkloadLogAggKeys[ctx.GetEvent().AggregationKey] {
+		return false
+	}
 	requestCtx := security.NewRequestContextForTenantAdmin(ctx.GetTenantId(), ctx.GetLogger(), nil, nil)
 	source, err := getLogSourceForAccount(requestCtx, ctx.GetAccountId(), "", "")
 	namespace := getEventNamespace(ctx.GetEvent())
 	if err != nil || source == nil {
 		// No configured log source — allow relay fallback only for non-cloud events
-		if ctx.GetEvent().SubjectName != "" && namespace != "" && !isCloudEventSource(ctx.GetEvent().Source) {
+		// whose subject the agent could actually resolve.
+		if isK8sLogTarget(getEventWorkload(ctx.GetEvent()), namespace) && !isCloudEventSource(ctx.GetEvent().Source) {
 			return true
 		}
 		return false
@@ -1745,15 +1978,18 @@ func traceIDFilterSurvivesStrip(mapping map[string]string, filter QueryRequestKe
 func (a *observabilityLogAction) autoExecuteByWorkload(ctx playbooks.PlaybookActionContext) (playbooks.PlaybookActionResponse, error) {
 	workloadName := getEventWorkload(ctx.GetEvent())
 	namespace := getEventNamespace(ctx.GetEvent())
+	where := buildWorkloadLogWhereClause(workloadName, namespace)
+	// A pod event reads that pod's logs, not its owner's: see eventPodSubject.
+	if pod := eventPodSubject(ctx.GetEvent()); pod != "" {
+		workloadName = pod
+		where = buildPodLogWhereClause(pod, namespace)
+	}
 
-	endTime := time.Now().UnixMilli()
-	startTime := endTime - int64(7*60*60*1000) // 1 hour default
-	// if ctx.GetEvent().StartedAt != nil {
-	// 	startTime = ctx.GetEvent().StartedAt.UnixMilli()
-	// }
-	// if ctx.GetEvent().EndedAt != nil {
-	// 	endTime = ctx.GetEvent().EndedAt.UnixMilli()
-	// }
+	// Anchor on the event window (floored/capped by resolveLogQueryWindow) rather than a
+	// fixed lookback from now, so logs for an event that ended hours ago still line up
+	// with it. The floor is what makes this safe: an event-anchored window used to
+	// collapse to a couple of seconds for a just-fired alert.
+	startTime, endTime := resolveLogQueryWindow(ctx.GetEvent(), 0)
 
 	// Try configured log source with workload-based query
 	requestCtx := security.NewRequestContextForTenantAdmin(ctx.GetTenantId(), ctx.GetLogger(), nil, nil)
@@ -1763,7 +1999,7 @@ func (a *observabilityLogAction) autoExecuteByWorkload(ctx playbooks.PlaybookAct
 		EndTime:   endTime,
 		Limit:     1000,
 		QueryRequest: LogsQueryBuilderRequest{
-			Where: buildWorkloadLogWhereClause(workloadName, namespace),
+			Where: where,
 		},
 	})
 
@@ -1789,6 +2025,14 @@ func (a *observabilityLogAction) autoExecuteByWorkload(ctx playbooks.PlaybookAct
 		return nil, nil
 	}
 
+	// Skip relay fallback when the subject is not a Kubernetes object (CI jobs, pull
+	// requests, and anything else whose "namespace"/"workload" are borrowed fields).
+	if !isK8sLogTarget(workloadName, namespace) {
+		ctx.GetLogger().Info("observability: skipping relay fallback for non-kubernetes subject",
+			"source", ctx.GetEvent().Source, "workload", workloadName, "namespace", namespace)
+		return nil, nil
+	}
+
 	// Fallback: relay kubectl logs
 	ctx.GetLogger().Info("observability: falling back to relay kubectl logs",
 		"workload", workloadName, "namespace", namespace)
@@ -1798,20 +2042,42 @@ func (a *observabilityLogAction) autoExecuteByWorkload(ctx playbooks.PlaybookAct
 // fetchLogsViaRelay fetches logs via relay. For workload kinds (Deployment, DaemonSet,
 // StatefulSet, ReplicaSet) it uses kubectl logs since logs_enricher expects a pod name.
 func (a *observabilityLogAction) fetchLogsViaRelay(ctx playbooks.PlaybookActionContext, workloadName, namespace string) (playbooks.PlaybookActionResponse, error) {
-	kind := ""
-	if ctx.GetEvent().Labels != nil {
-		kind = ctx.GetEvent().Labels["kind"]
-	}
-	// Fall back to SubjectType for agent-generated events (lowercase, e.g. "deployment")
-	if kind == "" {
-		kind = ctx.GetEvent().SubjectType
-	}
+	// The kind has to describe workloadName, not the event's subject. For a pod
+	// event with SubjectOwner set, getEventWorkload already resolved the name up
+	// to the owning workload ("llm-server", not "llm-server-8b5f-tc2jd"), so the
+	// matching kind is SubjectOwnerKind. Reading SubjectType here instead pairs a
+	// deployment name with kind "pod".
+	kind := relayLogKind(ctx.GetEvent(), workloadName)
 
-	if strings.EqualFold(kind, "Deployment") || strings.EqualFold(kind, "DaemonSet") || strings.EqualFold(kind, "StatefulSet") || strings.EqualFold(kind, "ReplicaSet") {
-		return a.fetchLogsViaKubectl(ctx, kind, workloadName, namespace)
+	if kubectlLogKinds[strings.ToLower(kind)] {
+		resp, err := a.fetchLogsViaKubectl(ctx, kind, workloadName, namespace)
+		if err == nil {
+			return resp, nil
+		}
+		// kubectl could not resolve the subject (RBAC, a kind this cluster
+		// shapes differently). logs_enricher may still answer for a pod name.
+		ctx.GetLogger().Info("observability: kubectl logs failed, falling back to logs_enricher",
+			"kind", kind, "workload", workloadName, "namespace", namespace, "error", err)
 	}
 
 	return a.fetchLogsViaLogsEnricher(ctx, workloadName, namespace)
+}
+
+// relayLogKind is the kind that describes name for `kubectl logs <kind>/<name>`.
+func relayLogKind(event playbooks.PlaybookEvent, name string) string {
+	// The pod subject itself: `kubectl logs pod/<name>`. Any workload kind here
+	// would read one arbitrary replica instead.
+	if pod := eventPodSubject(event); pod != "" && name == pod {
+		return "pod"
+	}
+	if event.SubjectOwner != "" && name == event.SubjectOwner && event.SubjectOwnerKind != "" {
+		return event.SubjectOwnerKind
+	}
+	if event.Labels != nil && event.Labels["kind"] != "" {
+		return event.Labels["kind"]
+	}
+	// Fall back to SubjectType for agent-generated events (lowercase, e.g. "deployment")
+	return event.SubjectType
 }
 
 // fetchLogsViaLogsEnricher uses the relay agent's logs_enricher to fetch logs for a pod.
@@ -1833,14 +2099,33 @@ func (a *observabilityLogAction) fetchLogsViaLogsEnricher(ctx playbooks.Playbook
 	if err != nil {
 		return nil, err
 	}
-	data, ok := relayResponse["data"].(string)
+	raw, ok := relayResponse["data"].(string)
 	if !ok {
 		return nil, errors.New("relay: unable to extract log data from response")
 	}
+	data, err := playbooks.DecodeAgentPayload(raw)
+	if err != nil {
+		return nil, fmt.Errorf("relay: unable to decode logs_enricher payload: %w", err)
+	}
+	logs := parseLogTextToOutputLogs(data)
+	if len(logs) == 0 {
+		// The agent answered with an empty (gzipped) log — the pod wrote nothing in
+		// range. Same rule as buildLogsActionResponse: no logs, no card.
+		ctx.GetLogger().Info("observability: logs_enricher returned no log content",
+			"workload", workloadName, "namespace", namespace)
+		return nil, nil
+	}
 	filename, _ := relayResponse["filename"].(string)
 	insight := playbooks.InsightFromRelayResponse(relayResponse)
-	if summary := computeLogSummaryFromText(data); summary != nil {
+	if summary := playbooks.ComputeLogSummary(outputLogsToInsightMaps(logs)); summary != nil {
 		additionalInfo["log_summary"] = summary
+	}
+	// The agent sends no insight for a log file, so without these the card has no
+	// summary line at all.
+	digest := summarizeOutputLogs(logs, actionLogMaxGroupInsights)
+	putLogGroups(additionalInfo, digest)
+	if len(insight) == 0 {
+		insight = digest.Insights
 	}
 	if filename != "" {
 		additionalInfo["filename"] = filename
@@ -1856,14 +2141,52 @@ func (a *observabilityLogAction) fetchLogsViaLogsEnricher(ctx playbooks.Playbook
 	// Return structured log entries (not a raw-text file) so the evidence renders in the UI
 	// log card and is consumed by the log-analysis pipeline. See parseLogTextToOutputLogs.
 	return playbooks.NewPlaybookActionResponseJson(
-		map[string]any{"data": parseLogTextToOutputLogs(data)}, additionalInfo, insight, metadata), nil
+		map[string]any{"data": logs}, additionalInfo, insight, metadata), nil
+}
+
+// kubectlLogKinds are the kinds `kubectl logs <kind>/<name>` resolves. Doubles as the
+// allowlist for the only value interpolated into the kubectl command that isK8sLogTarget
+// does not already screen — see fetchLogsViaKubectl.
+//
+// Pods and Jobs are here even though logs_enricher can also answer for them, because
+// this path bounds the read and that one does not. logs_enricher takes no time argument
+// — podLogParams has declared since_time/tail_lines since it was written and never sent
+// them, and nothing in the agent contract accepts them — so it returns the container's
+// whole lifetime up to the agent's own tail. Measured over a week on dev, that is a
+// median 4.8 days of log per evidence, 42 of 53 payloads truncated at the line cap, and
+// 19 of 53 with no parseable timestamp at all. The kubectl path asks for
+// --since-time=<event window> --timestamps and lands at a 570s median.
+var kubectlLogKinds = map[string]bool{
+	"deployment":  true,
+	"daemonset":   true,
+	"statefulset": true,
+	"replicaset":  true,
+	"pod":         true,
+	"job":         true,
 }
 
 // fetchLogsViaKubectl uses kubectl logs <kind>/<name> via kubectl_command_executor
 // for workload kinds where logs_enricher cannot resolve the resource.
 func (a *observabilityLogAction) fetchLogsViaKubectl(ctx playbooks.PlaybookActionContext, kind, workloadName, namespace string) (playbooks.PlaybookActionResponse, error) {
-	command := fmt.Sprintf("kubectl logs %s/%s -n %s --tail=1000 --all-containers=true",
-		strings.ToLower(kind), workloadName, namespace)
+	// kind reaches here from event labels / SubjectType, i.e. from a webhook payload.
+	// The sole caller already screens it, but the command is assembled here, so the
+	// check belongs here too: with this, every value interpolated below is either from
+	// this fixed set, screened by isK8sLogTarget, or a timestamp we formatted ourselves.
+	kind = strings.ToLower(kind)
+	if !kubectlLogKinds[kind] {
+		return nil, fmt.Errorf("relay: kubectl logs does not support kind %q", kind)
+	}
+
+	// --since-time bounds the output to the event's window. Without it `--tail=1000`
+	// returns whatever the container last wrote, however long ago: an event raised today
+	// was being enriched with the four lines a quiet pod emitted twelve days earlier, and
+	// nothing in the evidence said so. --timestamps is what makes that visible — it is
+	// the only way lines from this path carry a time at all (see parseLogTextToOutputLogs).
+	startTime, _ := resolveLogQueryWindow(ctx.GetEvent(), 0)
+	sinceTime := time.UnixMilli(startTime).UTC().Format(time.RFC3339)
+
+	command := fmt.Sprintf("kubectl logs %s/%s -n %s --tail=1000 --all-containers=true --timestamps=true --since-time=%s",
+		kind, workloadName, namespace, sinceTime)
 
 	ctx.GetLogger().Info("observability: fetching logs via kubectl", "command", command)
 
@@ -1886,14 +2209,47 @@ func (a *observabilityLogAction) fetchLogsViaKubectl(ctx playbooks.PlaybookActio
 	// kubectl_command_executor on the agent (robusta/playbooks/nudgebee_playbooks/kubectl_actions.py)
 	// returns its output wrapped in a JsonBlock, so stdout/stderr live one level deep inside
 	// relayResponse["data"] (a JSON-encoded string), not at the top level.
-	stdout, stderr := extractKubectlOutput(relayResponse)
+	stdout, stderr, exitCode, haveExitCode := extractKubectlOutput(relayResponse)
+	if kubectlLogsFailed(stdout, stderr, exitCode, haveExitCode) {
+		ctx.GetLogger().Error("relay: kubectl logs failed",
+			"exit_code", exitCode, "have_exit_code", haveExitCode, "stderr", stderr, "response", slog.AnyValue(relayResponse))
+		return nil, fmt.Errorf("relay: kubectl logs failed (exit %d): %s", exitCode, stderr)
+	}
 	if stdout == "" {
-		ctx.GetLogger().Error("relay: kubectl logs returned no output", "stderr", stderr, "response", slog.AnyValue(relayResponse))
-		return nil, fmt.Errorf("relay: kubectl logs failed: %s", stderr)
+		// With --since-time, "nothing" is an ordinary answer: the workload was simply
+		// quiet during the event window. Reporting the quiet case as an error is what
+		// used to push callers into treating the twelve-day-old tail as the better
+		// answer.
+		//
+		// Non-empty stderr is NOT that signal. `kubectl logs deployment/x` writes an
+		// informational "Found 21 pods, using pod/x-z5fq5" to stderr whenever the
+		// selector matches more than one pod, and exits 0. Every multi-replica
+		// workload therefore looked like a failure whenever the pod kubectl happened
+		// to pick was quiet in the window — observed on dev for
+		// victoria-prometheus-node-exporter, arc-nudgebee-vx286-runner and
+		// services-server, four times in twenty minutes. Trust the exit code, which
+		// the agent reports, and keep the stderr heuristic only for responses that
+		// carry no exit code at all.
+		ctx.GetLogger().Info("observability: kubectl logs returned nothing in the event window",
+			"workload", workloadName, "namespace", namespace, "since", sinceTime)
+		return nil, nil
+	}
+	logs := parseLogTextToOutputLogs(stdout)
+	if len(logs) == 0 {
+		ctx.GetLogger().Info("observability: kubectl logs produced no parseable entries",
+			"workload", workloadName, "namespace", namespace)
+		return nil, nil
 	}
 	insight := playbooks.InsightFromRelayResponse(relayResponse)
-	if summary := computeLogSummaryFromText(stdout); summary != nil {
+	if summary := playbooks.ComputeLogSummary(outputLogsToInsightMaps(logs)); summary != nil {
 		additionalInfo["log_summary"] = summary
+	}
+	// The agent sends no insight for a log file, so without these the card has no
+	// summary line at all.
+	digest := summarizeOutputLogs(logs, actionLogMaxGroupInsights)
+	putLogGroups(additionalInfo, digest)
+	if len(insight) == 0 {
+		insight = digest.Insights
 	}
 	additionalInfo["filename"] = fmt.Sprintf("%s-%s.log", workloadName, namespace)
 	metadata := map[string]any{
@@ -1907,7 +2263,27 @@ func (a *observabilityLogAction) fetchLogsViaKubectl(ctx playbooks.PlaybookActio
 	// Return structured log entries (not a raw-text file) so the evidence renders in the UI
 	// log card and is consumed by the log-analysis pipeline. See parseLogTextToOutputLogs.
 	return playbooks.NewPlaybookActionResponseJson(
-		map[string]any{"data": parseLogTextToOutputLogs(stdout)}, additionalInfo, insight, metadata), nil
+		map[string]any{"data": logs}, additionalInfo, insight, metadata), nil
+}
+
+// kubectlLogsFailed reports whether a kubectl_command_executor result is an
+// actual failure rather than a quiet window.
+//
+// The exit code is authoritative when the agent sends one. Non-empty stderr is
+// not: `kubectl logs deployment/x` writes "Found 21 pods, using pod/x-z5fq5" to
+// stderr whenever the selector matches more than one pod, and still exits 0. So
+// every multi-replica workload read as a failure whenever the pod kubectl picked
+// happened to be quiet in the window, which pushed the caller onto the unbounded
+// logs_enricher fallback — observed on dev for victoria-prometheus-node-exporter,
+// arc-nudgebee-vx286-runner and services-server, four times in twenty minutes.
+//
+// Responses that carry no exit code keep the old stderr heuristic, which is the
+// best signal available for them.
+func kubectlLogsFailed(stdout, stderr string, exitCode int, haveExitCode bool) bool {
+	if haveExitCode {
+		return exitCode != 0
+	}
+	return stdout == "" && strings.TrimSpace(stderr) != ""
 }
 
 // extractKubectlOutput unwraps the kubectl_command_executor response to recover stdout/stderr.
@@ -1917,7 +2293,7 @@ func (a *observabilityLogAction) fetchLogsViaKubectl(ctx playbooks.PlaybookActio
 // After relay.ExecuteAndExtractResponse unwraps the outer envelope, the agent action response
 // retains this JsonBlock shape, so stdout/stderr live inside the stringified "data" field rather
 // than at the top level. This helper handles that indirection.
-func extractKubectlOutput(relayResponse map[string]any) (stdout, stderr string) {
+func extractKubectlOutput(relayResponse map[string]any) (stdout, stderr string, exitCode int, haveExitCode bool) {
 	// First try the fast-path: some agent actions (future or alternate shapes) may put
 	// stdout/stderr at the top level already.
 	if s, ok := relayResponse["stdout"].(string); ok && s != "" {
@@ -1927,29 +2303,33 @@ func extractKubectlOutput(relayResponse map[string]any) (stdout, stderr string) 
 		stderr = s
 	}
 	if stdout != "" {
-		return stdout, stderr
+		return stdout, stderr, 0, false
 	}
 
 	// Fallback: unwrap JsonBlock payload — relayResponse["data"] is a JSON-encoded string
 	// containing {"command":..., "stdout":..., "stderr":...}.
 	dataStr, ok := relayResponse["data"].(string)
 	if !ok || dataStr == "" {
-		return stdout, stderr
+		return stdout, stderr, 0, false
 	}
 	var inner kubectlJsonBlockPayload
 	if err := json.Unmarshal([]byte(dataStr), &inner); err != nil {
-		return stdout, stderr
+		return stdout, stderr, 0, false
 	}
-	return inner.Stdout, inner.Stderr
+	if inner.ExitCode != nil {
+		return inner.Stdout, inner.Stderr, *inner.ExitCode, true
+	}
+	return inner.Stdout, inner.Stderr, 0, false
 }
 
 // kubectlJsonBlockPayload is the payload robusta's kubectl_command_executor writes
 // inside the JsonBlock data field — see robusta-ai/playbooks sdk: add_enrichment(
 // [JsonBlock(json.dumps({"command": ..., "stdout": ..., "stderr": ...}))]).
 type kubectlJsonBlockPayload struct {
-	Command string `json:"command"`
-	Stdout  string `json:"stdout"`
-	Stderr  string `json:"stderr"`
+	Command  string `json:"command"`
+	Stdout   string `json:"stdout"`
+	Stderr   string `json:"stderr"`
+	ExitCode *int   `json:"exit_code"`
 }
 
 // buildLogResponse creates a standard log action response from OutputLog results
@@ -1961,12 +2341,29 @@ func (a *observabilityLogAction) buildLogResponse(logoutput []OutputLog, queryIn
 // buildWorkloadLogWhereClause creates a where clause to filter logs by workload name and namespace.
 // Uses canonical keys "app" and "namespace" so that getMergedLabelMapping can translate them
 // to provider-specific field names (e.g. via the UI's Log Label Mapper: app → deployment.keyword).
-// For backends that use different native field names (Loki: service_name/workLoad_name),
-// the static GetLabelMapping() handles the translation.
+//
+// Note that a source's static GetLabelMapping() does not necessarily cover "app" — Loki's
+// is only {content: log} — so on those backends this clause matches solely when the
+// promtail/alloy scrape happens to emit an `app` label equal to the workload name. It is
+// the last resort before the agent: sources that can do better implement
+// PlaybookQueryGenerator (LokiSource matches on `pod=~"<workload>-.*"`), which AutoExecute
+// tries first.
 func buildWorkloadLogWhereClause(workloadName, namespace string) query.QueryWhereClause {
 	return query.QueryWhereClause{
 		And: []query.QueryWhereClause{
 			{Binary: query.BinaryWhereClause{"app": {query.Eq: workloadName}}},
+			{Binary: query.BinaryWhereClause{"namespace": {query.Eq: namespace}}},
+		},
+	}
+}
+
+// buildPodLogWhereClause is buildWorkloadLogWhereClause for a single pod. "pod" is
+// a canonical key every source that maps "app" also maps (Elasticsearch expands it
+// across shipper field names), so it reaches at least as many backends.
+func buildPodLogWhereClause(podName, namespace string) query.QueryWhereClause {
+	return query.QueryWhereClause{
+		And: []query.QueryWhereClause{
+			{Binary: query.BinaryWhereClause{"pod": {query.Eq: podName}}},
 			{Binary: query.BinaryWhereClause{"namespace": {query.Eq: namespace}}},
 		},
 	}
@@ -1979,7 +2376,7 @@ func isCloudEventSource(source string) bool {
 	switch source {
 	case "Azure_Monitor_Alert", "azure_monitor_webhook",
 		"AWS_CloudWatch_Alarm", "AWS_EventBridge",
-		"GCP_Metric_Alert":
+		"GCP_Metric_Alert", "gcp_monitoring_webhook":
 		return true
 	}
 	return false
@@ -1999,25 +2396,7 @@ func (a *observabilityLogAction) Execute(ctx playbooks.PlaybookActionContext, ra
 		return nil, errors.New("account_id is required")
 	}
 
-	startTime := int64(0)
-	endTime := int64(0)
-	if ctx.GetEvent().StartedAt != nil {
-		startTime = ctx.GetEvent().StartedAt.UnixMilli()
-	}
-	if ctx.GetEvent().EndedAt != nil {
-		endTime = ctx.GetEvent().EndedAt.UnixMilli()
-	}
-
-	if endTime == 0 {
-		endTime = time.Now().UnixMilli()
-	}
-
-	if startTime == 0 {
-		if params.Duration < 1 {
-			params.Duration = 60
-		}
-		startTime = endTime - int64(params.Duration*60*1000)
-	}
+	startTime, endTime := resolveLogQueryWindow(ctx.GetEvent(), params.Duration)
 
 	logResult, err := FetchLogs(security.NewRequestContextForTenantAdmin(ctx.GetTenantId(), ctx.GetLogger(), nil, nil), FetchLogRequest{
 		AccountId: params.AccountId,

@@ -1,5 +1,5 @@
 import { Box, Typography } from '@mui/material';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import PropTypes from 'prop-types';
 import LogQueryBuilderAutocomplete from './LogQueryBuilderAutocomplete';
 import FilterDropdown from '@ui/FilterDropdown';
@@ -27,7 +27,7 @@ import { ds } from '@utils/colors';
 // Providers whose metrics are queried with PromQL. They share the metric-name list, the
 // label/value endpoints and the CodeMirror PromQL autocomplete, so a provider missing from
 // this set silently renders an empty builder with no suggestions rather than erroring.
-const PROMQL_METRIC_PROVIDERS = ['prometheus', 'chronosphere', 'victoria-metrics', 'openobserve'];
+const PROMQL_METRIC_PROVIDERS = ['prometheus', 'chronosphere', 'victoria-metrics', 'openobserve', 'cubeapm'];
 
 const isPromQLMetricProvider = (provider) => PROMQL_METRIC_PROVIDERS.includes(provider);
 
@@ -142,6 +142,18 @@ const QueryModeSwitcher = ({
         return isMetric
           ? 'Example: rate(http_requests_total{status="500", job="api-server"}[5m])'
           : "Example: SELECT * FROM \"default\" WHERE k8s_namespace_name = 'prod' AND str_match(body, 'ERROR')";
+      case 'splunk_enterprise':
+        // Both modes are SPL, but metrics and logs use different halves of it: metrics
+        // live in a metrics index reachable only through the mstats generating command,
+        // logs in an event index reached with a plain search.
+        return isMetric
+          ? 'Example: | mstats avg(k8s.pod.cpu.usage) WHERE index="otel_metrics" AND k8s.namespace.name="prod" span=1m BY k8s.pod.name'
+          : 'Example: search index="otel_logs" k8s.namespace.name="prod" severity_text="ERROR"';
+      case 'cubeapm':
+        // Metrics go through the Prometheus-compatible API; logs are LogsQL.
+        return isMetric
+          ? 'Example: rate(http_requests_total{status="500", job="api-server"}[5m])'
+          : 'Example: {env="prod"} k8s.namespace.name:="prod" AND log.level:=error | sort ("_time" desc) | limit 100';
       case 'signoz':
         return isMetric
           ? 'Example: sum(rate(signoz_calls_total{service_name="api-server",http_status_code="500"}[5m])) by (service_name)'
@@ -180,7 +192,65 @@ const QueryModeSwitcher = ({
     logProvider === 'ES' && esQueryType === 'kql'
       ? 'Example: status:200 and service.name:"auth" and http.response.status_code >= 400'
       : getSampleQuery(logProvider, providerType);
-  const extensions = [EditorView.lineWrapping, cmPlaceholder(codeSample)];
+  // Every keystroke re-renders this component (onChange -> setQuery), so building the
+  // extension list inline meant a new PromQLExtension + linter per character typed,
+  // and a new array identity that made CodeMirror reconfigure itself each time.
+  const extensions = useMemo(() => {
+    const list = [EditorView.lineWrapping, cmPlaceholder(codeSample)];
+    if (!isPromQLMetricProvider(logProvider)) {
+      return list;
+    }
+    list.push(
+      new PromQLExtension()
+        .setComplete({
+          remote: {
+            cache: {
+              initialMetricList: metricsList,
+            },
+            fetchFn: (url) => {
+              const requestUrl = typeof url === 'string' ? url : url.url;
+              if (
+                requestUrl.includes('api/v1/metadata') ||
+                requestUrl.includes('api/v1/series') ||
+                requestUrl.includes('api/v1/label/__name__/values')
+              ) {
+                const mockResponse = new Response(JSON.stringify({}));
+                return Promise.resolve(mockResponse);
+              }
+              return fetch(url);
+            },
+          },
+        })
+        .activateCompletion(true)
+        .asExtension()
+    );
+    list.push(
+      linter(null, {
+        tooltipFilter: (diagnostics) => {
+          const uniqueMessages = new Map();
+          const filtered = [];
+          const addedKeys = new Set();
+
+          for (const diagnostic of diagnostics) {
+            const key = `${diagnostic.message}-${diagnostic.from}-${diagnostic.to}`;
+            if (!uniqueMessages.has(diagnostic.message)) {
+              uniqueMessages.set(diagnostic.message, true);
+              filtered.push(diagnostic);
+              addedKeys.add(key);
+            } else if (!addedKeys.has(key)) {
+              const existing = filtered.find((d) => d.message === diagnostic.message);
+              if (!existing || existing.to < diagnostic.from || existing.from > diagnostic.to) {
+                filtered.push(diagnostic);
+                addedKeys.add(key);
+              }
+            }
+          }
+          return filtered;
+        },
+      })
+    );
+    return list;
+  }, [codeSample, logProvider, metricsList]);
 
   const resetStates = () => {
     setQuery('');
@@ -252,8 +322,14 @@ const QueryModeSwitcher = ({
         .join(';');
       if (formattedQuery) {
         setQuery(formattedQuery);
+        if (logProvider === 'ES') {
+          // The backend renders the builder chips as a DSL body, so a KQL
+          // selection left over from a previous Code-tab visit would send this
+          // JSON to the KQL parser. Pin the language to what was just seeded.
+          setEsQueryType('dsl');
+        }
         if (onQueryChange) {
-          onQueryChange({ query: formattedQuery, queryKeys });
+          onQueryChange({ query: formattedQuery, queryKeys, ...(logProvider === 'ES' ? { queryType: 'dsl' } : {}) });
         }
       }
     } catch (err) {
@@ -382,7 +458,7 @@ const QueryModeSwitcher = ({
             },
           });
         } else {
-          console.warn(`Unsupported line operation operator: ${op.op}`);
+          console.warn('Unsupported line operation operator', { operator: op.op });
         }
       });
 
@@ -432,19 +508,24 @@ const QueryModeSwitcher = ({
     if (isPromQLMetricProvider(logProvider)) {
       const fetchMetrics = async () => {
         try {
-          const cachedPrometheusLabels = cache.getWithSuffix(`${accountId}.prometheus.labels`, null, {});
+          // Keyed by provider: the old `${accountId}.prometheus.labels` key was shared
+          // by every PromQL-family provider, so Chronosphere and Victoria Metrics read
+          // each other's (and Prometheus's) metric names out of one another's cache.
+          const promqlCacheKey = `${accountId}.${logProvider}.promql.labels`;
+          const cachedPrometheusLabels = cache.getWithSuffix(promqlCacheKey, null, {});
           if (cachedPrometheusLabels) {
             setMetricsList(cachedPrometheusLabels);
           } else {
             setMetricsList([]);
-            const res = await observability.metricsList(accountId);
+            // Pin the provider, else the completion list comes from the account default.
+            const res = await observability.metricsList(accountId, providerOverride ? { metricProvider: providerOverride } : undefined);
             if (res?.errors) {
               snackbar.error(`failed to fetch labels- ${parseHttpResponseBodyMessage(res)}`);
               return;
             }
             const metricsList = res?.data?.data?.metrics_list_names?.map((m) => m.metric) || [];
             if (metricsList.length) {
-              cache.setWithSuffix(`${accountId}.prometheus.labels`, metricsList, {}, 60 * 60 * 6);
+              cache.setWithSuffix(promqlCacheKey, metricsList, {}, 60 * 60 * 6);
               setMetricsList(metricsList);
             }
           }
@@ -506,60 +587,32 @@ const QueryModeSwitcher = ({
     setPrebuildQueryBlocks((prev) => prev.map((b, i) => (i === 0 ? { ...b, selectedMetric: initialEsIndex } : b)));
   }, [logProvider, initialEsIndex]);
 
-  const getExtension = () => {
-    if (isPromQLMetricProvider(logProvider)) {
-      extensions.push(
-        new PromQLExtension()
-          .setComplete({
-            remote: {
-              cache: {
-                initialMetricList: metricsList,
-              },
-              fetchFn: (url) => {
-                const requestUrl = typeof url === 'string' ? url : url.url;
-                if (
-                  requestUrl.includes('api/v1/metadata') ||
-                  requestUrl.includes('api/v1/series') ||
-                  requestUrl.includes('api/v1/label/__name__/values')
-                ) {
-                  const mockResponse = new Response(JSON.stringify({}));
-                  return Promise.resolve(mockResponse);
-                }
-                return fetch(url);
-              },
-            },
-          })
-          .activateCompletion(true)
-          .asExtension()
-      );
-      extensions.push(
-        linter(null, {
-          tooltipFilter: (diagnostics) => {
-            const uniqueMessages = new Map();
-            const filtered = [];
-            const addedKeys = new Set();
-
-            for (const diagnostic of diagnostics) {
-              const key = `${diagnostic.message}-${diagnostic.from}-${diagnostic.to}`;
-              if (!uniqueMessages.has(diagnostic.message)) {
-                uniqueMessages.set(diagnostic.message, true);
-                filtered.push(diagnostic);
-                addedKeys.add(key);
-              } else if (!addedKeys.has(key)) {
-                const existing = filtered.find((d) => d.message === diagnostic.message);
-                if (!existing || existing.to < diagnostic.from || existing.from > diagnostic.to) {
-                  filtered.push(diagnostic);
-                  addedKeys.add(key);
-                }
-              }
-            }
-            return filtered;
-          },
-        })
-      );
-    }
-    return extensions;
-  };
+  // ES index picker, shared by the Code and AI tabs. Both read and write the one
+  // selection (prebuildQueryBlocks[0].selectedMetric), so the index a query was
+  // generated against in the AI tab is the index it then runs against when the
+  // query lands in the Code tab. getQuery differs per tab — the Code tab has to
+  // round-trip the live CodeMirror ref, the AI tab the generated query.
+  const renderEsIndexPicker = (getQuery) => (
+    <Box sx={{ width: ds.space.mul(0, 130) }}>
+      <FilterDropdown
+        label='Select an Index'
+        value={selectedEsIndex || null}
+        options={esIndexList ?? []}
+        freeSolo
+        // Same affordance as the Build tab's picker: freeSolo alone is
+        // invisible, so the hint is what tells the user a wildcard
+        // pattern outside the listed indices is accepted.
+        searchPlaceholder='Search or type pattern (use * for wildcard)...'
+        onSelect={(_event, value) => {
+          setPrebuildQueryBlocks((prev) => prev.map((b, i) => (i === 0 ? { ...b, selectedMetric: value || '' } : b)));
+          if (onQueryChange) {
+            onQueryChange({ query: getQuery(), queryKeys: [''], index: value || '', queryType: esQueryType });
+          }
+        }}
+        isOptionsLoading={isEsIndexLoading}
+      />
+    </Box>
+  );
 
   const sendConversationIdAndLLMResponseToParent = (conversationId, llmResponse) => {
     if (conversationId && setConversationId) {
@@ -570,6 +623,56 @@ const QueryModeSwitcher = ({
     }
   };
 
+  // Reports the index a generated query was resolved against back to the parent,
+  // so Run Query executes it against that same index rather than whatever the
+  // Code tab last selected. Normally the current selection; when nothing was
+  // picked, the backend echoes the account default it fell back to, which then
+  // fills the dropdown in. Deliberately reports only the index — the query
+  // language is left exactly as the user set it, same as before.
+  const esIndexEcho = (queryData) => (logProvider === 'ES' ? { index: queryData?.index || selectedEsIndex } : {});
+
+  // Applies a generated metrics query to the editor. The backend now answers in one
+  // {query, provider, index} envelope for every metrics provider, but the older
+  // PromQL path answered with a map KEYED by the query itself, and conversations
+  // generated before this change still carry that shape. Both are accepted so a
+  // replayed or in-flight older response is not dropped.
+  const applyGeneratedMetricsQuery = (queryData, conversationId) => {
+    const key = uuidv4();
+
+    if (typeof queryData?.query === 'string' && queryData.query.trim()) {
+      setQuery(queryData.query);
+      if (onQueryChange) {
+        onQueryChange({
+          query: queryData.query,
+          queryKeys: [key],
+          ...esIndexEcho(queryData),
+          // The generator writes DSL, so a user sitting on the KQL option would
+          // otherwise have the query run through the wrong parser.
+          ...(logProvider === 'ES' ? { queryType: 'dsl' } : {}),
+        });
+      }
+      sendConversationIdAndLLMResponseToParent(conversationId, queryData.query);
+      return true;
+    }
+
+    // Object.keys on a string returns character indices, which would put "0" in the
+    // editor as if it were a query. Only an object can carry the legacy key-map shape.
+    if (typeof queryData !== 'object' || queryData === null) {
+      return false;
+    }
+
+    const queries = Object.keys(queryData);
+    if (queries.length > 0) {
+      setQuery(queries[0]);
+      if (onQueryChange) {
+        onQueryChange({ query: queries[0], queryKeys: [key] });
+      }
+      sendConversationIdAndLLMResponseToParent(conversationId, queryData[queries[0]]);
+      return true;
+    }
+    return false;
+  };
+
   const handleGenerateQuery = () => {
     setIsLoadingGenerateQuestionText(true);
     if (onAiLoadingChange) {
@@ -577,7 +680,15 @@ const QueryModeSwitcher = ({
     }
     setQuery('');
     setHelperTextForLLM('');
+    // This switcher serves both the logs and the metrics tab, and the branch below
+    // used to be selected on logProvider alone. Every provider outside the
+    // Prometheus family therefore fell into the log-query branch even on the metrics
+    // tab — an ES metrics account had its AI button generating a LOG query against
+    // LOG indices, then echoing that log index into the metrics index picker.
+    // providerType is what distinguishes the two tabs, so it decides the branch.
+    const isMetricsTab = providerType === 'metrics';
     if (
+      !isMetricsTab &&
       logProvider &&
       logProvider !== 'datadog' &&
       logProvider !== 'prometheus' &&
@@ -601,6 +712,12 @@ const QueryModeSwitcher = ({
           // dropdown shows. Always pinning to the currently-selected logProvider
           // removes that failure mode entirely.
           ...(logProvider ? { log_provider: logProvider } : {}),
+          // Elasticsearch field sets are per-index, so the selection has to
+          // reach generation, not just execution: it scopes the fields the
+          // generator is offered and pins the index the query resolves
+          // against. Omitted when blank — the backend then falls back to the
+          // account's default index and reports which one it used.
+          ...(logProvider === 'ES' && selectedEsIndex ? { index: selectedEsIndex } : {}),
         })
         .then((res) => {
           const errors = res?.data?.errors || [];
@@ -628,7 +745,7 @@ const QueryModeSwitcher = ({
                     const key = uuidv4();
                     setQuery(queryData.query);
                     if (onQueryChange) {
-                      onQueryChange({ query: queryData.query, queryKeys: [key] });
+                      onQueryChange({ query: queryData.query, queryKeys: [key], ...esIndexEcho(queryData) });
                     }
                     sendConversationIdAndLLMResponseToParent(result.conversationId, queryData.query);
                   }
@@ -644,7 +761,7 @@ const QueryModeSwitcher = ({
               const key = uuidv4();
               setQuery(queryData.query);
               if (onQueryChange) {
-                onQueryChange({ query: queryData.query, queryKeys: [key] });
+                onQueryChange({ query: queryData.query, queryKeys: [key], ...esIndexEcho(queryData) });
               }
               sendConversationIdAndLLMResponseToParent(data?.conversation_id ?? '', queryData.query);
             }
@@ -660,11 +777,14 @@ const QueryModeSwitcher = ({
             onAiLoadingChange(false);
           }
         });
-    } else if (logProvider == 'prometheus' || logProvider == 'chronosphere' || logProvider == 'victoria-metrics') {
+    } else if (isMetricsTab || logProvider === 'prometheus' || logProvider === 'chronosphere' || logProvider === 'victoria-metrics') {
       apiAskNudgebee
-        .askNudgebeeAiGeneratePrometheusQuery({
+        .askNudgebeeAiGenerateMetricsQuery({
           account_id: accountId,
           query: generateQuestionText,
+          // Backend resolves the query language from the account's metrics provider;
+          // the index only scopes it when that provider is Elasticsearch.
+          ...(logProvider === 'ES' && selectedEsIndex ? { index: selectedEsIndex } : {}),
         })
         .then((res) => {
           const errors = res?.data?.errors || [];
@@ -676,7 +796,7 @@ const QueryModeSwitcher = ({
             }
             return;
           }
-          const data = res?.data?.data?.ai_generate_prometheus_query?.data;
+          const data = res?.data?.data?.ai_generate_metrics_query?.data;
           const sessionId = data?.session_id;
           if (sessionId) {
             startPolling(sessionId, (conv) => {
@@ -689,14 +809,10 @@ const QueryModeSwitcher = ({
                 if (result) {
                   const queryData = safeJSONParse(result.response);
                   if (queryData) {
-                    const queries = Object.keys(queryData);
-                    if (queries.length > 0) {
-                      const key = uuidv4();
-                      setQuery(queries[0]);
-                      if (onQueryChange) {
-                        onQueryChange({ query: queries[0], queryKeys: [key] });
-                      }
-                      sendConversationIdAndLLMResponseToParent(result.conversationId, queryData[queries[0]]);
+                    // A parsed response carrying no usable query would otherwise leave
+                    // the editor empty with no explanation once the spinner stops.
+                    if (!applyGeneratedMetricsQuery(queryData, result.conversationId)) {
+                      snackbar.error('Could not extract a query from the AI response. Try asking for a specific query.');
                     }
                   } else {
                     // Extract the first code block from the response (handles indented fences, inline code, and multi-query responses)
@@ -730,16 +846,8 @@ const QueryModeSwitcher = ({
           } else {
             const query = data?.response[0] ?? '{}';
             const queryData = safeJSONParse(query);
-            if (queryData) {
-              const queries = Object.keys(queryData);
-              if (queries.length > 0) {
-                const key = uuidv4();
-                setQuery(queries[0]);
-                if (onQueryChange) {
-                  onQueryChange({ query: queries[0], queryKeys: [key] });
-                }
-                sendConversationIdAndLLMResponseToParent(data?.conversation_id ?? '', queryData[queries[0]]);
-              }
+            if (queryData && !applyGeneratedMetricsQuery(queryData, data?.conversation_id ?? '')) {
+              snackbar.error('Could not extract a query from the AI response. Try asking for a specific query.');
             }
             setIsLoadingGenerateQuestionText(false);
             if (onAiLoadingChange) {
@@ -818,25 +926,7 @@ const QueryModeSwitcher = ({
                   }}
                 />
               </Box>
-              <Box sx={{ width: ds.space.mul(0, 130) }}>
-                <FilterDropdown
-                  label='Select an Index'
-                  value={selectedEsIndex || null}
-                  options={esIndexList ?? []}
-                  freeSolo
-                  // Same affordance as the Build tab's picker: freeSolo alone is
-                  // invisible, so the hint is what tells the user a wildcard
-                  // pattern outside the listed indices is accepted.
-                  searchPlaceholder='Search or type pattern (use * for wildcard)...'
-                  onSelect={(_event, value) => {
-                    setPrebuildQueryBlocks((prev) => prev.map((b, i) => (i === 0 ? { ...b, selectedMetric: value || '' } : b)));
-                    if (onQueryChange) {
-                      onQueryChange({ query: codeQueryRef.current || query, queryKeys: [''], index: value || '', queryType: esQueryType });
-                    }
-                  }}
-                  isOptionsLoading={isEsIndexLoading}
-                />
-              </Box>
+              {renderEsIndexPicker(() => codeQueryRef.current || query)}
             </Box>
           )}
           <CodeMirror
@@ -855,7 +945,7 @@ const QueryModeSwitcher = ({
             theme='dark'
             editable={true}
             aria-expanded={true}
-            extensions={getExtension()}
+            extensions={extensions}
             onChange={(e) => {
               codeQueryRef.current = e;
               setQuery(e);
@@ -874,6 +964,11 @@ const QueryModeSwitcher = ({
       if (!mounted) return null;
       return (
         <>
+          {logProvider === 'ES' && (
+            <Box sx={{ display: 'flex', gap: 'var(--ds-space-3)', flexWrap: 'wrap', mt: 'var(--ds-space-4)' }}>
+              {renderEsIndexPicker(() => query)}
+            </Box>
+          )}
           <Box
             display='flex'
             sx={{
@@ -988,7 +1083,7 @@ const QueryModeSwitcher = ({
                 theme='dark'
                 editable={true}
                 aria-expanded={true}
-                extensions={getExtension()}
+                extensions={extensions}
                 onChange={(e) => {
                   setQuery(e);
                   if (onQueryChange) {

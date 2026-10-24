@@ -25,9 +25,22 @@ export const DBMS_OPTIONS = [
   { label: 'Oracle', value: 'oracle', icon: ouOracle },
 ];
 
+// A ready-to-use sample value for a field, mirroring runbook-server's
+// types.PropertyExample. Rendered as a click-to-fill chip under the input.
+export interface PropertyExample {
+  label: string;
+  value: any;
+  note?: string;
+}
+
 export interface SchemaProperty {
   type: string;
   description?: string;
+  // Long-form markdown reference content, shown in an info-icon tooltip in the
+  // guidance row below the input (backend: types.Property.Help).
+  help?: string;
+  // Click-to-fill sample values shown in the same guidance row.
+  examples?: PropertyExample[];
   required?: boolean;
   default?: any;
   enum?: string[];
@@ -93,10 +106,89 @@ export const FIELD_PLACEHOLDERS: Record<string, string> = {
   resources: '{\n  "cpu_request": "100m",\n  "cpu_limit": "500m",\n  "memory_request": "128Mi",\n  "memory_limit": "512Mi"\n}',
 };
 
+// Placeholder text for a field's empty state: an explicit FIELD_PLACEHOLDERS
+// entry wins, otherwise the first string example doubles as one. That makes the
+// empty box self-documenting for any field that declares examples, without a
+// second place to keep sample values in sync.
+export const getExamplePlaceholder = (fieldName: string, fieldSchema: SchemaProperty): string => {
+  if (FIELD_PLACEHOLDERS[fieldName]) return FIELD_PLACEHOLDERS[fieldName];
+  const first = fieldSchema.examples?.[0]?.value;
+  return typeof first === 'string' ? first : '';
+};
+
+// Click-to-fill example values arrive as strings, because that is what a user
+// would type. For JSON-typed fields, store the parsed value so the field holds
+// the same shape typing it by hand would produce; anything that isn't JSON — a
+// `{{ Tasks[...].output }}` template, most of all — stays a string.
+export const parseJsonExample = (value: any): any => {
+  if (typeof value !== 'string') return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+};
+
 // Jinja (default engine) uses {{ }} for expressions and {% %} for statements;
 // Go text/template only uses {{ }}. A string matching either is a template
 // reference the backend resolves at runtime, not a user-entered literal.
 export const isTemplateString = (s: string): boolean => /\{\{|\{%/.test(s);
+
+const isPlainObject = (value: any): boolean => !!value && typeof value === 'object' && !Array.isArray(value);
+
+// Normalize what an object-typed field has *stored*: a blank string becomes {},
+// a string holding a JSON object becomes that object. Anything else is kept when
+// the field renders as raw JSON text — it is the JsonEditor's in-progress edit, and
+// rewriting it mid-keystroke destroyed what the user typed (validateTaskData already
+// flags it). Other editors need an object, so they keep the old fall back to {}.
+export const normalizeStoredObjectValue = (value: any, rendersRawJsonText: boolean): { changed: boolean; value: any } => {
+  if (typeof value !== 'string' || isTemplateString(value)) {
+    return { changed: false, value };
+  }
+  if (value.trim()) {
+    try {
+      const parsed = JSON.parse(value);
+      // Plain objects only: an array is not a valid value for an object-typed
+      // field, and rejecting primitives keeps this converging after one pass.
+      if (isPlainObject(parsed)) {
+        return { changed: true, value: parsed };
+      }
+    } catch {
+      // Falls through.
+    }
+    if (rendersRawJsonText) {
+      return { changed: false, value };
+    }
+  }
+  return { changed: true, value: {} };
+};
+
+// Value an object-typed field should render with. Key/value-style editors need a
+// real object, so a stored string is parsed (or dropped) for them. Editors that own
+// the user's raw text (JsonEditor) get the string untouched: a half-typed document
+// is not parseable, and coercing it would hand the editor a value it never emitted,
+// reseeding the box mid-keystroke. Callers pass rendersRawJsonText because the two
+// param forms render the same field type with different editors.
+export const resolveObjectFieldValue = (rawValue: any, rendersRawJsonText: boolean): any => {
+  if (typeof rawValue !== 'string' || rendersRawJsonText) {
+    return rawValue;
+  }
+  // Template strings pass through so the hybrid editors can flip to expression mode.
+  if (isTemplateString(rawValue)) {
+    return rawValue;
+  }
+  if (rawValue.trim()) {
+    try {
+      const parsed = JSON.parse(rawValue);
+      if (isPlainObject(parsed)) {
+        return parsed;
+      }
+    } catch {
+      // Falls through.
+    }
+  }
+  return {};
+};
 
 // Detect code language from field name or sub_type
 export const getCodeLanguage = (fieldName: string, subType?: string): 'bash' | 'javascript' | 'sql' | 'json' | 'jsonata' => {
@@ -162,6 +254,12 @@ export const resolveFieldType = (fieldName: string, fieldSchema: SchemaProperty,
   // Check sub_type from backend schema (e.g., "textarea" for prompt fields)
   if (fieldSchema.sub_type === 'textarea') {
     return 'textarea';
+  }
+
+  // A field declaring JSON gets the code editor, whatever it is called; the
+  // name-based rule below only catches fields called script/command/query.
+  if (fieldSchema.sub_type === 'json') {
+    return 'script';
   }
 
   // Check for nested schema objects

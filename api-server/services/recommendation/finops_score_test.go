@@ -2,7 +2,9 @@ package recommendation
 
 import (
 	"encoding/json"
+	"log/slog"
 	"math"
+	"nudgebee/services/security"
 	"testing"
 	"time"
 )
@@ -207,5 +209,66 @@ func TestGetNFSCategory(t *testing.T) {
 		if got := GetNFSCategory(c.category, c.ruleName); got != c.want {
 			t.Errorf("GetNFSCategory(%q, %q) = %q, want %q", c.category, c.ruleName, got, c.want)
 		}
+	}
+}
+
+func TestRecomputeFinOpsScores_SkipsWhenAlreadyInFlight(t *testing.T) {
+	finopsRecomputeMu.Lock()
+	defer finopsRecomputeMu.Unlock()
+
+	ctx := security.NewRequestContextForSuperAdmin(slog.Default(), nil, nil)
+	done := make(chan error, 1)
+	go func() { done <- recomputeFinOpsScores(ctx, recentRecomputeWindow) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("expected a skipped run to return nil, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("recompute blocked on the in-flight guard instead of skipping")
+	}
+}
+
+// The effort boost is keyed on rule_name exactly, so a key nothing produces
+// costs its rule the boost with no sign that it happened. Every key here must
+// be a name a producer actually writes.
+func TestAutoFixableRulesAreNamesProducersWrite(t *testing.T) {
+	want := map[string]bool{
+		"pod_right_sizing":     true,
+		"replica_right_sizing": true,
+		"pv_rightsize":         true,
+		"unused_pvc":           true,
+		"health_check":         true,
+	}
+
+	for name := range autoFixableRules {
+		if !want[name] {
+			t.Errorf("%q earns the auto-fix boost but is not a rule any producer writes", name)
+		}
+	}
+	for name := range want {
+		if !autoFixableRules[name] {
+			t.Errorf("%q is auto-remediable but earns no auto-fix boost", name)
+		}
+	}
+}
+
+// A rule that can be applied for the user is easier to act on than one that
+// cannot, and the score is meant to say so.
+func TestAutoFixableRuleScoresAboveAnEquivalentManualOne(t *testing.T) {
+	const savings = 150
+
+	fixable := ComputeFinOpsScore("RightSizing", "replica_right_sizing", sevPtr("Medium"), savings, createdLongAgo())
+	manual := ComputeFinOpsScore("RightSizing", "ri_purchase", sevPtr("Medium"), savings, createdLongAgo())
+
+	// Spelled out rather than read from autoFixEffortBoost: retuning the boost
+	// should land here as a failing test to look at, not pass unnoticed.
+	if fixable.Score != manual.Score+5 {
+		t.Errorf("auto-fixable rule scored %d, expected %d (%d plus the boost)",
+			fixable.Score, manual.Score+5, manual.Score)
+	}
+	if got := fixable.Breakdown["adjustments"].(map[string]any)["effort_boost"]; got != 5 {
+		t.Errorf("breakdown reports effort_boost %v, expected 5", got)
 	}
 }

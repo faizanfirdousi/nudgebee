@@ -19,6 +19,17 @@ type Config struct {
 		WriteTimeout time.Duration `mapstructure:"write_timeout"`
 	} `mapstructure:"http"`
 
+	Health struct {
+		// ConsumeFailureRestartAfter is how long a tenant may have no consumer,
+		// while the broker is reachable, before /healthz/live starts failing and
+		// Kubernetes restarts the pod.
+		//
+		// Set to 0 to disable. That is the escape hatch: a false positive here
+		// restarts every replica in a loop, so the check must be switchable off
+		// without a rollback.
+		ConsumeFailureRestartAfter time.Duration `mapstructure:"consume_failure_restart_after"`
+	} `mapstructure:"health"`
+
 	Postgres struct {
 		// DSN is loaded from COLLECTOR_DB_URL if set, otherwise from file
 		DSN             string        `mapstructure:"dsn"`
@@ -39,6 +50,14 @@ type Config struct {
 		PrefetchCount int           `mapstructure:"prefetch_count"`
 		RetryDelay    time.Duration `mapstructure:"retry_delay"`
 		MessageTTL    time.Duration `mapstructure:"message_ttl"`
+		// LLMCacheInvalidationExchange is the fanout exchange llm-server
+		// consumes to drop its per-account integration caches. The relay
+		// publishes {"account_ids":[...]} there after registering agent
+		// datasources or changing their labels. Same name and default as
+		// api-server / llm-server (rabbit_mq_llm_cache_invalidation_exchange).
+		// Empty disables publishing.
+		// Env: RABBIT_MQ_LLM_CACHE_INVALIDATION_EXCHANGE
+		LLMCacheInvalidationExchange string `mapstructure:"llm_cache_invalidation_exchange"`
 	} `mapstructure:"rabbitmq"`
 
 	Security struct {
@@ -144,6 +163,7 @@ func Load() (*Config, error) {
 	_ = v.BindEnv("rabbitmq.password", "RABBIT_MQ_PASSWORD")
 	_ = v.BindEnv("rabbitmq.url", "RABBITMQ_URL")
 	_ = v.BindEnv("rabbitmq.message_ttl", "RABBITMQ_MESSAGE_TTL")
+	_ = v.BindEnv("rabbitmq.llm_cache_invalidation_exchange", "RABBIT_MQ_LLM_CACHE_INVALIDATION_EXCHANGE")
 
 	//bind all otel env vars
 	_ = v.BindEnv("otel.exporter_otlp_endpoint", "OTEL_EXPORTER_OTLP_ENDPOINT")
@@ -173,6 +193,9 @@ func Load() (*Config, error) {
 	v.SetDefault("security.secret_key", "")
 
 	v.SetDefault("http.port", 8080)
+	// Generous on purpose: well past any transient reconnect, so only a
+	// genuinely stuck session trips it.
+	v.SetDefault("health.consume_failure_restart_after", "5m")
 	v.SetDefault("http.read_timeout", "180s")
 	v.SetDefault("http.write_timeout", "180s")
 
@@ -181,7 +204,11 @@ func Load() (*Config, error) {
 	v.SetDefault("postgres.conn_max_lifetime", "5m")
 	v.SetDefault("postgres.driver", "postgres")
 
-	v.SetDefault("rabbitmq.prefetch_count", 1)
+	// Per-agent-session prefetch: how many of a tenant's requests may be
+	// in flight to its agent at once. 10 was hardcoded at the consumer and
+	// production tenants pinned at it, after which the broker stopped
+	// delivering and queued requests aged out against the 1m queue TTL.
+	v.SetDefault("rabbitmq.prefetch_count", 32)
 	v.SetDefault("rabbitmq.retry_delay", "1s")
 	v.SetDefault("rabbitmq.exchange_name", "nudgebee-relay")
 	v.SetDefault("rabbitmq.request_queue", "nudgebee_relay_request")
@@ -192,6 +219,7 @@ func Load() (*Config, error) {
 	v.SetDefault("rabbitmq.url", "")
 	v.SetDefault("rabbitmq.exchange_name", "nudgebee-relay")
 	v.SetDefault("rabbitmq.message_ttl", "1m")
+	v.SetDefault("rabbitmq.llm_cache_invalidation_exchange", "llm_cache_invalidation")
 
 	v.SetDefault("signing.private_key", "")
 	v.SetDefault("signing.key_id", "default")

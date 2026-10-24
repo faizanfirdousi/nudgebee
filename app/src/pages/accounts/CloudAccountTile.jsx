@@ -1,11 +1,13 @@
-import { Box, Grid, Typography, Stack, Alert } from '@mui/material';
+import { Box, Grid, Typography, Stack } from '@mui/material';
+import { Banner } from '@ui/Banner';
 import { Input } from '@ui/Input';
-import { ContentCopy, CheckCircleOutline, ErrorOutline } from '@mui/icons-material';
-import React, { useEffect, useState, useCallback, useMemo } from 'react';
+import { getBrandTitle } from '@hooks/useTenantBranding';
+import { ContentCopy } from '@mui/icons-material';
+import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import apiAccount from '@api1/account';
 import apiIntegrations from '@api1/integrations';
 import { Modal } from '@ui/Modal';
-import { isK8sAccountNameValid, safeJSONParse, toKebabCase } from 'src/utils/common';
+import { isK8sAccountNameValid, parseAwsRegions, safeJSONParse, toKebabCase } from 'src/utils/common';
 import CloudProviderIcon from '@shared/icons/CloudIcon';
 import CustomTable from '@shared/tables/CustomTable';
 import Datetime from '@shared/format/Datetime';
@@ -26,7 +28,12 @@ import apiUser from '@api1/user';
 import MarkDowns from '@shared/viewers/MarkDowns';
 import CfUpdateModal from './CfUpdateModal';
 import EnableGcpWebhookModal from './EnableGcpWebhookModal';
-import AccountEnvToggle, { ACCOUNT_ENV_PROD, DEFAULT_ACCOUNT_ENV } from '@shared/forms/AccountEnvToggle';
+import AccountEnvToggle, { DEFAULT_ACCOUNT_ENV } from '@shared/forms/AccountEnvToggle';
+import AccountEnvText from '@shared/format/AccountEnvText';
+import { getIntegrationDescription } from '@lib/integrationDescriptions';
+import { EmptyState } from '@ui/EmptyState';
+import AddIcon from '@mui/icons-material/Add';
+import LinkOutlinedIcon from '@mui/icons-material/LinkOutlined';
 
 const EVENTGRID_INSTRUCTIONS = `### Enable Real-Time Resource Events
   ### Step 1. Copy the values below
@@ -60,6 +67,9 @@ const TABLE_HEADERS = [
   { name: '', width: '5%' },
 ];
 
+// The status each page opens on; relaxed to "all" once if it returns nothing.
+const DEFAULT_STATUS_FILTER = 'active';
+
 const CloudAccountTile = ({ cloudProvider, title, AddAccountModalComponent, addAccountButtonText, AddOrgModalComponent, addOrgButtonText }) => {
   const [loading, setLoading] = useState(false);
   const [rawAccounts, setRawAccounts] = useState([]);
@@ -81,7 +91,14 @@ const CloudAccountTile = ({ cloudProvider, title, AddAccountModalComponent, addA
   const [totalCount, setTotalCount] = useState(0);
   const [nameInput, setNameInput] = useState('');
   const [selectedNameFilter, setSelectedNameFilter] = useState('');
-  const [selectedStatusFilter, setSelectedStatusFilter] = useState('active');
+  const [selectedStatusFilter, setSelectedStatusFilter] = useState(DEFAULT_STATUS_FILTER);
+  // Which provider the rows in state belong to. Tagged rather than a plain "have I
+  // loaded" boolean because this component is reused across providers without
+  // remounting — the account-form switch returns the same element type — so an
+  // untagged flag stays true through the swap and paints the previous provider's
+  // emptiness under the new provider's name.
+  const [loadedFor, setLoadedFor] = useState(null);
+  const hasLoaded = loadedFor === cloudProvider;
   const [refreshKey, setRefreshKey] = useState(0);
   const [eventGridModalOpen, setEventGridModalOpen] = useState(false);
   const [eventGridLoading, setEventGridLoading] = useState(false);
@@ -91,11 +108,17 @@ const CloudAccountTile = ({ cloudProvider, title, AddAccountModalComponent, addA
   const [eventBridgeData, setEventBridgeData] = useState(null);
   const [billingModalOpen, setBillingModalOpen] = useState(false);
   const [billingProjectId, setBillingProjectId] = useState('');
+  const [curReportName, setCurReportName] = useState('');
+  const [curS3Bucket, setCurS3Bucket] = useState('');
   const [billingDatasetName, setBillingDatasetName] = useState('');
   const [billingTableName, setBillingTableName] = useState('');
   const [billingLoading, setBillingLoading] = useState(false);
   const [billingValidationResult, setBillingValidationResult] = useState(null);
   const [isValidatingBilling, setIsValidatingBilling] = useState(false);
+  const [regionsModalOpen, setRegionsModalOpen] = useState(false);
+  const [regionsInput, setRegionsInput] = useState('');
+  const [savedRegions, setSavedRegions] = useState('');
+  const [regionsLoading, setRegionsLoading] = useState(false);
   const [cfUpdateModalOpen, setCfUpdateModalOpen] = useState(false);
   const [cfUpdateAccountId, setCfUpdateAccountId] = useState(null);
   const [webhookModalOpen, setWebhookModalOpen] = useState(false);
@@ -154,6 +177,31 @@ const CloudAccountTile = ({ cloudProvider, title, AddAccountModalComponent, addA
     setCurrentPage(page - 1);
     setRecordsPerPage(limit);
   };
+
+  // Swap the filter bar + table for a "connect your first account" prompt only when the
+  // list is empty with the filters untouched. A zero-row result the user filtered their
+  // way into keeps the toolbar, otherwise clearing that filter is unreachable. Known
+  // edge: status defaults to Active, so a tenant whose only accounts are disabled sees
+  // this prompt too.
+  const showConnectPrompt = hasLoaded && !loading && totalCount === 0 && !selectedNameFilter && !selectedStatusFilter;
+
+  // When the default status filter hides everything, fall back to "all statuses" once
+  // before declaring the screen empty. Without this a tenant whose only accounts are
+  // disabled sees the connect prompt — with no filter left on screen to clear, those
+  // accounts would be unreachable from the UI.
+  // Tagged for the same reason as `loadedFor`: a plain boolean would stay true
+  // after a swap and skip this fallback for every later provider in the session.
+  const relaxedFor = useRef(null);
+  useEffect(() => {
+    if (!hasLoaded || loading || relaxedFor.current === cloudProvider) {
+      return;
+    }
+    if (totalCount === 0 && !selectedNameFilter && selectedStatusFilter) {
+      relaxedFor.current = cloudProvider;
+      setSelectedStatusFilter('');
+      setCurrentPage(0);
+    }
+  }, [hasLoaded, loading, totalCount, selectedNameFilter, selectedStatusFilter, cloudProvider]);
 
   const statusOptions = [
     { label: 'Active', value: 'active' },
@@ -276,6 +324,14 @@ const CloudAccountTile = ({ cloudProvider, title, AddAccountModalComponent, addA
     }
     if (cloudProvider === 'AWS') {
       items.push({
+        label: 'Edit Billing Config',
+        id: 'billing-config',
+      });
+      items.push({
+        label: 'Edit AWS Regions',
+        id: 'aws-regions',
+      });
+      items.push({
         label: 'Update Permissions',
         id: 'update-permissions',
       });
@@ -305,12 +361,24 @@ const CloudAccountTile = ({ cloudProvider, title, AddAccountModalComponent, addA
           accountData = {};
         }
       }
-      const billing = accountData.billing_data || {};
-      setBillingProjectId(billing.billing_project_id || '');
-      setBillingDatasetName(billing.dataset_name || '');
-      setBillingTableName(billing.table_name || '');
+      if (cloudProvider === 'AWS') {
+        setCurReportName(accountData.cost_report_name || '');
+        setCurS3Bucket(accountData.cost_report_s3_bucket || '');
+      } else {
+        const billing = accountData.billing_data || {};
+        setBillingProjectId(billing.billing_project_id || '');
+        setBillingDatasetName(billing.dataset_name || '');
+        setBillingTableName(billing.table_name || '');
+      }
       setBillingValidationResult(null);
       setBillingModalOpen(true);
+    } else if (menuItem.id === 'aws-regions') {
+      setSelectedAccount(data);
+      const accountData = (typeof data.data === 'string' ? safeJSONParse(data.data) : data.data) || {};
+      const current = Array.isArray(accountData.regions) ? accountData.regions.join(', ') : '';
+      setSavedRegions(current);
+      setRegionsInput(current);
+      setRegionsModalOpen(true);
     } else if (menuItem.id === 'real-time-alerts') {
       setWebhookModalAccount(data);
       setWebhookModalOpen(true);
@@ -331,7 +399,7 @@ const CloudAccountTile = ({ cloudProvider, title, AddAccountModalComponent, addA
         { component: <Text value={item?.created_by_name || '-'} /> },
         { component: <Text value={item.account_number || '-'} /> },
         { component: <Label text={item.status || '-'} /> },
-        { component: <Text value={item.account_env === ACCOUNT_ENV_PROD ? 'Production' : 'Non-production'} /> },
+        { component: <AccountEnvText accountName={item.account_name} accountEnv={item.account_env} /> },
         { component: realtimeEventAccountIds.has(item.id) ? <Label text='active' /> : <Text value='-' /> },
         { component: <ThreeDotsMenu sx={{ ...action.primary }} menuItems={getMenuItems(item)} data={item} onMenuClick={onMenuClick} /> },
       ]),
@@ -424,11 +492,12 @@ const CloudAccountTile = ({ cloudProvider, title, AddAccountModalComponent, addA
       })
       .catch((error) => {
         snackbar.error(`Failed to fetch ${cloudProvider} accounts.`);
-        console.error(`Failed to fetch ${cloudProvider} accounts:`, error);
+        console.error('Failed to fetch cloud accounts', { cloudProvider, error });
         setRawAccounts([]);
       })
       .finally(() => {
         setLoading(false);
+        setLoadedFor(cloudProvider);
       });
   };
 
@@ -479,6 +548,44 @@ const CloudAccountTile = ({ cloudProvider, title, AddAccountModalComponent, addA
       })
       .finally(() => {
         setRenameLoading(false);
+      });
+  };
+
+  const closeRegionsModal = () => {
+    setRegionsModalOpen(false);
+    setSelectedAccount(null);
+    setRegionsInput('');
+    setSavedRegions('');
+    setRegionsLoading(false);
+  };
+
+  const handleRegionsSubmit = () => {
+    if (!selectedAccount) {
+      return;
+    }
+
+    setRegionsLoading(true);
+    // An empty box is a deliberate value, not a missing one: it clears the
+    // allowlist and puts the account back on auto-discovery, so it has to
+    // reach the server as [] rather than being skipped.
+    apiAccount
+      .updateAccount({ id: selectedAccount.id }, { regions: parseAwsRegions(regionsInput) })
+      .then((res) => {
+        if (res?.data?.errors?.length > 0) {
+          const error = res?.data?.errors?.[0]?.message || 'Failed to Update AWS Regions';
+          snackbar.error(error);
+        } else {
+          snackbar.success('AWS Regions updated successfully');
+          closeRegionsModal();
+          listCloudAccounts();
+        }
+      })
+      .catch((error) => {
+        console.error('Failed to update AWS regions:', error);
+        snackbar.error('Failed to Update AWS Regions');
+      })
+      .finally(() => {
+        setRegionsLoading(false);
       });
   };
 
@@ -549,9 +656,109 @@ const CloudAccountTile = ({ cloudProvider, title, AddAccountModalComponent, addA
     setBillingProjectId('');
     setBillingDatasetName('');
     setBillingTableName('');
+    setCurReportName('');
+    setCurS3Bucket('');
     setBillingLoading(false);
     setBillingValidationResult(null);
     setIsValidatingBilling(false);
+  };
+
+  const isAwsBilling = cloudProvider === 'AWS';
+  // Both providers need enough to identify the billing source before the
+  // Validate/Save buttons mean anything.
+  const billingFormComplete = isAwsBilling ? !!curReportName : !!billingDatasetName && !!billingTableName;
+
+  // Live CUR check for an already-onboarded AWS account. Same shape as the GCP
+  // check below: the stored credentials never came back to the client, so we
+  // send account_id and let the backend resolve (and decrypt) them. The report
+  // name/bucket narrow discovery to the report the user actually named rather
+  // than whichever one AWS returns first.
+  const handleValidateAwsCurConfig = async () => {
+    if (!selectedAccount || !curReportName) {
+      return;
+    }
+    setIsValidatingBilling(true);
+    setBillingValidationResult(null);
+    try {
+      const result = await apiAccount.validateCloudCredentials({
+        cloud_provider: 'AWS',
+        account_id: selectedAccount.id,
+        cur_report_name: curReportName,
+        cur_s3_bucket: curS3Bucket || undefined,
+      });
+      const curDetail = result?.permissionDetails?.find((d) => d.permission === 'Cost & Usage Report (CUR) Discovery');
+      const s3Detail = result?.permissionDetails?.find((d) => d.permission === 'CUR S3 Bucket Access');
+      if (curDetail && !curDetail.hasAccess) {
+        setBillingValidationResult({ success: false, message: curDetail.errorDetail || 'Cost & Usage Report not found.' });
+      } else if (s3Detail && !s3Detail.hasAccess) {
+        setBillingValidationResult({ success: false, message: s3Detail.errorDetail || 'Unable to read the CUR S3 bucket.' });
+      } else if (!result?.success) {
+        setBillingValidationResult({ success: false, message: result?.errorMessage || 'Failed to validate the Cost & Usage Report.' });
+      } else {
+        setBillingValidationResult({ success: true, message: 'Cost & Usage Report found and readable.' });
+      }
+    } catch {
+      setBillingValidationResult({ success: false, message: 'Failed to validate the Cost & Usage Report.' });
+    } finally {
+      setIsValidatingBilling(false);
+    }
+  };
+
+  // Store only the report name and bucket. resolveCostReportDefinition treats a
+  // missing cur_source as "look it up", so the collector re-derives region,
+  // prefix, compression, versioning and time unit from DescribeReportDefinitions
+  // on each sync. Writing cur_source here would make it trust these values and
+  // skip that lookup, which then needs every field and breaks on a stale prefix.
+  const handleAwsCurSubmit = () => {
+    if (!selectedAccount || !curReportName) {
+      return;
+    }
+    setBillingLoading(true);
+    let existingData = selectedAccount.data || {};
+    if (typeof existingData === 'string') {
+      try {
+        existingData = JSON.parse(existingData);
+      } catch {
+        existingData = {};
+      }
+    }
+    // updateAccount replaces `data` wholesale, so the spread is load-bearing:
+    // without it this write would drop CF stack info and agent config.
+    const updatedData = {
+      ...existingData,
+      cost_report_name: curReportName,
+      cost_report_s3_bucket: curS3Bucket || '',
+    };
+    // Drop cur_source and everything derived from the previous report. A
+    // CloudFormation-onboarded account carries cur_source=auto_callback, which
+    // makes the collector trust the stored prefix/region and skip the lookup —
+    // pairing the newly named report with the old report's S3 path. Removing
+    // these forces DescribeReportDefinitions to re-derive them on the next sync.
+    delete updatedData.cur_source;
+    delete updatedData.cost_report_s3_prefix;
+    delete updatedData.cost_report_s3_region;
+    delete updatedData.cost_report_compression;
+    delete updatedData.cost_report_versioning;
+    delete updatedData.cost_report_time_unit;
+    delete updatedData.cost_report_format;
+    apiAccount
+      .updateAccount({ id: selectedAccount.id }, { data: updatedData })
+      .then((res) => {
+        if (res?.data?.errors?.length > 0) {
+          snackbar.error('Failed to update billing config.');
+        } else {
+          snackbar.success('Billing config updated successfully.');
+          closeBillingModal();
+          listCloudAccounts();
+        }
+      })
+      .catch((error) => {
+        console.error('Failed to update billing config:', error);
+        snackbar.error('Failed to update billing config.');
+      })
+      .finally(() => {
+        setBillingLoading(false);
+      });
   };
 
   // Live BigQuery access check for an already-onboarded account. The service
@@ -701,10 +908,50 @@ const CloudAccountTile = ({ cloudProvider, title, AddAccountModalComponent, addA
         </Box>
       </Modal>
       <Modal
+        width='sm'
+        open={regionsModalOpen}
+        handleClose={regionsLoading ? () => {} : closeRegionsModal}
+        title='Edit AWS Regions'
+        loader={regionsLoading}
+        actionButtons={
+          <>
+            <DsButton id='aws-regions-cancel-btn' tone='secondary' size='md' onClick={closeRegionsModal} disabled={regionsLoading}>
+              Cancel
+            </DsButton>
+            <DsButton
+              id='aws-regions-save-btn'
+              tone='primary'
+              size='md'
+              loading={regionsLoading}
+              disabled={regionsLoading || parseAwsRegions(regionsInput).join(', ') === parseAwsRegions(savedRegions).join(', ')}
+              onClick={handleRegionsSubmit}
+            >
+              Save
+            </DsButton>
+          </>
+        }
+      >
+        <Box sx={{ px: ds.space[4], py: ds.space[2] }}>
+          <Input
+            value={regionsInput}
+            size='sm'
+            id='edit-aws-regions'
+            label='AWS Regions'
+            placeholder='ap-southeast-2, us-east-1'
+            onChange={setRegionsInput}
+            disabled={regionsLoading}
+            help='Leave blank to discover regions automatically. Set this only if the IAM role is restricted to specific regions — an unlisted region is not monitored, and resources already found there are marked deleted.'
+          />
+          <Box sx={{ mt: ds.space[3] }}>
+            <Banner tone='info' message='The new list applies on the next sync of this account. No reconnection is needed.' />
+          </Box>
+        </Box>
+      </Modal>
+      <Modal
         handleClose={envLoading ? () => {} : closeEnvModal}
         open={envModalOpen}
         title={
-          <Typography component='h2' variant='h6' fontWeight={600}>
+          <Typography component='h2' variant='h6' fontWeight={ds.weight.semibold}>
             Change Environment
           </Typography>
         }
@@ -729,7 +976,9 @@ const CloudAccountTile = ({ cloudProvider, title, AddAccountModalComponent, addA
       >
         <Box sx={{ px: ds.space[4], py: ds.space[2] }}>
           <Typography variant='body2' sx={{ mb: ds.space[4], color: ds.gray[400] }}>
-            {`Set the environment type for "${selectedAccount?.account_name}". This determines how NudgeBee prioritises its alerts, recommendations and incidents.`}
+            {`Set the environment type for "${
+              selectedAccount?.account_name
+            }". This determines how ${getBrandTitle()} prioritises its alerts, recommendations and incidents.`}
           </Typography>
           <AccountEnvToggle id='cloud-account-env' value={newAccountEnv} onChange={setNewAccountEnv} disabled={envLoading} />
         </Box>
@@ -738,7 +987,7 @@ const CloudAccountTile = ({ cloudProvider, title, AddAccountModalComponent, addA
         handleClose={isStatusUpdating ? () => {} : () => setUpdateAccountStatus({})}
         open={updateAccountStatus && Object.keys(updateAccountStatus).length > 0}
         title={
-          <Typography component='h2' variant='h6' fontWeight={600}>
+          <Typography component='h2' variant='h6' fontWeight={ds.weight.semibold}>
             {updateAccountStatus.status == 'active' ? 'Enable' : 'Disable'} {cloudProvider} Account
           </Typography>
         }
@@ -854,56 +1103,86 @@ const CloudAccountTile = ({ cloudProvider, title, AddAccountModalComponent, addA
         loader={billingLoading || isValidatingBilling}
       >
         <Grid container spacing={ds.space[4]} p={ds.space[4]}>
-          <Grid item xs={12}>
-            <Input
-              value={billingProjectId}
-              size='sm'
-              id='billing-project-id'
-              label='Billing Project ID'
-              onChange={(value) => {
-                setBillingProjectId(value);
-                setBillingValidationResult(null);
-              }}
-              help='The GCP project containing the BigQuery billing export. Leave empty if same as service account project.'
-            />
-          </Grid>
-          <Grid item xs={12}>
-            <Input
-              value={billingDatasetName}
-              size='sm'
-              id='billing-dataset-name'
-              label='BigQuery Dataset Name'
-              required
-              onChange={(value) => {
-                setBillingDatasetName(value);
-                setBillingValidationResult(null);
-              }}
-              placeholder='e.g., billing_export'
-            />
-          </Grid>
-          <Grid item xs={12}>
-            <Input
-              value={billingTableName}
-              size='sm'
-              id='billing-table-name'
-              label='BigQuery Table Name'
-              required
-              onChange={(value) => {
-                setBillingTableName(value);
-                setBillingValidationResult(null);
-              }}
-              placeholder='e.g., gcp_billing_export_v1_XXXXX'
-            />
-          </Grid>
+          {isAwsBilling ? (
+            <>
+              <Grid item xs={12}>
+                <Input
+                  value={curReportName}
+                  size='sm'
+                  id='cur-report-name'
+                  label='CUR Report Name'
+                  required
+                  onChange={(value) => {
+                    setCurReportName(value);
+                    setBillingValidationResult(null);
+                  }}
+                  placeholder='e.g., nudgebeeReport'
+                  help='Name of a Cost & Usage Report with Daily granularity and text/csv format. Data Exports / CUR 2.0 (Parquet) is not supported.'
+                />
+              </Grid>
+              <Grid item xs={12}>
+                <Input
+                  value={curS3Bucket}
+                  size='sm'
+                  id='cur-s3-bucket'
+                  label='CUR S3 Bucket'
+                  onChange={(value) => {
+                    setCurS3Bucket(value);
+                    setBillingValidationResult(null);
+                  }}
+                  placeholder='e.g., my-cur-bucket'
+                  help='Optional. Only needed to disambiguate when several reports share a name.'
+                />
+              </Grid>
+            </>
+          ) : (
+            <>
+              <Grid item xs={12}>
+                <Input
+                  value={billingProjectId}
+                  size='sm'
+                  id='billing-project-id'
+                  label='Billing Project ID'
+                  onChange={(value) => {
+                    setBillingProjectId(value);
+                    setBillingValidationResult(null);
+                  }}
+                  help='The GCP project containing the BigQuery billing export. Leave empty if same as service account project.'
+                />
+              </Grid>
+              <Grid item xs={12}>
+                <Input
+                  value={billingDatasetName}
+                  size='sm'
+                  id='billing-dataset-name'
+                  label='BigQuery Dataset Name'
+                  required
+                  onChange={(value) => {
+                    setBillingDatasetName(value);
+                    setBillingValidationResult(null);
+                  }}
+                  placeholder='e.g., billing_export'
+                />
+              </Grid>
+              <Grid item xs={12}>
+                <Input
+                  value={billingTableName}
+                  size='sm'
+                  id='billing-table-name'
+                  label='BigQuery Table Name'
+                  required
+                  onChange={(value) => {
+                    setBillingTableName(value);
+                    setBillingValidationResult(null);
+                  }}
+                  placeholder='e.g., gcp_billing_export_v1_XXXXX'
+                />
+              </Grid>
+            </>
+          )}
           {billingValidationResult && (
             <Grid item xs={12}>
-              <Alert
-                severity={billingValidationResult.success ? 'success' : 'error'}
-                icon={billingValidationResult.success ? <CheckCircleOutline sx={{ fontSize: 18 }} /> : <ErrorOutline sx={{ fontSize: 18 }} />}
-                sx={{ '& .MuiAlert-message': { fontSize: ds.text.body } }}
-              >
-                {billingValidationResult.message}
-              </Alert>
+              <Banner tone={billingValidationResult.success ? 'success' : 'critical'} message={billingValidationResult.message} />
             </Grid>
           )}
         </Grid>
@@ -925,18 +1204,19 @@ const CloudAccountTile = ({ cloudProvider, title, AddAccountModalComponent, addA
             id='validate-billing-config-btn'
             tone='secondary'
             size='md'
-            disabled={billingLoading || isValidatingBilling || !billingDatasetName || !billingTableName}
+            disabled={billingLoading || isValidatingBilling || !billingFormComplete}
             loading={isValidatingBilling}
-            onClick={handleValidateBillingConfig}
+            onClick={isAwsBilling ? handleValidateAwsCurConfig : handleValidateBillingConfig}
           >
             Validate
           </DsButton>
           <DsButton
+            id='save-billing-config-btn'
             tone='primary'
             size='md'
-            disabled={billingLoading || isValidatingBilling || !billingDatasetName || !billingTableName || !billingValidationResult?.success}
+            disabled={billingLoading || isValidatingBilling || !billingFormComplete || !billingValidationResult?.success}
             loading={billingLoading}
-            onClick={handleBillingSubmit}
+            onClick={isAwsBilling ? handleAwsCurSubmit : handleBillingSubmit}
           >
             Save
           </DsButton>
@@ -1025,15 +1305,10 @@ const CloudAccountTile = ({ cloudProvider, title, AddAccountModalComponent, addA
         />
       )}
       <ListingLayout id={`${cloudProvider?.toLowerCase()}-integrations`}>
-        <ListingLayout.Toolbar
-          title={
-            <Stack direction='row' alignItems='center' spacing={1}>
-              <Typography color={ds.gray[700]} fontSize={ds.text.title} fontWeight={600}>
-                {title}
-              </Typography>
-              <CloudProviderIcon cloud_provider={cloudProvider} />
-            </Stack>
-          }
+        <ListingLayout.Header
+          icon={<CloudProviderIcon cloud_provider={cloudProvider} width={ds.space[5]} height={ds.space[5]} />}
+          title={title}
+          description={getIntegrationDescription(cloudProvider)}
           actions={
             canManage('integrations', 'Write') ? (
               <Stack direction='row' spacing={1}>
@@ -1042,67 +1317,101 @@ const CloudAccountTile = ({ cloudProvider, title, AddAccountModalComponent, addA
                     id={`${toKebabCase(addOrgButtonText)}-btn`}
                     tone='primary'
                     size='md'
+                    icon={<AddIcon sx={{ fontSize: 18 }} />}
                     onClick={() => setOpenOrgModal(true)}
                     aria-label={addOrgButtonText}
                   >
                     {addOrgButtonText}
                   </DsButton>
                 )}
-                <DsButton
-                  id={`${toKebabCase(addAccountButtonText)}-btn`}
-                  tone='primary'
-                  size='md'
-                  onClick={() => setOpenAddModal(true)}
-                  aria-label={addAccountButtonText}
-                >
-                  {addAccountButtonText}
-                </DsButton>
+                {hasLoaded && totalCount > 0 && (
+                  <DsButton
+                    id={`${toKebabCase(addAccountButtonText)}-btn`}
+                    tone='primary'
+                    size='md'
+                    icon={<AddIcon sx={{ fontSize: 18 }} />}
+                    onClick={() => setOpenAddModal(true)}
+                    aria-label={addAccountButtonText}
+                  >
+                    {addAccountButtonText}
+                  </DsButton>
+                )}
               </Stack>
             ) : undefined
           }
-        >
-          <FilterDropdown
-            id={`${cloudProvider?.toLowerCase()}-status-filter`}
-            label='Status'
-            options={statusOptions}
-            value={statusOptions.find((o) => o.value === selectedStatusFilter) ?? null}
-            onSelect={(_e, item) => handleStatusFilterChange({ target: { value: item?.value || '' } })}
-          />
-          <SearchInput
-            id={`${cloudProvider?.toLowerCase()}-name-search`}
-            value={nameInput}
-            onChange={(next) => {
-              setNameInput((prev) => {
-                if (prev.trim() !== '' && next.trim() === '') {
+        />
+        {showConnectPrompt ? (
+          <ListingLayout.Body padding={ds.space[5]}>
+            <EmptyState
+              id={`${cloudProvider?.toLowerCase()}-no-accounts`}
+              icon={<LinkOutlinedIcon sx={{ fontSize: 20 }} />}
+              title={`No ${title} accounts connected`}
+              description={getIntegrationDescription(cloudProvider)}
+              action={
+                canManage('integrations', 'Write')
+                  ? {
+                      id: `${toKebabCase(addAccountButtonText)}-btn`,
+                      label: addAccountButtonText,
+                      onClick: () => setOpenAddModal(true),
+                      icon: <AddIcon sx={{ fontSize: 16 }} />,
+                    }
+                  : undefined
+              }
+            />
+          </ListingLayout.Body>
+        ) : (
+          <>
+            <ListingLayout.Toolbar
+              actions={
+                <Typography sx={{ fontSize: ds.text.small, color: ds.gray[500], whiteSpace: 'nowrap' }}>
+                  {totalCount} {totalCount === 1 ? 'account' : 'accounts'}
+                </Typography>
+              }
+            >
+              <FilterDropdown
+                id={`${cloudProvider?.toLowerCase()}-status-filter`}
+                label='Status'
+                options={statusOptions}
+                value={statusOptions.find((o) => o.value === selectedStatusFilter) ?? null}
+                onSelect={(_e, item) => handleStatusFilterChange({ target: { value: item?.value || '' } })}
+              />
+              <SearchInput
+                id={`${cloudProvider?.toLowerCase()}-name-search`}
+                value={nameInput}
+                onChange={(next) => {
+                  setNameInput((prev) => {
+                    if (prev.trim() !== '' && next.trim() === '') {
+                      setSelectedNameFilter('');
+                      setCurrentPage(0);
+                    }
+                    return next;
+                  });
+                }}
+                onEnterPress={() => {
+                  setSelectedNameFilter(nameInput);
+                  setCurrentPage(0);
+                }}
+                onClear={() => {
+                  setNameInput('');
                   setSelectedNameFilter('');
                   setCurrentPage(0);
-                }
-                return next;
-              });
-            }}
-            onEnterPress={() => {
-              setSelectedNameFilter(nameInput);
-              setCurrentPage(0);
-            }}
-            onClear={() => {
-              setNameInput('');
-              setSelectedNameFilter('');
-              setCurrentPage(0);
-            }}
-            label='Enter Name'
-          />
-        </ListingLayout.Toolbar>
-        <ListingLayout.Body>
-          <CustomTable
-            loading={loading}
-            tableData={tableData}
-            headers={TABLE_HEADERS}
-            totalRows={totalCount || tableData.length}
-            rowsPerPage={recordsPerPage}
-            pageNumber={currentPage + 1}
-            onPageChange={onPageChange}
-          />
-        </ListingLayout.Body>
+                }}
+                label='Enter Name'
+              />
+            </ListingLayout.Toolbar>
+            <ListingLayout.Body>
+              <CustomTable
+                loading={loading}
+                tableData={tableData}
+                headers={TABLE_HEADERS}
+                totalRows={totalCount || tableData.length}
+                rowsPerPage={recordsPerPage}
+                pageNumber={currentPage + 1}
+                onPageChange={onPageChange}
+              />
+            </ListingLayout.Body>
+          </>
+        )}
       </ListingLayout>
     </>
   );

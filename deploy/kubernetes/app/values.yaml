@@ -82,17 +82,17 @@ ingress:
 # -- Container resource [requests and limits](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/).
 # See the [API reference](https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#resources) for details.
 # @default -- No requests or limits.
+# Small-tier defaults. See docs/sizing-and-tiers.md.
+# Flat across every measured deployment: 173-268Mi average, 213-427Mi peak. CPU
+# tracks concurrent UI users, not estate size — 6-68m average, 186m peak — and the
+# chart shipped no CPU request, so the scheduler could not account for it at all.
 resources:
-  # We usually recommend not to specify default resources and to leave this as a conscious
-  # choice for the user. This also increases chances charts run on environments with little
-  # resources, such as Minikube. If you do want to specify resources, uncomment the following
-  # lines, adjust them as necessary, and remove the curly braces after 'resources:'.
   limits:
-    #cpu: 100m
+    cpu: 500m
     memory: 1Gi
   requests:
-    #cpu: 100m
-    memory: 384Mi
+    cpu: 50m
+    memory: 500Mi
 
 # -- Autoscaling by resources
 autoscaling:
@@ -152,7 +152,60 @@ secretName: 'nudgebee'
 statusNotice:
   configMapName: ''
 
+# -- Secret holding the deployment's admin address under the key `ADMIN_EMAIL`.
+# When set, the dummy-credentials login accepts only that address instead of
+# any email. Only that one key is read, so the Secret's other values (the
+# bundled agent's credential) never reach this pod. Optional: a missing Secret
+# or key leaves the login unpinned.
+adminEmailSecret: ''
+
+# -- Brand IMAGE files (logo, favicon, assistant icons) mounted at runtime.
+# Branding itself — title, which image URLs to use, colours, fonts — is
+# configured in the database, one row per hostname, which is an Enterprise
+# feature. The open-source build always renders the default brand.
+#
+# Brand assets are deliberately NOT baked into the image: only
+# `app/public/branding/default/` is committed (see `app/.gitignore`), so a
+# white-label deployment supplies its image files as ConfigMaps and this chart
+# mounts them. A row then points at them, e.g. `/branding/acme/logo.svg`.
+#
+# Create each ConfigMap out-of-band, one key per file:
+#
+#   kubectl create configmap <tenant>-branding \
+#     --from-file=./branding/<tenant> --dry-run=client -o yaml | kubectl apply -f -
+#
+# ConfigMap keys must match `[-._a-zA-Z0-9]+`, so **brand asset filenames
+# cannot contain spaces** — a kit with `Assistant icon.svg` in it cannot be
+# stored as a ConfigMap at all. Rename before creating the ConfigMap.
+#
+# Only the app container gets the mounts. The nginx sidecar aliases `/public/`
+# at its own copy of the static tree, but branding URLs are `/branding/<tenant>/…`,
+# which falls through to `location /` and is proxied to Next.js — so the app
+# container's filesystem is what serves them.
+branding:
+  # -- Mount the brand image files listed below.
+  enabled: false
+  # -- Image sets to mount. Each entry mounts `configMapName` at
+  # `/app/public/branding/<slug>/`, served at `/branding/<slug>/<file>`. `slug`
+  # also becomes part of a Kubernetes volume name, so keep it to a lowercase
+  # DNS label (`[a-z0-9-]`). `hostMap` and `defaultTenant` were removed; setting
+  # either fails the render.
+  # @default -- `[]`
+  tenants: []
+  #  - slug: acme
+  #    configMapName: acme-branding
+
 annotations: {}
+
+# -- Webhook paths the nginx sidecar proxies to sibling services. Turn a route
+# off when its chart is installed with `enabled: false` — nginx resolves
+# proxy_pass hostnames at startup, so a route to an absent Service crashes the
+# sidecar and the app with it.
+webhookRouting:
+  # -- Route /webhooks/slack/* to the notifications chart. Pair with `notifications.enabled`.
+  notifications: true
+  # -- Route /api/webhooks/* to the services-server chart.
+  servicesServer: true
 
 nginx:
   image:
@@ -162,4 +215,13 @@ nginx:
     repository: nginx
     tag: stable-alpine3.20-slim-nb1
     pullPolicy: IfNotPresent
-  resources: {}
+  # The sidecar was BestEffort (no requests, no limits), so it was first in line
+  # for eviction under node pressure — and it fronts the whole UI. Measured
+  # 10-21Mi memory and 1-27m CPU on every deployment. See docs/sizing-and-tiers.md.
+  resources:
+    limits:
+      cpu: 200m
+      memory: 250Mi
+    requests:
+      cpu: 25m
+      memory: 50Mi

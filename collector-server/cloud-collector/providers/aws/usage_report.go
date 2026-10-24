@@ -147,26 +147,80 @@ func convertToUsageReportItem(header []string, row []string) (providers.UsageRep
 	return item, nil
 }
 
-func readAwsBillingReport(data io.Reader, timeUnit string) ([]providers.UsageReportItem, error) {
-	items := []providers.UsageReportItem{}
+// scanAwsBillingReport parses a CUR CSV and calls fn for each line item, in
+// file order.
+func scanAwsBillingReport(data io.Reader, fn func(providers.UsageReportItem) error) error {
 	reader := csv.NewReader(data)
 	headers, err := reader.Read()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	for {
 		row, err := reader.Read()
 		if err == io.EOF {
-			break
+			return nil
 		}
 		if err != nil {
-			return nil, err
+			return err
 		}
 		item, err := convertToUsageReportItem(headers, row)
 		if err != nil {
-			return items, err
+			return err
 		}
+		if err := fn(item); err != nil {
+			return err
+		}
+	}
+}
+
+// streamAwsBillingReport hands one CUR file's line items to emit in batches of
+// providers.UsageReportBatchSize. A DAILY report is streamed row by row, so only
+// one batch is held. An HOURLY report has to be rolled up to days across the
+// whole file first, so it is parsed whole and then emitted in batches; onboarding
+// only accepts DAILY reports (curMatchesIngestionFilter), so that path is a
+// fallback, not a memory-bounded one.
+func streamAwsBillingReport(data io.Reader, timeUnit string, emit func([]providers.UsageReportItem) error) error {
+	if strings.ToUpper(timeUnit) == "HOURLY" {
+		items, err := readAwsBillingReport(data, timeUnit)
+		if err != nil {
+			return err
+		}
+		for start := 0; start < len(items); start += providers.UsageReportBatchSize {
+			if err := emit(items[start:min(start+providers.UsageReportBatchSize, len(items))]); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	batch := make([]providers.UsageReportItem, 0, providers.UsageReportBatchSize)
+	err := scanAwsBillingReport(data, func(item providers.UsageReportItem) error {
+		batch = append(batch, item)
+		if len(batch) < providers.UsageReportBatchSize {
+			return nil
+		}
+		if err := emit(batch); err != nil {
+			return err
+		}
+		batch = make([]providers.UsageReportItem, 0, providers.UsageReportBatchSize)
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if len(batch) > 0 {
+		return emit(batch)
+	}
+	return nil
+}
+
+func readAwsBillingReport(data io.Reader, timeUnit string) ([]providers.UsageReportItem, error) {
+	items := []providers.UsageReportItem{}
+	err := scanAwsBillingReport(data, func(item providers.UsageReportItem) error {
 		items = append(items, item)
+		return nil
+	})
+	if err != nil {
+		return items, err
 	}
 
 	if strings.ToUpper(timeUnit) == "HOURLY" {
@@ -205,7 +259,7 @@ func readAwsBillingReport(data io.Reader, timeUnit string) ([]providers.UsageRep
 		items = slices.Collect(maps.Values(aggregatedItemsMap))
 	}
 
-	return items, err
+	return items, nil
 }
 
 func getUsageBucketFromCostReport(ctx providers.CloudProviderContext, account providers.Account, reportName string, bucketName string) (string, string, string, string, string, string, string, error) {
@@ -246,7 +300,12 @@ func getUsageBucketFromCostReport(ctx providers.CloudProviderContext, account pr
 			break
 		}
 	}
-	return "", "", "", "GZIP", "", "", "", errors.New("unable to find cost report")
+	// Enumeration succeeded and simply matched nothing — the account has no
+	// usable CUR. That is a supported state (cost is optional at onboarding),
+	// not a fault, so flag it as such and let the caller ACK instead of
+	// dead-lettering. A DescribeReportDefinitions failure above is a real
+	// error and stays one.
+	return "", "", "", "GZIP", "", "", "", providers.ErrCostNotConfigured
 }
 
 func getS3KeysFromUsageReport(
@@ -399,20 +458,95 @@ func resolveCostReportDefinition(ctx providers.CloudProviderContext, account pro
 		}
 	}
 
+	// Capture whether the account carries stored CUR config BEFORE the call
+	// below, which overwrites reportName/s3Bucket with its own return values
+	// (empty on error) and would otherwise destroy the signal.
+	hadStoredCurConfig := reportName != "" || s3Bucket != ""
+
 	// Only call DescribeReportDefinitions if CUR details were not pre-populated
 	if region == "" {
 		s3Bucket, region, pathPrefix, compression, reportVersion, reportName, timeUnit, err = getUsageBucketFromCostReport(ctx, account, reportName, s3Bucket)
+		// An account onboarded without a CUR has no stored report name or
+		// bucket, and typically no cur:DescribeReportDefinitions permission
+		// either. For that account a permission denial is the steady state we
+		// now support, not a fault — so classify it as not-configured and let
+		// the queue ACK, rather than dead-lettering one message per day and
+		// failing every manual sync with a 500.
+		//
+		// An account that DOES have stored CUR config and then loses the
+		// permission is a genuine regression and stays a hard error.
+		if err != nil && !hadStoredCurConfig && isCurAuthorizationDenied(err) {
+			err = fmt.Errorf("%w: %w", providers.ErrCostNotConfigured, err)
+		}
 		if err != nil {
-			ctx.GetLogger().Error("unable to find cost report", "error", err)
+			// Not-configured is expected for accounts onboarded without a CUR
+			// and is logged at info; anything else is a genuine failure.
+			if errors.Is(err, providers.ErrCostNotConfigured) {
+				ctx.GetLogger().Info("aws: no cost report configured for account", "accountNumber", account.AccountNumber)
+			} else {
+				ctx.GetLogger().Error("unable to find cost report", "error", err)
+			}
 			return "", "", "", "", "", "", "", err
 		}
 	}
 
 	if s3Bucket == "" {
-		return "", "", "", "", "", "", "", errors.New("unable to find cost report")
+		return "", "", "", "", "", "", "", providers.ErrCostNotConfigured
 	}
 
 	return s3Bucket, region, pathPrefix, compression, reportVersion, reportName, timeUnit, nil
+}
+
+// isCurAuthorizationDenied reports whether err is AWS refusing the call on
+// authorization grounds specifically — the shape produced by a role without
+// cur:DescribeReportDefinitions.
+//
+// It borrows IsAWSPermissionError's typed inspection (errors.As over
+// smithy.APIError) rather than matching strings, but deliberately narrows the
+// result to the two access-denied codes. That helper also treats
+// ExpiredTokenException, InvalidClientTokenId and AuthFailure as permission
+// errors; those are broken credentials, not an account without cost reporting,
+// and classifying them as not-configured would silently swallow a real
+// credential failure behind an empty cost page.
+// classifyCurReadError maps AWS refusing to read the CUR's S3 objects onto
+// ErrCostNotConfigured, which the ETL treats as a supported steady state rather
+// than a fault.
+//
+// Onboarding already accepts an account whose CUR S3 access is missing: the
+// validator reports "CUR S3 Bucket Access" under MissingPermissions and still
+// returns Success=true. Without this, the runtime disagreed with that decision —
+// the spend sync returned a hard error, so /v1/cloud/store_usage answered 500
+// ("Sync now" failed), and agentStatusForUsageSync marked the WHOLE agent
+// disconnected, putting a red banner over a feature table whose every other row
+// read Connected. That is precisely the outcome that function's comment exists to
+// prevent, reached by a different route.
+//
+// A denial is deliberately treated the same whether or not CUR config is stored.
+// The stored-config case is not necessarily a regression: onboarding
+// auto-discovers a report via cur:DescribeReportDefinitions, so a role that may
+// list reports but not read the bucket — an explicit s3:GetObject Deny, say —
+// stores config it was never able to use. Either way there is nothing the system
+// can do differently, and the reason is not lost: it is wrapped, so it still
+// reaches the Spends error column, and the permission audit records it.
+//
+// A missing object is already benign (NoSuchKey, handled at each read site); this
+// closes the gap where a *denied* object was not.
+func classifyCurReadError(err error) error {
+	if err == nil || errors.Is(err, providers.ErrCostNotConfigured) {
+		return err
+	}
+	if isCurAuthorizationDenied(err) {
+		return fmt.Errorf("%w: %w", providers.ErrCostNotConfigured, err)
+	}
+	return err
+}
+
+func isCurAuthorizationDenied(err error) bool {
+	_, code, _, ok := IsAWSPermissionError(err)
+	if !ok {
+		return false
+	}
+	return code == "AccessDenied" || code == "AccessDeniedException"
 }
 
 // discoverAvailableBillingPeriods lists the CUR bucket prefix and returns the
@@ -511,13 +645,27 @@ func parseBillingPeriodStart(commonPrefix, pathPrefix string) (time.Time, bool) 
 }
 
 func getAwsUsageReport(ctx providers.CloudProviderContext, account providers.Account, month time.Month, year int) (providers.GetUsageReportResponse, error) {
+	items := []providers.UsageReportItem{}
+	err := streamAwsUsageReport(ctx, account, month, year, func(batch []providers.UsageReportItem) error {
+		items = append(items, batch...)
+		return nil
+	})
+	if err != nil {
+		return providers.GetUsageReportResponse{}, err
+	}
+	return providers.GetUsageReportResponse{Items: items, Dates: []time.Time{}}, nil
+}
+
+// streamAwsUsageReport reads the month's CUR files in order and hands their line
+// items to emit in batches (see streamAwsBillingReport).
+func streamAwsUsageReport(ctx providers.CloudProviderContext, account providers.Account, month time.Month, year int, emit func([]providers.UsageReportItem) error) error {
 	cfg, err := getAwsConfigFromAccount(ctx.GetContext(), account)
 	if err != nil {
-		return providers.GetUsageReportResponse{}, fmt.Errorf("failed to get AWS config for usage report: %w", err)
+		return fmt.Errorf("failed to get AWS config for usage report: %w", err)
 	}
 	s3Bucket, region, pathPrefix, compression, reportVersion, reportName, timeUnit, err := resolveCostReportDefinition(ctx, account)
 	if err != nil {
-		return providers.GetUsageReportResponse{}, err
+		return err
 	}
 
 	// Get the report from S3
@@ -528,19 +676,18 @@ func getAwsUsageReport(ctx providers.CloudProviderContext, account providers.Acc
 	s3Keys, err := getS3KeysFromUsageReport(s3Svc, s3Bucket, pathPrefix, reportVersion, reportName, month, year, timeUnit)
 	if err != nil {
 		ctx.GetLogger().Warn("unable to find cost report", "bucket", s3Bucket, "pathPrefix", pathPrefix)
-		return providers.GetUsageReportResponse{}, err
+		return classifyCurReadError(err)
 	}
 
 	if len(s3Keys) == 0 {
 		ctx.GetLogger().Warn("unable to find cost report", "bucket", s3Bucket, "pathPrefix", pathPrefix)
-		return providers.GetUsageReportResponse{}, nil
+		return nil
 	}
 
-	items := []providers.UsageReportItem{}
 	for _, key := range s3Keys {
 		// Wrap each key in an IIFE so that defers fire per-iteration, not when the
 		// outer function returns — preventing S3 response bodies from accumulating.
-		moreItems, iterErr := func(key string) ([]providers.UsageReportItem, error) {
+		iterErr := func(key string) error {
 			keyWithoutLeadingSlash := strings.TrimPrefix(key, "/")
 			input := &s3.GetObjectInput{
 				Bucket: &s3Bucket,
@@ -555,11 +702,11 @@ func getAwsUsageReport(ctx providers.CloudProviderContext, account providers.Acc
 						"bucket", s3Bucket,
 						"key", key,
 						"hint", "File may not be generated yet or was removed")
-					return nil, nil
+					return nil
 				}
 				// For other S3 errors (permissions, etc), return the error
 				ctx.GetLogger().Error("failed to fetch cost report", "error", err, "bucket", s3Bucket, "key", key)
-				return nil, err
+				return err
 			}
 			defer func() {
 				if err := result.Body.Close(); err != nil {
@@ -571,21 +718,21 @@ func getAwsUsageReport(ctx providers.CloudProviderContext, account providers.Acc
 				gzr, err := gzip.NewReader(result.Body)
 				if err != nil {
 					ctx.GetLogger().Error("failed to decompress cost report", "error", err, "bucket", s3Bucket, "key", key)
-					return nil, err
+					return err
 				}
 				stream = gzr
 			} else if compression == "ZIP" {
 				zipBodyBytes, err := io.ReadAll(result.Body)
 				if err != nil {
 					ctx.GetLogger().Error("failed to read S3 object body for ZIP", "error", err, "bucket", s3Bucket, "key", key)
-					return nil, nil
+					return nil
 				}
 
 				bytesReader := bytes.NewReader(zipBodyBytes)
 				zipReader, err := zip.NewReader(bytesReader, int64(len(zipBodyBytes)))
 				if err != nil {
 					ctx.GetLogger().Error("failed to create zip reader", "error", err, "bucket", s3Bucket, "key", key)
-					return nil, nil
+					return nil
 				}
 
 				// Find the first .csv file in the archive
@@ -614,12 +761,12 @@ func getAwsUsageReport(ctx providers.CloudProviderContext, account providers.Acc
 						}
 						ctx.GetLogger().Warn("No .csv file processed within ZIP archive", "bucket", s3Bucket, "key", key)
 					}
-					return nil, nil
+					return nil
 				}
 			}
 
 			if stream == nil {
-				return nil, errors.New("unable to find cost report")
+				return errors.New("unable to find cost report")
 			}
 
 			streamCloser, ok := stream.(io.ReadCloser)
@@ -632,18 +779,16 @@ func getAwsUsageReport(ctx providers.CloudProviderContext, account providers.Acc
 				}
 			}()
 
-			items2, err := readAwsBillingReport(stream, timeUnit)
-			if err != nil {
-				ctx.GetLogger().Error("failed to parse cost report", "error", err, "bucket", s3Bucket, "key", key)
-				return nil, err
+			if err := streamAwsBillingReport(stream, timeUnit, emit); err != nil {
+				ctx.GetLogger().Error("failed to process cost report", "error", err, "bucket", s3Bucket, "key", key)
+				return err
 			}
-			return items2, nil
+			return nil
 		}(key)
 		if iterErr != nil {
-			return providers.GetUsageReportResponse{}, iterErr
+			return classifyCurReadError(iterErr)
 		}
-		items = append(items, moreItems...)
 	}
 
-	return providers.GetUsageReportResponse{Items: items, Dates: []time.Time{}}, nil
+	return nil
 }

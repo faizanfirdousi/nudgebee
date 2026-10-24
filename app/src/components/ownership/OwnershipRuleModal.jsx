@@ -52,7 +52,7 @@ const INFO = {
   namespaceScope: 'The Kubernetes namespace to match. Every workload in this namespace is owned by the selected owner.',
   namespaceCascade: 'Pick the namespace whose workloads you want to select below.',
   workloads: 'Select one or more workloads in this namespace. The rule matches these workloads by name within the chosen account + namespace.',
-  owner: 'The Nudgebee user or group that owns the matched resources.',
+  owner: 'The user or group that owns the matched resources. Only active users appear here - make sure the user you want is active.',
   cloudAccountOptional: 'Optional. Restrict this rule to one cloud account. Leave empty to apply across all cloud accounts.',
   cloudAccountRequired: 'The cloud account the resources belong to. Required — it drives the resource list.',
   cloudTagKey: 'The cloud resource tag key to match, e.g. "team".',
@@ -186,6 +186,11 @@ export default function OwnershipRuleModal({ open, onClose, rule }) {
       open={open}
       handleClose={() => (saving ? undefined : onClose(false))}
       title={rule ? 'Edit rule' : 'Add rule'}
+      subtitle={
+        rule
+          ? 'Ownership moved? Change what this rule matches and who it hands the resources to — they re-resolve on the next lookup.'
+          : 'Every resource deserves an owner. Match a namespace, workload label or cloud resource and hand it to a user or group.'
+      }
       width='sm'
       loader={saving}
       actionButtons={actionButtons}

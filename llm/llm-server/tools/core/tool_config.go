@@ -19,6 +19,40 @@ const CacheNamespaceLlmToolConfig = "llm_tool_config"
 
 func init() {
 	common.CacheCreateNamespace(CacheNamespaceLlmToolConfig, common.CacheNamespaceWithExpiration(30*time.Minute))
+	// Join the same registry the other tool caches use, so an account-scoped
+	// invalidation from anywhere clears these shared entries too rather than
+	// depending on one call site remembering to.
+	RegisterToolCacheInvalidator(InvalidateToolConfigCache)
+}
+
+// ToolConfigAccountTag tags every llm_tool_config entry with the account it was
+// derived from, so InvalidateToolConfigCache can drop that account's entries
+// without enumerating key shapes. The namespace holds four key families
+// (account_config_summary, list_tool_configs per tool, list_all_tool_configs,
+// k8s_account_state per limit) and the per-tool and per-limit ones cannot be
+// enumerated at invalidation time.
+func ToolConfigAccountTag(accountId string) string {
+	return "tool_config_account:" + accountId
+}
+
+// InvalidateToolConfigCache drops the shared llm_tool_config entries derived
+// from this account's integrations and tool configs.
+//
+// Registered as a tool cache invalidator, so it runs from InvalidateAllCaches
+// alongside every other account-scoped invalidation.
+//
+// This is what makes the process-local invalidation in invalidateCachesForAccount
+// stick: GetAccountConfigSummary re-seeds its in-memory cache FROM this shared
+// cache on the next call, so clearing only the local map handed the stale
+// summary straight back and the account kept resolving tools against integrations
+// it no longer had (or missing ones it just gained) until the TTL expired.
+func InvalidateToolConfigCache(accountId string) {
+	if accountId == "" {
+		return
+	}
+	if err := common.CacheDeleteWithTag(CacheNamespaceLlmToolConfig, ToolConfigAccountTag(accountId)); err != nil {
+		slog.Error("tools: failed to invalidate tool config cache", "error", err, "account_id", accountId)
+	}
 }
 
 type AccountConfigSummary struct {
@@ -30,8 +64,10 @@ type AccountConfigSummary struct {
 	// resolver (ListToolConfigs / ToolConfigSourceTicket(All)) is tenant-scoped —
 	// so their visibility gate must match.
 	TenantIntegrationTypes map[string]bool
-	CloudProviders         map[string]bool
-	HasAgent               bool
+	// CloudProviders is ACCOUNT-scoped. A provider active on another account in
+	// the tenant must not enable cloud tools for this account.
+	CloudProviders map[string]bool
+	HasAgent       bool
 }
 
 type accountConfigSummaryCache struct {
@@ -94,16 +130,16 @@ func GetAccountConfigSummary(ctx *security.RequestContext, accountId string) (Ac
 	}
 
 	// Level 2: Shared cache (marshaled JSON).
-	// v2: bumped when TenantIntegrationTypes was added so pre-existing cached
-	// entries (which lack the field and would deserialize it as nil) are ignored
-	// rather than gating ticket tools off until the old entries expire.
-	cacheKey := "account_config_summary:v2:" + accountId
+	// v3: CloudProviders changed from tenant scope to account scope. Ignore v2
+	// entries so a provider active on a sibling account cannot remain authorized
+	// from cache after this fix is deployed.
+	cacheKey := "account_config_summary:v3:" + accountId
 	if cachedData, found := common.CacheGet(CacheNamespaceLlmToolConfig, cacheKey); found {
 		if err := common.UnmarshalJson(cachedData, &summary); err == nil {
 			accountConfigSummaryCacheInstance.set(accountId, summary)
 			return summary, nil
 		}
-		slog.Warn("tools: failed to unmarshal cached account summary", "error", "unmarshal error")
+		ctx.GetLogger().Warn("tools: failed to unmarshal cached account summary", "error", "unmarshal error")
 	}
 
 	if ctx == nil {
@@ -117,7 +153,7 @@ func GetAccountConfigSummary(ctx *security.RequestContext, accountId string) (Ac
 	// Verify that the account belongs to the tenant
 	tenantId := ctx.GetSecurityContext().GetTenantId()
 	if !security.IsAccountInTenant(accountId, tenantId) {
-		slog.Error("tools: account does not belong to tenant", "account_id", accountId, "tenant_id", tenantId)
+		ctx.GetLogger().Error("tools: account does not belong to tenant", "account_id", accountId, "tenant_id", tenantId)
 		return summary, errors.New("auth: unauthorized account access")
 	}
 
@@ -137,12 +173,12 @@ func GetAccountConfigSummary(ctx *security.RequestContext, accountId string) (Ac
 		JOIN integrations_cloud_accounts ia ON i.id = ia.integration_id
 		WHERE ia.cloud_account_id = $1 AND i.status = 'enabled'`, accountId)
 		if err != nil {
-			slog.Error("tools: failed to query integrations", "error", err, "account_id", accountId)
+			ctx.GetLogger().Error("tools: failed to query integrations", "error", err, "account_id", accountId)
 			return err
 		}
 		defer func() {
 			if err := integrationRows.Close(); err != nil {
-				slog.Error("tools: failed to close integration rows", "error", err)
+				ctx.GetLogger().Error("tools: failed to close integration rows", "error", err)
 			}
 		}()
 		for integrationRows.Next() {
@@ -171,12 +207,12 @@ func GetAccountConfigSummary(ctx *security.RequestContext, accountId string) (Ac
 		FROM integrations i
 		WHERE i.tenant_id = $1 AND i.status = 'enabled'`, tenantId)
 		if err != nil {
-			slog.Error("tools: failed to query tenant integrations", "error", err, "tenant_id", tenantId)
+			ctx.GetLogger().Error("tools: failed to query tenant integrations", "error", err, "tenant_id", tenantId)
 			return err
 		}
 		defer func() {
 			if err := tenantIntegrationRows.Close(); err != nil {
-				slog.Error("tools: failed to close tenant integration rows", "error", err)
+				ctx.GetLogger().Error("tools: failed to close tenant integration rows", "error", err)
 			}
 		}()
 		for tenantIntegrationRows.Next() {
@@ -190,17 +226,18 @@ func GetAccountConfigSummary(ctx *security.RequestContext, accountId string) (Ac
 		return nil
 	})
 
-	// Fetch cloud accounts for the tenant to see which providers are active
+	// Fetch the selected account's active provider. This feeds account-scoped
+	// cloud CLI authorization; querying the whole tenant lets an active provider
+	// on a sibling account enable tools on this account.
 	g.Go(func() error {
-		tenantId := ctx.GetSecurityContext().GetTenantId()
-		cloudProviderRows, err := dbms.Query("SELECT DISTINCT lower(cloud_provider) FROM cloud_accounts WHERE tenant = $1 AND status = 'active'", tenantId)
+		cloudProviderRows, err := dbms.Query("SELECT lower(cloud_provider) FROM cloud_accounts WHERE id = $1 AND status = 'active'", accountId)
 		if err != nil {
-			slog.Error("tools: failed to query cloud accounts", "error", err, "tenant_id", tenantId)
+			ctx.GetLogger().Error("tools: failed to query cloud account", "error", err, "account_id", accountId)
 			return err
 		}
 		defer func() {
 			if err := cloudProviderRows.Close(); err != nil {
-				slog.Error("tools: failed to close cloud provider rows", "error", err)
+				ctx.GetLogger().Error("tools: failed to close cloud provider rows", "error", err)
 			}
 		}()
 		for cloudProviderRows.Next() {
@@ -232,7 +269,9 @@ func GetAccountConfigSummary(ctx *security.RequestContext, accountId string) (Ac
 
 	accountConfigSummaryCacheInstance.set(accountId, summary)
 	if cachedBytes, err := common.MarshalJson(summary); err == nil {
-		_ = common.CacheSet(CacheNamespaceLlmToolConfig, cacheKey, cachedBytes, common.CacheSetWithExpiration(time.Duration(config.Config.CacheToolConfigExpirationMin)*time.Minute))
+		_ = common.CacheSet(CacheNamespaceLlmToolConfig, cacheKey, cachedBytes,
+			common.CacheSetWithExpiration(time.Duration(config.Config.CacheToolConfigExpirationMin)*time.Minute),
+			common.CacheSetWithTags(ToolConfigAccountTag(accountId)))
 	}
 
 	return summary, nil
@@ -513,67 +552,11 @@ func ListToolConfigs(context *security.RequestContext, accountId string, tool NB
 		}
 
 	case ToolConfigSourceAccount:
-		configRows, err := dbms.Query("select id::text, account_name, account_number  from cloud_accounts where tenant = $1 and lower(cloud_provider) = lower($2) and status = 'active'", context.GetSecurityContext().GetTenantId(), toolConfigSchema.ConfigType)
+		all, err := queryTenantAccountConfigs(dbms, context.GetSecurityContext().GetTenantId(), toolConfigSchema)
 		if err != nil {
-			slog.Error("tools: failed to get tool", "error", err)
 			return configs, err
 		}
-		defer func() {
-			if err := configRows.Close(); err != nil {
-				slog.Error("tools: failed to close configRows", "error", err)
-			}
-		}()
-
-		foundSameAccountId := false
-		var sameAccountConfigs ToolConfig
-
-		for configRows.Next() {
-			var configId, configName, configNumber *string
-			err = configRows.Scan(&configId, &configName, &configNumber)
-			if err != nil {
-				slog.Error("tools: failed to scan tool", "error", err)
-				return configs, err
-			}
-
-			if configId == nil {
-				continue
-			}
-
-			safeName := ""
-			if configName != nil {
-				safeName = *configName
-			}
-			safeNumber := ""
-			if configNumber != nil {
-				safeNumber = *configNumber
-			}
-
-			labels := map[string]string{}
-			configs = append(configs, ToolConfig{
-				Name: safeName,
-				Values: []ToolConfigValue{
-					{
-						Name:  "id",
-						Value: *configId,
-					},
-					{
-						Name:  "account_number",
-						Value: safeNumber,
-					},
-				},
-				Tags:   labels,
-				Schema: toolConfigSchema,
-			})
-
-			if *configId == accountId {
-				foundSameAccountId = true
-				sameAccountConfigs = configs[len(configs)-1]
-			}
-		}
-
-		if foundSameAccountId {
-			configs = []ToolConfig{sameAccountConfigs}
-		}
+		configs = currentAccountConfig(all, accountId)
 
 	case ToolConfigSourceTicketAll:
 		configRows, err := dbms.Query(`
@@ -858,7 +841,9 @@ func ListToolConfigs(context *security.RequestContext, accountId string, tool NB
 
 	// Cache the result
 	if cachedBytes, err := common.MarshalJson(configs); err == nil {
-		_ = common.CacheSet(CacheNamespaceLlmToolConfig, cacheKey, cachedBytes, common.CacheSetWithExpiration(time.Duration(config.Config.CacheToolConfigExpirationMin)*time.Minute))
+		_ = common.CacheSet(CacheNamespaceLlmToolConfig, cacheKey, cachedBytes,
+			common.CacheSetWithExpiration(time.Duration(config.Config.CacheToolConfigExpirationMin)*time.Minute),
+			common.CacheSetWithTags(ToolConfigAccountTag(accountId)))
 	}
 
 	return configs, nil
@@ -1063,7 +1048,9 @@ func ListAllToolConfigs(context *security.RequestContext, accountId string) ([]T
 
 	// Cache the result
 	if cachedBytes, err := common.MarshalJson(configs); err == nil {
-		_ = common.CacheSet(CacheNamespaceLlmToolConfig, cacheKey, cachedBytes, common.CacheSetWithExpiration(time.Duration(config.Config.CacheToolConfigExpirationMin)*time.Minute))
+		_ = common.CacheSet(CacheNamespaceLlmToolConfig, cacheKey, cachedBytes,
+			common.CacheSetWithExpiration(time.Duration(config.Config.CacheToolConfigExpirationMin)*time.Minute),
+			common.CacheSetWithTags(ToolConfigAccountTag(accountId)))
 	}
 
 	return configs, nil
@@ -1138,4 +1125,98 @@ func unmarshalLabelsToStringMap(configLabels *string) map[string]string {
 		labels[k] = fmt.Sprintf("%v", v)
 	}
 	return labels
+}
+
+// queryTenantAccountConfigs lists every active cloud account of the schema's
+// provider in the tenant, one ToolConfig per account.
+func queryTenantAccountConfigs(dbms *common.DatabaseManager, tenantId string, toolConfigSchema ToolConfigSchema) ([]ToolConfig, error) {
+	configs := []ToolConfig{}
+	configRows, err := dbms.Query("select id::text, account_name, account_number  from cloud_accounts where tenant = $1 and lower(cloud_provider) = lower($2) and status = 'active'", tenantId, toolConfigSchema.ConfigType)
+	if err != nil {
+		slog.Error("tools: failed to get tool", "error", err)
+		return configs, fmt.Errorf("queryTenantAccountConfigs: %w", err)
+	}
+	defer func() {
+		if err := configRows.Close(); err != nil {
+			slog.Error("tools: failed to close configRows", "error", err)
+		}
+	}()
+
+	for configRows.Next() {
+		var configId, configName, configNumber *string
+		if err := configRows.Scan(&configId, &configName, &configNumber); err != nil {
+			slog.Error("tools: failed to scan tool", "error", err)
+			return configs, fmt.Errorf("queryTenantAccountConfigs: %w", err)
+		}
+		if configId == nil {
+			continue
+		}
+		safeName := ""
+		if configName != nil {
+			safeName = *configName
+		}
+		safeNumber := ""
+		if configNumber != nil {
+			safeNumber = *configNumber
+		}
+		configs = append(configs, ToolConfig{
+			Name: safeName,
+			Values: []ToolConfigValue{
+				{Name: "id", Value: *configId},
+				{Name: "account_number", Value: safeNumber},
+			},
+			Tags:   map[string]string{},
+			Schema: toolConfigSchema,
+		})
+	}
+	if err := configRows.Err(); err != nil {
+		slog.Error("tools: failed to iterate account configs", "error", err)
+		return nil, fmt.Errorf("queryTenantAccountConfigs: %w", err)
+	}
+	return configs, nil
+}
+
+func accountIDOf(c ToolConfig) string {
+	for _, v := range c.Values {
+		if v.Name == "id" {
+			return v.Value
+		}
+	}
+	return ""
+}
+
+// currentAccountConfig keeps normal tool execution bound to the account that
+// owns the conversation. An inactive or otherwise unavailable current account
+// must produce no configuration; returning the tenant's other active accounts
+// here turns a failed current-account lookup into a cross-account picker.
+// Explicit cross-account callers use ListTenantAccountToolConfigs instead.
+func currentAccountConfig(configs []ToolConfig, accountID string) []ToolConfig {
+	for _, config := range configs {
+		if accountIDOf(config) == accountID {
+			return []ToolConfig{config}
+		}
+	}
+	return nil
+}
+
+// ListTenantAccountToolConfigs lists every account-backed config for an
+// account-sourced tool (e.g. every connected cluster for kubectl) in the
+// caller's tenant, without narrowing to the conversation's own account.
+// Callers must still filter by the caller's account access. It is not cached:
+// it only runs when a call names a target other than the saved one, and a
+// tenant-wide entry has no account tag that cluster add/remove would clear.
+func ListTenantAccountToolConfigs(context *security.RequestContext, tool NBTool) ([]ToolConfig, error) {
+	provider, ok := tool.(NBToolConfig)
+	if !ok {
+		return nil, fmt.Errorf("tools: %s has no config schema", tool.Name())
+	}
+	schema := provider.ConfigSchema(context)
+	if schema.ConfigSource != ToolConfigSourceAccount {
+		return nil, fmt.Errorf("tools: %s is not account-sourced", tool.Name())
+	}
+	dbms, err := common.GetDatabaseManager(common.Metastore)
+	if err != nil {
+		return nil, fmt.Errorf("ListTenantAccountToolConfigs: %w", err)
+	}
+	return queryTenantAccountConfigs(dbms, context.GetSecurityContext().GetTenantId(), schema)
 }

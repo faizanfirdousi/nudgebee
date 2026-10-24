@@ -200,9 +200,13 @@ func handleEventAction(actionPayload *ActionRequest, c *gin.Context, tracer *tra
 				"cluster", eventDto.Cluster,
 				"source", eventDto.Source)
 
-			if eventDto.FindingId == "" || eventDto.AggregationKey == "" || eventDto.Title == "" || eventDto.Tenant == "" || eventDto.AccountId == "" || eventDto.FindingType == "" || eventDto.Priority == "" || eventDto.SubjectName == "" || eventDto.Cluster == "" {
+			// A resolve may omit finding_id when it carries a fingerprint: it then
+			// closes every open event of that fingerprint (issue #39585).
+			findingIdMissing := eventDto.FindingId == "" && !event.IsResolveByFingerprint(eventDto)
+
+			if findingIdMissing || eventDto.AggregationKey == "" || eventDto.Title == "" || eventDto.Tenant == "" || eventDto.AccountId == "" || eventDto.FindingType == "" || eventDto.Priority == "" || eventDto.SubjectName == "" || eventDto.Cluster == "" {
 				tiLogger.Error("trigger_investigation: validation failed",
-					"finding_id_empty", eventDto.FindingId == "",
+					"finding_id_empty", findingIdMissing,
 					"aggregation_key_empty", eventDto.AggregationKey == "",
 					"title_empty", eventDto.Title == "",
 					"tenant_empty", eventDto.Tenant == "",
@@ -311,6 +315,172 @@ func handleEventAction(actionPayload *ActionRequest, c *gin.Context, tracer *tra
 			EventState:    request,
 			EventActor:    audit.EventActorApiService,
 			EventTarget:   request.EventId,
+			EventAction:   audit.EventActionUpdate,
+			EventStatus:   audit.EventStatusSuccess,
+		}}}); err != nil {
+			ctx.GetLogger().Error("failed to create audit event", "error", err)
+		}
+		return
+
+	case "event_update_status":
+		eventID, ok := actionRequest["event_id"].(string)
+		if !ok || eventID == "" {
+			c.JSON(400, common.ErrorActionBadRequest("event_id is required"))
+			return
+		}
+		status, ok := actionRequest["status"].(string)
+		if !ok || status == "" {
+			c.JSON(400, common.ErrorActionBadRequest("status is required"))
+			return
+		}
+		reasonCode, _ := actionRequest["reason_code"].(string)
+		reasonText, _ := actionRequest["reason_text"].(string)
+		evidenceUrl, _ := actionRequest["evidence_url"].(string)
+
+		ctx, err := buildContextFromPayload(c, actionPayload, tracer, meter, logger)
+		if err != nil {
+			c.JSON(400, common.ErrorActionBadRequest(err.Error()))
+			return
+		}
+
+		resp, err := event.UpdateEventStatus(ctx, event.UpdateEventStatusRequest{
+			EventID:     eventID,
+			Status:      status,
+			ReasonCode:  reasonCode,
+			ReasonText:  reasonText,
+			EvidenceUrl: evidenceUrl,
+		}, ctx.GetSecurityContext().GetUserId())
+		if err != nil {
+			c.JSON(400, common.ErrorActionBadRequest(err.Error()))
+			return
+		}
+
+		c.JSON(200, resp)
+		if err := audit.CreateAudit(ctx, &audit.AuditRequest{Audits: []audit.Audit{{
+			TenantId:       ctx.GetSecurityContext().GetTenantId(),
+			UserId:         ctx.GetSecurityContext().GetUserId(),
+			AccountId:      resp.AccountId,
+			EventTime:      time.Now().UTC(),
+			EventCategory:  audit.EventAlertEvent,
+			EventType:      audit.EventTypeEventUpdate,
+			EventPrevState: map[string]any{"event_id": eventID, "status": resp.PrevStatus},
+			EventState:     map[string]any{"event_id": eventID, "status": status, "reason_code": reasonCode, "reason_text": reasonText, "evidence_url": evidenceUrl},
+			EventActor:     audit.EventActorApiService,
+			EventTarget:    eventID,
+			EventAction:    audit.EventActionUpdate,
+			EventStatus:    audit.EventStatusSuccess,
+		}}}); err != nil {
+			ctx.GetLogger().Error("failed to create audit event", "error", err)
+		}
+		return
+
+	case "event_get_status_change":
+		rawEventIDs, ok := actionRequest["event_ids"].([]interface{})
+		if !ok || len(rawEventIDs) == 0 {
+			c.JSON(400, common.ErrorActionBadRequest("event_ids is required"))
+			return
+		}
+		eventIDs := make([]string, 0, len(rawEventIDs))
+		for _, v := range rawEventIDs {
+			if s, ok := v.(string); ok && s != "" {
+				eventIDs = append(eventIDs, s)
+			}
+		}
+
+		ctx, err := buildContextFromPayload(c, actionPayload, tracer, meter, logger)
+		if err != nil {
+			c.JSON(400, common.ErrorActionBadRequest(err.Error()))
+			return
+		}
+
+		resp, err := event.GetEventManualStatusChanges(ctx, eventIDs)
+		if err != nil {
+			c.JSON(400, common.ErrorActionBadRequest(err.Error()))
+			return
+		}
+
+		c.JSON(200, resp)
+		return
+
+	case "add_event_evidence":
+		// Lets an automation attach its collected output to the event that
+		// triggered it. trigger_investigation cannot do this: its duplicate
+		// branch deliberately drops evidences for an existing finding.
+		eventId, _ := actionRequest["event_id"].(string)
+		if eventId == "" {
+			c.JSON(400, common.ErrorActionBadRequest("event_id is required"))
+			return
+		}
+		// Two request shapes. `evidence` — the type an author picked plus the
+		// fields that type takes — is what the builder sends now; the raw
+		// `evidences` array is what automations written before it sent, and keeps
+		// working untouched.
+		rawEvidences, hasRaw := actionRequest["evidences"].([]any)
+		hasRaw = hasRaw && len(rawEvidences) > 0
+		rawEvidence, hasAuthored := actionRequest["evidence"].(map[string]any)
+
+		if hasAuthored && hasRaw {
+			c.JSON(400, common.ErrorActionBadRequest("pass either evidence or evidences, not both"))
+			return
+		}
+		if !hasAuthored && !hasRaw {
+			c.JSON(400, common.ErrorActionBadRequest("evidence, or a non-empty evidences array, is required"))
+			return
+		}
+		if hasAuthored {
+			var authored event.AuthoredEvidence
+			if err := common.UnmarshalMapToStruct(rawEvidence, &authored); err != nil {
+				c.JSON(400, common.ErrorActionBadRequest(err.Error()))
+				return
+			}
+			built, err := event.BuildAuthoredEvidence(authored)
+			if err != nil {
+				c.JSON(400, common.ErrorActionBadRequest(err.Error()))
+				return
+			}
+			rawEvidences = []any{built}
+		}
+
+		ctx, err := buildContextFromPayload(c, actionPayload, tracer, meter, logger)
+		if err != nil {
+			c.JSON(400, common.ErrorActionBadRequest(err.Error()))
+			return
+		}
+
+		// Sent by the events.add_evidence task; absent for any other caller, which
+		// then appends unstamped exactly as before.
+		var source *models.EvidenceSourceWorkflow
+		if rawSource, ok := actionRequest["source_workflow"].(map[string]any); ok {
+			workflowId, _ := rawSource["workflow_id"].(string)
+			if workflowId != "" {
+				workflowName, _ := rawSource["workflow_name"].(string)
+				executionId, _ := rawSource["execution_id"].(string)
+				taskId, _ := rawSource["task_id"].(string)
+				source = &models.EvidenceSourceWorkflow{
+					WorkflowID:   workflowId,
+					WorkflowName: workflowName,
+					ExecutionID:  executionId,
+					TaskID:       taskId,
+				}
+			}
+		}
+
+		if err := event.AddEvidence(ctx, eventId, rawEvidences, source); err != nil {
+			slog.Error("add_event_evidence: failed", "event_id", eventId, "error", err)
+			c.JSON(400, common.ErrorActionBadRequest(err.Error()))
+			return
+		}
+
+		c.JSON(200, gin.H{"event_id": eventId, "added": len(rawEvidences)})
+		if err := audit.CreateAudit(ctx, &audit.AuditRequest{Audits: []audit.Audit{{
+			TenantId:      ctx.GetSecurityContext().GetTenantId(),
+			UserId:        ctx.GetSecurityContext().GetUserId(),
+			EventTime:     time.Now().UTC(),
+			EventCategory: audit.EventAlertEvent,
+			EventType:     audit.EventTypeEventUpdate,
+			EventState:    map[string]any{"event_id": eventId, "evidence_count": len(rawEvidences)},
+			EventActor:    audit.EventActorApiService,
+			EventTarget:   eventId,
 			EventAction:   audit.EventActionUpdate,
 			EventStatus:   audit.EventStatusSuccess,
 		}}}); err != nil {

@@ -1,4 +1,4 @@
-FROM python:3.12-alpine AS python-base
+FROM public.ecr.aws/docker/library/python:3.12-alpine AS python-base
 LABEL maintainer="nudgebee"
 LABEL version="3.12-alpine"
 
@@ -20,8 +20,9 @@ FROM python-base AS builder-base
 # cache key so BuildKit re-runs the apk install and pulls current Alpine security
 # patches — its registry cache (mode=max) otherwise serves a stale package layer
 # forever. Committed (not a build-arg) so each refresh is a reviewable, revertable
-# diff; bump when the Trivy scan flags a stale package (e.g. c-ares CVE-2026-33630).
-ARG OS_PKG_EPOCH=2026-W28
+# diff; bump when the Trivy scan flags a stale package (e.g. c-ares CVE-2026-33630);
+# currently W36 pulls patched packages (libcrypto3 3.5.8-r0).
+ARG OS_PKG_EPOCH=2026-W36
 RUN echo "os-pkg-epoch: ${OS_PKG_EPOCH}" \
     && apk update && apk upgrade --no-cache && apk add --no-cache openssl && apk add --no-cache sqlite-libs \
     bash \

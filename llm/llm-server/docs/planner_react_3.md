@@ -2,9 +2,9 @@
 
 ## Overview
 
-ReAct3 is the single runtime planner. It combines the reasoning-acting loop of ReAct with parallel action execution and iterative replanning with multi-action parallelism. Every agent that declares `AgentPlannerTypeOrchestrating` or `AgentPlannerTypeReAct` runs under ReAct3 — the declared type expresses *intent*, the executor picks ReAct3 as the *implementation*.
+ReAct3 is the XML-based rollback and capability-fallback planner. It combines the reasoning-acting loop of ReAct with parallel action execution and iterative replanning with multi-action parallelism. Agents that declare `AgentPlannerTypeOrchestrating` or `AgentPlannerTypeReAct` use ReAct4 by default when the selected model supports native tools, and otherwise run under ReAct3. The declared type expresses *intent*; runtime routing chooses the implementation.
 
-Historically this was gated by two config flags (`LlmServerRewooToReact3Enabled`, `LlmServerReAct3Enabled`) that promoted the older ReWoo and ReAct2 planners to ReAct3 in prod. Both flags were on in every environment and have since been deleted; ReAct3 is now unconditional.
+Historically ReAct3 was gated by two config flags (`LlmServerRewooToReact3Enabled`, `LlmServerReAct3Enabled`) that promoted the older ReWoo and ReAct2 planners to ReAct3 in prod. Both flags were on in every environment and were deleted before ReAct4 became the default.
 
 ```
 User Query
@@ -274,7 +274,7 @@ worker        0/1     1
 ```go
 isTopLevel := request.ParentAgentId == "" || request.ParentAgentId == request.AgentId
 critiqueAllowed := enableCritique ||
-    (LlmServerReActCritiqueEnabled && isTopLevel && IsInvestigationRequestTask())
+    (isTopLevel && IsInvestigationRequestTask())
 ```
 
 - Only top-level agents (not sub-agents like kubectl, logs)
@@ -367,7 +367,7 @@ stepKeys map[string]bool  // toolID → processed
 ├──────────────────────────────────────────────┤
 │ 2. Client tools priority (if any)             │
 ├──────────────────────────────────────────────┤
-│ 3. Account prompt (optional)                  │
+│ 3. AccountContext / GlobalContext (optional)  │
 ├──────────────────────────────────────────────┤
 │ 4. Agent-specific prompt (domain expertise)   │
 └──────────────────────────────────────────────┘
@@ -377,6 +377,7 @@ stepKeys map[string]bool  // toolID → processed
 
 ```
 ┌──────────────────────────────────────────────┐
+│ request AccountPrompt / global preferences   │
 │ <task_context>                                │
 │   today, conversation_context, history        │
 │ </task_context>                               │
@@ -413,7 +414,7 @@ Executor tracks iterations with zero valid actions:
 
 ReAct3 replaced two earlier planners that used to coexist behind config flags:
 
-| Aspect | ReWoo (deleted) | ReAct2 (legacy) | ReAct3 (current) |
+| Aspect | ReWoo (deleted) | ReAct2 (deleted) | ReAct3 (fallback) |
 |--------|-----------------|-----------------|------------------|
 | Planning | Full plan upfront, then execute | Iterative single-action | Iterative, single or parallel actions |
 | Replanning | Mid-execution review on failure | Inherent in loop | Inherent in loop |
@@ -428,7 +429,7 @@ ReAct3 replaced two earlier planners that used to coexist behind config flags:
 - The ReWoo planner and its flag (`LlmServerRewooToReact3Enabled`) have been deleted.
 - The ReAct2 → ReAct3 flag (`LlmServerReAct3Enabled`) has been deleted.
 - `planner_react_2.go` and `planner_rewoo_2.go` have been deleted; symbols ReAct3 still needs were extracted to `planner_react_shared.go`.
-- Orchestrating and ReAct agents run under ReAct3 unconditionally.
+- Orchestrating and ReAct agents use ReAct4 by default, with ReAct3 retained as the explicit rollback and native-tool capability fallback.
 
 ## Test Coverage
 

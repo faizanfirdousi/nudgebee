@@ -4,9 +4,8 @@ import { useRouter } from 'next/router';
 import { Select, type SelectOption } from '@ui/Select';
 import { Box, Typography } from '@mui/material';
 import { ds } from 'src/utils/colors';
-import SafeIcon from '@shared/icons/SafeIcon';
-import { EventIconBlue } from '@assets';
 import dayjs from 'dayjs';
+import { parseDateValue } from '@shared/format/Datetime';
 import relativeTime from 'dayjs/plugin/relativeTime';
 
 dayjs.extend(relativeTime);
@@ -35,25 +34,15 @@ const InvestigateDropdown: React.FC<InvestigateDropdownProps> = ({
   resetStateWhenItemSelected,
   optionsOverride,
   excludeIds,
-  title = 'Related Events',
+  title = 'Other events here',
   placeholder = 'No related events found',
 }) => {
   const router = useRouter();
-  const [optionsData, setOptionsData] = useState<SelectOption[]>([]);
-  const [accountId, setAccountId] = useState<string | string[] | undefined>('');
+  const [fetchedOptions, setFetchedOptions] = useState<SelectOption[]>([]);
+  const accountId = router.query.accountId;
 
   useEffect(() => {
-    if (accountId != router.query.accountId) {
-      setAccountId(router?.query?.accountId);
-    }
-  }, [router.query.accountId]);
-
-  useEffect(() => {
-    if (optionsOverride) {
-      setOptionsData(optionsOverride);
-      return;
-    }
-    if (!query.id) {
+    if (optionsOverride || !query.id || !accountId) {
       return;
     }
     const queryParams: any = {};
@@ -64,28 +53,39 @@ const InvestigateDropdown: React.FC<InvestigateDropdownProps> = ({
     if (subjectNamespace) {
       queryParams.subject_namespace = subjectNamespace;
     }
-    if (accountId) {
-      queryParams.account_id = accountId;
-    }
+    queryParams.account_id = accountId;
     queryParams.finding_type = 'issue';
-    if (accountId) {
-      k8sApi
-        .getK8sEventsName(10, 0, queryParams)
-        .then((res: any) => {
-          const options: SelectOption[] = (res?.data?.events ?? [])
-            .filter((item: any) => !excludeIds?.includes(String(item.id)))
-            .map((item: any) => ({
-              value: String(item.id),
-              label: item.title,
-              subtext: dayjs(item.starts_at).fromNow(),
-            }));
-          setOptionsData(options);
-        })
-        .catch((e) => {
+
+    let cancelled = false;
+    k8sApi
+      .getK8sEventsName(10, 0, queryParams)
+      .then((res: any) => {
+        if (cancelled) {
+          return;
+        }
+        const events = res?.data?.events;
+        const options: SelectOption[] = (Array.isArray(events) ? events : [])
+          .filter((item: any) => !excludeIds?.includes(String(item.id)))
+          .map((item: any) => ({
+            value: String(item.id),
+            label: item.title,
+            // The server sends no offset, and dayjs reads such a string as local —
+            // every entry was off by the viewer's UTC offset.
+            subtext: dayjs(parseDateValue(item.starts_at)).fromNow(),
+          }));
+        setFetchedOptions(options);
+      })
+      .catch((e) => {
+        if (!cancelled) {
           console.error(e);
-        });
-    }
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [query, accountId, optionsOverride, excludeIds]);
+
+  const optionsData = optionsOverride ?? fetchedOptions;
 
   const handleChange = (next: string) => {
     if (next) {
@@ -98,29 +98,10 @@ const InvestigateDropdown: React.FC<InvestigateDropdownProps> = ({
   const selectedValue = optionsData.find((o) => o.value === selectedId) ? selectedId : null;
 
   return (
-    <Box sx={{ mt: 'var(--ds-space-5)' }}>
-      <Box
-        sx={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: 'var(--ds-space-1)',
-          mb: 'var(--ds-space-2)',
-          '&::after': { content: '""', height: '0.5px', flex: 1, backgroundColor: ds.gray[200] },
-        }}
-      >
-        <SafeIcon src={EventIconBlue} alt='related events' style={{ width: '16px', height: '16px' }} />
-        <Typography
-          sx={{
-            color: ds.gray[700],
-            fontSize: 'var(--ds-text-body-lg)',
-            fontWeight: 'var(--ds-font-weight-medium)',
-            lineHeight: 'normal',
-            whiteSpace: 'nowrap',
-          }}
-        >
-          {title}
-        </Typography>
-      </Box>
+    <Box>
+      {/* Rendered inside the sidebar's Related section, which carries the heading;
+          this is just the field's label. */}
+      <Typography sx={{ color: ds.gray[600], fontSize: ds.text.small, mb: ds.space[1] }}>{title}</Typography>
       <Select
         options={optionsData}
         onChange={handleChange}

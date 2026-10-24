@@ -7,12 +7,15 @@ import (
 	"nudgebee/services/anomoly"
 	"nudgebee/services/application"
 	"nudgebee/services/common"
+	"nudgebee/services/config"
 	"nudgebee/services/crawl"
 	"nudgebee/services/event"
 	"nudgebee/services/eventrule"
 	"nudgebee/services/insight"
 	"nudgebee/services/integrations"
+	integrationscore "nudgebee/services/integrations/core"
 	"nudgebee/services/internal/database"
+	"nudgebee/services/knowledge_graph/changedetect"
 	"nudgebee/services/knowledge_graph/core"
 	kgmodels "nudgebee/services/knowledge_graph/models"
 	kgqueue "nudgebee/services/knowledge_graph/queue"
@@ -84,6 +87,17 @@ func handleCrons(r *gin.Engine, tracer *trace.Tracer, meter *metric.Meter, logge
 					ctx.GetLogger().Error("cron: error recomputing finops scores", "error", err)
 				}
 				ctx.GetLogger().Info("cron: finops score recompute done", "duration", time.Since(t0))
+			}()
+			c.JSON(200, gin.H{"status": "ok"})
+		case "finops-score-recompute-recent":
+			go func() {
+				t0 := time.Now()
+				ctx.GetLogger().Info("cron: recomputing finops scores for recent recommendations")
+				err := recommendation.RecomputeRecentFinOpsScores(ctx)
+				if err != nil {
+					ctx.GetLogger().Error("cron: error recomputing recent finops scores", "error", err)
+				}
+				ctx.GetLogger().Info("cron: recent finops score recompute done", "duration", time.Since(t0))
 			}()
 			c.JSON(200, gin.H{"status": "ok"})
 		case "recommendation-nudge-digest":
@@ -277,6 +291,30 @@ func handleCrons(r *gin.Engine, tracer *trace.Tracer, meter *metric.Meter, logge
 				nb.CleanupData(ctx)
 			}()
 			c.JSON(200, gin.H{"status": "ok"})
+		case "Inactive Resource Event Sweep":
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						ctx.GetLogger().Error("cron: panic in inactive-resource event sweep", "recovered", r)
+					}
+				}()
+				t0 := time.Now()
+				// Detached cron context never cancels on its own; bound the run so a
+				// hung DB statement can't leak this goroutine indefinitely. `events`
+				// is a 200GB+ table, so a statement waiting on a lock is the realistic
+				// hang here, not a slow scan.
+				tctx, cancel := context.WithTimeout(ctx.GetContext(), 10*time.Minute)
+				defer cancel()
+				runCtx := security.NewRequestContext(tctx, ctx.GetSecurityContext(), ctx.GetLogger(), ctx.GetTracer(), ctx.GetMeter())
+				closed, err := event.CloseEventsForInactiveResources(runCtx)
+				if err != nil {
+					ctx.GetLogger().Error("cron: inactive-resource event sweep failed", "error", err)
+					return
+				}
+				ctx.GetLogger().Info("cron: inactive-resource event sweep done",
+					"closed", closed, "duration", time.Since(t0))
+			}()
+			c.JSON(200, gin.H{"status": "ok"})
 		case "LLM Token Usage Short Cleanup":
 			go func() {
 				defer func() {
@@ -382,6 +420,29 @@ func handleCrons(r *gin.Engine, tracer *trace.Tracer, meter *metric.Meter, logge
 				}
 			}()
 			c.JSON(200, gin.H{"status": "ok"})
+		case "Provider Status Check":
+			accountId := parseAccountIdPayload(actionPayload.Payload)
+			go func() {
+				// Unlike the neighbouring cases this one runs external HTTP probes against
+				// customer-controlled endpoints, so a panic here is a plausible way to take
+				// the process down; contain it the way the post-save path does.
+				defer func() {
+					if r := recover(); r != nil {
+						ctx.GetLogger().Error("cron: provider status check panicked", "panic", r)
+					}
+				}()
+				ctx.GetLogger().Info("cron: checking observability provider status")
+				// Detached cron context never cancels on its own; bound the run so a
+				// hung probe can't leak this goroutine indefinitely.
+				tctx, cancel := context.WithTimeout(ctx.GetContext(), 10*time.Minute)
+				defer cancel()
+				runCtx := security.NewRequestContext(tctx, ctx.GetSecurityContext(), ctx.GetLogger(), ctx.GetTracer(), ctx.GetMeter())
+				err := observability.RefreshProviderStatus(runCtx, accountId)
+				if err != nil {
+					ctx.GetLogger().Error("cron: error checking observability provider status", "error", err)
+				}
+			}()
+			c.JSON(200, gin.H{"status": "ok"})
 		case "Load Agent Playbook":
 			go func() {
 				ctx.GetLogger().Info("cron: Loading Agent Playbook")
@@ -442,6 +503,25 @@ func handleCrons(r *gin.Engine, tracer *trace.Tracer, meter *metric.Meter, logge
 					ctx.GetLogger().Error("cron: error refreshing knowledge graph", "error", err)
 				}
 			}()
+			c.JSON(200, gin.H{"status": "ok"})
+		case "kg_detect_inventory_changes":
+			if !config.Config.KGInventoryChangeDetectionEnabled {
+				c.JSON(200, gin.H{"status": "disabled"})
+				return
+			}
+			dbManager, err := database.GetDatabaseManager(database.Metastore)
+			if err != nil {
+				ctx.GetLogger().Error("cron: failed to get database manager", "error", err)
+				c.JSON(500, gin.H{"status": "error", "message": "Failed to initialize database"})
+				return
+			}
+			detector, err := changedetect.NewDetector(dbManager, ctx.GetLogger())
+			if err != nil {
+				ctx.GetLogger().Error("cron: failed to create inventory change detector", "error", err)
+				c.JSON(500, gin.H{"status": "error", "message": "Failed to create detector"})
+				return
+			}
+			go detector.Run(ctx)
 			c.JSON(200, gin.H{"status": "ok"})
 		case "build_knowledge_graph":
 			ctx.GetLogger().Info("cron: starting build_knowledge_graph - publishing to queue")
@@ -594,7 +674,7 @@ func handleCrons(r *gin.Engine, tracer *trace.Tracer, meter *metric.Meter, logge
 					}
 				}()
 				ctx.GetLogger().Info("cron: analyzing noisy alerts for threshold suggestions")
-				if err := triage.AnalyzeNoisyAlerts(ctx); err != nil {
+				if err := triage.AnalyzeNoisyAlerts(ctx, promQLRangeSeries); err != nil {
 					ctx.GetLogger().Error("cron: failed to analyze noisy alerts", "error", err)
 				}
 			}()
@@ -609,6 +689,18 @@ func handleCrons(r *gin.Engine, tracer *trace.Tracer, meter *metric.Meter, logge
 				ctx.GetLogger().Info("cron: processing expired snoozes")
 				if err := triage.ProcessExpiredSnoozes(ctx); err != nil {
 					ctx.GetLogger().Error("cron: failed to process expired snoozes", "error", err)
+				}
+			}()
+			c.JSON(200, gin.H{"status": "ok"})
+		case "Stuck Webhook Recovery":
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						ctx.GetLogger().Error("cron: panic in stuck webhook recovery", "panic", r)
+					}
+				}()
+				if err := integrationscore.RecoverStuckWebhooks(ctx); err != nil {
+					ctx.GetLogger().Error("cron: failed to recover stuck webhooks", "error", err)
 				}
 			}()
 			c.JSON(200, gin.H{"status": "ok"})
@@ -661,6 +753,20 @@ func handleCrons(r *gin.Engine, tracer *trace.Tracer, meter *metric.Meter, logge
 			}
 			ctx.GetLogger().Info("cron: vm vulnerability scan queued", "queued", queued, "failed", failed)
 			c.JSON(200, gin.H{"status": "ok", "queued": queued, "failed": failed})
+		case "VM Scan Status Sweep":
+			// Deliberately its own, independently-scheduled (every 5
+			// minutes, see cron_triggers.yaml) job rather than riding on
+			// "VM Vulnerability Scan" above (once daily): a scan stuck in
+			// "started" — process evicted/restarted mid-scan, or a path
+			// that somehow skipped a terminal write — must be caught
+			// within the scan timeout, not up to a day later. See #38466
+			// and the review that flagged the daily cadence as too slow.
+			if err := vmpackage.SweepStaleScanStatuses(); err != nil {
+				ctx.GetLogger().Error("cron: failed to sweep stale vm scan statuses", "error", err)
+				c.JSON(500, gin.H{"status": "error", "message": "Failed to sweep stale vm scan statuses"})
+				return
+			}
+			c.JSON(200, gin.H{"status": "ok"})
 		default:
 			common.MetricsApiRequestsFailedTotal(c.Request.Context(), "rpc_cron", "invalid_cron_job")
 			c.JSON(400, common.ErrorActionBadRequest("Invalid cron job"))
@@ -719,6 +825,7 @@ func triggerVerticalRightsizing(ctx *security.RequestContext, accountIds []strin
 			FROM cloud_accounts ca
 			INNER JOIN agent a ON ca.id = a.cloud_account_id
 			WHERE ca.cloud_provider = 'K8s'
+			AND ca.status = 'active'
 			AND a.status = 'CONNECTED'
 			AND a.last_connected_at > now() - interval '1 DAY'
 			GROUP BY ca.id, ca.tenant
@@ -736,6 +843,7 @@ func triggerVerticalRightsizing(ctx *security.RequestContext, accountIds []strin
     INNER JOIN agent a ON ca.id = a.cloud_account_id
     WHERE ca.id = ANY($1::uuid[]) -- Cast the input array, not the column
     AND ca.cloud_provider = 'K8s'
+    AND ca.status = 'active'
     AND a.status = 'CONNECTED'
     AND a.last_connected_at > now() - interval '1 DAY'
     GROUP BY ca.id, ca.tenant
@@ -761,12 +869,6 @@ func triggerVerticalRightsizing(ctx *security.RequestContext, accountIds []strin
 			ctx.GetTracer(),
 			ctx.GetMeter(),
 		)
-
-		// Check feature flag for tenant
-		if !tenant.IsFeatureEnabledByDefault(tenantCtx, acc.TenantId, tenant.FEATURE_VERTICAL_RIGHTSIZING) {
-			tenantCtx.GetLogger().Debug("vertical rightsizing: feature not enabled for tenant", "tenant_id", acc.TenantId)
-			continue
-		}
 
 		tenantCtx.GetLogger().Info("vertical rightsizing: triggering for account",
 			"account_id", acc.AccountId,
@@ -798,6 +900,16 @@ func triggerVerticalRightsizing(ctx *security.RequestContext, accountIds []strin
 			request.DatadogApiKey = apiKey
 			request.DatadogAppKey = appKey
 			request.DatadogSite = site
+		}
+
+		if metricsProvider == "ES" {
+			esCfg, esErr := observability.ElasticsearchRightsizingConfig(tenantCtx, acc.AccountId)
+			if esErr != nil {
+				tenantCtx.GetLogger().Error("vertical rightsizing: error getting elasticsearch config",
+					"account_id", acc.AccountId, "tenant_id", acc.TenantId, "error", esErr)
+				continue
+			}
+			request.Elasticsearch = esCfg
 		}
 
 		_, err := ml.TriggerVerticalRightsizing(tenantCtx, request)

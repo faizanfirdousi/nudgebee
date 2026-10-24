@@ -5,6 +5,7 @@ import CloudProviderIcon from '@shared/icons/CloudIcon';
 
 // Components
 import KubernetesTable from '@components/k8s/common/KubernetesTable';
+import IncidentGroupDrilldown from '@components/events/IncidentGroupDrilldown';
 import Datetime from '@shared/format/Datetime';
 import SeverityIcon from '@ui/SeverityIcon';
 import ListingLayout from '@ui/ListingLayout';
@@ -45,7 +46,7 @@ import { Box, Typography } from '@mui/material';
 import useKubernetesEventFilters from '@hooks/useKubernetesEventFilters';
 import { useEventCloudFilter } from '@hooks/useCloudFilters';
 import EventClassifyModal, { type ClassifyUpdate } from '@components/events/EventClassifyModal';
-import { CLASSIFICATION_OPTIONS, getTriageStatusTooltip } from '@api1/triage';
+import { CLASSIFICATION_OPTIONS, TRIAGE_SCORE_INFO, getTriageStatusTooltip } from '@api1/triage';
 import TicketCreatePopupForm from '@components/tickets/TicketCreatePopupForm';
 import { action } from 'src/utils/actionStyles';
 import CategoryOutlinedIcon from '@mui/icons-material/CategoryOutlined';
@@ -156,6 +157,13 @@ const transformTableData = (
     const accountName = account?.label || account?.account_name || item.account_id;
     const cloudProvider = account?.cloud_provider || accountType;
     const namespaceLabel = cloudProvider && cloudProvider !== 'K8s' ? 'service' : 'ns';
+    // How many distinct subjects (pod replicas, cloud resources) the row's workload collapses
+    // (#37273) — shown so the grouping is visible rather than silently hiding replicas.
+    const subjectLabel = cloudProvider && cloudProvider !== 'K8s' ? 'resources' : 'pods';
+    const collapsedSubjectCount = Number(item.count_subject_name) || 0;
+    // event_count is the events inside the selected range. fingerprint_event_count is the
+    // position in the fingerprint's occurrence run, which can begin before the range (#38458).
+    const runCount = Number(item.fingerprint_event_count) || 0;
 
     // Common Drilldown Props
     const commonDrilldown = {
@@ -164,6 +172,14 @@ const transformTableData = (
       startTime: dateRange.startDate,
       endTime: dateRange.endDate,
       accountId: item.account_id,
+      // For the Grouped Alerts drill-down tab (#34655). The group anchor is
+      // not the row's latest event — a recurring fingerprint leads its group
+      // from its OLDEST event — so the drill-down resolves from the anchor and
+      // only falls back to the latest event for rows with no group at all.
+      latestEventId: item.latest_event_id,
+      groupLeaderId: item.incident_group_leader_id,
+      aggregationKey: item.aggregation_key,
+      hasAlertGroup: Boolean((item.incident_group_size ?? 0) > 0 || item.is_incident_child),
       ...(nbStatus && nbStatus.length > 0 ? { nb_status: nbStatus } : {}),
     };
 
@@ -194,7 +210,7 @@ const transformTableData = (
           component: (
             <Box>
               <Box sx={{ display: 'flex', alignItems: 'center', gap: 'var(--ds-space-1)' }}>
-                <Text showAutoEllipsis value={item.subject_name} style={{ fontWeight: 'var(--ds-font-weight-medium)' }} />
+                <Text showAutoEllipsis value={item.subject_owner} style={{ fontWeight: 'var(--ds-font-weight-medium)' }} />
                 {item.is_new_issue && (
                   <Tooltip
                     title={`First seen: ${
@@ -208,16 +224,53 @@ const transformTableData = (
                     </span>
                   </Tooltip>
                 )}
+                {item.incident_group_size > 0 && (
+                  <Tooltip
+                    title={`${item.incident_group_size} related alert${
+                      item.incident_group_size > 1 ? 's' : ''
+                    } grouped under this alert — expand for Grouped Alerts`}
+                  >
+                    <span>
+                      <Chip variant='tag' tone='warning' size='xs' data-testid='inbox-group-leader-chip'>
+                        +{item.incident_group_size} GROUPED
+                      </Chip>
+                    </span>
+                  </Tooltip>
+                )}
+                {!item.incident_group_size && item.is_incident_child && (
+                  <Tooltip title='Part of an alert group — click to open the leading alert'>
+                    <span
+                      style={{ cursor: 'pointer' }}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        window.open(`/investigate?id=${item.incident_group_leader_id}&accountId=${item.account_id}`, '_blank');
+                      }}
+                    >
+                      <Chip variant='tag' tone='neutral' size='xs' data-testid='inbox-group-child-chip'>
+                        GROUPED
+                      </Chip>
+                    </span>
+                  </Tooltip>
+                )}
               </Box>
               {isTroubleshootPage && <Text value={`acc: ${accountName}`} secondaryText showAutoEllipsis />}
               {item.subject_namespace && <Text value={`${namespaceLabel}: ${item.subject_namespace}`} secondaryText showAutoEllipsis />}
+              {collapsedSubjectCount > 1 && <Text value={`${collapsedSubjectCount} ${subjectLabel} affected`} secondaryText showAutoEllipsis />}
               {hasExistingTicket && <TicketLink ticketURL={existingTicket?.url} ticketID={existingTicket?.ticket_id} />}
             </Box>
           ),
           drilldownQuery: commonDrilldown,
         },
         { component: <Text showAutoEllipsis value={titleCaseForAggregationKey(item.aggregation_key)} /> },
-        { component: <Text showAutoEllipsis value={item.fingerprint_event_count ?? item.event_count} /> },
+        {
+          component: (
+            <Box>
+              <Text showAutoEllipsis value={item.event_count ?? item.fingerprint_event_count} data-testid='inbox-event-count' />
+              {/* A run of 1 is just this firing, so it adds nothing to the Count; shown from 2 up. */}
+              {runCount >= 2 && <Text secondaryText showAutoEllipsis value={`run of ${runCount}`} data-testid='inbox-run-count' />}
+            </Box>
+          ),
+        },
         {
           component: (
             <Box display='flex' alignItems='center' gap={ds.space[1]}>
@@ -265,9 +318,9 @@ const transformTableData = (
                 size='xs'
                 trailingAccent={<FiArrowRight />}
                 href={`/investigate?id=${item.latest_event_id}&accountId=${item.account_id}`}
-                data-testid='investigate-btn'
+                data-testid={item.is_investigated ? 'view-analysis-btn' : 'investigate-btn'}
               >
-                Investigate
+                {item.is_investigated ? 'View Analysis' : 'Investigate'}
               </DsButton>
               <DropdownMenu
                 align='end'
@@ -454,6 +507,7 @@ const KubernetesGroupedEventsTable: React.FC<KubernetesGroupedEventsTableProps> 
   });
   const [selectedStatus, setSelectedStatus] = useState<string>('');
   const [selectedPriority, setSelectedPriority] = useState('');
+  const [selectedNbPriority, setSelectedNbPriority] = useState('');
 
   const [selectedSource, setSelectedSource] = useState<any[]>([]);
   const [selectedNBStatus, setSelectedNBStatus] = useState<Array<{ label: string; value: string }>>([]);
@@ -658,7 +712,9 @@ const KubernetesGroupedEventsTable: React.FC<KubernetesGroupedEventsTableProps> 
 
     return [
       `Event: ${data?.aggregation_key || ''}`,
-      `Subject: ${data?.subject_name || ''}`,
+      // Fingerprint rows carry the owning workload (subject_owner); the app/event_type
+      // variants still group on subject_name.
+      `Subject: ${data?.subject_owner || data?.subject_name || ''}`,
       `Namespace: ${data?.subject_namespace || ''}`,
       `Occurrences: ${data?.fingerprint_event_count ?? data?.event_count ?? ''}`,
       firstOccurred ? `Happening Since: ${firstOccurred}` : '',
@@ -718,13 +774,13 @@ const KubernetesGroupedEventsTable: React.FC<KubernetesGroupedEventsTableProps> 
           name: 'Count',
           width: '8%',
           sortable: true,
-          info: 'Number of times this event has fired in the selected time range.',
+          info: 'Number of events in the selected time range. The "run of N" line is how many times this issue has fired in its current run, which continues while it re-fires within 24 hours of the previous firing and so can begin before the selected range.',
         },
         {
           name: 'Triage Score',
           width: '10%',
           sortable: true,
-          info: "Triage Score is NudgeBee's context-aware triage score/level, computed using multiple signals beyond raw thresholds such as service criticality, customer/user impact, recurrence frequency, dependency (upstream/downstream) blast radius, and the nature of the service/workload.",
+          info: TRIAGE_SCORE_INFO,
         },
         triageStatusHeader,
         {
@@ -825,7 +881,7 @@ const KubernetesGroupedEventsTable: React.FC<KubernetesGroupedEventsTableProps> 
       priority: selectedPriority,
       priority_nin: !selectedPriority ? ['DEBUG', 'INFO'] : undefined,
       source: selectedSource?.map((f: any) => f.value) || [],
-      nb_priority: '',
+      nb_priority: selectedNbPriority,
       nb_status: selectedNBStatus.length > 0 ? selectedNBStatus.map((s) => s?.value || s) : undefined,
       is_new_issue: selectedIssueType === 'new' ? true : selectedIssueType === 'recurring' ? false : undefined,
     };
@@ -847,7 +903,8 @@ const KubernetesGroupedEventsTable: React.FC<KubernetesGroupedEventsTableProps> 
       cols = [
         'max_created_at',
         'event_count',
-        'subject_name',
+        'subject_owner',
+        'count_subject_name',
         'subject_namespace',
         'aggregation_key',
         'distinct_priority',
@@ -866,8 +923,17 @@ const KubernetesGroupedEventsTable: React.FC<KubernetesGroupedEventsTableProps> 
         'is_new_issue',
         'fingerprint_first_seen_at',
         'fingerprint_event_count',
+        'incident_group_size',
+        'is_incident_child',
+        'incident_group_leader_id',
+        'is_investigated',
       ];
-      groupCols = ['tenant_id', 'account_id', 'subject_name', 'subject_namespace', 'aggregation_key', 'fingerprint'];
+      // Grouped by the workload, not by the pod (#37273). A fingerprint resolves to the
+      // owning workload, so grouping on subject_name split one deployment's replicas into
+      // separate rows that shared a fingerprint — and therefore shared a Count and a
+      // drill-down, since both are fingerprint-scoped. subject_owner falls back to
+      // subject_name for events with no owner, so those keep a row each.
+      groupCols = ['tenant_id', 'account_id', 'subject_owner', 'subject_namespace', 'aggregation_key', 'fingerprint'];
     } else if (groupEventType === 'app') {
       cols = [
         'max_created_at',
@@ -900,7 +966,7 @@ const KubernetesGroupedEventsTable: React.FC<KubernetesGroupedEventsTableProps> 
     }
 
     const SORT_COLUMN_MAP: Record<string, string> = {
-      Count: 'fingerprint_event_count',
+      Count: 'event_count',
       'Event Count': 'event_count',
       Priority: 'latest_computed_score',
       'Last Occurred': 'max_created_at',
@@ -915,6 +981,9 @@ const KubernetesGroupedEventsTable: React.FC<KubernetesGroupedEventsTableProps> 
       const groupings = res?.data?.event_groupings ?? [];
       setRawEventGroupings(groupings);
       setTotalRows(res.data.event_groupings_aggregate.aggregate.count);
+      // Table can render now; ticket badges repopulate as a non-blocking second pass.
+      setTicketReferenceMap(new Map());
+      setLoading(false);
 
       // Only the fingerprint variant has a Create Ticket action keyed off fingerprint
       if (groupEventType === 'fingerprint') {
@@ -929,17 +998,11 @@ const KubernetesGroupedEventsTable: React.FC<KubernetesGroupedEventsTableProps> 
             setTicketReferenceMap(map);
           } catch (err) {
             console.error('Failed to fetch ticket summaries', err);
-            setTicketReferenceMap(new Map());
           }
-        } else {
-          setTicketReferenceMap(new Map());
         }
-      } else {
-        setTicketReferenceMap(new Map());
       }
     } catch (e) {
       console.error(e);
-    } finally {
       setLoading(false);
     }
   }, [
@@ -954,6 +1017,7 @@ const KubernetesGroupedEventsTable: React.FC<KubernetesGroupedEventsTableProps> 
     selectedAggregationKey,
     selectedStatus,
     selectedPriority,
+    selectedNbPriority,
 
     selectedSource,
     selectedNBStatus,
@@ -1202,6 +1266,22 @@ const KubernetesGroupedEventsTable: React.FC<KubernetesGroupedEventsTableProps> 
             type: 'dropdown',
             enabled: true,
             options: [
+              { value: 'P0', label: 'P0' },
+              { value: 'P1', label: 'P1' },
+              { value: 'P2', label: 'P2' },
+              { value: 'P3', label: 'P3' },
+            ],
+            onSelect: (e: any) => {
+              setSelectedNbPriority(e?.target?.value || '');
+              setCurrentPage(1);
+            },
+            label: 'Triage Priority',
+            value: selectedNbPriority,
+          },
+          {
+            type: 'dropdown',
+            enabled: true,
+            options: [
               { value: 'all', label: 'All Issues' },
               { value: 'new', label: 'New Issues' },
               { value: 'recurring', label: 'Recurring Issues' },
@@ -1294,7 +1374,22 @@ const KubernetesGroupedEventsTable: React.FC<KubernetesGroupedEventsTableProps> 
             tableHeadingCenter={['Severity']}
             showExpandable
             expandable={{
-              tabs: [{ text: 'Events', key: 'events' }],
+              // Per-row tab order: rows in an alert group open on Grouped
+              // Alerts; ungrouped rows open on their occurrences instead of an
+              // empty group message (#34655).
+              tabs: (dq: any) => {
+                // The table passes the row's merged drilldownQuery here.
+                if (groupEventType !== 'fingerprint') {
+                  return [{ text: 'Events', key: 'events' }];
+                }
+                const eventsTab = { text: 'Events', key: 'events' };
+                const groupedTab = {
+                  text: 'Grouped Alerts',
+                  key: 'incident-members',
+                  componentFn: (_opt: any, q: any) => <IncidentGroupDrilldown eventId={q.groupLeaderId || q.latestEventId} accountId={q.accountId} />,
+                };
+                return dq?.hasAlertGroup ? [groupedTab, eventsTab] : [eventsTab, groupedTab];
+              },
             }}
           />
         </ListingLayout.Body>

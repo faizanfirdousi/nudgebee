@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"nudgebee/llm/services_server"
 	"nudgebee/llm/tools/core"
 	"strings"
 	"sync"
@@ -90,212 +91,6 @@ func TestSanitizeFloats_MarshalableAfter(t *testing.T) {
 	data, err := json.Marshal(input)
 	require.NoError(t, err)
 	assert.Contains(t, string(data), `"a":0`)
-}
-
-// ---------------------------------------------------------------------------
-// getMappedValuesFromDataList
-// ---------------------------------------------------------------------------
-
-func TestGetMappedValuesFromDataList_SeriesListResult(t *testing.T) {
-	tool := PrometheusExecuteTool{}
-	series := []any{map[string]any{"metric": "cpu", "values": []any{1.0, 2.0}}}
-	dataList := []map[string]any{
-		{"data": map[string]any{"series_list_result": series}},
-	}
-	result, err := tool.getMappedValuesFromDataList(dataList)
-	require.NoError(t, err)
-	assert.Equal(t, series, result)
-}
-
-func TestGetMappedValuesFromDataList_VectorResult(t *testing.T) {
-	tool := PrometheusExecuteTool{}
-	vector := []any{map[string]any{"metric": "mem", "value": []any{1234567890.0, "0.5"}}}
-	dataList := []map[string]any{
-		{"data": map[string]any{"vector_result": vector}},
-	}
-	result, err := tool.getMappedValuesFromDataList(dataList)
-	require.NoError(t, err)
-	assert.Equal(t, vector, result)
-}
-
-func TestGetMappedValuesFromDataList_ScalarResult(t *testing.T) {
-	tool := PrometheusExecuteTool{}
-	scalar := []any{1234567890.0, "42"}
-	dataList := []map[string]any{
-		{"data": map[string]any{"scalar_result": scalar}},
-	}
-	result, err := tool.getMappedValuesFromDataList(dataList)
-	require.NoError(t, err)
-	require.Len(t, result, 1)
-	wrapped := result[0].(map[string]any)
-	assert.Equal(t, map[string]any{}, wrapped["metric"])
-	assert.Equal(t, scalar, wrapped["value"])
-}
-
-func TestGetMappedValuesFromDataList_DoubleEncodedJSON(t *testing.T) {
-	tool := PrometheusExecuteTool{}
-	innerJSON := `{"series_list_result":[{"metric":"cpu","values":[1,2]}]}`
-	dataList := []map[string]any{
-		{"data": innerJSON},
-	}
-	result, err := tool.getMappedValuesFromDataList(dataList)
-	require.NoError(t, err)
-	require.Len(t, result, 1)
-}
-
-func TestGetMappedValuesFromDataList_QueryWrapper(t *testing.T) {
-	tool := PrometheusExecuteTool{}
-	series := []any{map[string]any{"metric": "disk"}}
-	dataList := []map[string]any{
-		{"data": map[string]any{
-			"query": map[string]any{
-				"series_list_result": series,
-			},
-		}},
-	}
-	result, err := tool.getMappedValuesFromDataList(dataList)
-	require.NoError(t, err)
-	assert.Equal(t, series, result)
-}
-
-func TestGetMappedValuesFromDataList_ErrorResultType(t *testing.T) {
-	tool := PrometheusExecuteTool{}
-	dataList := []map[string]any{
-		{"data": map[string]any{
-			"result_type":   "error",
-			"string_result": "invalid PromQL expression",
-		}},
-	}
-	result, err := tool.getMappedValuesFromDataList(dataList)
-	assert.Nil(t, result)
-	require.Error(t, err)
-	assert.Equal(t, "invalid PromQL expression", err.Error())
-}
-
-func TestGetMappedValuesFromDataList_ErrorResultTypeDefaultMsg(t *testing.T) {
-	tool := PrometheusExecuteTool{}
-	dataList := []map[string]any{
-		{"data": map[string]any{"result_type": "error"}},
-	}
-	_, err := tool.getMappedValuesFromDataList(dataList)
-	require.Error(t, err)
-	assert.Equal(t, "prometheus query returned an error", err.Error())
-}
-
-func TestGetMappedValuesFromDataList_NilAndEmptyEntries(t *testing.T) {
-	tool := PrometheusExecuteTool{}
-
-	t.Run("nil data entries skipped", func(t *testing.T) {
-		series := []any{map[string]any{"metric": "net"}}
-		dataList := []map[string]any{
-			nil,
-			{"data": nil},
-			{"data": map[string]any{"series_list_result": series}},
-		}
-		result, err := tool.getMappedValuesFromDataList(dataList)
-		require.NoError(t, err)
-		assert.Equal(t, series, result)
-	})
-
-	t.Run("all nil returns empty", func(t *testing.T) {
-		dataList := []map[string]any{nil, {"data": nil}}
-		result, err := tool.getMappedValuesFromDataList(dataList)
-		require.NoError(t, err)
-		assert.Equal(t, []any{}, result)
-	})
-
-	t.Run("empty dataList returns empty", func(t *testing.T) {
-		result, err := tool.getMappedValuesFromDataList([]map[string]any{})
-		require.NoError(t, err)
-		assert.Equal(t, []any{}, result)
-	})
-}
-
-func TestGetMappedValuesFromDataList_AllResultFieldsEmpty(t *testing.T) {
-	tool := PrometheusExecuteTool{}
-	dataList := []map[string]any{
-		{"data": map[string]any{
-			"series_list_result": []any{},
-			"vector_result":      []any{},
-			"scalar_result":      []any{},
-		}},
-	}
-	result, err := tool.getMappedValuesFromDataList(dataList)
-	require.NoError(t, err)
-	assert.Equal(t, []any{}, result)
-}
-
-func TestGetMappedValuesFromDataList_UnsupportedDataType(t *testing.T) {
-	tool := PrometheusExecuteTool{}
-	dataList := []map[string]any{
-		{"data": 12345}, // int, not map or string
-	}
-	result, err := tool.getMappedValuesFromDataList(dataList)
-	require.NoError(t, err)
-	assert.Equal(t, []any{}, result)
-}
-
-func TestGetMappedValuesFromDataList_InvalidStringJSON(t *testing.T) {
-	tool := PrometheusExecuteTool{}
-	dataList := []map[string]any{
-		{"data": "not valid json"},
-	}
-	// Invalid JSON string should be skipped (continue), returning empty
-	result, err := tool.getMappedValuesFromDataList(dataList)
-	require.NoError(t, err)
-	assert.Equal(t, []any{}, result)
-}
-
-func TestGetMappedValuesFromDataList_SeriesTakesPriorityOverVector(t *testing.T) {
-	tool := PrometheusExecuteTool{}
-	series := []any{map[string]any{"metric": "series_data"}}
-	vector := []any{map[string]any{"metric": "vector_data"}}
-	dataList := []map[string]any{
-		{"data": map[string]any{
-			"series_list_result": series,
-			"vector_result":      vector,
-		}},
-	}
-	result, err := tool.getMappedValuesFromDataList(dataList)
-	require.NoError(t, err)
-	assert.Equal(t, series, result)
-}
-
-// ---------------------------------------------------------------------------
-// getDataFromRelayPrometheusResponse — empty findings
-// ---------------------------------------------------------------------------
-
-func TestGetDataFromRelayPrometheusResponse_EmptyFindings(t *testing.T) {
-	tool := PrometheusExecuteTool{}
-	response := map[string]any{
-		"data": map[string]any{
-			"findings": []any{},
-		},
-	}
-	result, err := tool.getDataFromRelayPrometheusResponse(response)
-	require.NoError(t, err)
-	assert.Equal(t, []any{}, result)
-}
-
-func TestGetDataFromRelayPrometheusResponse_MissingData(t *testing.T) {
-	tool := PrometheusExecuteTool{}
-	result, err := tool.getDataFromRelayPrometheusResponse(map[string]any{})
-	assert.Nil(t, result)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "data field not found")
-}
-
-func TestGetDataFromRelayPrometheusResponse_NilFindings(t *testing.T) {
-	tool := PrometheusExecuteTool{}
-	response := map[string]any{
-		"data": map[string]any{
-			"findings": nil,
-		},
-	}
-	result, err := tool.getDataFromRelayPrometheusResponse(response)
-	assert.Nil(t, result)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "findings field not found")
 }
 
 // ---------------------------------------------------------------------------
@@ -657,4 +452,289 @@ func TestMetricsListTool_DescriptionMatchesAcceptedInput(t *testing.T) {
 	assert.Contains(t, desc, "keyword", "keyword form must stay documented")
 	assert.Contains(t, desc, "wildcard", "the index-pattern form must be documented too")
 	assert.Contains(t, desc, "index pattern")
+}
+
+// ---------------------------------------------------------------------------
+// metrics_label_values — Elasticsearch argument contract.
+//
+// Every pre-existing test in this file builds the tool with Provider "prometheus".
+// The ES branch had no coverage at all, which is how `metric_name` came to carry a
+// metric name into the index position and stay there. Reproduced against dev account
+// 25f42d26 on 2026-08-26:
+//
+//	metric_name = "kubernetes.pod.cpu.usage.nanocores" -> 404 no such index [...]
+//	metric_name = "metricbeat-8.19.11"                 -> 200 + pod names
+// ---------------------------------------------------------------------------
+
+func TestSanitizeMetricsArg(t *testing.T) {
+	// The quoted form is what produced `no such index [\"aws.rds.cpu.total.pct\"]`.
+	assert.Equal(t, "aws.rds.cpu.total.pct", sanitizeMetricsArg(`"aws.rds.cpu.total.pct"`))
+	assert.Equal(t, "aws.rds.cpu.total.pct", sanitizeMetricsArg("`aws.rds.cpu.total.pct`"))
+	assert.Equal(t, "instance", sanitizeMetricsArg(`  'instance'  `))
+	assert.Equal(t, "instance", sanitizeMetricsArg(`inst\\ance`))
+	assert.Equal(t, "", sanitizeMetricsArg(`  `))
+}
+
+func TestValidateLabelArg_RejectsQueryStringSyntax(t *testing.T) {
+	// The exact value the planner produced.
+	err := validateLabelArg("kubernetes.pod.name&filter=api-preprod")
+	require.Error(t, err)
+	// The message must name the argument to use, or the agent reformulates the label
+	// instead of fixing the call — which is the loop this guards against.
+	assert.Contains(t, err.Error(), `"filter"`)
+	assert.Contains(t, err.Error(), `"api-preprod"`)
+	assert.Contains(t, err.Error(), `"kubernetes.pod.name"`)
+
+	assert.Error(t, validateLabelArg("pod?x=1"))
+	assert.Error(t, validateLabelArg("pod name"))
+
+	// Ordinary field names, including dotted ES paths, must pass untouched.
+	for _, ok := range []string{
+		"instance", "kubernetes.pod.name", "metricset.dimensions.DBInstanceIdentifier",
+	} {
+		assert.NoError(t, validateLabelArg(ok), "label %q must be accepted", ok)
+	}
+}
+
+func TestListMetricsLabelValuesTool_RejectsMangledLabel(t *testing.T) {
+	tool := ListMetricsLabelValuesTool{Provider: "ES", DefaultIndex: "metricbeat-8.19.11"}
+	resp, err := tool.Call(core.NbToolContext{}, core.NBToolCallRequest{
+		Arguments: map[string]any{"label": "kubernetes.pod.name&filter=app-dev"},
+	})
+	require.NoError(t, err)
+	// Must fail BEFORE any network call, and must fail loudly: this previously
+	// reached Elasticsearch, matched no field and returned `200 []`.
+	assert.Equal(t, core.NBToolResponseStatusError, resp.Status)
+	assert.Contains(t, resp.Data, `"filter"`)
+}
+
+func TestListMetricsLabelValuesTool_DescriptionStatesESIgnoresMetric(t *testing.T) {
+	tool := ListMetricsLabelValuesTool{Provider: "ES"}
+	// The old text said "providers that support it" without naming any, which is why
+	// the planner kept supplying a metric on ES.
+	assert.Contains(t, strings.ToLower(tool.Description()), "ignored on elasticsearch",
+		"the description must say plainly that ES ignores `metric`")
+	assert.Contains(t, strings.ToLower(tool.InputSchema().Properties["metric"].Description),
+		"ignored on elasticsearch")
+	// And it must not describe a JSON tool in function-call syntax.
+	assert.NotContains(t, tool.Description(), `metrics_label_values(label=`)
+}
+
+// ---------------------------------------------------------------------------
+// ES metric-name discovery.
+//
+// Reproduced on dev 2026-08-27, account 25f42d26, index pattern `metric*`:
+//
+//	metrics_list "metric*"  -> container.cpu.usage, container.memory.working_set
+//	agent: "no RDS metrics found", zero queries issued
+//
+// Eight CloudWatch metrics were in that pattern and had been read successfully
+// through the same account minutes earlier. Discovery returned on the first
+// non-empty source, so whichever shape carried a `name` field hid the rest.
+// ---------------------------------------------------------------------------
+
+func TestESDiscoveryProvenance_SeparatesDataFromSchema(t *testing.T) {
+	// Both sources contributed: the caller must be able to tell them apart, because
+	// on dev the mapping supplies 4306 names of which 79 have ever held a value.
+	both := esDiscoveryProvenance(2, 4306)
+	assert.Contains(t, both, "2 read from documents")
+	assert.Contains(t, both, "4306 declared in the index mapping")
+	assert.Contains(t, both, "may have no data")
+
+	// Mapping only: the warning has to be unmissable, since every name may be empty.
+	mappingOnly := esDiscoveryProvenance(0, 4306)
+	assert.Contains(t, mappingOnly, "may have no data")
+	assert.Contains(t, mappingOnly, "confirm a metric exists before concluding")
+
+	// Documents only: every name is a fact, so no caveat belongs on it.
+	docsOnly := esDiscoveryProvenance(8, 0)
+	assert.Contains(t, docsOnly, "8 read from documents")
+	assert.NotContains(t, docsOnly, "may have no data")
+
+	assert.Equal(t, "none found", esDiscoveryProvenance(0, 0))
+}
+
+// ---------------------------------------------------------------------------
+// metrics provider routing
+// ---------------------------------------------------------------------------
+
+// Discovery uses the configured integration for external metrics backends.
+// These decisions do not change EE execution through QueryMetrics.
+func TestMetricsDiscoveryUsesConfiguredProvider(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		provider services_server.ObservabilityProvider
+		want     bool
+		why      string
+	}{
+		{
+			name:     "user-configured CubeAPM",
+			provider: services_server.ObservabilityProvider{Provider: "cubeapm", IntegrationSource: "user"},
+			want:     true,
+			why:      "the relay has no agent that can answer for CubeAPM",
+		},
+		{
+			name:     "user-configured OpenObserve",
+			provider: services_server.ObservabilityProvider{Provider: "openobserve", IntegrationSource: "user"},
+			want:     true,
+		},
+		{
+			name:     "in-cluster Prometheus behind the k8s agent",
+			provider: services_server.ObservabilityProvider{Provider: "prometheus", IntegrationSource: "agent"},
+			want:     false,
+			why:      "this is exactly what the relay path exists for",
+		},
+		{
+			name:     "cloud CLI fallback is labelled agent",
+			provider: services_server.ObservabilityProvider{Provider: "aws", IntegrationSource: "agent"},
+			want:     false,
+			why:      "GetMetricsProvider labels the cloud fallbacks agent; they are not api-server metric sources",
+		},
+		{
+			name:     "user-configured Prometheus discovers prometheus",
+			provider: services_server.ObservabilityProvider{Provider: "prometheus", IntegrationSource: "user"},
+			want:     false,
+			why:      "its discovery provider is already prometheus",
+		},
+		{
+			name:     "unresolved provider",
+			provider: services_server.ObservabilityProvider{},
+			want:     false,
+			why:      "no provider resolved is not a reason to change where the query goes",
+		},
+		{
+			name:     "casing and padding are not significant",
+			provider: services_server.ObservabilityProvider{Provider: "  CubeAPM ", IntegrationSource: " USER "},
+			want:     true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := metricsDiscoveryUsesConfiguredProvider(tc.provider)
+			assert.Equal(t, tc.want, got, tc.why)
+		})
+	}
+}
+
+// Discovery has to enumerate the backend the account actually uses. Asking for
+// Prometheus metrics on a CubeAPM account returns nothing, and the agent then
+// guesses names from its Kubernetes priors — container_http_requests_total,
+// istio_requests_total — which match nothing and read as "no metrics reported".
+func TestMetricsDiscoveryProviderFor(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		provider services_server.ObservabilityProvider
+		want     string
+		why      string
+	}{
+		{
+			name:     "user-configured CubeAPM enumerates CubeAPM",
+			provider: services_server.ObservabilityProvider{Provider: "cubeapm", IntegrationSource: "user"},
+			want:     "cubeapm",
+			why:      "this is the case that silently returned nothing",
+		},
+		{
+			name:     "user-configured OpenObserve enumerates OpenObserve",
+			provider: services_server.ObservabilityProvider{Provider: "openobserve", IntegrationSource: "user"},
+			want:     "openobserve",
+		},
+		{
+			name:     "user-configured Splunk Enterprise enumerates Splunk Enterprise",
+			provider: services_server.ObservabilityProvider{Provider: "splunk_enterprise", IntegrationSource: "user"},
+			want:     "splunk_enterprise",
+			why:      "series-match resolves through this, so a wrong provider routes to the agent relay",
+		},
+		{
+			name:     "in-cluster Prometheus stays prometheus",
+			provider: services_server.ObservabilityProvider{Provider: "prometheus", IntegrationSource: "agent"},
+			want:     "prometheus",
+		},
+		{
+			name:     "cloud CLI fallback stays prometheus",
+			provider: services_server.ObservabilityProvider{Provider: "aws", IntegrationSource: "agent"},
+			want:     "prometheus",
+			why:      "the cloud agents own those metrics; discovery here must not claim them",
+		},
+		{
+			name:     "unresolved provider stays prometheus",
+			provider: services_server.ObservabilityProvider{},
+			want:     "prometheus",
+		},
+		{
+			name:     "surrounding whitespace is trimmed",
+			provider: services_server.ObservabilityProvider{Provider: " cubeapm ", IntegrationSource: " user "},
+			want:     "cubeapm",
+			why:      "the value is sent to the api-server as a provider name",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, metricsDiscoveryProviderFor(tc.provider), tc.why)
+		})
+	}
+}
+
+// seriesFromMetricsResponse — the services-server answer, flattened for the
+// stats pass exactly as the relay's series_list_result used to be.
+
+func TestSeriesFromMetricsResponse_FlattensSeriesWithNumericValues(t *testing.T) {
+	tool := PrometheusExecuteTool{}
+	got, err := tool.seriesFromMetricsResponse(core.ObservabilityMetricsQueryResponse{Results: []core.ObservabilityMetricsQueryResult{{
+		QueryKey: "query",
+		Payload: []core.ObservabilityMetricsQuerySeries{
+			{Metric: map[string]string{"pod": "api-1"}, Timestamps: []int64{1700000000, 1700000060}, Values: []float64{1, 2.5}},
+			{Metric: map[string]string{"pod": "api-2"}, Timestamps: []int64{1700000000}, Values: []float64{3}},
+		},
+	}}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 series, got %d", len(got))
+	}
+	first := got[0].(map[string]any)
+	if first["metric"].(map[string]any)["pod"] != "api-1" {
+		t.Errorf("metric labels not carried: %v", first["metric"])
+	}
+	if vals := first["values"].([]any); len(vals) != 2 || vals[1] != 2.5 {
+		t.Errorf("values not carried as numbers: %v", vals)
+	}
+	if ts := first["timestamps"].([]any); len(ts) != 2 || ts[0] != 1.7e9 {
+		t.Errorf("timestamps not carried as seconds: %v", ts)
+	}
+}
+
+func TestSeriesFromMetricsResponse_PerQueryErrorSurfaces(t *testing.T) {
+	tool := PrometheusExecuteTool{}
+	msg := "parse error at char 5: unexpected end of input"
+	_, err := tool.seriesFromMetricsResponse(core.ObservabilityMetricsQueryResponse{Results: []core.ObservabilityMetricsQueryResult{{QueryKey: "query", Error: &msg}}})
+	if err == nil || err.Error() != msg {
+		t.Fatalf("expected the provider's error, got %v", err)
+	}
+}
+
+func TestSeriesFromMetricsResponse_EmptyIsEmptyNotNil(t *testing.T) {
+	tool := PrometheusExecuteTool{}
+	got, err := tool.seriesFromMetricsResponse(core.ObservabilityMetricsQueryResponse{})
+	if err != nil || got == nil || len(got) != 0 {
+		t.Fatalf("expected an empty list, got %v (%v)", got, err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// executePromQl — nil request context
+// ---------------------------------------------------------------------------
+
+// TestExecutePromQl_NilRequestContextReturnsError guards the regression that
+// broke promql_query entirely: executePromQl dereferences nbRequestContext.Ctx
+// to reach services-server, so an internal caller that hand-builds an
+// NbToolContext without one took the whole agent run down with a nil pointer
+// dereference instead of failing a single tool call. A nil Ctx must surface as
+// an error the caller can handle.
+func TestExecutePromQl_NilRequestContextReturnsError(t *testing.T) {
+	tool := PrometheusExecuteTool{}
+
+	assert.NotPanics(t, func() {
+		data, err := tool.executePromQl(core.NbToolContext{}, "up", "acct-1", map[string]any{})
+		assert.Error(t, err)
+		assert.Nil(t, data)
+	})
 }

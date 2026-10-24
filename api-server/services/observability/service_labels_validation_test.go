@@ -5,6 +5,7 @@ import (
 	"nudgebee/services/common"
 	"nudgebee/services/query"
 	"nudgebee/services/security"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -17,21 +18,44 @@ import (
 // it; valuesErr forces QueryLabelValues to fail. lastValuesReq records the most recent
 // QueryLabelValues request so tests can assert on the (widened) time window passed in.
 type fakeLabelSource struct {
+	mu            sync.Mutex
 	labels        []OutputLogLabel
 	err           error
 	labelValues   map[string][]string
 	valuesErr     error
 	lastValuesReq FetchLogLabelValuesRequest
+	// valuesReqs records every QueryLabelValues call (lastValuesReq only keeps the most
+	// recent), so a test can assert every referenced label was actually probed under
+	// concurrent fan-out, not just the last one to finish.
+	valuesReqs    []FetchLogLabelValuesRequest
+	lastLabelsReq FetchLogLabelRequest
+	// probeLogs / probeErr are what QueryLogs answers the labelValueExists probe with:
+	// probeLogs non-empty means the backend does hold the value, probeErr means the probe
+	// could not be run. Both must make the diagnosis fail open.
+	probeLogs   []OutputLog
+	probeErr    error
+	probeReqs   []FetchLogRequest
+	probeCalled int
 }
 
-func (f *fakeLabelSource) QueryLogs(*security.RequestContext, FetchLogRequest) ([]OutputLog, error) {
-	return nil, nil
+func (f *fakeLabelSource) QueryLogs(_ *security.RequestContext, req FetchLogRequest) ([]OutputLog, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.probeCalled++
+	f.probeReqs = append(f.probeReqs, req)
+	return f.probeLogs, f.probeErr
 }
-func (f *fakeLabelSource) QueryLabels(*security.RequestContext, FetchLogLabelRequest) ([]OutputLogLabel, error) {
+func (f *fakeLabelSource) QueryLabels(_ *security.RequestContext, req FetchLogLabelRequest) ([]OutputLogLabel, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastLabelsReq = req
 	return f.labels, f.err
 }
 func (f *fakeLabelSource) QueryLabelValues(_ *security.RequestContext, req FetchLogLabelValuesRequest) ([]OutputLogLabelValue, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.lastValuesReq = req
+	f.valuesReqs = append(f.valuesReqs, req)
 	if f.valuesErr != nil {
 		return nil, f.valuesErr
 	}
@@ -171,7 +195,21 @@ func TestUnknownReferencedLabels(t *testing.T) {
 type fakeTraceSource struct {
 	labels []OutputTraceLabel
 	err    error
+	// mapping is the source's STATIC label mapping. Empty means the provider has
+	// declared nothing about which canonical fields it resolves, so the full canonical
+	// set stays valid for it (see providerDeclaresTraceFields).
+	mapping map[string]string
+	// values / valuesErr drive GetLabelValues for the value-validation tests.
+	values        map[string][]string
+	valuesErr     error
+	lastValuesReq TracesV3LabelValuesRequest
 }
+
+// completeFakeTraceSource is a fakeTraceSource that declares its value enumeration complete, so
+// validateReferencedTraceLabelValues will actually run against it.
+type completeFakeTraceSource struct{ fakeTraceSource }
+
+func (f *completeFakeTraceSource) TraceLabelValuesAreComplete() {}
 
 func (f *fakeTraceSource) QueryTraces(*security.RequestContext, TracesV3Request) ([]common.OpenTelemetryTrace, error) {
 	return nil, nil
@@ -182,8 +220,9 @@ func (f *fakeTraceSource) GetQuery(*security.RequestContext, TracesV3Request) (s
 func (f *fakeTraceSource) CountTraces(*security.RequestContext, TracesV3Request) (common.OpenTelemetryTraceCount, error) {
 	return common.OpenTelemetryTraceCount{}, nil
 }
-func (f *fakeTraceSource) GetLabelValues(*security.RequestContext, TracesV3LabelValuesRequest) (common.OpenTelemetryTraceLabelValues, error) {
-	return common.OpenTelemetryTraceLabelValues{}, nil
+func (f *fakeTraceSource) GetLabelValues(_ *security.RequestContext, req TracesV3LabelValuesRequest) (common.OpenTelemetryTraceLabelValues, error) {
+	f.lastValuesReq = req
+	return common.OpenTelemetryTraceLabelValues{Label: req.Label, Values: f.values[req.Label]}, f.valuesErr
 }
 func (f *fakeTraceSource) QueryLabels(*security.RequestContext, FetchTraceLabelRequest) ([]OutputTraceLabel, error) {
 	return f.labels, f.err
@@ -203,7 +242,7 @@ func (f *fakeTraceSource) CountTracesByTrace(*security.RequestContext, TracesV3R
 func (f *fakeTraceSource) QueryTracesHeatmap(*security.RequestContext, TracesHeatMapRequest) ([]common.OpenTelemetryTraceHeatMap, error) {
 	return nil, nil
 }
-func (f *fakeTraceSource) GetLabelMapping() map[string]string { return nil }
+func (f *fakeTraceSource) GetLabelMapping() map[string]string { return f.mapping }
 func (f *fakeTraceSource) GetSupportedOperators() []string    { return nil }
 
 func traceLabelSet(names ...string) []OutputTraceLabel {
@@ -226,11 +265,33 @@ func TestValidateReferencedTraceLabels(t *testing.T) {
 		assert.Contains(t, err.Error(), "trace provider")
 	})
 
-	t.Run("canonical trace field passes without backend discovery", func(t *testing.T) {
-		// service_name is a canonical trace field, so it is valid even though the
-		// backend QueryLabels only returns custom attributes.
+	t.Run("canonical trace field passes for a provider that declares no mapping", func(t *testing.T) {
+		// An empty static mapping means the provider has declared nothing about what it
+		// resolves, so the whole canonical vocabulary stays valid — this is the
+		// passthrough case (ClickHouse, Jaeger, Application Insights).
 		src := &fakeTraceSource{labels: traceLabelSet("app.custom.attr")}
 		assert.NoError(t, validateReferencedTraceLabels(ctx, src, traceReq, refSet("service_name"), nil))
+	})
+
+	t.Run("canonical trace field the provider declares passes without backend discovery", func(t *testing.T) {
+		// service_name is a canonical trace field AND declared by this provider's label
+		// mapping, so it is valid even though the backend QueryLabels only returns
+		// custom attributes.
+		mapping := map[string]string{"service_name": "service_name"}
+		src := &fakeTraceSource{labels: traceLabelSet("app.custom.attr"), mapping: mapping}
+		assert.NoError(t, validateReferencedTraceLabels(ctx, src, traceReq, refSet("service_name"), mapping))
+	})
+
+	t.Run("canonical trace field a declaring provider cannot resolve is rejected", func(t *testing.T) {
+		// The counterpart of the advertising rule in buildTraceLabels. This provider DOES
+		// publish a mapping, and that mapping does not cover duration_ns — so the caller
+		// is told the name is unknown here instead of receiving the empty result that
+		// reads as "there are no slow traces".
+		mapping := map[string]string{"service_name": "service_name"}
+		src := &fakeTraceSource{labels: traceLabelSet("app.custom.attr"), mapping: mapping}
+		err := validateReferencedTraceLabels(ctx, src, traceReq, refSet("duration_ns"), mapping)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "duration_ns")
 	})
 
 	t.Run("discovered attribute passes", func(t *testing.T) {
@@ -250,5 +311,161 @@ func TestValidateReferencedTraceLabels(t *testing.T) {
 		assert.Contains(t, err.Error(), "zzzzzz")
 		assert.Contains(t, err.Error(), "verify the name")
 		assert.NotContains(t, err.Error(), "traces_list_labels") // don't name a tool the caller may lack
+	})
+}
+
+// fakeESSource is an ES-shaped LogSource: QueryLabels answers with the index's FIELDS,
+// exactly as the real ES sources now do by delegating to QueryIndexFields. It adds the
+// alias capability so the canonical/.keyword names are exercised too.
+type fakeESSource struct {
+	fakeLabelSource
+	aliases func(discovered []string) []string
+}
+
+// GetQueryFieldAliases implements QueryFieldAliasSource.
+func (f *fakeESSource) GetQueryFieldAliases(discovered []string) []string {
+	if f.aliases == nil {
+		return nil
+	}
+	return f.aliases(discovered)
+}
+
+// esShaped builds a source whose queryable fields are the given names, wired to the REAL
+// alias function so these tests exercise the shipped logic rather than a restatement.
+func esShaped(fields ...string) *fakeESSource {
+	return &fakeESSource{
+		fakeLabelSource: fakeLabelSource{labels: labelSet(fields...)},
+		aliases:         esQueryFieldAliases,
+	}
+}
+
+func TestValidateReferencedLabels_ESFieldSource(t *testing.T) {
+	ctx := mockRequestContext()
+
+	// Regression for the live defect: validating ES field names against the INDEX names
+	// QueryLabels returns declared every correct field unknown, and the diagnosis told the
+	// agent to remove filters that were right.
+	t.Run("correct ES fields are not flagged as unknown", func(t *testing.T) {
+		src := esShaped("kubernetes.container_name", "kubernetes.namespace_name", "log")
+		referenced := map[string]struct{}{
+			"kubernetes.container_name": {},
+			"kubernetes.namespace_name": {},
+		}
+		err := validateReferencedLabels(ctx, src, FetchLogRequest{}, referenced, nil)
+		assert.NoError(t, err, "fields present in the index mapping must pass")
+	})
+
+	t.Run("a genuinely unknown field still errors with a close match", func(t *testing.T) {
+		src := esShaped("kubernetes.container_name", "kubernetes.namespace_name")
+		err := validateReferencedLabels(ctx, src, FetchLogRequest{},
+			map[string]struct{}{"kubernetes.container_nam": {}}, nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "kubernetes.container_nam")
+		assert.Contains(t, err.Error(), "kubernetes.container_name")
+	})
+
+	t.Run("fails open when the field lookup errors", func(t *testing.T) {
+		src := esShaped("kubernetes.container_name")
+		src.err = errors.New("mapping unavailable")
+		err := validateReferencedLabels(ctx, src, FetchLogRequest{},
+			map[string]struct{}{"whatever": {}}, nil)
+		assert.NoError(t, err)
+	})
+
+	t.Run("fails open when the field set is empty", func(t *testing.T) {
+		src := esShaped()
+		err := validateReferencedLabels(ctx, src, FetchLogRequest{},
+			map[string]struct{}{"whatever": {}}, nil)
+		assert.NoError(t, err)
+	})
+
+	t.Run("only the index is forwarded to the field lookup", func(t *testing.T) {
+		src := esShaped("kubernetes.container_name")
+		req := FetchLogRequest{Request: map[string]any{"index": "logs-*", "query_type": "dsl"}}
+		_ = validateReferencedLabels(ctx, src, req,
+			map[string]struct{}{"kubernetes.container_name": {}}, nil)
+		assert.Equal(t, map[string]any{"index": "logs-*"}, src.lastLabelsReq.Request,
+			"the index must travel; other provider-specific keys must not")
+	})
+
+	t.Run("no index yields a nil request so the source applies its own default", func(t *testing.T) {
+		src := esShaped("kubernetes.container_name")
+		_ = validateReferencedLabels(ctx, src, FetchLogRequest{},
+			map[string]struct{}{"kubernetes.container_name": {}}, nil)
+		assert.Nil(t, src.lastLabelsReq.Request)
+	})
+}
+
+// The ES query builder accepts names the index _mapping never reports — the canonical
+// k8s labels it expands, and a `.keyword` suffix on a field mapped as bare keyword.
+// Validating against the mapping alone reported all of them unknown and told the agent
+// to remove filters that were correct.
+func TestValidateReferencedLabels_QueryFieldAliases(t *testing.T) {
+	ctx := mockRequestContext()
+
+	t.Run("canonical k8s names are not flagged unknown", func(t *testing.T) {
+		src := esShaped("kubernetes.namespace_name", "kubernetes.pod_name", "log")
+		err := validateReferencedLabels(ctx, src, FetchLogRequest{}, map[string]struct{}{
+			"app": {}, "namespace": {}, "pod": {}, "container": {},
+		}, nil)
+		assert.NoError(t, err, "the ES query builder expands these; none is ever in a mapping")
+	})
+
+	t.Run("_body is not flagged unknown", func(t *testing.T) {
+		src := esShaped("log")
+		assert.NoError(t, validateReferencedLabels(ctx, src, FetchLogRequest{},
+			map[string]struct{}{"_body": {}}, nil))
+	})
+
+	t.Run("_body is not flagged on a non-ES provider either", func(t *testing.T) {
+		// llm-server advertises _body unconditionally, so it is never a typo anywhere.
+		src := &fakeLabelSource{labels: labelSet("service_name")}
+		assert.NoError(t, validateReferencedLabels(ctx, src, FetchLogRequest{},
+			map[string]struct{}{"_body": {}}, nil))
+	})
+
+	t.Run("a .keyword suffix on a mapped field is not flagged unknown", func(t *testing.T) {
+		src := esShaped("kubernetes.pod_name")
+		assert.NoError(t, validateReferencedLabels(ctx, src, FetchLogRequest{},
+			map[string]struct{}{"kubernetes.pod_name.keyword": {}}, nil))
+	})
+
+	t.Run("a canonical name is suggested for its typo", func(t *testing.T) {
+		src := esShaped("log")
+		err := validateReferencedLabels(ctx, src, FetchLogRequest{},
+			map[string]struct{}{"namesapce": {}}, nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "namespace", "aliases must reach the suggestion list, not just the known set")
+	})
+
+	t.Run("aliases do not rescue a genuinely unknown field", func(t *testing.T) {
+		src := esShaped("kubernetes.pod_name")
+		assert.Error(t, validateReferencedLabels(ctx, src, FetchLogRequest{},
+			map[string]struct{}{"zzz_unrelated_field": {}}, nil))
+	})
+
+	t.Run("aliases are never manufactured when discovery fails", func(t *testing.T) {
+		// The fail-open guard must run BEFORE the alias merge: aliases alone are not a
+		// field set, and returning them would flip every correct field to "unknown".
+		src := esShaped("kubernetes.pod_name")
+		src.err = errors.New("mapping unavailable")
+		assert.NoError(t, validateReferencedLabels(ctx, src, FetchLogRequest{},
+			map[string]struct{}{"zzz_unrelated_field": {}}, nil))
+	})
+
+	t.Run("a canonical name with a .keyword suffix is still unknown", func(t *testing.T) {
+		// Deliberate: binaryClauseForField would emit a term on a literal `namespace`
+		// field that no shipper writes.
+		src := esShaped("log")
+		assert.Error(t, validateReferencedLabels(ctx, src, FetchLogRequest{},
+			map[string]struct{}{"namespace.keyword": {}}, nil))
+	})
+
+	t.Run("canonical ES names stay unknown on a non-ES provider", func(t *testing.T) {
+		// The aliases are ES-scoped: on Loki/Pinot these names are genuine typos, and a
+		// global widen would destroy real diagnoses there.
+		src := &fakeLabelSource{labels: labelSet("service_name", "k8s_namespace_name")}
+		assert.Error(t, validateReferencedLabels(ctx, src, FetchLogRequest{},
+			map[string]struct{}{"namespace": {}}, nil))
 	})
 }

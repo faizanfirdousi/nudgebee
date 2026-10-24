@@ -7,12 +7,22 @@ import { toast as snackbar } from '@ui/Toast';
 import CustomTable from '@shared/tables/CustomTable';
 import { Label } from '@ui/Label';
 import { hasWriteAccess, fetchFeatureFlagsForAccount, canManage } from '@lib/auth';
-import { Box, Grid, Stack, Typography } from '@mui/material';
+import { Box, Grid, IconButton, Typography } from '@mui/material';
+import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined';
+import Tooltip from '@ui/Tooltip';
 import { Input } from '@ui/Input';
 import { Link } from '@ui/Link';
 import { useEffect, useRef, useState } from 'react';
 import { Modal } from '@ui/Modal';
 import Heading from '@components/common/Heading';
+import TenantAccountCommonSettings from '@shared/settings/TenantAccountCommonSettings';
+import {
+  EMPTY_TRACE_LABEL_SETTINGS,
+  TRACE_LABEL_ADVANCED_FIELDS,
+  TRACE_LABEL_FIELDS,
+  traceLabelsToSettings,
+  traceSettingsToLabelsValue,
+} from '@shared/settings/labelMapperFields';
 import { Divider } from '@ui/Divider';
 import K8sAccountModal from '@components/integrations/modal/K8sAccountModal';
 import { ListingLayout } from '@ui/ListingLayout';
@@ -28,16 +38,26 @@ import { Checkbox } from '@ui/Checkbox';
 import { parseHttpResponseBodyMessage, safeJSONParse } from 'src/utils/common';
 import apiUser from '@api1/user';
 import CopyButton from '@shared/buttons/CopyButton';
+import AccountEnvToggle, { accountEnvTooltip, DEFAULT_ACCOUNT_ENV } from '@shared/forms/AccountEnvToggle';
+import AccountEnvText from '@shared/format/AccountEnvText';
+import { getIntegrationDescription } from '@lib/integrationDescriptions';
+import { EmptyState } from '@ui/EmptyState';
+import AddIcon from '@mui/icons-material/Add';
+import LinkOutlinedIcon from '@mui/icons-material/LinkOutlined';
 
 // Agents connect asynchronously minutes after an account is created, so the
 // health columns are still empty on the fetch that follows install. Poll to
 // pick them up instead of making the user reload the page (#34174).
 const AGENT_POLL_MS = 30000;
 
+// The status each page opens on; relaxed to "all" once if it returns nothing.
+const DEFAULT_STATUS_FILTER = 'active';
+
 const K8sIntegrationTile = () => {
   const headers = [
     'Name',
     { name: 'Status', width: '10%' },
+    { name: 'Environment', width: '10%' },
     { name: 'Installed At', width: '10%' },
     { name: 'Last Connected At', width: '10%' },
     { name: 'Created By', width: '15%' },
@@ -56,18 +76,25 @@ const K8sIntegrationTile = () => {
   const [logNamespaceLabel, setLogNamespaceLabel] = useState('');
   const [logAppLabel, setLogAppLabel] = useState('');
   const [cloudAccountAttributes, setCloudAccountAttributes] = useState({});
-  const [logDefaultQuery, setLogDefaultQuery] = useState('');
+  const [traceSettings, setTraceSettings] = useState({ ...EMPTY_TRACE_LABEL_SETTINGS });
   const [certificateExpiry, setCertificateExpiry] = useState(0);
   const [networkThreshold, setNetworkThreshold] = useState(0);
   const [observationDays, setObservationDays] = useState(0);
+  // Image scanning is on for every account until someone turns it off here.
+  const [imageScanEnabled, setImageScanEnabled] = useState(true);
+  const [imageScanExcludedNamespaces, setImageScanExcludedNamespaces] = useState('');
   const [updateAccountStatus, setUpdateAccountStatus] = useState({});
   const [isStatusUpdating, setIsStatusUpdating] = useState(false);
   const [k8sCurlCommand, setK8sCurlCommand] = useState('');
   const [selectedAnomalyConfigs, setSelectedAnomalyConfigs] = useState([]);
   const [accountName, setAccountName] = useState('');
+  const [accountEnv, setAccountEnv] = useState(DEFAULT_ACCOUNT_ENV);
+  const [initialAccountEnv, setInitialAccountEnv] = useState(DEFAULT_ACCOUNT_ENV);
   const [nameInput, setNameInput] = useState('');
   const [selectedNameFilter, setSelectedNameFilter] = useState('');
-  const [selectedStatusFilter, setSelectedStatusFilter] = useState('active');
+  const [selectedStatusFilter, setSelectedStatusFilter] = useState(DEFAULT_STATUS_FILTER);
+  // The connect-empty-state must not flash before the first response lands.
+  const [hasLoaded, setHasLoaded] = useState(false);
   const [updating, setUpdating] = useState(false);
   const [featureOptions, setFeatureOptions] = useState([]);
   const [selectedFeatures, setSelectedFeatures] = useState([]);
@@ -118,6 +145,29 @@ const K8sIntegrationTile = () => {
     { label: 'Disabled', value: 'disabled' },
   ];
 
+  // Swap the filter bar + table for a "connect your first cluster" prompt only when the
+  // list is empty with the filters untouched. A zero-row result the user filtered their
+  // way into keeps the toolbar, otherwise clearing that filter is unreachable. Known
+  // edge: status defaults to Active, so a tenant whose only clusters are disabled sees
+  // this prompt too.
+  const showConnectPrompt = hasLoaded && !loading && totalCount === 0 && !selectedNameFilter && !selectedStatusFilter;
+
+  // When the default status filter hides everything, fall back to "all statuses" once
+  // before declaring the screen empty. Without this a tenant whose only configs are
+  // disabled sees the connect prompt — with no filter left on screen to clear, its
+  // disabled configs would be unreachable from the UI.
+  const relaxedStatusRef = useRef(false);
+  useEffect(() => {
+    if (!hasLoaded || loading || relaxedStatusRef.current) {
+      return;
+    }
+    if (totalCount === 0 && !selectedNameFilter && selectedStatusFilter) {
+      relaxedStatusRef.current = true;
+      setSelectedStatusFilter('');
+      setCurrentPage(0);
+    }
+  }, [hasLoaded, loading, totalCount, selectedNameFilter, selectedStatusFilter]);
+
   const getMenuItems = (item) => {
     return hasWriteAccess()
       ? [
@@ -143,6 +193,8 @@ const K8sIntegrationTile = () => {
       setSelectedAccountName(data.account_name);
       setAccountName(data.account_name);
       setSelectedAccountId(data.id);
+      setAccountEnv(data.account_env || DEFAULT_ACCOUNT_ENV);
+      setInitialAccountEnv(data.account_env || DEFAULT_ACCOUNT_ENV);
     } else if (menuItem.id === 'renew-token') {
       apiAccount.generateAgentToken(data.id).then((res) => {
         if (res?.data?.data?.agents_create_token?.access_secret) {
@@ -190,6 +242,9 @@ const K8sIntegrationTile = () => {
                 component: <Label text={item.status} />,
               },
               {
+                component: <AccountEnvText accountName={item.account_name} accountEnv={item.account_env} />,
+              },
+              {
                 component: <Datetime value={item.created_at} />,
               },
               health?.last_connected_at ? { component: <Datetime value={health.last_connected_at} /> } : { text: '-' },
@@ -219,6 +274,7 @@ const K8sIntegrationTile = () => {
         // response could clear a spinner the live request still needs.
         if (seq === listSeqRef.current) {
           setLoading(false);
+          setHasLoaded(true);
         }
       });
   };
@@ -252,9 +308,12 @@ const K8sIntegrationTile = () => {
         prevData.map((itemData) => {
           const item = healthByAccountId.get(itemData[0].drilldownQuery.id);
           const updatedItemData = [...itemData];
-          updatedItemData[3] = item?.last_connected_at ? { component: <Datetime value={item.last_connected_at} /> } : { text: '-' };
-          updatedItemData[5] = { text: item?.k8s_version || '-' };
-          updatedItemData[6] = { text: item?.version || '-' };
+          // Column indices below account for the Environment column inserted at
+          // index 2 (after Status): Last Connected At → 4, K8s Version → 6,
+          // Installed Agent Version → 7.
+          updatedItemData[4] = item?.last_connected_at ? { component: <Datetime value={item.last_connected_at} /> } : { text: '-' };
+          updatedItemData[6] = { text: item?.k8s_version || '-' };
+          updatedItemData[7] = { text: item?.version || '-' };
           return updatedItemData;
         })
       );
@@ -277,6 +336,18 @@ const K8sIntegrationTile = () => {
 
   useEffect(() => {
     if (accountSettings) {
+      // Outside the attrs-present guard below, and assigned unconditionally: an account
+      // with no attributes at all must show an empty mapper rather than the previously
+      // selected account's values. safeJSONParse returns null for a missing attribute,
+      // so that path yields the all-empty shape.
+      const accountAttrs = cloudAccountAttributes[selectedAccountId] || [];
+      setTraceSettings(traceLabelsToSettings(safeJSONParse(accountAttrs.find((l) => l.name === 'trace_labels')?.value)));
+      // Assigned unconditionally, for the same reason as trace_labels above: an
+      // account with no image_scan attribute must fall back to the defaults
+      // rather than show the previously opened account's values.
+      const imageScan = safeJSONParse(accountAttrs.find((l) => l.name === 'image_scan')?.value) || {};
+      setImageScanEnabled(imageScan.enabled !== false);
+      setImageScanExcludedNamespaces((imageScan.excluded_namespaces || []).join(', '));
       if (
         selectedAccountId in cloudAccountAttributes &&
         cloudAccountAttributes[selectedAccountId] &&
@@ -295,9 +366,6 @@ const K8sIntegrationTile = () => {
             }
             if (logLabelValues.namespace) {
               setLogNamespaceLabel(logLabelValues.namespace);
-            }
-            if (logLabelValues.defaultQuery) {
-              setLogDefaultQuery(logLabelValues.defaultQuery);
             }
           }
         }
@@ -346,10 +414,12 @@ const K8sIntegrationTile = () => {
     setLogAppLabel('');
     setLogNamespaceLabel('');
     setLogPodLabel('');
-    setLogDefaultQuery('');
+    setTraceSettings({ ...EMPTY_TRACE_LABEL_SETTINGS });
     setCertificateExpiry(0);
     setNetworkThreshold(0);
     setObservationDays(0);
+    setAccountEnv(DEFAULT_ACCOUNT_ENV);
+    setInitialAccountEnv(DEFAULT_ACCOUNT_ENV);
     setUpdating(false);
   };
 
@@ -419,7 +489,27 @@ const K8sIntegrationTile = () => {
           pod: logPodLabel,
           namespace: logNamespaceLabel,
           app: logAppLabel,
-          defaultQuery: logDefaultQuery,
+        }),
+        cloud_account_id: selectedAccountId,
+      },
+      // Unconditional for the same reason as log_labels above: trace_labels has no
+      // non-empty defaults, and gating the write would make clearing an override a no-op.
+      {
+        name: 'trace_labels',
+        value: traceSettingsToLabelsValue(traceSettings),
+        cloud_account_id: selectedAccountId,
+      },
+      // Also unconditional: re-enabling scanning or clearing the excluded list has
+      // to overwrite the stored value, which a "only write when non-empty" guard
+      // would skip.
+      {
+        name: 'image_scan',
+        value: JSON.stringify({
+          enabled: imageScanEnabled,
+          excluded_namespaces: imageScanExcludedNamespaces
+            .split(',')
+            .map((ns) => ns.trim())
+            .filter(Boolean),
         }),
         cloud_account_id: selectedAccountId,
       },
@@ -468,6 +558,25 @@ const K8sIntegrationTile = () => {
       } catch (error) {
         console.log('error', error);
         snackbar.error('Failed to Update Account Name');
+      }
+    }
+
+    if (accountEnv !== initialAccountEnv) {
+      try {
+        const res = await apiAccount.updateAccount({ id: selectedAccountId }, { account_env: accountEnv });
+
+        // updateAccount swallows failures and RETURNS the Error (resolves, not
+        // rejects), so guard against an Error/absent-data shape here — otherwise
+        // a failed update falls through to the success toast.
+        if (res instanceof Error || !res?.data || res?.data?.errors?.length > 0) {
+          const error = (res instanceof Error ? res.message : res?.data?.errors?.[0]?.message) || 'Failed to Update Environment';
+          snackbar.error(error);
+        } else {
+          snackbar.success('Account Environment Updated successfully');
+        }
+      } catch (error) {
+        console.log('error', error);
+        snackbar.error('Failed to Update Environment');
       }
     }
     setUpdating(false);
@@ -602,6 +711,18 @@ const K8sIntegrationTile = () => {
             </Box>
           </Box>
 
+          <Box sx={{ mt: ds.space[4] }}>
+            <Box sx={{ display: 'flex', alignItems: 'center' }}>
+              <Heading value='Environment' borderWidth='md' />
+              <Tooltip title={accountEnvTooltip()} placement='right'>
+                <IconButton id='k8s-account-env-info-btn' size='small' sx={{ p: 0.5 }}>
+                  <InfoOutlinedIcon fontSize='small' />
+                </IconButton>
+              </Tooltip>
+            </Box>
+            <AccountEnvToggle id='k8s-account-env' label='' value={accountEnv} onChange={setAccountEnv} disabled={updating || !hasWriteAccess()} />
+          </Box>
+
           <Divider color={ds.background[200]} sx={{ marginTop: ds.space[5], marginBottom: ds.space[5] }} />
 
           <Heading value='Log Label Mapper' borderWidth='md' />
@@ -620,11 +741,29 @@ const K8sIntegrationTile = () => {
               <Typography sx={styles.label}>App</Typography>
               <Input value={logAppLabel} placeholder='Log App label' onChange={(value) => setLogAppLabel(value)} />
             </Box>
+          </Box>
+          {/* The removed "Default query" box wrote a key nothing ever read (#37402). The working
+              setting lives on the log integration, so point there instead of leaving a gap. */}
+          <Typography sx={{ fontSize: ds.text.small, color: ds.gray[500], mt: ds.space[3] }}>
+            Looking for filters applied to every log query? Those are configured on the log integration: Integrations &rarr; your log integration
+            &rarr; Advanced Settings &rarr; Default Log Filters.
+          </Typography>
+          <Divider color={ds.background[200]} sx={{ marginTop: ds.space[5], marginBottom: ds.space[5] }} />
 
-            <Box display='flex' flexDirection='column'>
-              <Typography sx={styles.label}>Default query</Typography>
-              <Input value={logDefaultQuery} placeholder='Default Query' onChange={(value) => setLogDefaultQuery(value)} />
-            </Box>
+          {/* title={null} so this section carries the same accented <Heading> as the ones
+              either side of it, instead of the shared component's plain heading. */}
+          <Heading value='Trace Label Mapper' borderWidth='md' />
+          <Box sx={{ mt: ds.space[4] }}>
+            <TenantAccountCommonSettings
+              title={null}
+              idPrefix='trace-label'
+              fields={TRACE_LABEL_FIELDS}
+              advancedFields={TRACE_LABEL_ADVANCED_FIELDS}
+              advancedLabel='advanced trace fields'
+              settings={traceSettings}
+              setSettings={setTraceSettings}
+              disabled={!hasWriteAccess()}
+            />
           </Box>
           <Divider color={ds.background[200]} sx={{ marginTop: ds.space[5], marginBottom: ds.space[5] }} />
 
@@ -676,6 +815,29 @@ const K8sIntegrationTile = () => {
                     e.preventDefault();
                   }
                 }}
+              />
+            </Box>
+          </Box>
+
+          <Divider color={ds.background[200]} sx={{ marginTop: ds.space[5], marginBottom: ds.space[5] }} />
+
+          <Heading value='Image Vulnerability Scanning' borderWidth='md' />
+          <Box display='flex' flexDirection='column' gap={ds.space[3]} sx={{ mt: ds.space[3] }}>
+            <Checkbox
+              size='sm'
+              checked={imageScanEnabled}
+              label='Scan running container images for vulnerabilities'
+              onChange={(next) => setImageScanEnabled(next)}
+              disabled={!hasWriteAccess()}
+            />
+            <Box display='flex' flexDirection='column'>
+              <Input
+                value={imageScanExcludedNamespaces}
+                label='Excluded Namespaces'
+                help='Comma-separated. Images running only in these namespaces are never scanned. kube-system and nudgebee-agent are always excluded.'
+                placeholder='e.g. staging, sandbox'
+                onChange={(value) => setImageScanExcludedNamespaces(value)}
+                disabled={!imageScanEnabled || !hasWriteAccess()}
               />
             </Box>
           </Box>
@@ -743,7 +905,7 @@ const K8sIntegrationTile = () => {
         handleClose={isStatusUpdating ? () => {} : () => setUpdateAccountStatus({})}
         open={updateAccountStatus && Object.keys(updateAccountStatus).length > 0}
         title={
-          <Typography component='h2' variant='h6' fontWeight={600}>
+          <Typography component='h2' variant='h6' fontWeight={ds.weight.semibold}>
             {updateAccountStatus.status == 'active' ? 'Enable' : 'Disable'} Kubernetes Account
           </Typography>
         }
@@ -779,69 +941,98 @@ const K8sIntegrationTile = () => {
       </Modal>
       <K8sAccountModal openModal={openModal} handleClose={closeModal} handleOnAccountCreate={handleOnAccountCreate} />
       <ListingLayout id='k8s-integrations'>
-        <ListingLayout.Toolbar
-          title={
-            <Stack direction='row' alignItems='center' spacing={1}>
-              <Typography color={ds.gray[700]} fontSize={ds.text.title} fontWeight={600}>
-                Kubernetes
-              </Typography>
-              <CloudProviderIcon cloud_provider='K8S' />
-            </Stack>
-          }
+        <ListingLayout.Header
+          icon={<CloudProviderIcon cloud_provider='K8S' width={ds.space[5]} height={ds.space[5]} />}
+          title='Kubernetes'
+          description={getIntegrationDescription('K8S')}
           actions={
             canManage('integrations', 'Write') ? (
               <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
                 <TourLauncher tourId='connect-cluster' label='How to connect a cluster' />
-                <DsButton id='add-k8s-account' tone='primary' size='md' onClick={() => setOpenModal(true)} aria-label='Add K8s Account'>
-                  Add K8s Account
-                </DsButton>
+                {hasLoaded && totalCount > 0 && (
+                  <DsButton
+                    id='add-k8s-account'
+                    tone='primary'
+                    size='md'
+                    icon={<AddIcon sx={{ fontSize: 18 }} />}
+                    onClick={() => setOpenModal(true)}
+                    aria-label='Add K8s Account'
+                  >
+                    Add K8s Account
+                  </DsButton>
+                )}
               </Box>
             ) : undefined
           }
-        >
-          <FilterDropdown
-            id='k8s-status-filter'
-            label='Status'
-            options={statusOptions}
-            value={statusOptions.find((o) => o.value === selectedStatusFilter) ?? null}
-            onSelect={(_e, item) => handleStatusFilterChange({ target: { value: item?.value || '' } })}
-          />
-          <SearchInput
-            id='k8s-name-search'
-            value={nameInput}
-            onChange={(next) => {
-              setNameInput((prev) => {
-                if (prev.trim() !== '' && next.trim() === '') {
+        />
+        {showConnectPrompt ? (
+          <ListingLayout.Body padding={ds.space[5]}>
+            <EmptyState
+              id='k8s-no-accounts'
+              icon={<LinkOutlinedIcon sx={{ fontSize: 20 }} />}
+              title='No Kubernetes clusters connected'
+              description={getIntegrationDescription('K8S')}
+              action={
+                canManage('integrations', 'Write')
+                  ? { id: 'add-k8s-account', label: 'Add K8s Account', onClick: () => setOpenModal(true), icon: <AddIcon sx={{ fontSize: 16 }} /> }
+                  : undefined
+              }
+            />
+          </ListingLayout.Body>
+        ) : (
+          <>
+            <ListingLayout.Toolbar
+              actions={
+                <Typography sx={{ fontSize: ds.text.small, color: ds.gray[500], whiteSpace: 'nowrap' }}>
+                  {totalCount} {totalCount === 1 ? 'cluster' : 'clusters'}
+                </Typography>
+              }
+            >
+              <FilterDropdown
+                id='k8s-status-filter'
+                label='Status'
+                options={statusOptions}
+                value={statusOptions.find((o) => o.value === selectedStatusFilter) ?? null}
+                onSelect={(_e, item) => handleStatusFilterChange({ target: { value: item?.value || '' } })}
+              />
+              <SearchInput
+                id='k8s-name-search'
+                value={nameInput}
+                onChange={(next) => {
+                  setNameInput((prev) => {
+                    if (prev.trim() !== '' && next.trim() === '') {
+                      setSelectedNameFilter('');
+                      setCurrentPage(0);
+                    }
+                    return next;
+                  });
+                }}
+                onEnterPress={() => {
+                  setSelectedNameFilter(nameInput);
+                  setCurrentPage(0);
+                }}
+                onClear={() => {
+                  setNameInput('');
                   setSelectedNameFilter('');
                   setCurrentPage(0);
-                }
-                return next;
-              });
-            }}
-            onEnterPress={() => {
-              setSelectedNameFilter(nameInput);
-              setCurrentPage(0);
-            }}
-            onClear={() => {
-              setNameInput('');
-              setSelectedNameFilter('');
-              setCurrentPage(0);
-            }}
-            label='Enter Name'
-          />
-        </ListingLayout.Toolbar>
-        <ListingLayout.Body>
-          <CustomTable
-            stickyColumnIndex={'8'}
-            loading={loading}
-            tableData={tableData}
-            headers={headers}
-            totalRows={totalCount || tableData.length}
-            rowsPerPage={recordsPerPage}
-            pageNumber={currentPage + 1}
-            onPageChange={onPageChange}
-          />
-        </ListingLayout.Body>
+                }}
+                label='Enter Name'
+              />
+            </ListingLayout.Toolbar>
+            <ListingLayout.Body>
+              <CustomTable
+                stickyColumnIndex={'9'}
+                loading={loading}
+                tableData={tableData}
+                headers={headers}
+                totalRows={totalCount || tableData.length}
+                rowsPerPage={recordsPerPage}
+                pageNumber={currentPage + 1}
+                onPageChange={onPageChange}
+              />
+            </ListingLayout.Body>
+          </>
+        )}
       </ListingLayout>
     </>
   );

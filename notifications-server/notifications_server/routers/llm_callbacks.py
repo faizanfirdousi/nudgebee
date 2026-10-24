@@ -8,11 +8,12 @@ from sqlalchemy.orm import Session
 
 from notifications_server import sync_engine, slack_app, teams_app
 from notifications_server.routers.common import verify_action_token
-from notifications_server.services.common import CommonService
+from notifications_server.services.common import CommonService, extract_event_fingerprint
 from notifications_server.services.events import Events
 from notifications_server.services.cache import Cache
 from notifications_server.models.models import MessagingPlatform
 from notifications_server.utils.feature_flag_utils import is_feature_enabled
+from notifications_server.services.bot_messages import is_conversation_in_progress_error
 
 LOG = logging.getLogger(__name__)
 
@@ -29,10 +30,21 @@ event_cache = Cache()
 
 class LLMResponse(BaseModel):
     conversation_id: str
-    type: str  # "follow-up", "final" or "error"
+    type: str  # "follow-up", "final", "error", or "watch_registered"
     response: str
     tenant_id: Optional[str] = None
     session_id: Optional[str] = None
+    # Per-question correlator (see events.py:build_llm_payload) echoed back
+    # unchanged by llm-server. conversation_id/session_id are deliberately
+    # reused across every @mention in a bound incident channel, so they can't
+    # identify which physical Slack thread this specific response answers —
+    # reply_ref can. Optional: absent on requests sent before this field
+    # existed, and on responses to non-Slack-chat requests that never set it
+    # (e.g. the automated event-investigation pipeline).
+    reply_ref: Optional[str] = None
+    # From the llm-server watch feature: keys the in-progress status message on
+    # "watch_registered", and on "final" lets the handler retire it.
+    watch_id: Optional[str] = None
 
 
 async def get_cached_or_fallback_entry(
@@ -53,6 +65,7 @@ async def get_cached_or_fallback_entry(
             "channel_id": channel_id,
             "team_id": team_id,
             "account_id": account_id,
+            "tenant_id": payload.tenant_id,
             "session_id": conversation_id,
             "is_thread": False,
         }
@@ -100,17 +113,52 @@ def _parse_conversation(common_service: CommonService, conversation_id: str, pay
 
 
 def _handle_event_conversation(common_service: CommonService, conversation_id: str, payload: LLMResponse):
+    # A bound incident channel reuses this same conversation_id for every future
+    # @mention, so it alone can't tell which physical Slack thread a response
+    # belongs to. reply_ref (per-question, set only for a real @mention) wins
+    # when present; sent_notifications wins for finding-alert channels; the
+    # incident cache below covers channels bound only via slack.join_channel,
+    # which sent_notifications never sees.
     channel_id, thread_ts, team_id, account_id = common_service.get_channel_and_ts_from_sent_notifications(
         conversation_id, tenant_id=payload.tenant_id
     )
 
-    if payload.tenant_id:
+    reply_ref_channel_id = reply_ref_thread_ts = None
+    if payload.reply_ref:
+        parts = payload.reply_ref.rsplit("-", 1)
+        if len(parts) == 2 and parts[0] and parts[1]:
+            reply_ref_channel_id, reply_ref_thread_ts = parts
+        else:
+            LOG.warning(
+                "Malformed reply_ref on event conversation",
+                extra={"conversation_id": conversation_id, "reply_ref": payload.reply_ref},
+            )
+
+    # Exclude watch_registered only: it carries an empty response, so this path
+    # would just log a spurious "Missing required fields". Other types keep
+    # their prior behaviour — an allow-list here would silently drop `error`.
+    if reply_ref_channel_id and reply_ref_thread_ts:
+        channel_id, thread_ts = reply_ref_channel_id, reply_ref_thread_ts
+    elif payload.tenant_id and payload.type != "watch_registered":
         with Session(sync_engine) as session:
             if is_feature_enabled(session, "EVENT_ANALYSIS_ON_CHANNEL", payload.tenant_id):
-                parts = conversation_id.split("-", 1)
-                if len(parts) == 2 and parts[1]:
-                    incident_uuid = parts[1]
-                    common_service.get_incident_details_and_reply_on_channel(incident_uuid, payload)
+                incident_uuid = extract_event_fingerprint(conversation_id)
+                if incident_uuid:
+                    # Only overrides on success, so a sent_notifications hit above
+                    # (a normal finding-alert channel) isn't wiped out by a miss here.
+                    incident_channel_id, incident_thread_ts, incident_team_id, incident_account_id = (
+                        common_service.resolve_incident_channel_and_thread(incident_uuid)
+                    )
+                    if incident_channel_id and incident_thread_ts:
+                        # account_id isn't in resolve_incident_channel_and_thread's own
+                        # required-fields check, so a cache entry missing it must not
+                        # clobber a valid account_id already found via sent_notifications.
+                        channel_id, thread_ts, team_id, account_id = (
+                            incident_channel_id,
+                            incident_thread_ts,
+                            incident_team_id,
+                            incident_account_id or account_id,
+                        )
                 else:
                     LOG.warning(
                         "Could not extract incident_uuid from conversation_id for incident reply",
@@ -193,6 +241,7 @@ async def handle_llm_response(request: Request, background_tasks: BackgroundTask
                     "follow-up": events_service.handle_followup_response,
                     "final": events_service.handle_final_response,
                     "error": events_service.handle_error_response,
+                    "watch_registered": events_service.handle_watch_registered,
                 },
                 "ms_teams": {
                     "follow-up": events_service.handle_teams_followup_response,
@@ -209,12 +258,20 @@ async def handle_llm_response(request: Request, background_tasks: BackgroundTask
             if payload.type == "error":
                 # The upstream error text stays server-side; the thread only ever
                 # sees the generic copy the error handlers post.
-                LOG.error(
-                    "LLM run failed: conversation_id=%s, platform=%s, error=%s",
-                    payload.conversation_id,
-                    platform,
-                    payload.response,
-                )
+                if is_conversation_in_progress_error(payload.response):
+                    LOG.warning(
+                        "LLM run rejected (conversation in progress): conversation_id=%s, platform=%s, error=%s",
+                        payload.conversation_id,
+                        platform,
+                        payload.response,
+                    )
+                else:
+                    LOG.error(
+                        "LLM run failed: conversation_id=%s, platform=%s, error=%s",
+                        payload.conversation_id,
+                        platform,
+                        payload.response,
+                    )
 
             platform_handlers = handlers.get(platform)
             if not platform_handlers:
@@ -223,6 +280,15 @@ async def handle_llm_response(request: Request, background_tasks: BackgroundTask
 
             handler = platform_handlers.get(payload.type)
             if not handler:
+                # watch_registered = best-effort Slack-only indicator; other
+                # platforms skip rather than 400 (llm-server fires it for any chat).
+                if payload.type == "watch_registered":
+                    LOG.debug(
+                        "watch_registered not supported for platform=%s; skipping (conversation_id=%s)",
+                        platform,
+                        payload.conversation_id,
+                    )
+                    return {"status": "skipped"}
                 LOG.error("Unknown response type '%s' for conversation_id=%s", payload.type, payload.conversation_id)
                 raise HTTPException(status_code=400, detail=f"Unknown response type: {payload.type}")
 

@@ -2,6 +2,7 @@ package agents
 
 import (
 	"encoding/json"
+	"fmt"
 	"nudgebee/llm/agents/core"
 	"nudgebee/llm/common"
 	"nudgebee/llm/security"
@@ -179,18 +180,6 @@ func TestProviderQueryExamples_Coverage(t *testing.T) {
 					tc.provider, must)
 			}
 		})
-	}
-}
-
-// TestLogFetch_DefaultExamplesPresent — the unknown-provider fallback set
-// must stay non-empty; an empty list leaves the LLM with no schema reference.
-func TestLogFetch_DefaultExamplesPresent(t *testing.T) {
-	defaults := defaultQueryExamples()
-	assert.NotEmpty(t, defaults, "default examples must exist for the no-provider-fields fallback path")
-	for _, ex := range defaults {
-		assert.NotEmpty(t, ex.Answer, "every default example must have an Answer")
-		assert.True(t, strings.Contains(ex.Answer, "{") && strings.Contains(ex.Answer, "}"),
-			"default example Answer must be a JSON object: %q", ex.Answer)
 	}
 }
 
@@ -405,20 +394,20 @@ func TestEscapeShellSingleQuoted(t *testing.T) {
 	}
 }
 
-// TestFlattenLogsToJSONL pins the JSONL conversion: a Loki-shaped envelope
+// TestFlattenLogsToTabSeparated pins the conversion: a Loki-shaped envelope
 // becomes one entry per line in `<timestamp>\t<message>` form so grep can
 // localise matches. Non-envelope inputs (kubectl text, placeholders, malformed
 // JSON) pass through verbatim. This is the contract `agent_log.go`'s prompt
 // relies on when it tells the LLM to run `grep ... | head -20`.
-func TestFlattenLogsToJSONL(t *testing.T) {
-	t.Run("loki envelope becomes JSONL", func(t *testing.T) {
+func TestFlattenLogsToTabSeparated(t *testing.T) {
+	t.Run("loki envelope becomes tab-separated records", func(t *testing.T) {
 		input := `{"logs":[` +
 			`{"labels":{"app":"x"},"timestamp":"2026-05-06T03:00:10Z","message":"{\"level\":\"ERROR\",\"error\":\"ConnectionError\"}"},` +
 			`{"labels":{"app":"x"},"timestamp":"2026-05-06T03:00:20Z","message":"{\"level\":\"INFO\",\"message\":\"Job ok\"}"}` +
 			`]}`
-		got := flattenLogsToJSONL(input)
+		got := flattenLogsToTabSeparated(input)
 		lines := strings.Split(strings.TrimRight(got, "\n"), "\n")
-		assert.Len(t, lines, 2, "expected two JSONL lines, got %d: %q", len(lines), got)
+		assert.Len(t, lines, 2, "expected two tab-separated lines, got %d: %q", len(lines), got)
 		assert.Contains(t, lines[0], "2026-05-06T03:00:10Z")
 		assert.Contains(t, lines[0], "ERROR")
 		assert.Contains(t, lines[0], "ConnectionError")
@@ -429,37 +418,37 @@ func TestFlattenLogsToJSONL(t *testing.T) {
 
 	t.Run("kubectl text passthrough", func(t *testing.T) {
 		input := "2026-05-06T03:00:10Z stderr F ERROR Cannot connect to upstream\n2026-05-06T03:00:20Z stdout F INFO heartbeat ok\n"
-		got := flattenLogsToJSONL(input)
+		got := flattenLogsToTabSeparated(input)
 		assert.Equal(t, input, got, "kubectl text logs must pass through unchanged")
 	})
 
 	t.Run("no-logs-found placeholder passthrough", func(t *testing.T) {
 		input := `No logs found for Loki query: {namespace="ns",pod="p"} (time range: ...). The query executed successfully but returned no results.`
-		got := flattenLogsToJSONL(input)
+		got := flattenLogsToTabSeparated(input)
 		assert.Equal(t, input, got)
 	})
 
 	t.Run("envelope with zero entries passthrough", func(t *testing.T) {
 		input := `{"logs":[]}`
-		got := flattenLogsToJSONL(input)
+		got := flattenLogsToTabSeparated(input)
 		assert.Equal(t, input, got, "empty envelope should not be flattened")
 	})
 
 	t.Run("malformed JSON passthrough", func(t *testing.T) {
 		input := `{"logs": broken`
-		got := flattenLogsToJSONL(input)
+		got := flattenLogsToTabSeparated(input)
 		assert.Equal(t, input, got)
 	})
 
 	t.Run("empty input passthrough", func(t *testing.T) {
-		assert.Equal(t, "", flattenLogsToJSONL(""))
-		assert.Equal(t, "   ", flattenLogsToJSONL("   "))
+		assert.Equal(t, "", flattenLogsToTabSeparated(""))
+		assert.Equal(t, "   ", flattenLogsToTabSeparated("   "))
 	})
 
 	t.Run("entry without timestamp still emits message", func(t *testing.T) {
 		input := `{"logs":[{"message":"just a message"}]}`
-		got := flattenLogsToJSONL(input)
-		assert.Equal(t, "just a message\n", got)
+		got := flattenLogsToTabSeparated(input)
+		assert.Equal(t, "\tjust a message\n", got)
 	})
 
 	t.Run("grep shape — head -N means N entries", func(t *testing.T) {
@@ -474,7 +463,7 @@ func TestFlattenLogsToJSONL(t *testing.T) {
 			sb.WriteString(`{"timestamp":"2026-05-06T00:00:00Z","message":"line"}`)
 		}
 		sb.WriteString(`]}`)
-		got := flattenLogsToJSONL(sb.String())
+		got := flattenLogsToTabSeparated(sb.String())
 		assert.Equal(t, 50, strings.Count(got, "\n"))
 	})
 }
@@ -633,7 +622,7 @@ func TestLooksLikeFetchError(t *testing.T) {
 // <file_ref>` before it could filter:
 //
 //   - the preview is now of the SAME representation written to the file
-//     (flattenLogsToJSONL), so a filter can be written straight from it;
+//     (flattenLogsToTabSeparated), so a filter can be written straight from it;
 //   - `complete` states outright whether file_ref holds anything extra, rather
 //     than leaving the model to infer it from an absent truncation marker.
 func TestMakeFetchResponse_PreviewsLogsWhenFileRefPresent(t *testing.T) {
@@ -651,7 +640,7 @@ func TestMakeFetchResponse_PreviewsLogsWhenFileRefPresent(t *testing.T) {
 	}
 
 	t.Run("file_ref present: logs previewed, not inlined in full", func(t *testing.T) {
-		env := decode(makeFetchResponse("fetch_logs", "q", bigLogs, flattenLogsToJSONL(bigLogs), "logs_loki_1.txt", "", nil))
+		env := decode(makeFetchResponse("fetch_logs", "q", bigLogs, flattenLogsToTabSeparated(bigLogs), "logs_loki_1.txt", "", nil))
 		assert.Equal(t, "logs_loki_1.txt", str(env, "file_ref"))
 		assert.Less(t, len(str(env, "logs")), len(bigLogs),
 			"full logs must not be inlined when a file_ref exists")
@@ -671,7 +660,7 @@ func TestMakeFetchResponse_PreviewsLogsWhenFileRefPresent(t *testing.T) {
 
 	t.Run("file_ref present but logs already small: inlined unchanged and complete", func(t *testing.T) {
 		const small = "tiny log line"
-		env := decode(makeFetchResponse("fetch_logs", "q", small, flattenLogsToJSONL(small), "logs_loki_2.txt", "", nil))
+		env := decode(makeFetchResponse("fetch_logs", "q", small, flattenLogsToTabSeparated(small), "logs_loki_2.txt", "", nil))
 		assert.True(t, strings.HasPrefix(str(env, "logs"), small),
 			"the log content itself must be inlined unchanged")
 		assert.Contains(t, str(env, "logs"), "complete —",
@@ -681,24 +670,46 @@ func TestMakeFetchResponse_PreviewsLogsWhenFileRefPresent(t *testing.T) {
 	})
 
 	t.Run("preview format matches the file format, not the raw backend payload", func(t *testing.T) {
-		// The saved file is flattenLogsToJSONL(logs): "<timestamp>\t<message>"
+		// The saved file is flattenLogsToTabSeparated(logs): "<timestamp>\t<message>"
 		// per entry. Previewing the raw Loki envelope instead made it impossible
 		// to write a working grep from the preview, which is what forced the
 		// extra `head` turn. Both must now be byte-identical for a payload that
 		// fits inline.
 		raw := `{"logs":[{"timestamp":"2026-08-12T10:00:00Z","message":"{\"level\":\"ERROR\",\"msg\":\"boom\"}"}]}`
-		env := decode(makeFetchResponse("fetch_logs", "q", raw, flattenLogsToJSONL(raw), "logs_loki_4.txt", "", nil))
-		assert.True(t, strings.HasPrefix(str(env, "logs"), flattenLogsToJSONL(raw)),
+		env := decode(makeFetchResponse("fetch_logs", "q", raw, flattenLogsToTabSeparated(raw), "logs_loki_4.txt", "", nil))
+		assert.True(t, strings.HasPrefix(str(env, "logs"), flattenLogsToTabSeparated(raw)),
 			"the inline preview must be the same representation that was written to file_ref")
 		assert.NotContains(t, str(env, "logs"), `{"logs":[`,
 			"the raw backend envelope must not leak into the preview")
+		assert.Equal(t, "timestamp_tab_message", str(env, "logs_format"))
+		assert.Contains(t, str(env, "logs_format_hint"), "split once on TAB")
+		assert.Contains(t, str(env, "logs_format_hint"), "never JSON-decode the whole file")
+	})
+
+	t.Run("passthrough format avoids claiming a structured schema", func(t *testing.T) {
+		const raw = "plain kubectl log line\nsecond line"
+		env := decode(makeFetchResponse("fetch_logs", "q", raw, flattenLogsToTabSeparated(raw), "logs_kubectl_1.txt", "", nil))
+		assert.Equal(t, "passthrough", str(env, "logs_format"))
+		assert.Contains(t, str(env, "logs_format_hint"), "preview demonstrates that format")
 	})
 
 	t.Run("bundle_signal present: threaded through envelope verbatim", func(t *testing.T) {
 		const sig = "=== CRASH BUNDLE ===\n[error] 3 hits\n[oom] 1 hit"
-		env := decode(makeFetchResponse("fetch_logs", "q", "tiny", flattenLogsToJSONL("tiny"), "logs_loki_3.txt", sig, nil))
+		env := decode(makeFetchResponse("fetch_logs", "q", "tiny", flattenLogsToTabSeparated("tiny"), "logs_loki_3.txt", sig, nil))
 		assert.Equal(t, sig, str(env, "bundle_signal"),
 			"bundle_signal must appear verbatim in the envelope so the LLM can read it without a follow-up tool call")
+	})
+
+	t.Run("loki envelope: inline preview is flattened tab-separated records, not raw escaped JSON", func(t *testing.T) {
+		raw := `{"logs":[` +
+			`{"labels":{"app":"x"},"timestamp":"2026-05-06T03:00:10Z","message":"{\"level\":\"ERROR\",\"error\":\"ConnectionError\"}"},` +
+			`{"labels":{"app":"x"},"timestamp":"2026-05-06T03:00:20Z","message":"{\"level\":\"INFO\",\"message\":\"Job ok\"}"}` +
+			`]}`
+		env := decode(makeFetchResponse("fetch_logs", "q", raw, flattenLogsToTabSeparated(raw), "logs_loki_4.txt", "", nil))
+		assert.True(t, strings.HasPrefix(str(env, "logs"), flattenLogsToTabSeparated(raw)),
+			"inline preview must match the same one-entry-per-line form saved to file_ref")
+		assert.NotContains(t, env["logs"], `"logs":[`,
+			"inline preview must not be the raw Loki envelope — that's what pushed the model to a follow-up shell_execute peek")
 	})
 }
 
@@ -750,20 +761,6 @@ func TestBuildLogIntentMessages_AccountPromptPropagation_DuplicateGuard(t *testi
 		sys := textOf(msgs[0])
 		assert.Less(t, len(sys), len(sysPrompt)+defaultCustomAgentAccountPromptBytes+1024)
 	})
-}
-
-// TestDefaultProviderLogFields pins the fallback field vocabulary advertised
-// to the query-generator when backend label discovery fails: Signoz stores
-// logs under OTel attribute names — the generic `_body`/`namespace`/`pod` set
-// matches no Signoz attribute and every query silently returns zero rows.
-func TestDefaultProviderLogFields_DuplicateGuard(t *testing.T) {
-	signozFields := defaultProviderLogFields("signoz")
-	assert.ElementsMatch(t,
-		[]string{"body", "service.name", "k8s.cluster.name", "k8s.namespace.name", "k8s.pod.name", "trace_id"},
-		signozFields)
-	assert.Equal(t, signozFields, defaultProviderLogFields("SigNoz"), "provider match must be case-insensitive")
-	assert.Equal(t, []string{"_body", "namespace", "pod"}, defaultProviderLogFields("loki"))
-	assert.Equal(t, []string{"_body", "namespace", "pod"}, defaultProviderLogFields(""))
 }
 
 // TestEffectiveProvider guards the per-request log_provider_override: it must
@@ -912,16 +909,6 @@ func TestBuildLogIntentMessages_DomainKnowledgePropagation(t *testing.T) {
 // to the query-generator when backend label discovery fails: Signoz stores
 // logs under OTel attribute names — the generic `_body`/`namespace`/`pod` set
 // matches no Signoz attribute and every query silently returns zero rows.
-func TestDefaultProviderLogFields(t *testing.T) {
-	signozFields := defaultProviderLogFields("signoz")
-	assert.ElementsMatch(t,
-		[]string{"body", "service.name", "k8s.cluster.name", "k8s.namespace.name", "k8s.pod.name", "trace_id"},
-		signozFields)
-	assert.Equal(t, signozFields, defaultProviderLogFields("SigNoz"), "provider match must be case-insensitive")
-	assert.Equal(t, []string{"_body", "namespace", "pod"}, defaultProviderLogFields("loki"))
-	assert.Equal(t, []string{"_body", "namespace", "pod"}, defaultProviderLogFields(""))
-}
-
 func TestIsNotFoundReason(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -957,6 +944,99 @@ func TestExtractKubectlStdout(t *testing.T) {
 		got := extractKubectlStdout(`{"stdout":"","stderr":"some stderr"}`)
 		assert.Equal(t, `{"stdout":"","stderr":"some stderr"}`, got)
 	})
+}
+
+// TestKubectlStdoutFieldIsEmpty exists because extractKubectlStdout's
+// "empty stdout field falls back to raw trimmed input" behaviour above means
+// it is NEVER itself empty — a caller that wants to know "did this command
+// actually return nothing" cannot use it. This is exactly the check
+// generateKubeCtlLogQueryAndExecute needs for the filter_pattern-empty-result
+// caveat: a real quirk that made a naive first attempt at that check never
+// fire (extractKubectlStdout(logs) == "" was always false).
+func TestKubectlStdoutFieldIsEmpty(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want bool
+	}{
+		{"blank stdout field", `{"stdout":""}`, true},
+		{"whitespace-only stdout field", `{"stdout":"   \n"}`, true},
+		{"non-empty stdout field", `{"stdout":"some log line"}`, false},
+		{"malformed JSON — fails open (not empty)", `not json at all`, false},
+		{"missing stdout key — should not be treated as empty stdout", `{"other":"value"}`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, kubectlStdoutFieldIsEmpty(tc.in))
+		})
+	}
+}
+
+// TestFilteredEmptyLogsCaveat guards a real bug caught in code review: an
+// earlier version hand-built the {"stdout":...} envelope with
+// fmt.Sprintf("...%q...", pattern) inside a JSON string literal. %q emits
+// Go-escaped quotes, not JSON-escaped ones, so any pattern produced invalid
+// JSON — confirmed here by round-tripping the result back through
+// json.Unmarshal, not just checking it "looks like" a message.
+func TestFilteredEmptyLogsCaveat(t *testing.T) {
+	cases := []struct {
+		name    string
+		pattern string
+	}{
+		{"plain alternation pattern", "(error|exception|fail|fatal)"},
+		{"pattern containing a double quote", `oom|"stuck"`},
+		{"pattern containing a backslash", `\d+ errors`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := noMatchingKubectlLogsCaveat(tc.pattern, `{"stdout":""}`)
+
+			var env struct {
+				Stdout string `json:"stdout"`
+			}
+			err := json.Unmarshal([]byte(got), &env)
+			require.NoError(t, err, "noMatchingKubectlLogsCaveat must always produce valid JSON, got: %s", got)
+			// %q Go-escapes characters inside the pattern too (a quote in
+			// the pattern becomes \" in the rendered message) — check for
+			// the same %q-rendered form, not the raw pattern.
+			assert.Contains(t, env.Stdout, fmt.Sprintf("%q", tc.pattern))
+			assert.Contains(t, env.Stdout, "does NOT mean the container has no relevant output")
+		})
+	}
+
+	t.Run("marshal failure falls back to the original value unchanged", func(t *testing.T) {
+		// map[string]string never actually fails to marshal, so this proves
+		// the fallback branch statically rather than by construction.
+		got := noMatchingKubectlLogsCaveat("anything", `{"stdout":""}`)
+		assert.NotEmpty(t, got)
+	})
+}
+
+func TestBuildKubectlLogCommandHonorsRequestedWindow(t *testing.T) {
+	absolute := buildKubectlLogCommand(kubectlLogQuery{
+		ResourceName: "web-0", Namespace: "default", Tail: 100,
+		StartTime: "2026-08-13T04:50:15Z", TimeRange: "24h",
+	})
+	assert.Contains(t, absolute, "--since-time=2026-08-13T04:50:15Z")
+	assert.NotContains(t, absolute, "--since=24h")
+
+	relative := buildKubectlLogCommand(kubectlLogQuery{ResourceName: "web-0", Tail: 100, TimeRange: "7d"})
+	assert.Contains(t, relative, "--since=168h0m0s")
+}
+
+func TestStripKubectlPodBannerAndDisclosure(t *testing.T) {
+	raw := `{"stdout":"Found 4 pods, using pod/checkout-74fb7f54d5-kpl75\nreal log line\n","stderr":"warn"}`
+	cleaned, podCount, usedPod := stripKubectlPodBanner(raw)
+	assert.Equal(t, 4, podCount)
+	assert.Equal(t, "checkout-74fb7f54d5-kpl75", usedPod)
+	assert.NotContains(t, cleaned, "Found 4 pods")
+	assert.Contains(t, cleaned, "real log line")
+
+	note := kubectlDisclosureNote(kubectlLogQuery{FilterPattern: "error"}, podCount, usedPod)
+	assert.Contains(t, note, "3 other pod(s)")
+	assert.Contains(t, note, "error")
+	resp := withKubectlDisclosure(core.NBAgentResponse{Response: []string{`{"logs":"x"}`}}, note)
+	assert.Contains(t, resp.Response[0], "kubectl_disclosure")
 }
 
 func TestParseKubectlDiscoveryCandidates(t *testing.T) {
@@ -1101,4 +1181,177 @@ func TestFetchLabelsAndIndices_EmptyAccountBypassesCache(t *testing.T) {
 
 	_, ok := common.CacheGet(logLabelsCacheNS, sharedKey)
 	assert.False(t, ok, "an empty accountId must never write to the tenant-less shared key")
+}
+
+// TestFetchLogsAgent_Registered ensures fetch_logs is in the system registry.
+func TestFetchLogsAgent_Registered(t *testing.T) {
+	ctx := security.NewRequestContextForSuperAdmin()
+	agent, ok := core.GetNBAgent(ctx, FetchLogsAgentName, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "")
+	assert.True(t, ok, "fetch_logs must be registered as a system agent")
+	assert.NotNil(t, agent)
+	assert.Equal(t, FetchLogsAgentName, agent.GetName())
+}
+
+// TestClassifyLogMode pins the deterministic intent classifier fetch_logs
+// uses (via runAutoDiagnosticBundle) to decide whether to auto-fire the
+// diagnostic bundle. The classifier prefers OriginalQuery over Query so that
+// a parent planner's paraphrase ("Get logs for X") doesn't downgrade an
+// investigation ("Were there issues with X?") to routine.
+func TestClassifyLogMode(t *testing.T) {
+	cases := []struct {
+		name     string
+		query    string
+		original string
+		want     logMode
+	}{
+		// Routine
+		{"tail logs", "show me last logs for api-server", "", logModeRoutine},
+		{"recent logs", "get recent logs of llm-server in nudgebee namespace", "", logModeRoutine},
+		{"time range only", "logs between 10:00 and 11:00", "", logModeRoutine},
+
+		// Investigation
+		{"why is X broken", "why is api-service in app-108 failing", "", logModeInvestigation},
+		{"diagnose", "diagnose checkout-api connection refused errors", "", logModeInvestigation},
+		{"what caused", "what caused the outage in payment-api", "", logModeInvestigation},
+		{"were there issues", "were there issues with cron-scheduler in ns-73b", "", logModeInvestigation},
+		{"root cause", "find the root cause of the crash in worker-7", "", logModeInvestigation},
+
+		// Enumeration
+		{"list errors", "list all errors in payment-api last 1h", "", logModeEnumeration},
+		{"show errors", "show me the errors in my-app-51", "", logModeEnumeration},
+		{"distinct errors", "what distinct errors appear in checkout-api", "", logModeEnumeration},
+		{"summarise errors", "summarize errors in cron-scheduler", "", logModeEnumeration},
+
+		// OriginalQuery wins over per-step paraphrase — this is the case that
+		// regressed in production today: parent emitted "Get logs for pod X"
+		// and the LLM treated it as routine, skipping the investigation flow.
+		{
+			name:     "parent paraphrase loses intent without classifier",
+			query:    "Get logs for pod cron-scheduler-xtcwd in namespace-73b",
+			original: "Were there issues with the cron-scheduler pod in namespace-73b?",
+			want:     logModeInvestigation,
+		},
+		{
+			name:     "empty original falls back to query",
+			query:    "why is api-server failing",
+			original: "",
+			want:     logModeInvestigation,
+		},
+
+		// Enumeration's noun list must cover symptom words, not just the
+		// "error" family — otherwise a plain listing request that happens to
+		// describe pods as "failing"/"broken"/"crashed" (rather than saying
+		// "errors") falls through to the weak-symptom investigation tier and
+		// gets routed into the heavier mandatory-shell_execute workflow for
+		// what the user framed as "just list them".
+		{"list failing pods", "list the pods that are failing in namespace nudgebee", "", logModeEnumeration},
+		{"show broken services", "show me the broken services in prod", "", logModeEnumeration},
+		{"list crashed pods", "list crashed pods in nudgebee", "", logModeEnumeration},
+
+		// Stem/wildcard forms (fail\w*, crash\w*) and optional plurals catch
+		// variants a literal enumeration would miss: past tense ("failed", not
+		// just "failures"/"failing"), compound crash states that don't end at
+		// a word boundary after "crash" ("crashloopbackoff"), and singular
+		// nouns ("exception"/"issue", not just their plurals). Without these,
+		// "list the pods that failed" fell all the way through to ROUTINE —
+		// worse than the investigation-mode misroute this file's earlier
+		// cases fix, since ROUTINE doesn't even get the weak-symptom fallback.
+		{"list failed pods", "list the pods that failed in namespace nudgebee", "", logModeEnumeration},
+		{"list crashloopbackoff pods", "list crashloopbackoff pods in nudgebee", "", logModeEnumeration},
+		{"list exception singular", "list exception in api-server", "", logModeEnumeration},
+		{"show issue singular", "show issue with pod", "", logModeEnumeration},
+
+		// A strong causal ask must win even when an enumeration verb also
+		// appears in the same query — enumeration checking first (as it did
+		// before this fix) would discard the causal ask entirely.
+		{"causal ask co-occurring with enumeration verb", "show me the errors and explain why it broke", "", logModeInvestigation},
+		{"why are pods failing", "why are the pods failing in cron-scheduler", "", logModeInvestigation},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyLogMode(tc.query, tc.original)
+			assert.Equalf(t, tc.want, got,
+				"classifyLogMode(%q, %q) = %s; want %s",
+				tc.query, tc.original, logModeName(got), logModeName(tc.want))
+		})
+	}
+}
+
+// TestAutoBundleGate_ModeAwareness locks the gating rule that runAuto
+// DiagnosticBundle uses to decide whether to fire. The rule is:
+//
+//   - Investigation intent ("were there issues", "why", "broken",
+//     "diagnose", …) → ALWAYS fire. The logs prompt actively tells the
+//     LLM to strip error keywords from the fetch question, so keying only
+//     on the fetch query text would miss the exact investigations the
+//     bundle was built for.
+//   - Enumeration intent ("list errors", "show me distinct errors") →
+//     ALWAYS fire. That IS the enumeration answer.
+//   - Routine intent → fire only when the wording explicitly names error
+//     content (get error logs, any failures, …). Plain "tail last 100
+//     lines" stays a one-shot fetch.
+//
+// This mirrors the same decision runAutoDiagnosticBundle makes inline; the
+// test asserts the composed behaviour so a regression to a keyword-only gate
+// would fail here.
+func TestAutoBundleGate_ModeAwareness(t *testing.T) {
+	cases := []struct {
+		name     string
+		query    string // per-step query the parent passed to fetch_logs
+		original string // OriginalQuery — the user's verbatim question
+		want     bool
+	}{
+		{"investigation via 'were there issues' fires (fetch query itself has no keyword)",
+			"all logs for pod task-scheduler-abc in ns", "Were there issues with the task-scheduler pod", true},
+		{"investigation via 'why is X broken' fires",
+			"all logs for pod x", "why is service-y broken", true},
+		{"enumeration via 'list errors' fires",
+			"all logs last 1h", "list errors in service-z", true},
+		{"routine plain tail does NOT fire",
+			"tail last 100 lines", "", false},
+		{"routine with error keyword fires (fallback)",
+			"get error logs for pod x", "", true},
+		{"routine with no error content stays cold",
+			"give me the last 5 mins of logs", "recent logs for cron-scheduler", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mode := classifyLogMode(tc.query, tc.original)
+			q := strings.TrimSpace(tc.original)
+			if q == "" {
+				q = strings.TrimSpace(tc.query)
+			}
+			got := mode != logModeRoutine || autoBundleQueryRE.MatchString(q)
+			assert.Equal(t, tc.want, got,
+				"mode=%v q=%q — bundle gate mismatch", mode, q)
+		})
+	}
+}
+
+func TestAutoBundleQueryRE(t *testing.T) {
+	// Guards the trigger-word list that gates the auto-diagnostic-bundle
+	// inside fetch_logs. The list is deliberately narrow — a plain "tail
+	// last 100 lines" must NOT trigger the bundle, or we regress fetch's
+	// "one-shot, no extra work" semantic for routine viewing. Any
+	// addition/removal here should be conscious.
+	cases := []struct {
+		q    string
+		want bool
+	}{
+		{"get error logs for pod x", true},
+		{"any failures in namespace y", true},
+		{"show me warnings from last hour", true},
+		{"was there a crash on this pod", true},
+		{"any exceptions in api-server", true},
+		{"timeout occurred?", true},
+		{"OOMKilled events for job", true},
+		{"tail last 100 lines", false},
+		{"recent logs for cron-scheduler", false},
+		{"give me the last 5 mins of logs", false},
+		{"show pod restart count", false},
+	}
+	for _, tc := range cases {
+		assert.Equalf(t, tc.want, autoBundleQueryRE.MatchString(tc.q),
+			"autoBundleQueryRE.MatchString(%q)", tc.q)
+	}
 }

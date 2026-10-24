@@ -1,16 +1,19 @@
 import apiAccount from '@api1/account';
+import { getBrandTitle } from '@hooks/useTenantBranding';
 import apiIntegrations from '@api1/integrations';
 import { withAccountGuard } from '@shared/AccountGuard';
 import k8sApi from '@api1/kubernetes';
 import apiUser from '@api1/user';
 import apiWorkflow from '@api1/workflow';
 import { ListingLayout } from '@ui/ListingLayout';
+import { EmptyState } from '@ui/EmptyState';
 import FilterDropdown from '@ui/FilterDropdown';
 import SearchInput from '@ui/SearchInput';
 import { Button as DsButton } from '@ui/Button';
 import ThreeDotsMenu from '@ui/ThreeDotsMenu';
 import CloudProviderIcon from '@shared/icons/CloudIcon';
 import IntegrationDynamicFormModal from '@components/integrations/modal/IntegrationDynamicFormModal';
+import WebhookActivityLogModal from '@components/integrations/modal/WebhookActivityLogModal';
 import AddLLMConfigModal from '@components/llm/AddLLMConfigModal';
 import VmAgentCredentialsDialog from '@components/integrations/modal/VmAgentCredentialsDialog';
 import { Label } from '@ui/Label';
@@ -18,15 +21,20 @@ import { Modal } from '@ui/Modal';
 import { toast as snackbar } from '@ui/Toast';
 import CustomTable from '@shared/tables/CustomTable';
 import { canManage } from '@lib/auth';
+import { getIntegrationDescription } from '@lib/integrationDescriptions';
+import { buildWebhookUrl, getWebhookToken } from '@lib/webhookUrl';
+import CopyButton from '@shared/buttons/CopyButton';
 import { action } from 'src/utils/actionStyles';
 import { ds } from 'src/utils/colors';
 import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined';
+import AddIcon from '@mui/icons-material/Add';
+import LinkOutlinedIcon from '@mui/icons-material/LinkOutlined';
 import { Box, Stack, Typography } from '@mui/material';
 import Tooltip from '@ui/Tooltip';
 import { Chip } from '@ui/Chip';
 import { useSession } from 'next-auth/react';
 import { useRouter } from 'next/router';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, useRef } from 'react';
 import { parseHttpResponseBodyMessage, safeJSONParse, snakeToTitleCase, toKebabCase } from 'src/utils/common';
 
 const getDisplayName = (name) => {
@@ -40,10 +48,15 @@ const getDisplayName = (name) => {
     return 'SSH';
   }
   if (name === 'llm_gateway') {
-    return 'LLM Gateway';
+    return 'AI Gateway';
   }
   return snakeToTitleCase(name);
 };
+
+// The status each page opens on; relaxed to "all" once if it returns nothing.
+const DEFAULT_STATUS_FILTER = 'enabled';
+// LLM configs list at most this many linked accounts before collapsing the rest.
+const VISIBLE_ACCOUNT_CHIPS = 2;
 
 // Maps integration name to the config key that holds its primary connection info
 const integrationConnectionKey = {
@@ -72,9 +85,13 @@ const integrationConnectionKey = {
   datadog: 'site',
   newrelic: 'region',
   splunk_observability_platform: 'realm',
+  splunk_enterprise: 'splunk_url',
   chronosphere: 'chronosphere_url',
   signoz: 'signoz_url',
+  loki: 'loki_url',
+  prometheus: 'prometheus_url',
   openobserve: 'openobserve_url',
+  cubeapm: 'cubeapm_url',
   observe: 'domain',
   azure_app_insights: 'azure_app_insights_app_id',
   dynatrace: 'base_url',
@@ -131,6 +148,7 @@ const ListIntegrations = ({ integrationName }) => {
     'dynatrace_webhook',
     'solarwinds_webhook',
     'elasticsearch_webhook',
+    'openobserve_webhook',
   ];
   const integrationWebhooks = [
     'pagerduty_webhook',
@@ -146,6 +164,7 @@ const ListIntegrations = ({ integrationName }) => {
     'solarwinds',
     'solarwinds_webhook',
     'elasticsearch_webhook',
+    'openobserve_webhook',
   ];
   const agentManagedIntegrations = ['ES', 'loki', 'prometheus', 'otel_clickhouse', 'jaeger'];
   const hideConnectionInfo =
@@ -158,7 +177,12 @@ const ListIntegrations = ({ integrationName }) => {
   // LLM Gateway is tenant-scoped (no account concept) — it drops the Account column.
   const isLLMGateway = integrationName === 'llm_gateway';
   const accountCols = isLLMGateway ? [] : ['Account'];
-  const headers = hideConnectionInfo
+  // Webhook integrations surface their inbound receiver URL where the connection
+  // info would otherwise sit — that URL is the whole point of the integration.
+  const showWebhookUrl = !!integrationName?.endsWith('_webhook');
+  const headers = showWebhookUrl
+    ? ['Name', 'URL', ...accountCols, 'Created By', 'Updated By', 'Status', '']
+    : hideConnectionInfo
     ? ['Name', ...accountCols, 'Created By', 'Updated By', 'Status', '']
     : ['Name', 'Connection Info', ...accountCols, 'Created By', 'Updated By', 'Status', ''];
 
@@ -218,9 +242,17 @@ const ListIntegrations = ({ integrationName }) => {
   const [testingConnectionId, setTestingConnectionId] = useState(null);
   const [testableConfig, setTestableConfig] = useState({ testable: false, testable_when: null });
   const [agentHealthMap, setAgentHealthMap] = useState({});
+  const [activityLogIntegration, setActivityLogIntegration] = useState(null);
   const [nameInput, setNameInput] = useState('');
   const [selectedNameFilter, setSelectedNameFilter] = useState('');
-  const [selectedStatusFilter, setSelectedStatusFilter] = useState('enabled');
+  const [selectedStatusFilter, setSelectedStatusFilter] = useState(DEFAULT_STATUS_FILTER);
+  // Which integration the rows in state belong to. Tagged rather than a plain "have I
+  // loaded" boolean because this component is reused across integrations without
+  // remounting — the account-form switch returns the same element type — so an
+  // untagged flag stays true through the swap and paints the previous integration's
+  // emptiness under the new integration's name.
+  const [loadedFor, setLoadedFor] = useState(null);
+  const hasLoaded = loadedFor === integrationName;
 
   const handleTestConnection = async (item) => {
     setTestingConnectionId(item.id);
@@ -238,14 +270,14 @@ const ListIntegrations = ({ integrationName }) => {
     }
   };
 
+  // The tenant's default LLM provider is recorded as the integration's own
+  // default_llm_provider config value.
+  const isTenantDefault = (item) =>
+    (Array.isArray(item?.integration_config_values) ? item.integration_config_values : []).some(
+      (v) => v?.name === 'default_llm_provider' && v?.value === 'true'
+    );
+
   const linkedAccounts = (item) => (Array.isArray(item?.integrations_cloud_accounts) ? item.integrations_cloud_accounts : []);
-
-  const defaultAccountCount = (item) => linkedAccounts(item).filter((a) => a?.default_llm_provider === true).length;
-
-  const isDefaultForAllAccounts = (item) => {
-    const accounts = linkedAccounts(item);
-    return accounts.length > 0 && defaultAccountCount(item) === accounts.length;
-  };
 
   const getMenuItems = (item) => {
     // Same gate as the Add-integration button below (canManage('integrations',
@@ -256,6 +288,11 @@ const ListIntegrations = ({ integrationName }) => {
     if (!canManage('integrations', 'Write')) return [];
     const status = item.status || 'enabled';
     const items = [];
+    // Webhook integrations get an Activity Log entry point — the incoming events
+    // received on this webhook, plus total/processed counts.
+    if (integrationName?.endsWith('_webhook')) {
+      items.push({ label: 'Activity Log', id: 'activity_log' });
+    }
     if (item?.source === 'agent' && agentManagedIntegrations.includes(integrationName)) {
       if (status === 'disabled') {
         items.push({ label: 'Enable', id: 'enable' });
@@ -292,7 +329,7 @@ const ListIntegrations = ({ integrationName }) => {
       // Offered only where it can take effect — a disabled config is skipped by
       // resolution — and hidden once this config already serves every account
       // it is linked to.
-      if (isLLMIntegration && status !== 'disabled' && !isDefaultForAllAccounts(item)) {
+      if (isLLMIntegration && status !== 'disabled' && !isTenantDefault(item)) {
         items.push({ label: 'Set as default', id: 'set-default' });
       }
     }
@@ -411,6 +448,8 @@ const ListIntegrations = ({ integrationName }) => {
       setModalAction('regenerate');
     } else if (menuItem.id === 'test_connection') {
       handleTestConnection(item);
+    } else if (menuItem.id === 'activity_log') {
+      setActivityLogIntegration(item);
     }
   };
 
@@ -451,17 +490,10 @@ const ListIntegrations = ({ integrationName }) => {
   };
 
   // The marker sits on the config's own name rather than in a column, because
-  // it is a property of this config, not of any one account it serves.
-  //
-  // The UI applies one default to every account a config is linked to, so the
-  // normal state is all-or-nothing and a bare chip says it. A mixed state can
-  // only arrive through the API (the write path accepts a per-account map); it
-  // shows the count rather than being rounded to a plain "Default", which would
-  // misstate the accounts it excludes.
+  // it is a property of this config, not of any one account it serves: the
+  // tenant's default LLM provider, which accounts added later are linked to.
   const nameCell = (item) => {
-    const linked = linkedAccounts(item);
-    const marked = linked.filter((a) => a?.default_llm_provider === true).length;
-    if (!isLLMIntegration || marked === 0) {
+    if (!isLLMIntegration || !isTenantDefault(item)) {
       return { text: item.name };
     }
     return {
@@ -469,9 +501,9 @@ const ListIntegrations = ({ integrationName }) => {
         <Stack direction='row' spacing={0.5} alignItems='center' useFlexGap flexWrap='wrap'>
           <span>{item.name}</span>
           <Chip size='sm' variant='tag' tone='success'>
-            {marked === linked.length ? 'Default' : `Default (${marked} of ${linked.length})`}
+            Default
           </Chip>
-          <Tooltip title='Accounts added here use this provider by default.'>
+          <Tooltip title='Accounts added later use this provider automatically.'>
             <InfoOutlinedIcon sx={{ fontSize: ds.text.body, color: ds.gray[500], cursor: 'help' }} />
           </Tooltip>
         </Stack>
@@ -480,21 +512,72 @@ const ListIntegrations = ({ integrationName }) => {
   };
 
   // LLM only: other integration types are one-per-account, so they keep the
-  // plain text list and gain nothing from chips.
+  // plain text list and gain nothing from chips. One config can serve many
+  // accounts, so only the first few are shown and the rest collapse into a
+  // "+N more" chip whose tooltip lists every account.
   const accountChips = (item) => {
     const linked = linkedAccounts(item).filter((a) => a?.cloud_account_name);
     if (linked.length === 0) {
       return <span>-</span>;
     }
+    const visible = linked.slice(0, VISIBLE_ACCOUNT_CHIPS);
+    const hiddenCount = linked.length - visible.length;
     return (
       <Stack direction='row' spacing={0.5} useFlexGap flexWrap='wrap'>
-        {linked.map((acc, i) => (
+        {visible.map((acc, i) => (
           <Chip key={`${acc.cloud_account_name}-${i}`} size='sm' variant='tag' tone='neutral'>
             {acc.cloud_account_name}
           </Chip>
         ))}
+        {hiddenCount > 0 && (
+          <Tooltip
+            title={
+              <Stack spacing={0.5}>
+                {linked.map((acc, i) => (
+                  <span key={`${acc.cloud_account_name}-${i}`}>{acc.cloud_account_name}</span>
+                ))}
+              </Stack>
+            }
+          >
+            <span tabIndex={0} aria-label={`Linked accounts: ${linked.map((acc) => acc.cloud_account_name).join(', ')}`}>
+              <Chip size='sm' variant='tag' tone='subtle'>
+                {`+${hiddenCount} more`}
+              </Chip>
+            </span>
+          </Tooltip>
+        )}
       </Stack>
     );
+  };
+
+  // Webhook receiver URL cell: truncated to one line with the full URL on hover,
+  // plus a copy button — the same URL the Add/Edit modal hands out on creation.
+  const webhookUrlCell = (item) => {
+    const url = buildWebhookUrl(integrationName, getWebhookToken(item.integration_config_values));
+    if (!url) {
+      return { text: '-' };
+    }
+    return {
+      component: (
+        <Stack direction='row' spacing={0.5} alignItems='center'>
+          <Tooltip title={url}>
+            <Typography
+              sx={{
+                fontSize: ds.text.small,
+                color: ds.gray[600],
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+                maxWidth: ds.space.mul(1, 70),
+              }}
+            >
+              {url}
+            </Typography>
+          </Tooltip>
+          <CopyButton text={url} size='sm' toastMessage='Webhook URL copied' />
+        </Stack>
+      ),
+    };
   };
 
   const buildIntegrationRow = (item) => {
@@ -511,6 +594,9 @@ const ListIntegrations = ({ integrationName }) => {
         component: <ThreeDotsMenu sx={{ ...action.primary }} menuItems={getMenuItems(item)} data={item} onMenuClick={onMenuClick} />,
       },
     ];
+    if (showWebhookUrl) {
+      return [baseRow[0], webhookUrlCell(item), ...baseRow.slice(1)];
+    }
     if (hideConnectionInfo) {
       return baseRow;
     }
@@ -568,6 +654,7 @@ const ListIntegrations = ({ integrationName }) => {
       })
       .finally(() => {
         setLoading(false);
+        setLoadedFor(integrationName);
       });
   };
 
@@ -674,6 +761,62 @@ const ListIntegrations = ({ integrationName }) => {
     setSelectedIntegration({});
   };
 
+  // otel_clickhouse is still agent-only: it has no user-configurable form, so there is
+  // nothing for an Add button to open. Loki and Prometheus have both left that list —
+  // each can now be connected directly.
+  const canAddAccount = integrationName != 'otel_clickhouse' && canManage('integrations', 'Write');
+
+  const addAccountButton = canAddAccount ? (
+    <DsButton
+      id={`add-${toKebabCase(integrationName)}-account-btn`}
+      tone='primary'
+      size='md'
+      icon={<AddIcon sx={{ fontSize: 18 }} />}
+      onClick={() => {
+        setSelectedIntegration({});
+        setOpenModal(true);
+      }}
+      aria-label={`Add ${integrationName} Account`}
+    >
+      {`Add ${getDisplayName(integrationName)} Account`}
+    </DsButton>
+  ) : undefined;
+
+  // Providers whose header carries a "how do I get these values" guide.
+  const setupGuideIntegration =
+    integrationName === 'splunk_observability_platform'
+      ? 'Splunk Observability Cloud'
+      : integrationName === 'splunk_enterprise'
+      ? 'Splunk Enterprise'
+      : integrationName === 'solarwinds'
+      ? 'SolarWinds Observability'
+      : '';
+
+  // Swap the filter bar + table for a "connect your first account" prompt only when the
+  // list is empty with the filters untouched. A zero-row result the user filtered their
+  // way into keeps the toolbar, otherwise clearing that filter is unreachable. Known
+  // edge: status defaults to Enabled, so a tenant whose only configs are disabled sees
+  // this prompt too.
+  const showConnectPrompt = hasLoaded && !loading && totalCount === 0 && !selectedNameFilter && !selectedStatusFilter;
+
+  // When the default status filter hides everything, fall back to "all statuses" once
+  // before declaring the screen empty. Without this a tenant whose only configs are
+  // disabled sees the connect prompt — with no filter left on screen to clear, its
+  // disabled configs would be unreachable from the UI.
+  // Tagged for the same reason as `loadedFor`: a plain boolean would stay true
+  // after a swap and skip this fallback for every later integration in the session.
+  const relaxedFor = useRef(null);
+  useEffect(() => {
+    if (!hasLoaded || loading || relaxedFor.current === integrationName) {
+      return;
+    }
+    if (totalCount === 0 && !selectedNameFilter && selectedStatusFilter) {
+      relaxedFor.current = integrationName;
+      setSelectedStatusFilter('');
+      setCurrentPage(0);
+    }
+  }, [hasLoaded, loading, totalCount, selectedNameFilter, selectedStatusFilter, integrationName]);
+
   const handleConfirmationSubmit = () => {
     if (modalAction === 'delete') {
       handleDelete();
@@ -692,11 +835,12 @@ const ListIntegrations = ({ integrationName }) => {
         accessKey={regeneratedCredentials?.accessKey}
         accessSecret={regeneratedCredentials?.accessSecret}
       />
+      <WebhookActivityLogModal open={!!activityLogIntegration} onClose={() => setActivityLogIntegration(null)} integration={activityLogIntegration} />
       {integrationName === 'solarwinds' && (
         <Modal
           handleClose={() => setOpenSetupGuide(false)}
           title={
-            <Typography component='h2' variant='h6' fontWeight={600}>
+            <Typography component='h2' variant='h6' fontWeight={ds.weight.semibold}>
               SolarWinds Observability Setup Guide
             </Typography>
           }
@@ -707,7 +851,7 @@ const ListIntegrations = ({ integrationName }) => {
           isCancelRequired={false}
         >
           <Stack spacing={ds.space[4]} sx={{ fontSize: ds.text.bodyLg }}>
-            <Typography variant='subtitle2' fontWeight={600}>
+            <Typography variant='subtitle2' fontWeight={ds.weight.semibold}>
               Step 1: Choose your Data Center Region
             </Typography>
             <Typography variant='body2' component='div'>
@@ -728,7 +872,7 @@ const ListIntegrations = ({ integrationName }) => {
                 </li>
               </ul>
             </Typography>
-            <Typography variant='subtitle2' fontWeight={600}>
+            <Typography variant='subtitle2' fontWeight={ds.weight.semibold}>
               Step 2: Create an API Access Token
             </Typography>
             <Typography variant='body2' component='div'>
@@ -744,8 +888,8 @@ const ListIntegrations = ({ integrationName }) => {
               </ol>
             </Typography>
             <Typography variant='body2' sx={{ color: 'text.secondary' }}>
-              Enter the <strong>Data Center Region</strong> and <strong>API Access Token</strong> in the form above to connect Nudgebee to your
-              SolarWinds account.
+              Enter the <strong>Data Center Region</strong> and <strong>API Access Token</strong> in the form above to connect{' '}
+              {`${getBrandTitle()} to your SolarWinds account.`}
             </Typography>
           </Stack>
         </Modal>
@@ -754,7 +898,7 @@ const ListIntegrations = ({ integrationName }) => {
         <Modal
           handleClose={() => setOpenSetupGuide(false)}
           title={
-            <Typography component='h2' variant='h6' fontWeight={600}>
+            <Typography component='h2' variant='h6' fontWeight={ds.weight.semibold}>
               Splunk Observability Cloud Setup Guide
             </Typography>
           }
@@ -765,7 +909,7 @@ const ListIntegrations = ({ integrationName }) => {
           isCancelRequired={false}
         >
           <Stack spacing={ds.space[4]} sx={{ fontSize: ds.text.bodyLg }}>
-            <Typography variant='subtitle2' fontWeight={600}>
+            <Typography variant='subtitle2' fontWeight={ds.weight.semibold}>
               Step 1: Find your Realm
             </Typography>
             <Typography variant='body2' component='div'>
@@ -777,7 +921,7 @@ const ListIntegrations = ({ integrationName }) => {
                 </li>
               </ol>
             </Typography>
-            <Typography variant='subtitle2' fontWeight={600}>
+            <Typography variant='subtitle2' fontWeight={ds.weight.semibold}>
               Step 2: Create an Organization Access Token
             </Typography>
             <Typography variant='body2' component='div'>
@@ -792,8 +936,102 @@ const ListIntegrations = ({ integrationName }) => {
               </ol>
             </Typography>
             <Typography variant='body2' sx={{ color: 'text.secondary' }}>
-              Enter the <strong>Realm</strong> and <strong>Access Token</strong> in the form above to connect Nudgebee to your Splunk Observability
-              Cloud account.
+              Enter the <strong>Realm</strong> and <strong>Access Token</strong> in the form above to connect{' '}
+              {`${getBrandTitle()} to your Splunk Observability Cloud account.`}
+            </Typography>
+          </Stack>
+        </Modal>
+      )}
+      {integrationName === 'splunk_enterprise' && (
+        <Modal
+          handleClose={() => setOpenSetupGuide(false)}
+          title={
+            <Typography component='h2' variant='h6' fontWeight={ds.weight.semibold}>
+              Splunk Enterprise Setup Guide
+            </Typography>
+          }
+          open={openSetupGuide}
+          width='md'
+          confirmText='Close'
+          onConfirm={() => setOpenSetupGuide(false)}
+          isCancelRequired={false}
+        >
+          <Stack spacing={ds.space[4]} sx={{ fontSize: ds.text.bodyLg }}>
+            <Typography variant='body2' sx={{ color: 'text.secondary' }}>
+              This is for Splunk Enterprise and Splunk Cloud Platform, which are queried with SPL. For Splunk Observability Cloud (SignalFx), use the
+              separate <strong>Splunk Observability Cloud</strong> integration instead.
+            </Typography>
+            <Typography variant='subtitle2' fontWeight={ds.weight.semibold}>
+              Step 1: Find your management endpoint
+            </Typography>
+            <Typography variant='body2' component='div'>
+              {getBrandTitle()} talks to the management port, not the web UI.
+              <ul style={{ paddingLeft: ds.space[4], marginTop: ds.space[1] }}>
+                <li>
+                  Use <code>https://&lt;host&gt;:8089</code> — port <code>8089</code>, not <code>8000</code>
+                </li>
+                <li>
+                  On Kubernetes this is the <code>splunk-&lt;name&gt;-standalone-service</code> service in your Splunk namespace
+                </li>
+              </ul>
+            </Typography>
+            <Typography variant='subtitle2' fontWeight={ds.weight.semibold}>
+              Step 2: Create a least-privilege role and user
+            </Typography>
+            <Typography variant='body2' component='div'>
+              {getBrandTitle()} only ever reads, so give it a role that can only read.
+              <ol style={{ paddingLeft: ds.space[4], marginTop: ds.space[1] }}>
+                <li>
+                  Go to <strong>Settings → Roles</strong> and create a role with the <code>search</code> capability only
+                </li>
+                <li>
+                  Set <strong>Indexes searched by default</strong> to empty and restrict <strong>Indexes</strong> to the indexes below
+                </li>
+                <li>
+                  Create a user in that role under <strong>Settings → Users</strong>
+                </li>
+              </ol>
+            </Typography>
+            <Typography variant='subtitle2' fontWeight={ds.weight.semibold}>
+              Step 3: Create an authentication token
+            </Typography>
+            <Typography variant='body2' component='div'>
+              <ol style={{ paddingLeft: ds.space[4], marginTop: ds.space[1] }}>
+                <li>
+                  Go to <strong>Settings → Tokens</strong> and enable token authentication if it is off
+                </li>
+                <li>
+                  Click <strong>New Token</strong>, select the user from Step 2, and copy the token value
+                </li>
+                <li>Basic auth with a username and password also works if token auth is unavailable</li>
+              </ol>
+            </Typography>
+            <Typography variant='subtitle2' fontWeight={ds.weight.semibold}>
+              Step 4: Name the indexes
+            </Typography>
+            <Typography variant='body2' component='div'>
+              Every search {getBrandTitle()} runs is pinned to one of these indexes. If you ingest with the Splunk Distribution of the OpenTelemetry
+              Collector, they are the indexes set as <code>splunkPlatform.index</code>, <code>splunkPlatform.metricsIndex</code> and{' '}
+              <code>splunkPlatform.tracesIndex</code> in that chart.
+              <ul style={{ paddingLeft: ds.space[4], marginTop: ds.space[1] }}>
+                <li>
+                  <strong>Log index</strong> (commonly <code>otel_logs</code>) — required. Backs Query Log and Log Groups.
+                </li>
+                <li>
+                  <strong>Metric index</strong> (commonly <code>otel_metrics</code>) — must be created with <code>datatype=metric</code>, which is not
+                  the default. Backs Query Metrics.
+                </li>
+                <li>
+                  <strong>Trace index</strong> (commonly <code>otel_traces</code>) — an ordinary event index holding spans. Backs Traces and Trace
+                  Group.
+                </li>
+              </ul>
+              Leave the metric or trace index empty if this Splunk holds no metrics or spans: those tabs then stay disabled rather than searching an
+              index with nothing in it. Whichever indexes you name must also be in the role&apos;s allowed list from Step 2.
+            </Typography>
+            <Typography variant='body2' sx={{ color: 'text.secondary' }}>
+              The Splunk Operator for Kubernetes issues a self-signed certificate by default. If {getBrandTitle()} cannot verify it, enable{' '}
+              <strong>Skip TLS certificate verification</strong> in the form above.
             </Typography>
           </Stack>
         </Modal>
@@ -801,7 +1039,7 @@ const ListIntegrations = ({ integrationName }) => {
       <Modal
         handleClose={isActionLoading ? () => {} : handleConfirmationClose}
         title={
-          <Typography component='h2' variant='h6' fontWeight={600}>
+          <Typography component='h2' variant='h6' fontWeight={ds.weight.semibold}>
             {`${snakeToTitleCase(modalAction || '')} ${getDisplayName(integrationName)} Integration: ${selectedIntegration.name}`}
           </Typography>
         }
@@ -889,42 +1127,27 @@ const ListIntegrations = ({ integrationName }) => {
           handleClose={closeModal}
           integrationName={integrationName == 'postgres' ? 'postgresql' : integrationName}
           title={selectedIntegration.name ? `Edit ${getDisplayName(integrationName)} Account` : `Add ${getDisplayName(integrationName)} Account`}
+          subtitle={getIntegrationDescription(integrationName)}
           integrationData={integrationData}
           editData={selectedIntegration || {}}
           listIntegrationConfigurationById={listIntegrationConfigurationById}
         />
       )}
       <ListingLayout id={`${integrationName}-integrations`}>
-        <ListingLayout.Toolbar
+        <ListingLayout.Header
+          icon={<CloudProviderIcon cloud_provider={integrationName} width={ds.space[5]} height={ds.space[5]} />}
           title={
             <Stack direction='row' alignItems='center' spacing={1}>
-              <Typography color={ds.gray[700]} fontSize={ds.text.title} fontWeight={600}>
-                {getDisplayName(integrationName)}
-              </Typography>
-              <CloudProviderIcon cloud_provider={integrationName} />
-              {integrationName === 'splunk_observability_platform' && (
-                <Tooltip title='View Splunk Observability Cloud setup guide'>
+              <span>{getDisplayName(integrationName)}</span>
+              {setupGuideIntegration && (
+                <Tooltip title={`View ${setupGuideIntegration} setup guide`}>
                   <span>
                     <DsButton
                       tone='ghost'
                       composition='icon-only'
                       size='xs'
                       icon={<InfoOutlinedIcon sx={{ fontSize: ds.text.title }} />}
-                      aria-label='View Splunk Observability Cloud setup guide'
-                      onClick={() => setOpenSetupGuide(true)}
-                    />
-                  </span>
-                </Tooltip>
-              )}
-              {integrationName === 'solarwinds' && (
-                <Tooltip title='View SolarWinds Observability setup guide'>
-                  <span>
-                    <DsButton
-                      tone='ghost'
-                      composition='icon-only'
-                      size='xs'
-                      icon={<InfoOutlinedIcon sx={{ fontSize: ds.text.title }} />}
-                      aria-label='View SolarWinds Observability setup guide'
+                      aria-label={`View ${setupGuideIntegration} setup guide`}
                       onClick={() => setOpenSetupGuide(true)}
                     />
                   </span>
@@ -932,81 +1155,97 @@ const ListIntegrations = ({ integrationName }) => {
               )}
             </Stack>
           }
-          actions={
-            integrationName != 'loki' &&
-            integrationName != 'prometheus' &&
-            integrationName != 'otel_clickhouse' &&
-            canManage('integrations', 'Write') ? (
-              <DsButton
-                id={`add-${toKebabCase(integrationName)}-account-btn`}
-                tone='primary'
-                size='md'
-                onClick={() => {
-                  setSelectedIntegration({});
-                  setOpenModal(true);
+          description={getIntegrationDescription(integrationName)}
+          actions={hasLoaded && totalCount > 0 ? addAccountButton : undefined}
+        />
+        {showConnectPrompt ? (
+          <ListingLayout.Body padding={ds.space[5]}>
+            <EmptyState
+              id={`${integrationName}-no-accounts`}
+              icon={<LinkOutlinedIcon sx={{ fontSize: 20 }} />}
+              title={`No ${getDisplayName(integrationName)} accounts connected`}
+              description={getIntegrationDescription(integrationName)}
+              action={
+                canAddAccount
+                  ? {
+                      id: `add-${toKebabCase(integrationName)}-account-btn`,
+                      label: `Add ${getDisplayName(integrationName)} Account`,
+                      onClick: () => {
+                        setSelectedIntegration({});
+                        setOpenModal(true);
+                      },
+                      icon: <AddIcon sx={{ fontSize: 16 }} />,
+                    }
+                  : undefined
+              }
+            />
+          </ListingLayout.Body>
+        ) : (
+          <>
+            <ListingLayout.Toolbar
+              actions={
+                <Typography sx={{ fontSize: ds.text.small, color: ds.gray[500], whiteSpace: 'nowrap' }}>
+                  {totalCount} {totalCount === 1 ? 'account' : 'accounts'}
+                </Typography>
+              }
+            >
+              {(() => {
+                const statusOptions = [
+                  { label: 'Enabled', value: 'enabled' },
+                  { label: 'Disabled', value: 'disabled' },
+                ];
+                const selectedStatusOption = statusOptions.find((o) => o.value === selectedStatusFilter) ?? null;
+                return (
+                  <FilterDropdown
+                    id={`${integrationName}-status-filter`}
+                    label='Status'
+                    options={statusOptions}
+                    value={selectedStatusOption}
+                    onSelect={(_e, item) => handleStatusFilterChange({ target: { value: item?.value || '' } })}
+                  />
+                );
+              })()}
+              <SearchInput
+                id={`${integrationName}-name-search`}
+                value={nameInput}
+                onChange={(next) => {
+                  setNameInput((prev) => {
+                    if (prev.trim() !== '' && next.trim() === '') {
+                      setSelectedNameFilter('');
+                      setCurrentPage(0);
+                    }
+                    return next;
+                  });
                 }}
-                aria-label={`Add ${integrationName} Account`}
-              >
-                {`Add ${getDisplayName(integrationName)} Account`}
-              </DsButton>
-            ) : undefined
-          }
-        >
-          {(() => {
-            const statusOptions = [
-              { label: 'Enabled', value: 'enabled' },
-              { label: 'Disabled', value: 'disabled' },
-            ];
-            const selectedStatusOption = statusOptions.find((o) => o.value === selectedStatusFilter) ?? null;
-            return (
-              <FilterDropdown
-                id={`${integrationName}-status-filter`}
-                label='Status'
-                options={statusOptions}
-                value={selectedStatusOption}
-                onSelect={(_e, item) => handleStatusFilterChange({ target: { value: item?.value || '' } })}
-              />
-            );
-          })()}
-          <SearchInput
-            id={`${integrationName}-name-search`}
-            value={nameInput}
-            onChange={(next) => {
-              setNameInput((prev) => {
-                if (prev.trim() !== '' && next.trim() === '') {
+                onEnterPress={() => {
+                  setSelectedNameFilter(nameInput);
+                  setCurrentPage(0);
+                }}
+                onClear={() => {
+                  setNameInput('');
                   setSelectedNameFilter('');
                   setCurrentPage(0);
-                }
-                return next;
-              });
-            }}
-            onEnterPress={() => {
-              setSelectedNameFilter(nameInput);
-              setCurrentPage(0);
-            }}
-            onClear={() => {
-              setNameInput('');
-              setSelectedNameFilter('');
-              setCurrentPage(0);
-            }}
-            label='Enter Name'
-          />
-        </ListingLayout.Toolbar>
-        <ListingLayout.Body>
-          <CustomTable
-            id={`${integrationName}`}
-            loading={loading}
-            tableData={tableData}
-            headers={headers}
-            totalRows={totalCount}
-            rowsPerPage={recordsPerPage}
-            pageNumber={currentPage + 1}
-            onPageChange={(page, limit) => {
-              setCurrentPage(page - 1);
-              setRecordsPerPage(limit);
-            }}
-          />
-        </ListingLayout.Body>
+                }}
+                label='Enter Name'
+              />
+            </ListingLayout.Toolbar>
+            <ListingLayout.Body>
+              <CustomTable
+                id={`${integrationName}`}
+                loading={loading}
+                tableData={tableData}
+                headers={headers}
+                totalRows={totalCount}
+                rowsPerPage={recordsPerPage}
+                pageNumber={currentPage + 1}
+                onPageChange={(page, limit) => {
+                  setCurrentPage(page - 1);
+                  setRecordsPerPage(limit);
+                }}
+              />
+            </ListingLayout.Body>
+          </>
+        )}
       </ListingLayout>
     </>
   );

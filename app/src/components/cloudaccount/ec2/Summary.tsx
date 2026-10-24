@@ -344,7 +344,7 @@ const ClusterSummary = ({ accountId, ec2Summary = {}, serviceName = '' }: any) =
           <Chart.Doughnut
             borderWidth={0}
             borderRadius={0}
-            values={[spotInstances, reservedInstances]}
+            values={[reservedInstances, spotInstances]}
             labels={[labels.reservedLabel, labels.spotLabel]}
             displayValue={instancesCount}
             valueUnit=''
@@ -529,17 +529,22 @@ export const OptimizeSummary = ({
 
   useEffect(() => {
     if (!accountId || !showSummary) return; // summary cards only render in showSummary mode
+    let cancelled = false;
     setLoadingSummary(true);
     apiCloudAccount
       .cloudAccountEC2Summary(accountId, { serviceName })
       .then((res) => {
+        if (cancelled) return;
         setSummary(res);
         setLoadingSummary(false);
       })
       .catch((error) => {
         console.error(error);
-        setLoadingSummary(false);
+        if (!cancelled) setLoadingSummary(false);
       });
+    return () => {
+      cancelled = true;
+    };
   }, [accountId, serviceName, showSummary]);
 
   const handleDateRangeChange = (passedSelectedDateTime: any) => {

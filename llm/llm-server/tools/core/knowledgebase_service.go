@@ -14,6 +14,7 @@ import (
 	"nudgebee/llm/common"
 	"nudgebee/llm/config"
 	"nudgebee/llm/security"
+	"slices"
 	"strings"
 	"time"
 
@@ -25,11 +26,119 @@ import (
 // Worker pool for async KB embedding generation
 var kbEmbeddingWorkerPool *common.WorkerPool
 
-const CacheNamespaceLlmKbMapping = "llm_kb_mapping"
+// CacheNamespaceLlmKbMapping caches ListAgentKBs results as marshalled
+// []Knowledgebase.
+//
+// The `_v4` suffix refreshes context tags while preserving the production
+// `_v3` integration collection identity change. The `_v2` suffix retired
+// the pre-`enabled` cache shape. Entries written
+// before this change carry no "enabled" key, so unmarshalling one into the
+// current struct yields Enabled=false on every row — under Redis (the
+// CacheProvider on deployed envs) those entries outlive the rollout and would
+// have made every KB look switched off for up to the 30-minute TTL. Bump this
+// suffix again if the cached value shape ever changes in a way old entries
+// cannot satisfy.
+const CacheNamespaceLlmKbMapping = "llm_kb_mapping_v4"
 
 // CacheNamespaceLlmSkillContent caches individual skill content fetched by load_skills.
 // Declared here (in tools/core) so KB update/delete paths can invalidate it.
 const CacheNamespaceLlmSkillContent = "llm_skill_content"
+
+// KBAgentWildcard is the agent_id a knowledge base is mapped to when the user
+// picks "All agents" in the KB form. It is stored as an ordinary row in
+// llm_kb_agent_mappings, so every mapping read in this file — and the
+// mapping-existence INNER JOINs behind load_skills — picks it up with no query
+// special-casing: callers just append the sentinel to the agent-name list they
+// look up (see WithKBAgentWildcard). Map/unmap invalidate the per-agent cache
+// key for "*" exactly as they do for a real agent.
+//
+// The sentinel deliberately stays out of the agents-tab per-agent mapping modal:
+// "all agents" is a KB-level setting, and letting one agent's modal unmap it
+// would silently strip the KB from every other agent.
+const KBAgentWildcard = "*"
+
+// WithKBAgentWildcard returns names plus the all-agents sentinel.
+//
+// The result is always a fresh slice: callers pass a slice whose backing array
+// is shared (the executor re-slices ownSkillNames into skillAgentNames), and an
+// in-place append would clobber the neighbouring element.
+func WithKBAgentWildcard(names []string) []string {
+	out := make([]string, 0, len(names)+1)
+	out = append(out, names...)
+	return append(out, KBAgentWildcard)
+}
+
+// KB cache entries carry no TTL under the redis cache provider: common.CacheSet
+// only attaches an expiration when the caller passes one, and the
+// CacheNamespaceWithExpiration options in init() configure the in-memory store
+// only. A missed invalidation is therefore permanent, not a 15/30-minute
+// window — every create, update and delete must clear both the per-name skill
+// bodies and the per-agent skill menus.
+
+// invalidateSkillContentCache drops the cached body of each supplied name.
+// Callers must pass every name the KB has been known by: load_skills keys on
+// the name the model asks for, not the KB id, so after a rename it is the OLD
+// name's entry that keeps serving stale content.
+func invalidateSkillContentCache(accountId string, names ...string) {
+	seen := make(map[string]bool, len(names))
+	for _, name := range names {
+		name = strings.ToLower(strings.TrimSpace(name))
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		key := fmt.Sprintf("skill:%s:%s", accountId, name)
+		if err := common.CacheDelete(CacheNamespaceLlmSkillContent, key); err != nil {
+			slog.Warn("kb: failed to invalidate skill content cache", "error", err, "key", key)
+		}
+	}
+}
+
+// invalidateKBMappingCache drops the cached per-agent skill menu (the
+// `<skill-lists>` block built from ListAgentKBs) for each supplied agent.
+func invalidateKBMappingCache(accountId string, agentIds ...string) {
+	for _, agentId := range agentIds {
+		if agentId == "" {
+			continue
+		}
+		key := fmt.Sprintf("kb_mapping:%s:%s", accountId, agentId)
+		if err := common.CacheDelete(CacheNamespaceLlmKbMapping, key); err != nil {
+			slog.Warn("kb: failed to invalidate KB mapping cache", "error", err, "key", key)
+		}
+	}
+}
+
+// kbMappedAgentIds returns the agents a KB is mapped to. ok is false when the
+// lookup fails, so callers can fall back to a namespace-wide clear instead of
+// leaving a menu pinned to a name that no longer exists. Read it before
+// deleting the KB — the mapping rows go with it.
+func kbMappedAgentIds(dbms *common.DatabaseManager, accountId, kbId string) ([]string, bool) {
+	var agentIds []string
+	if err := dbms.Db.Select(&agentIds,
+		`SELECT agent_id FROM llm_kb_agent_mappings WHERE kb_id = $1 AND account_id = $2`,
+		kbId, accountId); err != nil {
+		slog.Error("kb: failed to list mapped agents for cache invalidation", "error", err, "kb_id", kbId)
+		return nil, false
+	}
+	return agentIds, true
+}
+
+// invalidateKBCaches clears every cached view of one KB: the skill bodies under
+// each supplied name, and the skill menu of every agent it is mapped to.
+func invalidateKBCaches(dbms *common.DatabaseManager, accountId, kbId string, names ...string) {
+	invalidateSkillContentCache(accountId, names...)
+	if kbId == "" {
+		return
+	}
+	agentIds, ok := kbMappedAgentIds(dbms, accountId, kbId)
+	if !ok {
+		if err := common.CacheClear(CacheNamespaceLlmKbMapping); err != nil {
+			slog.Error("kb: failed to clear KB mapping cache", "error", err)
+		}
+		return
+	}
+	invalidateKBMappingCache(accountId, agentIds...)
+}
 
 func init() {
 	workerCount := 3 // Default worker count for KB embeddings
@@ -43,25 +152,38 @@ func init() {
 
 // Knowledgebase represents an account-scoped knowledge base
 type Knowledgebase struct {
-	Id            string     `json:"id" db:"id"`
-	TenantId      string     `json:"tenant_id" db:"tenant_id"`
-	AccountId     string     `json:"account_id" db:"account_id"`
-	Name          string     `json:"name" db:"name"`
-	Description   string     `json:"description,omitempty" db:"description"`
-	Data          string     `json:"data,omitempty" db:"data"` // Omit in list responses
-	DataFormat    string     `json:"data_format" db:"data_format"`
-	DataFilename  string     `json:"data_filename" db:"data_filename"`
-	DataSizeBytes int64      `json:"data_size_bytes" db:"data_size_bytes"`
-	Status        string     `json:"status" db:"status"`
-	KBType        string     `json:"kb_type" db:"kb_type"`                         // Type: manual or integration
-	KBSource      *string    `json:"kb_source,omitempty" db:"kb_source"`           // Source: confluence, servicenow (null for manual)
-	IntegrationId *string    `json:"integration_id,omitempty" db:"integration_id"` // Link to integrations table (null for manual)
-	CreatedBy     string     `json:"created_by,omitempty" db:"created_by"`         // Display name, not UUID
-	UpdatedBy     string     `json:"updated_by,omitempty" db:"updated_by"`         // Display name, not UUID
-	CreatedAt     time.Time  `json:"created_at" db:"created_at"`
-	UpdatedAt     time.Time  `json:"updated_at" db:"updated_at"`
-	DocumentCount *int       `json:"document_count,omitempty" db:"document_count"`
-	LastLoadedAt  *time.Time `json:"last_loaded_at,omitempty" db:"last_loaded_at"`
+	Id            string `json:"id" db:"id"`
+	TenantId      string `json:"tenant_id" db:"tenant_id"`
+	AccountId     string `json:"account_id" db:"account_id"`
+	Name          string `json:"name" db:"name"`
+	Description   string `json:"description,omitempty" db:"description"`
+	Data          string `json:"data,omitempty" db:"data"` // Omit in list responses
+	DataFormat    string `json:"data_format" db:"data_format"`
+	DataFilename  string `json:"data_filename" db:"data_filename"`
+	DataSizeBytes int64  `json:"data_size_bytes" db:"data_size_bytes"`
+	Status        string `json:"status" db:"status"`
+	// Enabled is the user's on/off switch, independent of Status (the load
+	// lifecycle). A disabled KB is never searched, listed as a loadable skill,
+	// or injected into an agent prompt — see UsableForAgents. Every SELECT that
+	// scans into this struct MUST project kb.enabled: a query that omits it
+	// leaves the field false and silently hides a live KB.
+	Enabled       bool    `json:"enabled" db:"enabled"`
+	KBType        string  `json:"kb_type" db:"kb_type"`                         // Type: manual or integration
+	KBSource      *string `json:"kb_source,omitempty" db:"kb_source"`           // Source: confluence, servicenow (null for manual)
+	IntegrationId *string `json:"integration_id,omitempty" db:"integration_id"` // Link to integrations table (null for manual)
+	// NoteCategory controls manual knowledge treatment: sop is procedural;
+	// fact, empty and legacy categories are reference material.
+	NoteCategory string `json:"note_category,omitempty" db:"note_category"`
+	// ContextTags are scope labels (e.g. "Service: auth-svc") captured on a note.
+	// pq.StringArray, not []string: the struct is sqlx-StructScan'd and
+	// database/sql cannot scan a Postgres TEXT[] into a plain []string.
+	ContextTags   pq.StringArray `json:"context_tags" db:"context_tags"`
+	CreatedBy     string         `json:"created_by,omitempty" db:"created_by"` // Display name, not UUID
+	UpdatedBy     string         `json:"updated_by,omitempty" db:"updated_by"` // Display name, not UUID
+	CreatedAt     time.Time      `json:"created_at" db:"created_at"`
+	UpdatedAt     time.Time      `json:"updated_at" db:"updated_at"`
+	DocumentCount *int           `json:"document_count,omitempty" db:"document_count"`
+	LastLoadedAt  *time.Time     `json:"last_loaded_at,omitempty" db:"last_loaded_at"`
 	// ErrorMessage carries the reason for the most recent failed load when
 	// Status == "error", letting the card show *why* a KB failed. Persisted on
 	// the KB row (set wherever status flips to error, cleared on
@@ -75,6 +197,18 @@ type Knowledgebase struct {
 	// column when no single account is in scope; per-account list calls
 	// leave it empty (the page already knows which account it's on).
 	AccountName string `json:"account_name,omitempty" db:"account_name"`
+}
+
+// UsableForAgents reports whether this KB may supply content to an agent.
+//
+// Two independent gates, and both must hold:
+//   - Status == "active" — indexing finished, so there is content to serve.
+//   - Enabled            — the user has not switched the KB off.
+//
+// Single-sourced so a new consumer cannot honour one gate and forget the other.
+// The SQL-side equivalent is `kb.status = 'active' AND kb.enabled`.
+func (kb Knowledgebase) UsableForAgents() bool {
+	return kb.Status == string(KBStatusActive) && kb.Enabled
 }
 
 // KBLoadHistoryEntry represents a single load history record from rag_embedding_token_usage.
@@ -147,6 +281,7 @@ const (
 	errKBNotFound          = "knowledgebase not found"
 	errKBUnauthorized      = "you don't have permission to access this knowledgebase"
 	errKBIntegrationDelete = "integration knowledge bases are managed by the integration; disable the integration to remove it"
+	errKBDisabled          = "this knowledgebase is disabled; enable it before re-syncing"
 )
 
 // Log messages
@@ -208,10 +343,11 @@ func CreateKnowledgebase(sc *security.RequestContext, accountId string, kb Knowl
 		return Knowledgebase{}, errors.New(errKBFilenameRequired)
 	}
 
-	kb.DataSizeBytes = int64(len(kb.Data))
-	if kb.DataSizeBytes > maxKBSizeBytes {
-		return Knowledgebase{}, fmt.Errorf("%s: %d bytes", errKBSizeTooLarge, kb.DataSizeBytes)
+	dataSize, err := resolveKBDataSize(kb.Data, kb.DataFormat)
+	if err != nil {
+		return Knowledgebase{}, err
 	}
+	kb.DataSizeBytes = dataSize
 
 	tenantId := sc.GetSecurityContext().GetTenantId()
 	if tenantId == "" {
@@ -251,11 +387,18 @@ func CreateKnowledgebase(sc *security.RequestContext, accountId string, kb Knowl
 
 	kb.Description = strings.TrimSpace(kb.Description)
 	if kb.Description == "" && kb.Data != "" {
-		for _, line := range strings.Split(kb.Data, "\n") {
-			line = strings.TrimSpace(line)
-			if line != "" {
-				kb.Description = common.TruncateHead(line, 200)
-				break
+		// A PDF's data is base64, so the first line of it is not a description
+		// of anything — the filename is the only human-readable handle there is
+		// until the document has been extracted.
+		if kb.DataFormat == string(KBFormatPDF) {
+			kb.Description = common.TruncateHead(kb.DataFilename, 200)
+		} else {
+			for _, line := range strings.Split(kb.Data, "\n") {
+				line = strings.TrimSpace(line)
+				if line != "" {
+					kb.Description = common.TruncateHead(line, 200)
+					break
+				}
 			}
 		}
 	}
@@ -263,15 +406,25 @@ func CreateKnowledgebase(sc *security.RequestContext, accountId string, kb Knowl
 	nullableCreatedBy := sql.NullString{String: kb.CreatedBy, Valid: kb.CreatedBy != ""}
 	nullableUpdatedBy := sql.NullString{String: kb.UpdatedBy, Valid: kb.UpdatedBy != ""}
 	nullableDescription := sql.NullString{String: kb.Description, Valid: kb.Description != ""}
+	nullableNoteCategory := sql.NullString{String: kb.NoteCategory, Valid: kb.NoteCategory != ""}
+	// context_tags is NOT NULL DEFAULT '{}' — a nil pq.StringArray binds SQL NULL
+	// and violates the constraint, so fall back to an empty array when no tags.
+	contextTags, err := NormalizeKnowledgeTags(kb.ContextTags)
+	if err != nil {
+		return Knowledgebase{}, err
+	}
+	if contextTags == nil {
+		contextTags = pq.StringArray{}
+	}
 
 	// Insert into database
 	kbAny, err := dbms.DoInTransaction(func(tx *sqlx.Tx) (any, error) {
 		_, err = tx.Exec(`
 			INSERT INTO llm_knowledgebases
-			(id, tenant_id, account_id, name, description, data, data_format, data_filename, data_size_bytes, status, kb_type, kb_source, created_by, updated_by, created_at, updated_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW(), NOW())`,
+			(id, tenant_id, account_id, name, description, data, data_format, data_filename, data_size_bytes, status, kb_type, kb_source, note_category, context_tags, created_by, updated_by, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, NOW(), NOW())`,
 			kb.Id, kb.TenantId, kb.AccountId, kb.Name, nullableDescription, kb.Data,
-			kb.DataFormat, kb.DataFilename, kb.DataSizeBytes, kb.Status, "manual", nil, nullableCreatedBy, nullableUpdatedBy)
+			kb.DataFormat, kb.DataFilename, kb.DataSizeBytes, kb.Status, "manual", nil, nullableNoteCategory, pq.StringArray(contextTags), nullableCreatedBy, nullableUpdatedBy)
 		if err != nil {
 			slog.Error("kb: failed to insert", "error", err)
 			return Knowledgebase{}, err
@@ -282,8 +435,10 @@ func CreateKnowledgebase(sc *security.RequestContext, accountId string, kb Knowl
 		err = tx.Get(&createdKB, `
 			SELECT kb.id, kb.tenant_id, kb.account_id, kb.name,
 			       COALESCE(kb.description, '') as description,
-			       kb.data, kb.data_format, kb.data_filename, kb.data_size_bytes,
-			       kb.status, kb.kb_type, kb.kb_source, kb.integration_id,
+			       kb.data, kb.data_format, kb.data_filename,
+			       COALESCE(kb.data_size_bytes, 0) as data_size_bytes,
+			       kb.status, kb.enabled, kb.kb_type, kb.kb_source, kb.integration_id,
+			       COALESCE(kb.note_category, '') as note_category, kb.context_tags,
 			       COALESCE(cu.display_name, '') as created_by,
 			       COALESCE(uu.display_name, '') as updated_by,
 			       kb.created_at, kb.updated_at,
@@ -309,8 +464,12 @@ func CreateKnowledgebase(sc *security.RequestContext, accountId string, kb Knowl
 	submissionCtx, cancel := context.WithTimeout(context.Background(), time.Duration(config.Config.AsyncOperationTimeoutSeconds)*time.Second)
 	defer cancel()
 	_ = kbEmbeddingWorkerPool.Submit(submissionCtx, func() {
-		processKBEmbeddingsAsync(sc, accountId, createdKB.Id, kb.Data, kb.DataFormat)
+		processKBEmbeddingsAsync(sc, accountId, createdKB.Id, kb.Data, kb.DataFormat, contextTags)
 	})
+
+	// A KB recreated under a name that existed before would otherwise be served
+	// from the previous KB's cached body.
+	invalidateKBCaches(dbms, accountId, createdKB.Id, createdKB.Name)
 
 	// Create audit entry
 	auditReq := &audit.AuditRequest{
@@ -366,8 +525,10 @@ func GetKnowledgebase(sc *security.RequestContext, accountId, kbId string) (Know
 	err = dbms.Db.Get(&kb, `
 		SELECT kb.id, kb.tenant_id, kb.account_id, kb.name,
 		       COALESCE(kb.description, '') as description,
-		       kb.data, kb.data_format, kb.data_filename, kb.data_size_bytes,
-		       kb.status, kb.kb_type, kb.kb_source, kb.integration_id,
+		       kb.data, kb.data_format, kb.data_filename,
+		       COALESCE(kb.data_size_bytes, 0) as data_size_bytes,
+		       kb.status, kb.enabled, kb.kb_type, kb.kb_source, kb.integration_id,
+		       COALESCE(kb.note_category, '') as note_category, kb.context_tags,
 		       kb.created_at, kb.updated_at,
 		       kb.document_count, kb.last_loaded_at,
 		       COALESCE(cu.display_name, '') as created_by,
@@ -383,6 +544,14 @@ func GetKnowledgebase(sc *security.RequestContext, accountId, kbId string) (Know
 		}
 		slog.Error(logKBFailedQuery, "error", err, "kb_id", kbId)
 		return Knowledgebase{}, err
+	}
+
+	// A PDF's data column holds base64 of the original document — megabytes no
+	// consumer can render or edit. The editor identifies the document by
+	// data_filename and data_size_bytes instead, and re-indexing reads the
+	// column straight from the database, so nothing needs it over the wire.
+	if kb.DataFormat == string(KBFormatPDF) {
+		kb.Data = ""
 	}
 
 	return kb, nil
@@ -424,8 +593,9 @@ func ListKnowledgebasesForTenant(sc *security.RequestContext) ([]Knowledgebase, 
 		SELECT kb.id, kb.tenant_id, kb.account_id, kb.name,
 		       COALESCE(kb.description, '') as description,
 		       kb.data_format, kb.data_filename,
-		       kb.data_size_bytes, kb.status,
+		       COALESCE(kb.data_size_bytes, 0) as data_size_bytes, kb.status, kb.enabled,
 		       kb.kb_type, kb.kb_source, kb.integration_id,
+		       COALESCE(kb.note_category, '') as note_category, kb.context_tags,
 		       kb.created_at, kb.updated_at,
 		       kb.document_count, kb.last_loaded_at,
 		       COALESCE(cu.display_name, '') as created_by,
@@ -484,8 +654,9 @@ func ListKnowledgebases(sc *security.RequestContext, accountId string) ([]Knowle
 		SELECT kb.id, kb.tenant_id, kb.account_id, kb.name,
 		       COALESCE(kb.description, '') as description,
 		       kb.data_format, kb.data_filename,
-		       kb.data_size_bytes, kb.status,
+		       COALESCE(kb.data_size_bytes, 0) as data_size_bytes, kb.status, kb.enabled,
 		       kb.kb_type, kb.kb_source, kb.integration_id,
+		       COALESCE(kb.note_category, '') as note_category, kb.context_tags,
 		       kb.created_at, kb.updated_at,
 		       kb.document_count, kb.last_loaded_at,
 		       COALESCE(cu.display_name, '') as created_by,
@@ -529,8 +700,9 @@ func UpdateKnowledgebase(sc *security.RequestContext, accountId, kbId string, up
 	err = dbms.Db.Get(&existingKB, `
 		SELECT kb.id, kb.tenant_id, kb.account_id, kb.name,
 		       COALESCE(kb.description, '') as description,
-		       kb.data, kb.data_format, kb.data_filename, kb.data_size_bytes,
-		       kb.status,
+		       kb.data, kb.data_format, kb.data_filename,
+		       COALESCE(kb.data_size_bytes, 0) as data_size_bytes,
+		       kb.status, kb.enabled, kb.context_tags,
 		       kb.created_at, kb.updated_at,
 		       kb.document_count, kb.last_loaded_at,
 		       COALESCE(cu.display_name, '') as created_by,
@@ -578,10 +750,11 @@ func UpdateKnowledgebase(sc *security.RequestContext, accountId, kbId string, up
 			updates.DataFormat = existingKB.DataFormat
 		}
 
-		updates.DataSizeBytes = int64(len(updates.Data))
-		if updates.DataSizeBytes > maxKBSizeBytes {
-			return fmt.Errorf("%s: %d bytes", errKBSizeTooLarge, updates.DataSizeBytes)
+		dataSize, sizeErr := resolveKBDataSize(updates.Data, updates.DataFormat)
+		if sizeErr != nil {
+			return sizeErr
 		}
+		updates.DataSizeBytes = dataSize
 	} else {
 		// Keep existing data fields
 		updates.Data = existingKB.Data
@@ -597,9 +770,23 @@ func UpdateKnowledgebase(sc *security.RequestContext, accountId, kbId string, up
 	updates.UpdatedBy = sc.GetSecurityContext().GetUserId()
 	nullableUpdatedBy := sql.NullString{String: updates.UpdatedBy, Valid: updates.UpdatedBy != ""}
 	nullableDescription := sql.NullString{String: updates.Description, Valid: updates.Description != ""}
+	nullableNoteCategory := sql.NullString{String: updates.NoteCategory, Valid: updates.NoteCategory != ""}
+	// Omitted tags preserve the stored values; an explicit empty list clears them.
+	contextTags, err := NormalizeKnowledgeTags(updates.ContextTags)
+	if err != nil {
+		return err
+	}
+	if contextTags == nil {
+		contextTags = existingKB.ContextTags
+	}
+	if contextTags == nil {
+		contextTags = []string{}
+	}
+	tagsChanged := !slices.Equal([]string(existingKB.ContextTags), contextTags)
+	reindex := dataChanged || tagsChanged
 
-	// If data changed, set status to processing
-	if dataChanged {
+	// Content or tag changes require a new searchable representation.
+	if reindex {
 		updates.Status = string(KBStatusProcessing)
 	}
 
@@ -610,19 +797,19 @@ func UpdateKnowledgebase(sc *security.RequestContext, accountId, kbId string, up
 		query := `
 			UPDATE llm_knowledgebases
 			SET name = $1, description = $2, data = $3, data_format = $4, data_filename = $5,
-			    data_size_bytes = $6, updated_by = $7, updated_at = NOW()`
+			    data_size_bytes = $6, updated_by = $7, note_category = COALESCE($8, note_category), context_tags = $9, updated_at = NOW()`
 		args := []any{
 			updates.Name, nullableDescription, updates.Data, updates.DataFormat, updates.DataFilename,
-			updates.DataSizeBytes, nullableUpdatedBy,
+			updates.DataSizeBytes, nullableUpdatedBy, nullableNoteCategory, pq.StringArray(contextTags),
 		}
 
-		// Only update status if data changed. Re-processing clears any prior
+		// Only update status when reindexing. Re-processing clears any prior
 		// error_message so a recovered KB stops showing a stale reason.
-		if dataChanged {
-			query += `, status = $8, error_message = NULL WHERE id = $9 AND account_id = $10`
+		if reindex {
+			query += `, status = $10, error_message = NULL WHERE id = $11 AND account_id = $12`
 			args = append(args, nullableStatus, kbId, accountId)
 		} else {
-			query += ` WHERE id = $8 AND account_id = $9`
+			query += ` WHERE id = $10 AND account_id = $11`
 			args = append(args, kbId, accountId)
 		}
 
@@ -638,19 +825,19 @@ func UpdateKnowledgebase(sc *security.RequestContext, accountId, kbId string, up
 		return err
 	}
 
-	// If data changed, update embeddings asynchronously and invalidate skill content cache.
-	if dataChanged {
+	// Refresh embeddings when content or search tags changed.
+	if reindex {
 		submissionCtx, cancel := context.WithTimeout(context.Background(), time.Duration(config.Config.AsyncOperationTimeoutSeconds)*time.Second)
 		defer cancel()
 		_ = kbEmbeddingWorkerPool.Submit(submissionCtx, func() {
-			processKBUpdateEmbeddingsAsync(sc, accountId, kbId, updates.Data, updates.DataFormat, "user_update")
+			processKBUpdateEmbeddingsAsync(sc, accountId, kbId, updates.Data, updates.DataFormat, "user_update", contextTags)
 		})
-		// Invalidate cached skill content so the updated content is served immediately.
-		skillCacheKey := fmt.Sprintf("skill:%s:%s", accountId, strings.ToLower(updates.Name))
-		if err := common.CacheDelete(CacheNamespaceLlmSkillContent, skillCacheKey); err != nil {
-			slog.Warn("kb: failed to invalidate skill content cache", "error", err, "key", skillCacheKey)
-		}
 	}
+
+	// Invalidate on every update, not only when the data changed: a name-only
+	// edit is exactly the case that left load_skills serving the previous body
+	// under the previous name, and the agent's skill menu advertising it.
+	invalidateKBCaches(dbms, accountId, kbId, existingKB.Name, updates.Name)
 
 	// Create audit entry
 	auditReq := &audit.AuditRequest{
@@ -680,6 +867,114 @@ func UpdateKnowledgebase(sc *security.RequestContext, accountId, kbId string, up
 	return nil
 }
 
+// SetKnowledgebaseEnabled flips the user-facing on/off switch for a knowledge
+// base. Disabling takes the KB out of every consumption path — RAG search
+// (rag-server drops its vector collection from the searchable set), the
+// load_skills catalogue, the `<skill-lists>` menu, and prompt injection —
+// without touching its content, its agent mappings, or its indexing state.
+// Re-enabling restores all of that with no re-embedding.
+//
+// Works for manual AND integration KBs. It deliberately does NOT go through
+// UpdateKnowledgebase: that path rewrites name/description/data and would
+// clobber an integration KB's sync-owned fields.
+func SetKnowledgebaseEnabled(sc *security.RequestContext, accountId, kbId string, enabled bool) error {
+	if accountId == "" {
+		return errors.New(errKBAccountIDRequired)
+	}
+	if kbId == "" {
+		return errors.New(errKBIDRequired)
+	}
+	if !sc.GetSecurityContext().HasAccountAccess(accountId, security.SecurityAccessTypeUpdate) {
+		return errors.New(errKBUnauthorized)
+	}
+
+	dbms, err := common.GetDatabaseManager(common.Metastore)
+	if err != nil {
+		slog.Error(logKBFailedDBManager, "error", err)
+		return err
+	}
+
+	// Name is needed to invalidate the skill-content cache, which is keyed by
+	// lowercased KB name rather than id.
+	var existing struct {
+		Name    string `db:"name"`
+		Enabled bool   `db:"enabled"`
+	}
+	err = dbms.Db.Get(&existing,
+		"SELECT name, enabled FROM llm_knowledgebases WHERE id = $1 AND account_id = $2", kbId, accountId)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return errors.New(errKBNotFound)
+		}
+		slog.Error(logKBFailedQuery, "error", err, "kb_id", kbId)
+		return err
+	}
+
+	updatedBy := sc.GetSecurityContext().GetUserId()
+	nullableUpdatedBy := sql.NullString{String: updatedBy, Valid: updatedBy != ""}
+	_, err = dbms.Db.Exec(`
+		UPDATE llm_knowledgebases
+		SET enabled = $1, updated_by = $2, updated_at = NOW()
+		WHERE id = $3 AND account_id = $4`, enabled, nullableUpdatedBy, kbId, accountId)
+	if err != nil {
+		slog.Error("kb: failed to set enabled", "error", err, "kb_id", kbId, "enabled", enabled)
+		return err
+	}
+
+	// Both caches can hold a view of a KB whose switch just moved, so both are
+	// invalidated on every toggle — including a no-op re-set, which costs two
+	// cheap operations and removes any chance of a stale entry surviving.
+	//
+	// The mapping cache goes through invalidateKBCaches (#37653): it is keyed
+	// per (account, agent), and that helper reads the KB's mappings and drops
+	// exactly those keys rather than emptying the namespace for every account.
+	invalidateKBCaches(dbms, accountId, kbId, existing.Name)
+
+	// The skill-content cache, however, must go by NAMESPACE. It is keyed by the
+	// name the CALLER asked for, not the KB's own name: load_skills' fuzzy path
+	// resolves an alias to a KB and enrichIntegrationSkillsFromRAG then caches
+	// the body under that alias (tools/skills.go). #37653 handles a rename by
+	// passing both the old and new name, but an alias is neither — there is no
+	// enumerable key set. fetchSkillsBatch reads this cache before it ever
+	// reaches the `AND kb.enabled` SQL gate, so a name-keyed delete would let a
+	// disabled integration KB keep answering an aliased load_skills call for a
+	// further TTL. A toggle is a rare admin action; correctness wins over the
+	// other accounts' cache warmth.
+	if err := common.CacheClear(CacheNamespaceLlmSkillContent); err != nil {
+		slog.Error("kb: failed to clear skill content cache", "error", err)
+	}
+
+	slog.Info("kb: enabled flag changed", "kb_id", kbId, "account_id", accountId,
+		"from", existing.Enabled, "to", enabled)
+
+	auditReq := &audit.AuditRequest{
+		Audits: []audit.Audit{
+			{
+				AccountId:     accountId,
+				EventTime:     time.Now().UTC(),
+				EventCategory: "knowledgebase",
+				EventType:     "KB_SET_ENABLED",
+				EventActor:    audit.EventActor(updatedBy),
+				EventTarget:   kbId,
+				EventAction:   audit.EventActionUpdate,
+				EventStatus:   audit.EventStatusSuccess,
+				TransactionId: sc.GetTraceId(),
+				EventAttr: map[string]any{
+					"kb_id": kbId, "kb_name": existing.Name,
+					"enabled": enabled, "previous_enabled": existing.Enabled,
+				},
+				TenantId: sc.GetSecurityContext().GetTenantId(),
+				UserId:   updatedBy,
+			},
+		},
+	}
+	if auditErr := audit.CreateAudit(sc, auditReq); auditErr != nil {
+		slog.Error("kb: failed to create audit entry", "error", auditErr, "kb_id", kbId)
+	}
+
+	return nil
+}
+
 // DeleteKnowledgebase deletes a knowledge base and its vector collection
 func DeleteKnowledgebase(sc *security.RequestContext, accountId, kbId string) error {
 	if accountId == "" {
@@ -702,7 +997,7 @@ func DeleteKnowledgebase(sc *security.RequestContext, accountId, kbId string) er
 
 	// Get KB details for audit before deletion
 	var kb Knowledgebase
-	err = dbms.Db.Get(&kb, "SELECT id, name, account_id, tenant_id, kb_type, status, integration_id FROM llm_knowledgebases WHERE id = $1 AND account_id = $2", kbId, accountId)
+	err = dbms.Db.Get(&kb, "SELECT id, name, account_id, tenant_id, kb_type, status, enabled, integration_id FROM llm_knowledgebases WHERE id = $1 AND account_id = $2", kbId, accountId)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return errors.New(errKBNotFound)
@@ -715,6 +1010,10 @@ func DeleteKnowledgebase(sc *security.RequestContext, accountId, kbId string) er
 	if kb.KBType == KBTypeIntegration && kb.Status != string(KBStatusArchived) {
 		return errors.New(errKBIntegrationDelete)
 	}
+
+	// Read the mappings before the DELETE — the rows go with the KB, and the
+	// per-agent skill menus keyed on them still have to be invalidated after.
+	mappedAgentIds, mappedAgentsOk := kbMappedAgentIds(dbms, accountId, kbId)
 
 	// Delete the vector collection first. Manual KBs own a kb_<id> collection;
 	// an archived integration KB's documents live in the shared
@@ -765,12 +1064,11 @@ func DeleteKnowledgebase(sc *security.RequestContext, accountId, kbId string) er
 	}
 
 	// Invalidate caches
-	if err := common.CacheClear(CacheNamespaceLlmKbMapping); err != nil {
+	invalidateSkillContentCache(accountId, kb.Name)
+	if mappedAgentsOk {
+		invalidateKBMappingCache(accountId, mappedAgentIds...)
+	} else if err := common.CacheClear(CacheNamespaceLlmKbMapping); err != nil {
 		slog.Error("kb: failed to clear KB mapping cache", "error", err)
-	}
-	skillCacheKey := fmt.Sprintf("skill:%s:%s", accountId, strings.ToLower(kb.Name))
-	if err := common.CacheDelete(CacheNamespaceLlmSkillContent, skillCacheKey); err != nil {
-		slog.Warn("kb: failed to invalidate skill content cache", "error", err, "key", skillCacheKey)
 	}
 
 	// Create audit entry
@@ -828,6 +1126,11 @@ func kbCollectionName(kbType string, integrationID *string, kbId string) string 
 		return *integrationID + "_knowledge_base"
 	}
 	return "kb_" + kbId
+}
+
+// KnowledgebaseCollectionName returns the RAG collection backing a KB.
+func KnowledgebaseCollectionName(kb Knowledgebase) string {
+	return kbCollectionName(kb.KBType, kb.IntegrationId, kb.Id)
 }
 
 // GetKBLoadHistory returns the load history for a knowledge base by querying rag_embedding_token_usage.
@@ -905,14 +1208,16 @@ func RetriggerKnowledgebase(sc *security.RequestContext, accountId, kbId string)
 
 	// Fetch existing KB
 	var existingKB struct {
-		Data          string  `db:"data"`
-		DataFormat    string  `db:"data_format"`
-		Status        string  `db:"status"`
-		KBType        string  `db:"kb_type"`
-		KBSource      *string `db:"kb_source"`
-		IntegrationID *string `db:"integration_id"`
+		ContextTags   pq.StringArray `db:"context_tags"`
+		Data          string         `db:"data"`
+		DataFormat    string         `db:"data_format"`
+		Status        string         `db:"status"`
+		Enabled       bool           `db:"enabled"`
+		KBType        string         `db:"kb_type"`
+		KBSource      *string        `db:"kb_source"`
+		IntegrationID *string        `db:"integration_id"`
 	}
-	err = dbms.Db.Get(&existingKB, "SELECT data, data_format, status, kb_type, kb_source, integration_id FROM llm_knowledgebases WHERE id = $1 AND account_id = $2", kbId, accountId)
+	err = dbms.Db.Get(&existingKB, "SELECT data, data_format, status, enabled, kb_type, kb_source, integration_id, context_tags FROM llm_knowledgebases WHERE id = $1 AND account_id = $2", kbId, accountId)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return errors.New(errKBNotFound)
@@ -922,6 +1227,12 @@ func RetriggerKnowledgebase(sc *security.RequestContext, accountId, kbId string)
 
 	if existingKB.Status == string(KBStatusProcessing) {
 		return errors.New("knowledgebase is currently being processed")
+	}
+
+	// Re-indexing a disabled KB would burn embedding tokens on content nothing
+	// can read. Enable it first.
+	if !existingKB.Enabled {
+		return errors.New(errKBDisabled)
 	}
 
 	// Set status to processing. The terminal active/error flip is owned by the
@@ -950,7 +1261,7 @@ func RetriggerKnowledgebase(sc *security.RequestContext, accountId, kbId string)
 		submissionCtx, cancel := context.WithTimeout(context.Background(), time.Duration(config.Config.AsyncOperationTimeoutSeconds)*time.Second)
 		defer cancel()
 		if err := kbEmbeddingWorkerPool.Submit(submissionCtx, func() {
-			processKBUpdateEmbeddingsAsync(sc, accountId, kbId, existingKB.Data, existingKB.DataFormat, "user_retrigger")
+			processKBUpdateEmbeddingsAsync(sc, accountId, kbId, existingKB.Data, existingKB.DataFormat, "user_retrigger", existingKB.ContextTags)
 		}); err != nil {
 			_ = updateKBStatusError(dbms, kbId, fmt.Sprintf("failed to submit retrigger task: %v", err))
 			return fmt.Errorf("kb: failed to submit retrigger task: %w", err)
@@ -982,7 +1293,7 @@ func RetriggerKnowledgebase(sc *security.RequestContext, accountId, kbId string)
 }
 
 // processKBEmbeddingsAsync handles embedding generation asynchronously
-func processKBEmbeddingsAsync(sc *security.RequestContext, accountId, kbId, data, format string) {
+func processKBEmbeddingsAsync(sc *security.RequestContext, accountId, kbId, data, format string, contextTags []string) {
 	slog.Info("kb: starting async embedding generation", "kb_id", kbId, "account_id", accountId)
 
 	dbms, err := common.GetDatabaseManager(common.Metastore)
@@ -991,9 +1302,19 @@ func processKBEmbeddingsAsync(sc *security.RequestContext, accountId, kbId, data
 		return
 	}
 
+	// Convert the stored payload into what the rag-server should index. For a
+	// PDF this is where the document is read and its figures are described;
+	// every other format passes straight through.
+	ragData, ragFormat, filename, err := resolveKBIngestPayload(sc, accountId, kbId, data, format)
+	if err != nil {
+		slog.Error("kb: async - failed to prepare content for indexing", "error", err, "kb_id", kbId)
+		recordKBIngestFailure(sc, dbms, accountId, kbId, "KB_EMBEDDING_ERROR", err)
+		return
+	}
+
 	// Call RAG server to create vector embeddings
 	triggeredBy := sc.GetSecurityContext().GetUserId()
-	docCount, err := createKBVectorCollection(accountId, kbId, data, format, triggeredBy, "user_create")
+	docCount, err := createKBVectorCollection(accountId, kbId, ragData, ragFormat, filename, triggeredBy, "user_create", contextTags)
 	if err != nil {
 		slog.Error("kb: async - failed to create vector collection", "error", err, "kb_id", kbId)
 		// Update status to error, capturing the reason for the UI.
@@ -1050,12 +1371,19 @@ func processKBEmbeddingsAsync(sc *security.RequestContext, accountId, kbId, data
 }
 
 // processKBUpdateEmbeddingsAsync handles embedding update asynchronously
-func processKBUpdateEmbeddingsAsync(sc *security.RequestContext, accountId, kbId, data, format, triggerType string) {
+func processKBUpdateEmbeddingsAsync(sc *security.RequestContext, accountId, kbId, data, format, triggerType string, contextTags []string) {
 	slog.Info("kb: starting async embedding update", "kb_id", kbId, "account_id", accountId)
 
 	dbms, err := common.GetDatabaseManager(common.Metastore)
 	if err != nil {
 		slog.Error("kb: async update - failed to get database manager", "error", err, "kb_id", kbId)
+		return
+	}
+
+	ragData, ragFormat, filename, err := resolveKBIngestPayload(sc, accountId, kbId, data, format)
+	if err != nil {
+		slog.Error("kb: async update - failed to prepare content for indexing", "error", err, "kb_id", kbId)
+		recordKBIngestFailure(sc, dbms, accountId, kbId, "KB_EMBEDDING_UPDATE_ERROR", err)
 		return
 	}
 
@@ -1068,7 +1396,7 @@ func processKBUpdateEmbeddingsAsync(sc *security.RequestContext, accountId, kbId
 
 	// Create new vector collection
 	triggeredBy := sc.GetSecurityContext().GetUserId()
-	docCount, err := createKBVectorCollection(accountId, kbId, data, format, triggeredBy, triggerType)
+	docCount, err := createKBVectorCollection(accountId, kbId, ragData, ragFormat, filename, triggeredBy, triggerType, contextTags)
 	if err != nil {
 		slog.Error("kb: async update - failed to create vector collection", "error", err, "kb_id", kbId)
 		_ = updateKBStatusError(dbms, kbId, fmt.Sprintf("failed to create embeddings: %v", err))
@@ -1121,7 +1449,10 @@ func processKBUpdateEmbeddingsAsync(sc *security.RequestContext, accountId, kbId
 }
 
 // Helper function to create vector collection via RAG server
-func createKBVectorCollection(accountId, kbId, data, format, triggeredBy, triggerType string) (int, error) {
+func createKBVectorCollection(accountId, kbId, data, format, filename, triggeredBy, triggerType string, contextTags []string) (int, error) {
+	if contextTags == nil {
+		contextTags = []string{}
+	}
 	ragServerURL := config.Config.RAGServerUrl
 	if ragServerURL == "" {
 		return 0, errors.New("failed to process knowledgebase for semantic search. Service not configured")
@@ -1155,8 +1486,10 @@ func createKBVectorCollection(accountId, kbId, data, format, triggeredBy, trigge
 		"kb_id":        kbId,
 		"data":         ragData,
 		"format":       ragFormat,
+		"filename":     filename,
 		"triggered_by": triggeredBy,
 		"trigger_type": triggerType,
+		"context_tags": contextTags,
 	}
 
 	payloadBytes, err := common.MarshalJson(payload)
@@ -1171,7 +1504,12 @@ func createKBVectorCollection(accountId, kbId, data, format, triggeredBy, trigge
 	req.Header.Set("Content-Type", "application/json")
 	addRAGAuth(req)
 
-	client := common.HttpClient()
+	client := ragClient
+	if ragFormat == string(KBFormatPDF) {
+		// Reading a PDF and describing its figures legitimately takes minutes;
+		// the shared client's 120s header budget is sized for JSON responses.
+		client = kbPDFExtractClient
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return 0, fmt.Errorf("failed to process knowledgebase for semantic search: %w", err)
@@ -1216,7 +1554,7 @@ func deleteKBVectorCollection(accountId, kbId string) error {
 	}
 	addRAGAuth(req)
 
-	client := common.HttpClient()
+	client := ragClient
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to remove knowledgebase from search index: %w", err)
@@ -1266,7 +1604,7 @@ func triggerIntegrationKBSync(ctx context.Context, accountId, integrationID, kbS
 	req.Header.Set("Content-Type", "application/json")
 	addRAGAuth(req)
 
-	resp, err := common.HttpClient().Do(req)
+	resp, err := ragClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("kb: failed to reach rag-server for integration sync: %w", err)
 	}
@@ -1297,7 +1635,7 @@ func deleteRAGCollection(collectionName string) error {
 	}
 	addRAGAuth(req)
 
-	resp, err := common.HttpClient().Do(req)
+	resp, err := ragClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to remove collection from search index: %w", err)
 	}
@@ -1350,11 +1688,11 @@ func ListAgentKBs(sc *security.RequestContext, accountId, agentId string) ([]Kno
 	// Note: Excluding data field for performance
 	err = dbms.Db.Select(&kbs, `
 		SELECT kb.id, kb.tenant_id, kb.account_id, kb.name,
-		       COALESCE(kb.description, '') as description,
+		       COALESCE(kb.description, '') as description, kb.context_tags,
 		       kb.data_format,
-		       kb.data_filename, kb.data_size_bytes, kb.status,
+		       kb.data_filename, COALESCE(kb.data_size_bytes, 0) as data_size_bytes, kb.status, kb.enabled,
 		       COALESCE(kb.kb_type, 'manual') as kb_type,
-		       kb.kb_source,
+		       kb.kb_source, kb.integration_id,
 		       kb.created_at, kb.updated_at,
 		       kb.document_count, kb.last_loaded_at,
 		       COALESCE(cu.display_name, '') as created_by,
@@ -1401,12 +1739,13 @@ func ListActiveAgentSkillCandidates(sc *security.RequestContext, accountId strin
 		SELECT DISTINCT ON (kb.id)
 		       kb.id,
 		       kb.name,
-		       COALESCE(kb.description, '') as description
+		       concat_ws(' ', kb.description, array_to_string(kb.context_tags, ' ')) as description
 		FROM llm_knowledgebases kb
 		INNER JOIN llm_kb_agent_mappings m ON kb.id = m.kb_id
 		WHERE m.account_id = $1
 		  AND m.agent_id = ANY($2::text[])
 		  AND kb.status = 'active'
+		  AND kb.enabled
 		ORDER BY kb.id, kb.name ASC`, accountId, pq.Array(agentNames))
 	if err != nil {
 		return nil, fmt.Errorf("ListActiveAgentSkillCandidates: query failed: %w", err)
@@ -1426,8 +1765,7 @@ func ListActiveAgentSkillCandidates(sc *security.RequestContext, accountId strin
 // traces, logs, logs_default) so a delegated sub-agent can see KBs the user
 // mapped to an upstream custom-planner parent.
 //
-// restrictToIds carries the top-level question-aware selection, mirroring
-// injectKBContext:
+// restrictToIds carries a caller-provided mapped-skill selection:
 //
 //   - nil            → selection disabled (legacy "every active mapped skill")
 //   - non-nil (any)  → selection ran at top-level. Own-name KBs are ALWAYS
@@ -1435,11 +1773,10 @@ func ListActiveAgentSkillCandidates(sc *security.RequestContext, accountId strin
 //     never be hidden by an upstream parent's filter. Only
 //     *inherited* KBs are filtered to the restriction.
 //
-// This is intended for agents whose planner type is AgentPlannerTypeCustom — those
-// agents implement their own Execute() and bypass the executor's systemMessage path,
-// so the lazy load_skills tool flow used by ReAct planners never reaches them.
-// For such agents we eagerly inline the skill content (instead of just names and
-// descriptions). Returns "" / nil when no active skills match.
+// This is retained for specialized callers such as code analysis. The main
+// executor no longer uses it; custom agents should opt into bounded account-wide
+// discovery through AgentKnowledgeAutoChunks. Returns "" / nil when no active
+// mapped skills match.
 // escapeCDATA makes a string safe to inline inside a `<![CDATA[...]]>` section
 // by splitting any literal `]]>` across two CDATA sections. The sequence
 // `]]>` is the only reserved marker inside CDATA — it's replaced with
@@ -1460,10 +1797,13 @@ func escapeCDATA(s string) string {
 // agentSkillRow is the full skill record (metadata + body) rendered into a
 // `<skills>` block. Shared by every loader below so the framing stays identical.
 type agentSkillRow struct {
-	ID          string `db:"id"`
-	Name        string `db:"name"`
-	Description string `db:"description"`
-	Data        string `db:"data"`
+	KBType       string `db:"kb_type"`
+	NoteCategory string `db:"note_category"`
+	ID           string `db:"id"`
+	Name         string `db:"name"`
+	Description  string `db:"description"`
+	Data         string `db:"data"`
+	DataFormat   string `db:"data_format"`
 }
 
 // renderSkillsBlock renders skill rows into the canonical `<skills>...</skills>`
@@ -1490,8 +1830,14 @@ func renderSkillsBlock(rows []agentSkillRow) (string, []NBToolResponseReference)
 		// contain a literal `]]>` (e.g. a skill that teaches XML/XSD or embeds
 		// CDATA examples) which would prematurely close the section — escapeCDATA
 		// handles that via the standard split-the-marker trick.
+		sb.WriteString("<guidance>" + KnowledgePurposeGuidance(KnowledgePurpose(r.KBType, r.NoteCategory)) + "</guidance>\n")
+		body := r.Data
+		if r.DataFormat == string(KBFormatPDF) {
+			// The loaders never select a PDF's base64 data; point at retrieval instead.
+			body = PDFKnowledgePointer
+		}
 		sb.WriteString("<![CDATA[\n")
-		sb.WriteString(escapeCDATA(r.Data))
+		sb.WriteString(escapeCDATA(body))
 		sb.WriteString("\n]]>\n</skill>\n")
 
 		references = append(references, NBToolResponseReference{
@@ -1534,11 +1880,14 @@ func LoadAgentSkillContentsByIDs(sc *security.RequestContext, accountId string, 
 		       kb.id,
 		       kb.name,
 		       COALESCE(kb.description, '') as description,
-		       COALESCE(kb.data, '')        as data
+		       CASE WHEN kb.data_format = 'pdf' THEN '' ELSE COALESCE(kb.data, '') END as data,
+		       COALESCE(kb.data_format, '') as data_format,
+		       COALESCE(kb.kb_type, 'manual') as kb_type, COALESCE(kb.note_category, '') as note_category
 		FROM llm_knowledgebases kb
 		WHERE kb.account_id = $1
 		  AND kb.id = ANY($2::uuid[])
 		  AND kb.status = 'active'
+		  AND kb.enabled
 		ORDER BY kb.id, kb.name ASC`, accountId, pq.Array(ids))
 	if err != nil {
 		return "", nil, fmt.Errorf("LoadAgentSkillContentsByIDs: query failed: %w", err)
@@ -1564,7 +1913,7 @@ func LoadActiveAgentSkillContents(sc *security.RequestContext, accountId string,
 	// Own name (first entry) is ALWAYS loaded regardless of the top-level
 	// selection — a sub-agent's scoped expertise must not be hidden by an upstream
 	// parent's filter. Inherited ancestor names are only honoured when they pass
-	// the selection. This mirrors the own/inherited split inside injectKBContext.
+	// the caller-provided selection.
 	ownName := agentNames[0]
 	inheritedNames := agentNames[1:]
 
@@ -1579,12 +1928,15 @@ func LoadActiveAgentSkillContents(sc *security.RequestContext, accountId string,
 			       kb.id,
 			       kb.name,
 			       COALESCE(kb.description, '') as description,
-			       COALESCE(kb.data, '')        as data
+			       CASE WHEN kb.data_format = 'pdf' THEN '' ELSE COALESCE(kb.data, '') END as data,
+		       COALESCE(kb.data_format, '') as data_format,
+			       COALESCE(kb.kb_type, 'manual') as kb_type, COALESCE(kb.note_category, '') as note_category
 			FROM llm_knowledgebases kb
 			INNER JOIN llm_kb_agent_mappings m ON kb.id = m.kb_id
 			WHERE m.account_id = $1
 			  AND m.agent_id = ANY($2::text[])
 			  AND kb.status = 'active'
+			  AND kb.enabled
 			ORDER BY kb.id, kb.name ASC`, accountId, pq.Array(agentNames))
 
 	case len(inheritedNames) == 0:
@@ -1597,12 +1949,15 @@ func LoadActiveAgentSkillContents(sc *security.RequestContext, accountId string,
 			       kb.id,
 			       kb.name,
 			       COALESCE(kb.description, '') as description,
-			       COALESCE(kb.data, '')        as data
+			       CASE WHEN kb.data_format = 'pdf' THEN '' ELSE COALESCE(kb.data, '') END as data,
+		       COALESCE(kb.data_format, '') as data_format,
+			       COALESCE(kb.kb_type, 'manual') as kb_type, COALESCE(kb.note_category, '') as note_category
 			FROM llm_knowledgebases kb
 			INNER JOIN llm_kb_agent_mappings m ON kb.id = m.kb_id
 			WHERE m.account_id = $1
 			  AND m.agent_id = $2
 			  AND kb.status = 'active'
+			  AND kb.enabled
 			ORDER BY kb.id, kb.name ASC`, accountId, ownName)
 
 	case len(restrictToIds) == 0:
@@ -1613,12 +1968,15 @@ func LoadActiveAgentSkillContents(sc *security.RequestContext, accountId string,
 			       kb.id,
 			       kb.name,
 			       COALESCE(kb.description, '') as description,
-			       COALESCE(kb.data, '')        as data
+			       CASE WHEN kb.data_format = 'pdf' THEN '' ELSE COALESCE(kb.data, '') END as data,
+		       COALESCE(kb.data_format, '') as data_format,
+			       COALESCE(kb.kb_type, 'manual') as kb_type, COALESCE(kb.note_category, '') as note_category
 			FROM llm_knowledgebases kb
 			INNER JOIN llm_kb_agent_mappings m ON kb.id = m.kb_id
 			WHERE m.account_id = $1
 			  AND m.agent_id = $2
 			  AND kb.status = 'active'
+			  AND kb.enabled
 			ORDER BY kb.id, kb.name ASC`, accountId, ownName)
 
 	default:
@@ -1630,11 +1988,14 @@ func LoadActiveAgentSkillContents(sc *security.RequestContext, accountId string,
 			       kb.id,
 			       kb.name,
 			       COALESCE(kb.description, '') as description,
-			       COALESCE(kb.data, '')        as data
+			       CASE WHEN kb.data_format = 'pdf' THEN '' ELSE COALESCE(kb.data, '') END as data,
+		       COALESCE(kb.data_format, '') as data_format,
+			       COALESCE(kb.kb_type, 'manual') as kb_type, COALESCE(kb.note_category, '') as note_category
 			FROM llm_knowledgebases kb
 			INNER JOIN llm_kb_agent_mappings m ON kb.id = m.kb_id
 			WHERE m.account_id = $1
 			  AND kb.status = 'active'
+			  AND kb.enabled
 			  AND (
 			      m.agent_id = $2
 			      OR (m.agent_id = ANY($3::text[]) AND kb.id = ANY($4::text[]))

@@ -14,8 +14,10 @@ import {
 } from 'reactflow';
 import 'reactflow/dist/style.css';
 import { useRouter } from 'next/router';
-import { Alert, Box, Typography, CircularProgress, Drawer, Divider } from '@mui/material';
+import { Box, Typography, CircularProgress, Drawer } from '@mui/material';
+import { Divider } from '@ui/Divider';
 import Tooltip from '@ui/Tooltip';
+import { Banner } from '@ui/Banner';
 import { Checkbox } from '@ui/Checkbox';
 import { Input } from '@ui/Input';
 import { Select } from '@ui/Select';
@@ -64,13 +66,14 @@ import { validateWorkflowForSave, wouldCreateCycle } from './utils/workflowValid
 import { parseDurationToSeconds } from './utils/taskUtils';
 import { extractTriggersFromNodes, extractTasksFromWorkflowNodes, getPreviousNodesOutputSchemas } from './utils/workflowTaskExtraction';
 import { disableTask, enableTask } from './utils/toggleTaskDisable';
+import { defaultVersionStatus, VERSION_STATUS_HELP, type VersionStatus } from './utils/versionStatus';
 import {
   cleanupSwitchReferencesAfterDelete,
   findExecutionTaskForNode,
   getPreviousTasksForNode,
   getSwitchDryRunEligibility,
 } from './utils/templateUtils';
-import { buildWorkflowFromAIResponse, type AIGenerateWorkflowResponse, sanitizeTaskId, buildFilterExpression } from './utils';
+import { buildWorkflowFromAIResponse, type AIGenerateWorkflowResponse, sanitizeTaskId, buildFilterExpression, resolveApprovalOptions } from './utils';
 import { parseConditionLabel, hasConditionalStyling } from './utils/conditionParser';
 
 // Custom imports
@@ -107,7 +110,7 @@ import { useWorkflowHistory } from './hooks/useWorkflowHistory';
 import { useWorkflowClipboard } from './hooks/useWorkflowClipboard';
 import { useWorkflowShortcuts } from './hooks/useWorkflowShortcuts';
 import SafeIcon from '@shared/icons/SafeIcon';
-import { hasFeatureAccess, hasPermission, hasWriteAccess } from '@lib/auth';
+import { hasPermission, hasWriteAccess } from '@lib/auth';
 import { Modal } from '@ui/Modal';
 import Text from '@shared/format/Text';
 
@@ -125,7 +128,6 @@ const TriggerWorkflowModal = lazy(() => import('./components/TriggerWorkflowModa
 // The three statuses a version (and, once promoted, the workflow) can be in.
 // Shared by the live row's status control and the Make-live dialog, so it lives
 // at module scope rather than being re-allocated per version row.
-type VersionStatus = 'ACTIVE' | 'PAUSED' | 'INACTIVE';
 const VERSION_STATUS_ITEMS: { value: VersionStatus; label: string; tone: LabelTone; dotColor: string }[] = [
   { value: 'ACTIVE', label: 'Active', tone: 'success', dotColor: 'var(--ds-green-600)' },
   { value: 'PAUSED', label: 'Paused', tone: 'warning', dotColor: 'var(--ds-amber-600)' },
@@ -156,6 +158,7 @@ interface WorkflowData {
   tags: Record<string, any>;
   description?: string;
   ai_invocable?: boolean;
+  ai_auto_approve?: boolean;
   created_from_session_id?: string | null;
   live_version_id?: string | null;
   live_version_number?: number | null;
@@ -390,6 +393,7 @@ const WorkflowBuilderNoteBook: React.FC<WorkflowBuilderNotebookProps> = ({ mode 
     status: 'ACTIVE',
     description: '',
     aiInvocable: false,
+    aiAutoApprove: false,
     llmDescription: '',
   });
   const workflowSettingsRef = useRef(workflowSettings);
@@ -432,6 +436,7 @@ const WorkflowBuilderNoteBook: React.FC<WorkflowBuilderNotebookProps> = ({ mode 
           // ai_invocable is a workflow field; the AI description/keywords live in
           // the definition alongside the rest of the settings above.
           aiInvocable: workflowData.ai_invocable ?? prev.aiInvocable,
+          aiAutoApprove: workflowData.ai_auto_approve ?? prev.aiAutoApprove,
           llmDescription: workflowData.definition.llm_description ?? prev.llmDescription,
         };
       });
@@ -521,7 +526,6 @@ const WorkflowBuilderNoteBook: React.FC<WorkflowBuilderNotebookProps> = ({ mode 
       nubiChatEverOpenedRef.current = true;
     }
   }, [showNubiChat]);
-  const [nubiChatFeatureEnabled, setNubiChatFeatureEnabled] = useState(false); // Feature flag for NubiChat
   const [nubiChatContext, setNubiChatContext] = useState<{
     type: 'workflow' | 'workflowbuilder';
     data?: any;
@@ -546,17 +550,14 @@ const WorkflowBuilderNoteBook: React.FC<WorkflowBuilderNotebookProps> = ({ mode 
   const [publishDescription, setPublishDescription] = useState('');
   const [publishSetLive, setPublishSetLive] = useState(true);
   // Initial status the published version (and the workflow row, when
-  // setLive=true) lands in. Default PAUSED matches the backend default so the
-  // user must opt in to ACTIVE — V746 contract. The live row's dropdown in the
-  // version drawer is the long-term knob, but offering the initial value here
-  // saves a round-trip when the user already knows what they want.
-  const [publishStatus, setPublishStatus] = useState<'ACTIVE' | 'PAUSED' | 'INACTIVE'>('PAUSED');
+  // setLive=true) lands in. Seeded from the live version each time the dialog opens.
+  const [publishStatus, setPublishStatus] = useState<VersionStatus>('PAUSED');
   const [publishing, setPublishing] = useState(false);
   const [confirmLiveVersion, setConfirmLiveVersion] = useState<WorkflowVersionEntry | null>(null);
   // Status the promoted version lands in. Asked for at promotion time because
   // that is the only moment a version's status starts having runtime effect —
   // non-live versions no longer expose a status control at all.
-  const [makeLiveStatus, setMakeLiveStatus] = useState<VersionStatus>('ACTIVE');
+  const [makeLiveStatus, setMakeLiveStatus] = useState<VersionStatus>('PAUSED');
   const [settingLive, setSettingLive] = useState(false);
   const [confirmDeleteVersion, setConfirmDeleteVersion] = useState<WorkflowVersionEntry | null>(null);
   const [deleting, setDeleting] = useState(false);
@@ -605,21 +606,6 @@ const WorkflowBuilderNoteBook: React.FC<WorkflowBuilderNotebookProps> = ({ mode 
     return Array.from(placeholders);
   }, [workflowData?.definition?.tasks, aiSessionId]);
 
-  // Check NubiChat feature flag on mount
-  useEffect(() => {
-    const checkNubiChatFeatureAccess = async () => {
-      try {
-        const hasAccess = await hasFeatureAccess('WORKFLOWS');
-        setNubiChatFeatureEnabled(hasAccess);
-      } catch (error) {
-        console.error('Error checking NubiChat feature access:', error);
-        setNubiChatFeatureEnabled(false);
-      }
-    };
-
-    checkNubiChatFeatureAccess();
-  }, []);
-
   // Auto-open the NuBi sidebar when the route carries a conversation_id (or
   // session_id) query param so the linked conversation is rendered without a
   // manual toggle. The actual fetch is owned by KubernetesLLMResponseGenerator
@@ -629,13 +615,13 @@ const WorkflowBuilderNoteBook: React.FC<WorkflowBuilderNotebookProps> = ({ mode 
   useEffect(() => {
     // Don't auto-open for read-only users: the panel is gated on canEdit, so
     // flipping the flag would only push the layout aside for a hidden sidebar.
-    if (!nubiChatFeatureEnabled || !canEdit) return;
+    if (!canEdit) return;
     const urlId = urlConversationId || urlSessionId || workflowSessionId;
     if (!urlId) return;
     if (autoOpenedNubiUrlRef.current === urlId) return;
     autoOpenedNubiUrlRef.current = urlId;
     setShowNubiChat(true);
-  }, [urlConversationId, urlSessionId, workflowSessionId, nubiChatFeatureEnabled, canEdit]);
+  }, [urlConversationId, urlSessionId, workflowSessionId, canEdit]);
 
   // Adjust viewport when JSON panel or NubiChat visibility changes
   useEffect(() => {
@@ -1011,12 +997,14 @@ const WorkflowBuilderNoteBook: React.FC<WorkflowBuilderNotebookProps> = ({ mode 
       if (hasEventContext && taskDefinitions.length > 0 && !eventTriggerInitializedRef.current) {
         try {
           const filter = buildFilterExpression({
-            event_type: eventTypeQ,
-            priority: eventPriorityQ,
-            source: eventSourceQ,
-            cluster: eventClusterQ,
-            namespace: eventNamespaceQ,
+            event_type: [eventTypeQ],
+            priority: [eventPriorityQ],
+            source: [eventSourceQ],
+            namespace: [eventNamespaceQ],
           });
+          // The event's account is who the trigger listens to, not a filter clause; the
+          // automation's own account is the default, so only another one is saved.
+          const eventParams = { filter, ...(eventClusterQ && eventClusterQ !== accountId ? { accounts: [eventClusterQ] } : {}) };
 
           const eventWorkflowData: WorkflowData = {
             id: null,
@@ -1026,7 +1014,7 @@ const WorkflowBuilderNoteBook: React.FC<WorkflowBuilderNotebookProps> = ({ mode 
               timeout: '',
               inputs: [],
               tasks: [],
-              triggers: [{ type: 'event', params: { filter } }],
+              triggers: [{ type: 'event', params: eventParams }],
               output: {},
               retry_policy: {
                 maximum_attempts: 3,
@@ -1563,11 +1551,13 @@ const WorkflowBuilderNoteBook: React.FC<WorkflowBuilderNotebookProps> = ({ mode 
         setNodes((prev) =>
           prev.map((node) => {
             if (node.type !== 'action' && node.type !== 'switch') return node;
-            const { executionStatus, executionDuration, lastExecutionTime, executionOutput, executionError, ...rest } = node.data || {};
+            const { executionStatus, executionDuration, lastExecutionTime, executionInput, executionOutput, executionError, ...rest } =
+              node.data || {};
             const hadAny =
               executionStatus !== undefined ||
               executionDuration !== undefined ||
               lastExecutionTime !== undefined ||
+              executionInput !== undefined ||
               executionOutput !== undefined ||
               executionError !== undefined;
             return hadAny ? { ...node, data: rest } : node;
@@ -2147,8 +2137,7 @@ const WorkflowBuilderNoteBook: React.FC<WorkflowBuilderNotebookProps> = ({ mode 
     setPublishName('');
     setPublishDescription('');
     setPublishSetLive(true);
-    // Reset to PAUSED each open so the safer default always wins.
-    setPublishStatus('PAUSED');
+    setPublishStatus(defaultVersionStatus(workflowDataRef.current?.live_version_status));
     setPublishDialogOpen(true);
   }, []);
 
@@ -2600,7 +2589,13 @@ const WorkflowBuilderNoteBook: React.FC<WorkflowBuilderNotebookProps> = ({ mode 
               ...node.data,
               taskConfig: needsIdSync ? { ...node.data.taskConfig, id: sanitizeTaskId(node.id) } : node.data.taskConfig,
               ...(needsStatusClear
-                ? { executionStatus: undefined, lastExecutionTime: undefined, executionOutput: undefined, executionError: undefined }
+                ? {
+                    executionStatus: undefined,
+                    lastExecutionTime: undefined,
+                    executionInput: undefined,
+                    executionOutput: undefined,
+                    executionError: undefined,
+                  }
                 : {}),
             },
           };
@@ -2754,6 +2749,21 @@ const WorkflowBuilderNoteBook: React.FC<WorkflowBuilderNotebookProps> = ({ mode 
       }
     },
     [prepareDryRunRequest, startPollingDryRun]
+  );
+
+  // Trigger simulator: dry-run the automation against the payload the user
+  // assembled in the trigger sidebar. Skips the inputs modal — the simulator
+  // panel already is the inputs editor.
+  const handleSimulateTriggerRun = useCallback(
+    (inputs: Record<string, any>) => {
+      const validationError = validateBeforeExecution('dryrun');
+      if (validationError) {
+        snackbar.error(validationError);
+        return;
+      }
+      executeDryRun(inputs);
+    },
+    [validateBeforeExecution, executeDryRun]
   );
 
   // Handle trigger from modal: execute with user-provided inputs
@@ -3388,6 +3398,12 @@ const WorkflowBuilderNoteBook: React.FC<WorkflowBuilderNotebookProps> = ({ mode 
         status: task.status,
         startTime: task.start_time,
         endTime: task.end_time,
+        // The params as they were actually rendered for this run. Needed for
+        // anything whose canvas affordance depends on a templated value — e.g.
+        // core.approval's buttons, whose approval_options may be
+        // "{{ Tasks['x'].output.data }}" in the definition and only become a
+        // list here.
+        input: task.input,
         output: task.output,
         error: task.error,
       });
@@ -3407,6 +3423,7 @@ const WorkflowBuilderNoteBook: React.FC<WorkflowBuilderNotebookProps> = ({ mode 
                 ...node.data,
                 executionStatus: taskStatus.status,
                 lastExecutionTime: taskStatus.startTime || new Date().toISOString(),
+                executionInput: taskStatus.input,
                 executionOutput: taskStatus.output,
                 executionError: taskStatus.error,
               },
@@ -3429,12 +3446,27 @@ const WorkflowBuilderNoteBook: React.FC<WorkflowBuilderNotebookProps> = ({ mode 
   };
 
   // Update all nodes to final execution state
-  const updateAllNodeStatesToFinalState = (_executionStatus: string) => {
+  const updateAllNodeStatesToFinalState = (executionStatus: string) => {
+    // An aborted run leaves nodes mid-flight; preserving those reads as "still waiting"
+    // forever, and an approval stuck at SCHEDULED keeps its form alive (#36358).
+    const abortedRun = ['CANCELED', 'CANCELLED', 'TERMINATED', 'TIMED_OUT'].includes(executionStatus?.toUpperCase());
+    const unfinishedNodeStatuses = ['SCHEDULED', 'STARTED', 'RUNNING', 'IN_PROGRESS', 'PENDING'];
+
     setNodes((prevNodes) =>
       prevNodes.map((node) => {
         if ((node.type === 'action' || node.type === 'switch') && node.data.taskConfig) {
           // Preserve task-specific status if already set by polling (e.g. COMPLETED, FAILED)
           if (node.data.executionStatus) {
+            if (abortedRun && unfinishedNodeStatuses.includes(String(node.data.executionStatus).toUpperCase())) {
+              return {
+                ...node,
+                data: {
+                  ...node.data,
+                  executionStatus: 'CANCELED',
+                  lastExecutionTime: new Date().toISOString(),
+                },
+              };
+            }
             return node;
           }
           // Tasks that were never reached get SKIPPED status
@@ -3573,10 +3605,17 @@ const WorkflowBuilderNoteBook: React.FC<WorkflowBuilderNotebookProps> = ({ mode 
 
       {/* Config placeholder warning for AI-generated workflows */}
       {configPlaceholders.length > 0 && !configWarningDismissed && (
-        <Alert severity='info' onClose={() => setConfigWarningDismissed(true)} sx={{ borderRadius: 0 }}>
-          This workflow uses configuration placeholders: <strong>{configPlaceholders.join(', ')}</strong>. Please ensure these are set in the Config
-          Manager before running.
-        </Alert>
+        <Banner
+          tone='info'
+          dismissible
+          onDismiss={() => setConfigWarningDismissed(true)}
+          message={
+            <>
+              This workflow uses configuration placeholders: <strong>{configPlaceholders.join(', ')}</strong>. Please ensure these are set in the
+              Config Manager before running.
+            </>
+          }
+        />
       )}
 
       {/* Content Area - Sidebar + Main Content */}
@@ -3607,7 +3646,7 @@ const WorkflowBuilderNoteBook: React.FC<WorkflowBuilderNotebookProps> = ({ mode 
               Gated by canEdit: read-only users (who are forced into the
               Executions tab) have no workflow-authoring access, so the Nubi
               assistant must not be offered to them. */}
-          {nubiChatFeatureEnabled && canEdit && (
+          {canEdit && (
             <Box
               sx={{
                 position: 'absolute',
@@ -3684,8 +3723,8 @@ const WorkflowBuilderNoteBook: React.FC<WorkflowBuilderNotebookProps> = ({ mode 
               </Suspense>
             </Box>
           )}
-          {/* NubiChat Toggle Button (Feature Flag Controlled, write-access only) */}
-          {nubiChatFeatureEnabled && canEdit && (
+          {/* NubiChat Toggle Button (write-access only) */}
+          {canEdit && (
             <Box
               id='workflow-nubi-chat-toggle'
               onClick={() => setShowNubiChat(!showNubiChat)}
@@ -3713,7 +3752,7 @@ const WorkflowBuilderNoteBook: React.FC<WorkflowBuilderNotebookProps> = ({ mode 
                 '&:hover': {
                   backgroundColor: 'var(--ds-background-200)',
                 },
-                boxShadow: '2px 0 8px rgba(0, 0, 0, 0.1)',
+                boxShadow: `2px 0 8px ${ds.gray.alpha[300]}`,
               }}
             >
               {showNubiChat ? (
@@ -3738,7 +3777,7 @@ const WorkflowBuilderNoteBook: React.FC<WorkflowBuilderNotebookProps> = ({ mode 
             <Box
               sx={{
                 height: '100%',
-                marginLeft: nubiChatFeatureEnabled && canEdit && showNubiChat ? `${nubiChatWindowWidth}px` : '0',
+                marginLeft: canEdit && showNubiChat ? `${nubiChatWindowWidth}px` : '0',
                 transition: isResizingRef.current ? 'none' : 'margin-left 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
               }}
             >
@@ -3883,7 +3922,7 @@ const WorkflowBuilderNoteBook: React.FC<WorkflowBuilderNotebookProps> = ({ mode 
                   sx={{
                     height: '100%',
                     flex: 1,
-                    marginLeft: nubiChatFeatureEnabled && canEdit && showNubiChat ? `${nubiChatWindowWidth}px` : '0',
+                    marginLeft: canEdit && showNubiChat ? `${nubiChatWindowWidth}px` : '0',
                     marginRight: jsonPanelVisible ? `${jsonWindowWidth}px` : '0',
                     position: 'relative',
                     transition: isResizingRef.current
@@ -4062,7 +4101,7 @@ const WorkflowBuilderNoteBook: React.FC<WorkflowBuilderNotebookProps> = ({ mode 
                                 color: ds.gray[700],
                                 fontWeight: 'var(--ds-font-weight-semibold)',
                                 fontSize: 'var(--ds-text-heading)',
-                                fontFamily: 'poppins',
+                                fontFamily: ds.font.display,
                                 letterSpacing: '-0.010em',
                               }}
                             >
@@ -4169,7 +4208,7 @@ const WorkflowBuilderNoteBook: React.FC<WorkflowBuilderNotebookProps> = ({ mode 
                                       fontSize: 'var(--ds-text-body)',
                                       fontWeight: 'var(--ds-font-weight-semibold)',
                                       color: ds.gray[700],
-                                      fontFamily: 'poppins',
+                                      fontFamily: ds.font.display,
                                       lineHeight: 1.3,
                                     }}
                                   >
@@ -4211,12 +4250,10 @@ const WorkflowBuilderNoteBook: React.FC<WorkflowBuilderNotebookProps> = ({ mode 
                               n.data.taskConfig?.type === 'core.approval' &&
                               String(n.data.executionStatus ?? '').toUpperCase() === 'SCHEDULED'
                           )
-                          .map((n) => {
-                            const opts = Array.isArray(n.data.taskConfig?.config?.approval_options)
-                              ? (n.data.taskConfig.config.approval_options as any[]).filter((o: any) => typeof o === 'string' && o.length > 0)
-                              : [];
-                            return { taskId: n.data.taskConfig.id || n.id, options: opts };
-                          })}
+                          .map((n) => ({
+                            taskId: n.data.taskConfig.id || n.id,
+                            options: resolveApprovalOptions(n.data.executionInput, n.data.taskConfig?.config),
+                          }))}
                         onApprove={handleCompleteApproval}
                         approvalLoading={approvalLoading}
                       />
@@ -4408,8 +4445,8 @@ const WorkflowBuilderNoteBook: React.FC<WorkflowBuilderNotebookProps> = ({ mode 
                           {/* Divider */}
                           <Box sx={{ width: '1px', height: '28px', backgroundColor: ds.brand[200] }} />
 
-                          {/* NuBi AI Chat Button */}
-                          {nubiChatFeatureEnabled && (
+                          {/* NuBi AI Chat Button (write-access only, matching the sidebar it toggles) */}
+                          {canEdit && (
                             <Button
                               id='workflow-nubi-chat-btn'
                               composition='icon-only'
@@ -4592,6 +4629,7 @@ const WorkflowBuilderNoteBook: React.FC<WorkflowBuilderNotebookProps> = ({ mode 
                     taskDefinitions={taskDefinitions}
                     taskData={sidebarTaskData}
                     validationErrors={sidebarValidationErrors}
+                    serverError={sidebarSelectedNode ? serverErrors[sidebarSelectedNode.id] : null}
                     viewOnlyMode={false}
                     previousNodeOutputSchema={sidebarPreviousNodeOutputSchema}
                     accountId={accountId}
@@ -4689,6 +4727,7 @@ const WorkflowBuilderNoteBook: React.FC<WorkflowBuilderNotebookProps> = ({ mode 
                     }}
                     pendingConfig={pendingTriggerDiscard?.pendingConfig ?? null}
                     onPendingConfigConsumed={() => setPendingTriggerDiscard(null)}
+                    onSimulateRun={handleSimulateTriggerRun}
                   />
                 </Suspense>
               )}
@@ -4822,7 +4861,7 @@ const WorkflowBuilderNoteBook: React.FC<WorkflowBuilderNotebookProps> = ({ mode 
                   onClick={() => setHistoryOpen(false)}
                 />
               </Box>
-              <Divider />
+              <Divider sx={{ my: 0 }} />
               <Box sx={{ flex: 1, overflowY: 'auto' }}>
                 {loadingVersions ? (
                   <Box sx={{ display: 'flex', justifyContent: 'center', p: 4 }}>
@@ -4923,7 +4962,7 @@ const WorkflowBuilderNoteBook: React.FC<WorkflowBuilderNotebookProps> = ({ mode 
                                   tone='secondary'
                                   size='sm'
                                   onClick={() => {
-                                    setMakeLiveStatus('ACTIVE');
+                                    setMakeLiveStatus(defaultVersionStatus(workflowData?.live_version_status));
                                     setConfirmLiveVersion(v);
                                   }}
                                   disabled={anyInFlight}
@@ -5153,9 +5192,9 @@ const WorkflowBuilderNoteBook: React.FC<WorkflowBuilderNotebookProps> = ({ mode 
                   minRows={2}
                 />
               </Box>
-              {/* Per-version status (V746). Default PAUSED so the user has to
-                  actively choose ACTIVE — matches the backend default and
-                  prevents surprise auto-fires on publish. When setLive is on,
+              {/* Per-version status (V746). Defaults to the live version's
+                  status (PAUSED when none) so publishing never flips triggers
+                  the user didn't touch — same default as Make live. When setLive is on,
                   the chosen status also mirrors onto workflows.status via
                   DAO.SetLiveVersion in a single tx. After the fact it can be
                   changed from the live row's status control in the version
@@ -5164,7 +5203,7 @@ const WorkflowBuilderNoteBook: React.FC<WorkflowBuilderNotebookProps> = ({ mode 
                 <Select
                   size='sm'
                   label='Version status'
-                  help="Active = all triggers fire. Paused = manual only. Inactive = blocked. Change later from the live version's status control, or when you promote another version."
+                  help={VERSION_STATUS_HELP}
                   value={publishStatus}
                   onChange={(next) => setPublishStatus(next as VersionStatus)}
                   disabled={publishing}
@@ -5218,14 +5257,13 @@ const WorkflowBuilderNoteBook: React.FC<WorkflowBuilderNotebookProps> = ({ mode 
                 live pointer does not modify what you&apos;re editing.
               </Typography>
               {/* Promotion is the moment a version's status starts mattering, so
-                  it is chosen here rather than on the archived row. Default
-                  ACTIVE: the user is explicitly putting this version into
-                  service, so "running" is the expected landing state. */}
+                  it is chosen here rather than on the archived row. Defaults to
+                  the live version's status, same as the Publish dialog. */}
               <Box data-testid='workflow-make-live-status-select' sx={{ mt: 2 }}>
                 <Select
                   size='sm'
                   label='Version status'
-                  help='Active = all triggers fire. Paused = manual runs only. Inactive = blocked.'
+                  help={VERSION_STATUS_HELP}
                   value={makeLiveStatus}
                   onChange={(next) => setMakeLiveStatus(next as VersionStatus)}
                   disabled={settingLive}

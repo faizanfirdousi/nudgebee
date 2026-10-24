@@ -1,4 +1,4 @@
-import { getToken, type JWT } from 'next-auth/jwt';
+import { type JWT } from 'next-auth/jwt';
 import type { NextApiRequest } from 'next';
 import {
   parse,
@@ -10,10 +10,12 @@ import {
   type ValueNode,
 } from 'graphql';
 import { decodeSessionJWT, decrypt } from '@lib/internal';
+import { readSessionToken } from '@lib/sessionCookie';
 import { isSessionRevoked } from '@lib/sessionRevocation';
 import { loadActionInputSchema, loadRpcRoutes, type RpcRoute, type SchemaFieldInfo } from '@lib/rpcRoutes';
 import { elevateRoles } from '@lib/authHooks';
 import { pickDefaultRole } from '@lib/rolePriority';
+import { isTokenScopeBlockedAction } from '@lib/permissionCatalog';
 
 // Shared primitives for the RPC-bypass path. Used by both /api/rpc
 // (JSON-RPC envelope) and /api/graphql (GraphQL envelope when the bypass is
@@ -129,6 +131,7 @@ function synthesizeJwtFromBearer(rawJwt: string): Promise<JWT | null> {
         namespacedAccountIds: (p.namespaced_account_ids as string[]) ?? [],
         namespacedReadOnlyAccountIds: (p.namespaced_readonly_account_ids as string[]) ?? [],
       };
+      if (Array.isArray(p.token_scopes)) synth.tokenScopes = p.token_scopes;
       return synth as unknown as JWT;
     })
     .catch(() => null);
@@ -146,7 +149,7 @@ export async function authenticateRequest(req: NextApiRequest): Promise<AuthCont
       }
     }
   }
-  let jwt = await getToken({ req });
+  let jwt = await readSessionToken(req);
   const fromCookie = !!jwt && !token;
   // Bearer-only flow (no NextAuth cookie): decode the bearer JWT and
   // synthesize the JWT shape buildSessionVariables expects. Without this,
@@ -188,6 +191,9 @@ export type SessionVariables = {
   // upstream Go handlers re-resolve grants from the DB (NewSecurityContext) and
   // do NOT trust this list for their own re-validation.
   permissions: string[];
+  // Present only for a scoped API key: the `<module>:<Class>` keys it was limited
+  // to at creation (user_auths.scopes). Every call must also match one of them.
+  token_scopes?: string[];
   user_id: string;
   tenant_id: string;
 };
@@ -215,13 +221,15 @@ export function buildSessionVariables(jwt: JWT): SessionVariables {
   if (jwt.isSuperAdminReadonly && !allowedRoles.includes('super_admin_readonly')) {
     allowedRoles.push('super_admin_readonly');
   }
-  return {
+  const vars: SessionVariables = {
     role: defaultRole,
     allowed_roles: allowedRoles,
     permissions: (jwt.permissions as string[]) || [],
     user_id: userId,
     tenant_id: tenantId,
   };
+  if (Array.isArray(jwt.tokenScopes)) vars.token_scopes = jwt.tokenScopes as string[];
+  return vars;
 }
 
 // Substitutes `{{ENV_VAR}}` placeholders in an action's handler URL, reporting any
@@ -295,6 +303,17 @@ export function actionHasCustomGrant(actionName: string, route: Pick<RpcRoute, '
   );
 }
 
+// actionAllowedByTokenScopes is the scoped-API-key gate. It narrows, never widens:
+// forwardAction applies it IN ADDITION to the role/grant gate, so a key reaches an
+// action only when its owner may call it AND one of the key's scopes covers it.
+// Same matcher as custom grants (Write⇒Read), so a scope means exactly what the
+// same box means in the role editor. Unclassified actions fail closed, and
+// credential/role management is refused outright (isTokenScopeBlockedAction).
+export function actionAllowedByTokenScopes(actionName: string, route: Pick<RpcRoute, 'permission' | 'handler'>, tokenScopes: string[]): boolean {
+  if (isTokenScopeBlockedAction(actionName)) return false;
+  return actionHasCustomGrant(actionName, route, tokenScopes);
+}
+
 export type ForwardOptions = {
   method: string;
   params: Record<string, unknown>;
@@ -307,6 +326,11 @@ export type ForwardOptions = {
   clientAuthorization?: string;
   traceparent: string;
   requestId: string;
+  // Aborts the upstream fetch (and the body read) when the caller is gone.
+  // The HTTP handlers wire it to the response's close event: a browser that
+  // gave up on a slow panel otherwise leaves this process buffering an answer
+  // nobody will read, and a burst of those is what OOM-kills the pod.
+  signal?: AbortSignal;
 };
 
 // Shown when a session carries no roles at all (e.g. the user switched to a
@@ -320,7 +344,12 @@ export type ForwardError =
   | { kind: 'handler_unresolved'; method: string; handler: string; missingEnv: string[] }
   | { kind: 'no_tenant_role'; method: string }
   | { kind: 'forbidden'; method: string; role: string; allowedRoles: string[] }
+  // A scoped API key called an action none of its scopes cover.
+  | { kind: 'token_scope_denied'; method: string }
   | { kind: 'upstream_unreachable'; method: string; url: string; detail: string }
+  // The caller disconnected (opts.signal aborted) before the upstream answered.
+  // Nobody reads the response, so this is logged at info, not as an error.
+  | { kind: 'client_disconnected'; method: string; url: string }
   | { kind: 'upstream_parse_failed'; method: string; url: string; detail: string }
   | { kind: 'upstream_error'; method: string; url: string; status: number; payload: unknown };
 
@@ -337,6 +366,13 @@ export async function forwardAction(opts: ForwardOptions): Promise<ForwardResult
   // account_admin]` whose `defaultRole` is `tenant_admin_readonly` would
   // otherwise be falsely denied from `account_admin`-only actions even
   // though they genuinely have account_admin. super_admin sessions bypass.
+  // Scoped API key: checked first and with no bypass (super-admin, tenant-agnostic),
+  // because it narrows whatever the owner could otherwise do.
+  const tokenScopes = opts.sessionVariables.token_scopes;
+  if (tokenScopes && !actionAllowedByTokenScopes(opts.method, route, tokenScopes)) {
+    return { ok: false, error: { kind: 'token_scope_denied', method: opts.method } };
+  }
+
   const role = opts.sessionVariables.role || '';
   const allowedRoles = opts.sessionVariables.allowed_roles || [];
   const isSuperAdmin = allowedRoles.includes('super_admin');
@@ -443,19 +479,54 @@ export async function forwardAction(opts: ForwardOptions): Promise<ForwardResult
       method: 'POST',
       headers: upstreamHeaders,
       body: JSON.stringify(upstreamBody),
+      signal: opts.signal,
     });
   } catch (err: unknown) {
+    if (opts.signal?.aborted) return { ok: false, error: { kind: 'client_disconnected', method: opts.method, url: upstreamUrl } };
     const detail = err instanceof Error ? err.message : String(err);
     return { ok: false, error: { kind: 'upstream_unreachable', method: opts.method, url: upstreamUrl, detail } };
   }
 
   const upstreamCT = upstream.headers.get('content-type') || '';
-  let payload: unknown;
+  let rawBody: string;
   try {
-    payload = upstreamCT.includes('application/json') ? await upstream.json() : await upstream.text();
+    rawBody = await upstream.text();
   } catch (err: unknown) {
+    if (opts.signal?.aborted) return { ok: false, error: { kind: 'client_disconnected', method: opts.method, url: upstreamUrl } };
     const detail = err instanceof Error ? err.message : String(err);
-    return { ok: false, error: { kind: 'upstream_parse_failed', method: opts.method, url: upstreamUrl, detail } };
+    return { ok: false, error: { kind: 'upstream_unreachable', method: opts.method, url: upstreamUrl, detail } };
+  }
+
+  let payload: unknown;
+  if (upstreamCT.includes('application/json')) {
+    // An upstream that declares JSON and then sends nothing has failed mid-response;
+    // it has not sent an unparseable one. gin writes the `application/json` header
+    // before json.Marshal runs, so a marshal failure (a NaN/±Inf metric sample was
+    // the case that surfaced this) ships 200 + application/json + an empty body.
+    // Reporting that as a parse failure aimed the message at the client, when the
+    // upstream is the thing that broke.
+    if (rawBody.trim() === '') {
+      const detail = `upstream returned ${upstream.status} with an empty body`;
+      console.error('%s', `[graphql-gateway] upstream_empty_body method=${opts.method} url=${upstreamUrl} status=${upstream.status}`);
+      return {
+        ok: false,
+        error: {
+          kind: 'upstream_error',
+          method: opts.method,
+          url: upstreamUrl,
+          status: upstream.status,
+          payload: { message: `${opts.method} failed: ${detail}` },
+        },
+      };
+    }
+    try {
+      payload = JSON.parse(rawBody);
+    } catch (err: unknown) {
+      const detail = err instanceof Error ? err.message : String(err);
+      return { ok: false, error: { kind: 'upstream_parse_failed', method: opts.method, url: upstreamUrl, detail } };
+    }
+  } else {
+    payload = rawBody;
   }
 
   if (!upstream.ok) {
@@ -613,6 +684,8 @@ export async function tryBypassGraphQL(opts: {
   // path threads this; the HTTP path leaves it undefined and relies on
   // the cookie JWT's tenant binding.
   tenantOverride?: string;
+  // See ForwardOptions.signal.
+  signal?: AbortSignal;
 }): Promise<GraphQLBypassResult> {
   const parsed = parseOperation(opts.query, opts.variables);
   if (!parsed.ok) return { handled: false, reason: parsed.reason };
@@ -651,6 +724,7 @@ export async function tryBypassGraphQL(opts: {
         clientAuthorization: opts.clientAuthorization,
         traceparent: opts.traceparent,
         requestId: opts.requestId,
+        signal: opts.signal,
       })
     )
   );
@@ -671,6 +745,8 @@ export async function tryBypassGraphQL(opts: {
         err.extensions = { code: 'FORBIDDEN', role: r.error.role, allowedRoles: r.error.allowedRoles };
       } else if (r.error.kind === 'no_tenant_role') {
         err.extensions = { code: 'NO_TENANT_ROLE' };
+      } else if (r.error.kind === 'token_scope_denied') {
+        err.extensions = { code: 'TOKEN_SCOPE_DENIED' };
       } else if (r.error.kind === 'upstream_error') {
         err.extensions = { upstream: { status: r.error.status, body: r.error.payload } };
       }
@@ -753,21 +829,30 @@ function forwardErrorMessage(err: ForwardError): string {
     case 'handler_unresolved':
       // The missing variable names go to the server log only — the client message
       // stays generic, as it does for the other upstream-side failures.
-      console.error(`[graphql-gateway] handler_unresolved method=${err.method} handler=${err.handler} missingEnv=${err.missingEnv.join(',')}`);
+      console.error('%s', `[graphql-gateway] handler_unresolved method=${err.method} handler=${err.handler} missingEnv=${err.missingEnv.join(',')}`);
       return `Handler URL unresolved for ${err.method}`;
     case 'no_tenant_role':
       return NO_TENANT_ROLE_MESSAGE;
     case 'forbidden':
       return err.role ? `Role '${err.role}' is not permitted to invoke '${err.method}'` : `Your permissions do not allow '${err.method}'`;
+    case 'token_scope_denied':
+      return tokenScopeDeniedMessage(err.method);
     case 'upstream_unreachable':
-      console.error(`[graphql-gateway] upstream_unreachable method=${err.method} url=${err.url} detail=${err.detail}`);
+      console.error('%s', `[graphql-gateway] upstream_unreachable method=${err.method} url=${err.url} detail=${err.detail}`);
       return `Upstream unreachable for ${err.method}`;
+    case 'client_disconnected':
+      console.log('%s', `[graphql-gateway] client_disconnected method=${err.method} url=${err.url}`);
+      return `Client disconnected before ${err.method} answered`;
     case 'upstream_parse_failed':
-      console.error(`[graphql-gateway] upstream_parse_failed method=${err.method} url=${err.url} detail=${err.detail}`);
+      console.error('%s', `[graphql-gateway] upstream_parse_failed method=${err.method} url=${err.url} detail=${err.detail}`);
       return `Upstream response parse failed for ${err.method}`;
     case 'upstream_error':
       return extractUpstreamErrorDetail(err.payload) || genericMessageForStatus(err.status);
   }
+}
+
+export function tokenScopeDeniedMessage(method: string): string {
+  return `This API key's scopes do not allow '${method}'. Create a key with the needed module scope in Settings → API Tokens.`;
 }
 
 function genericMessageForStatus(status: number): string {

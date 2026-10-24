@@ -27,13 +27,19 @@ const (
 	ConfigSourceExperiment ConfigSource = "experiment"
 	ConfigSourceDatabase   ConfigSource = "database"
 	ConfigSourceDefault    ConfigSource = "default"
+	// ConfigSourceForcedDev marks resolution via the PROMPTS_VERSION /
+	// PROMPTS_VERSION_<NAME> local-dev override (config.Config.PromptsVersion,
+	// prompts/loader.go's forcedVersionFor) -- distinct from
+	// ConfigSourceDefault so logs/metrics show it wasn't a deliberate
+	// DB-configured version.
+	ConfigSourceForcedDev ConfigSource = "forced_dev"
 )
 
 // PromptRequest contains parameters for loading a prompt
 type PromptRequest struct {
 	Name      string         // Prompt name (e.g., "k8s_debug")
 	Category  PromptCategory // Category (agents, planners, tools, utilities)
-	Provider  string         // LLM provider (bedrock, azure, openai, etc.)
+	Model     string         // LLM model actually serving this request (e.g., "qwen3-235b-vertex")
 	AccountID string         // Account ID for experiments and overrides
 }
 
@@ -46,7 +52,7 @@ type PromptResponse struct {
 // PromptMetadata contains information about how the prompt was resolved
 type PromptMetadata struct {
 	Version        string         // Version used (e.g., "v1", "v2")
-	Provider       string         // Provider used
+	Model          string         // Model key actually resolved (exact match, canonical match, or "default")
 	Category       PromptCategory // Category
 	ConfigSource   ConfigSource   // Where config came from
 	ExperimentID   *uuid.UUID     // Experiment ID if from experiment
@@ -60,7 +66,7 @@ type DBConfig struct {
 	ID            uuid.UUID      `db:"id"`
 	PromptName    string         `db:"prompt_name"`
 	Category      PromptCategory `db:"category"`
-	Provider      string         `db:"provider"`
+	Model         string         `db:"model"`
 	ActiveVersion string         `db:"active_version"`
 	AccountID     *string        `db:"account_id"` // NULL for global
 	Enabled       bool           `db:"enabled"`
@@ -79,7 +85,7 @@ type DBExperiment struct {
 	TestVersion    string         `db:"test_version"`
 	ControlVersion string         `db:"control_version"`
 	TargetAccounts []string       `db:"target_accounts"` // PostgreSQL array
-	Providers      []string       `db:"providers"`       // PostgreSQL array
+	Models         []string       `db:"models"`          // PostgreSQL array; NULL/empty = all models
 	StartDate      *time.Time     `db:"start_date"`
 	EndDate        *time.Time     `db:"end_date"`
 	Enabled        bool           `db:"enabled"`
@@ -95,7 +101,7 @@ type DBAuditLog struct {
 	ID           uuid.UUID      `db:"id"`
 	PromptName   string         `db:"prompt_name"`
 	Category     PromptCategory `db:"category"`
-	Provider     *string        `db:"provider"`
+	Model        *string        `db:"model"`
 	AccountID    *string        `db:"account_id"`
 	Action       string         `db:"action"`
 	OldVersion   *string        `db:"old_version"`
@@ -112,7 +118,7 @@ type DBMetrics struct {
 	ID             uuid.UUID      `db:"id"`
 	PromptName     string         `db:"prompt_name"`
 	Category       PromptCategory `db:"category"`
-	Provider       string         `db:"provider"`
+	Model          string         `db:"model"`
 	Version        string         `db:"version"`
 	AccountID      *string        `db:"account_id"`
 	ConversationID *string        `db:"conversation_id"`
@@ -127,10 +133,10 @@ type DBMetrics struct {
 	Timestamp      time.Time      `db:"timestamp"`
 }
 
-// ResolvedConfig represents a resolved configuration (version + provider)
+// ResolvedConfig represents a resolved configuration (version + model)
 type ResolvedConfig struct {
 	Version        string
-	Provider       string
+	Model          string
 	ConfigSource   ConfigSource
 	ExperimentID   *uuid.UUID
 	ExperimentName *string
@@ -144,7 +150,7 @@ type ExperimentCreateRequest struct {
 	TestVersion    string   `json:"test_version" binding:"required"`
 	ControlVersion string   `json:"control_version" binding:"required"`
 	TargetAccounts []string `json:"target_accounts" binding:"required,min=1"`
-	Providers      []string `json:"providers,omitempty"`
+	Models         []string `json:"models,omitempty"`
 	StartDate      *string  `json:"start_date,omitempty"`
 	EndDate        *string  `json:"end_date,omitempty"`
 	Description    string   `json:"description,omitempty"`
@@ -160,7 +166,7 @@ type ExperimentUpdateAccountsRequest struct {
 type ConfigVersionUpdateRequest struct {
 	PromptName string  `json:"prompt_name" binding:"required"`
 	Category   string  `json:"category" binding:"required"`
-	Provider   string  `json:"provider"`
+	Model      string  `json:"model"`
 	AccountID  *string `json:"account_id"`
 	NewVersion string  `json:"new_version" binding:"required"`
 	Reason     string  `json:"reason,omitempty"`

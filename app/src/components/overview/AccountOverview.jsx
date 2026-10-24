@@ -4,18 +4,17 @@ import apiKubernetes from '@api1/kubernetes';
 import apiHome from '@api1/home';
 import apiOverview from '@api1/overview';
 import ClusterViewCard from '@components/k8s/common/ClusterViewCard';
+import { checkConnections } from '@shared/widgets/ClusterStatusIndicator';
 import KubernetesMemoryCpuOverView, { CpuMemorySkeleton } from '@components/k8s/common/KubernetesMemoryCpuOverView';
 import KubernetesIssuesOverView from '@components/k8s/common/KubernetesIssuesOverView';
 import KubernetesSaving from '@components/k8s/common/KubernetesSaving';
 import K8sClusterInsights from '@components/k8s/common/k8sClusterInsights';
 import { Grid, Box, Typography, Stack } from '@mui/material';
 import { K8sIcon } from '@assets';
-import KubernetesDashboardIssues from '@components/k8s/dashboard/KubernetesDashboardIssues';
-import KubernetesDashboardPodExceptions from '@components/k8s/dashboard/KubernetesDashboardPodExceptions';
-import KubernetesDashboardNodeExceptions from '@components/k8s/dashboard/KubernetesDashboardNodeExceptions';
 import CloudAccountOverviewCard from '@components/overview/CloudAccountOverviewCard';
 import VmAccountOverviewCard from '@components/overview/VmAccountOverviewCard';
 import ErrorBoundary from '@shared/ErrorBoundary';
+import Heading from '@shared/Heading';
 import { Skeleton } from '@ui/Skeleton';
 import { toast as snackbar } from '@ui/Toast';
 import K8sAccountModal from '@components/integrations/modal/K8sAccountModal';
@@ -66,11 +65,8 @@ const ClusterCardSkeleton = ({ cardStyle }) => (
  * bar scrolls to, so each group is reachable from the tab strip.
  */
 const SectionHeading = ({ id, title, count }) => (
-  <Box id={id} sx={{ display: 'flex', alignItems: 'baseline', gap: 'var(--ds-space-2)', mt: ds.space[4], scrollMarginTop: ds.space.mul(0, 60) }}>
-    <Typography sx={{ fontSize: 'var(--ds-text-body-lg)', fontWeight: 'var(--ds-font-weight-medium)', color: 'var(--ds-gray-700)' }}>
-      {title}
-    </Typography>
-    {count > 0 ? <Typography sx={{ fontSize: 'var(--ds-text-small)', color: 'var(--ds-gray-500)' }}>({count})</Typography> : null}
+  <Box id={id} sx={{ mt: ds.space[4], scrollMarginTop: ds.space.mul(0, 60) }}>
+    <Heading value={title} borderWidth='md' backgroundColor='var(--ds-background-100)' span={count > 0 ? `(${count})` : ''} />
   </Box>
 );
 
@@ -80,9 +76,7 @@ const SectionHeading = ({ id, title, count }) => (
  *
  * Three sections, each rendered only when the tenant has accounts of that kind:
  * K8s clusters, provider-API cloud accounts (AWS / Azure / GCP / CloudFoundry)
- * and self-hosted VM fleets. The K8s fleet tables below them (issues, pod and
- * node exceptions) stay K8s-only because there is no cross-provider equivalent
- * of a pod.
+ * and self-hosted VM fleets.
  *
  * Request shape differs by section on purpose. The K8s cards keep their
  * existing per-cluster fan-out (each child component fetches its own slice);
@@ -92,8 +86,6 @@ const SectionHeading = ({ id, title, count }) => (
 const AccountOverview = () => {
   const router = useRouter();
   const { setSelectedCluster } = useData();
-  const [clusterOption, setClusterOption] = useState([]);
-  const [allNameSpaces, setAllNameSpaces] = useState([]);
   const [k8sClusters, setK8sClusters] = useState([]);
   const [cloudAccounts, setCloudAccounts] = useState([]);
   const [vmAccounts, setVmAccounts] = useState([]);
@@ -113,15 +105,6 @@ const AccountOverview = () => {
 
   const sortedClusters = useMemo(() => {
     if (!k8sClusters?.length) return k8sClusters || [];
-
-    const checkConnections = (clusterEntry) => {
-      const requiredProps = ['logsConnection', 'nodeAgentConnection', 'prometheusConnection', 'relayConnection'];
-      for (const prop of requiredProps) {
-        if (!clusterEntry?.agent?.connection_status?.[prop]) return false;
-      }
-      const connectionStatus = clusterEntry?.agent?.connection_status;
-      return !!(connectionStatus?.opencostConnection || connectionStatus?.opencostServerSide);
-    };
 
     const getConnectionPriority = (clusterEntry) => {
       if (clusterEntry?.agent?.status === 'CONNECTED') {
@@ -184,12 +167,6 @@ const AccountOverview = () => {
     };
   }, []);
 
-  useEffect(() => {
-    if (clusterOption && clusterOption.length > 0) {
-      getDropDownData(clusterOption.map((co) => co.value));
-    }
-  }, [clusterOption]);
-
   // /vm is a single tenant-level route with no account path segment, so opening
   // a fleet has to move the header's selected account as well as navigate —
   // the same two-step the header's own account dropdown does.
@@ -214,27 +191,10 @@ const AccountOverview = () => {
       const response = await apiKubernetes.listk8ClusterData();
       const data = response?.cloudaccount_k8s_aggregate;
       setK8sClusters(data);
-      const clusters = data
-        .filter((f) => f.account_name)
-        .map((item) => ({
-          label: item.account_name,
-          value: item.account_id,
-        }));
-
-      setClusterOption(clusters);
     } catch {
       snackbar.error('Failed to fetch clusters');
     } finally {
       setLoading(false);
-    }
-  };
-
-  const getDropDownData = async (accountIds) => {
-    try {
-      const response = await apiKubernetes.getK8sNamespacesList(accountIds);
-      setAllNameSpaces(response);
-    } catch (error) {
-      console.error(error);
     }
   };
 
@@ -393,7 +353,7 @@ const AccountOverview = () => {
                 fontWeight: 'var(--ds-font-weight-semibold)',
                 color: 'var(--ds-foreground)',
                 mb: ds.space[2],
-                fontFamily: 'Poppins',
+                fontFamily: ds.font.display,
               }}
             >
               Get started with infrastructure monitoring
@@ -544,27 +504,6 @@ const AccountOverview = () => {
                     ))}
               </Box>
             </>
-          ) : null}
-
-          {hasK8sClusters ? (
-            <ErrorBoundary>
-              <KubernetesDashboardIssues id={'issues'} allClusters={k8sClusters} clusterOption={clusterOption} allNameSpaces={allNameSpaces} />
-            </ErrorBoundary>
-          ) : null}
-          {hasK8sClusters ? (
-            <ErrorBoundary>
-              <KubernetesDashboardPodExceptions
-                id={'pod-exception'}
-                allClusters={k8sClusters}
-                clusterOption={clusterOption}
-                allNameSpaces={allNameSpaces}
-              />
-            </ErrorBoundary>
-          ) : null}
-          {hasK8sClusters ? (
-            <ErrorBoundary>
-              <KubernetesDashboardNodeExceptions id={'node-exception'} allClusters={k8sClusters} clusterOption={clusterOption} />
-            </ErrorBoundary>
           ) : null}
         </>
       )}

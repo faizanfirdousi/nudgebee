@@ -26,8 +26,8 @@ import { Box, Typography, DialogContent, IconButton, DialogActions, Fade } from 
 import type { TransitionProps } from '@mui/material/transitions';
 import CloseIcon from '@mui/icons-material/Close';
 import { modalSuccess, modalPasswordChange } from '@assets';
-import LinearLoader from '@components/k8s/common/LinearLoader';
-import { Button } from '@ui/Button';
+import { ProgressLinear } from '@ui/ProgressLinear';
+import { Button, type ButtonTone } from '@ui/Button';
 
 // Fade transition drives MUI's enter/exit lifecycle for opacity; the Paper
 // itself runs a keyframe (defined in PaperProps below) that scales up and rises
@@ -142,6 +142,16 @@ export interface ModalProps {
   confirmText?: string;
   /** Click handler for the Confirm button. */
   onConfirm?: () => void;
+  /**
+   * Visual weight of the Confirm button. Defaults to `'primary'`.
+   *
+   * Pass `'danger'` when confirming destroys data or stops something running —
+   * a blue Confirm on a delete reads as "proceed", which is the opposite of the
+   * signal the moment calls for. Dialogs that build their own footer via
+   * `actionButtons` already choose a tone per button; this brings the standard
+   * footer to parity so a destructive confirm looks the same either way.
+   */
+  confirmTone?: Extract<ButtonTone, 'primary' | 'danger'>;
   /** Disable the Confirm button independently of the `loader` flag. */
   confirmDisabled?: boolean;
   /** Show the Confirm button. Default `true`. */
@@ -202,6 +212,7 @@ export function Modal({
   actionButtonsFullBleed = false,
   confirmText,
   onConfirm,
+  confirmTone = 'primary',
   confirmDisabled = false,
   isConfirmRequired = true,
   isCancelRequired = true,
@@ -334,7 +345,7 @@ export function Modal({
     >
       {loader && (
         <Box sx={{ position: 'absolute', top: 0, left: 0, width: '100%', zIndex: 1 }}>
-          <LinearLoader />
+          <ProgressLinear surface='page-top' />
         </Box>
       )}
 
@@ -478,7 +489,7 @@ export function Modal({
             </Button>
           )}
           {isConfirmRequired && (
-            <Button tone='primary' size='md' id='submit' type='button' onClick={onConfirm} disabled={confirmDisabled || loader}>
+            <Button tone={confirmTone} size='md' id='submit' type='button' onClick={onConfirm} disabled={confirmDisabled || loader}>
               {confirmText}
             </Button>
           )}

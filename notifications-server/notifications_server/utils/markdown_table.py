@@ -116,6 +116,15 @@ _SLACK_LINK_SPAN_RE = re.compile(rf"<{_SLACK_URL_SCHEME}[^|<>]+(?<!\\)\|[^<>]+>"
 # so right-alignment actually fires on the tables it's meant for.
 _CURRENCY_PREFIX_RE = re.compile(r"^[$€£¥]")
 _UNIT_SUFFIX_RE = re.compile(r"[a-zA-Z%]+$")
+# LLM output routinely stacks several values into one table cell with an
+# HTML ``<br>`` (e.g. ``0 / 0<br>1 / 1``, ``redis-replicas<br>redis-master``).
+# Slack's table block has no such markup, so left alone it renders the
+# literal ``<br>`` characters in the cell. Collapse each ``<br>`` (and its
+# XHTML spellings, any case) together with the whitespace hugging it into a
+# newline - both the ``raw_text`` and ``rich_text`` cell tiers render ``\n``
+# as a line break. Mirrors mermaid_graph.py's handling of ``<br>`` in node
+# labels.
+_CELL_BR_RE = re.compile(r"\s*<br\s*/?>\s*", re.IGNORECASE)
 # A generic ``` fence (any language, or none) still present by the time this
 # module runs - real Mermaid/nb-chart fences were already extracted by their
 # own splitters (see module docstring) - must be treated as opaque. Without
@@ -127,6 +136,12 @@ _FENCE_LINE_RE = re.compile(r"^```")
 # Slack's table block hard caps (see the doc link above).
 _MAX_TABLE_ROWS = 100
 _MAX_TABLE_COLUMNS = 20
+# Stand-in for a blank markdown cell - Slack's table block rejects a
+# raw_text cell outright ("must be more than 0 characters"), confirmed live
+# against the real API. Single character so it's negligible against
+# _MAX_TABLE_CHARS below - no separate accounting needed, it flows through
+# the normal per-cell char count like any other cell text.
+_BLANK_CELL_PLACEHOLDER = "-"
 # Slack rejects the whole message if a table's cell content exceeds this many
 # characters in aggregate - confirmed empirically (error
 # table_character_count_must_not_exceed_10000, not documented on the page
@@ -329,12 +344,20 @@ def _truncate_elements(elements: List[Dict[str, Any]], max_chars: int = _MAX_CEL
 
 
 def _build_cell(text: str) -> Dict[str, Any]:
+    # .strip() drops the edge newline a leading/trailing <br> would leave
+    # (which would otherwise show as a blank first/last line in the cell);
+    # a cell that was *only* a <br> becomes "" and picks up the blank-cell
+    # placeholder below.
+    text = _CELL_BR_RE.sub("\n", text).strip()
     # Tokenize first, truncate the parsed elements after - truncating the
     # raw string first could cut a long URL mid-pattern and break link
     # detection, turning a clean link into garbled raw text.
     elements = _tokenize_cell(text)
     if len(elements) == 1 and "style" not in elements[0] and elements[0]["type"] == "text":
-        return {"type": "raw_text", "text": _truncate_cell_text(elements[0]["text"])}
+        # A blank markdown cell (ragged row padding, or a deliberately empty
+        # cell for a "merged" visual grouping) must not produce "" - see
+        # _BLANK_CELL_PLACEHOLDER.
+        return {"type": "raw_text", "text": _truncate_cell_text(elements[0]["text"]) or _BLANK_CELL_PLACEHOLDER}
     elements = _truncate_elements(elements)
     return {
         "type": "rich_text",

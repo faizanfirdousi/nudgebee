@@ -56,6 +56,22 @@ func getPricingValue(currentInstance map[string]interface{}) (float64, error) {
 	return currentInsatnceCost, nil
 }
 
+// usablyPricedInstances keeps only the entries the pricing API gave a real USD
+// amount for. A 0 (or a failed lookup) is missing data, not a free instance,
+// and callers pick alternatives by sorting on price — so leaving those in puts
+// them at the front as the "cheapest" option, where they either fabricate
+// savings worth the whole resource or, once guarded against, silently discard
+// an otherwise valid recommendation.
+func usablyPricedInstances(instances []map[string]interface{}) []map[string]interface{} {
+	usable := make([]map[string]interface{}, 0, len(instances))
+	for _, instance := range instances {
+		if p, err := getPricingValue(instance); err == nil && p > 0 {
+			usable = append(usable, instance)
+		}
+	}
+	return usable
+}
+
 func alternateInstancesBasedOnPricing(instances []map[string]interface{}, currentInstance map[string]interface{}) ([]map[string]interface{}, error) {
 	recommendedInstances := []map[string]interface{}{}
 	currentInsatnceCost, err := getPricingValue(currentInstance)
@@ -82,7 +98,10 @@ func alternateInstancesBasedOnPricing(instances []map[string]interface{}, curren
 		if err != nil {
 			continue
 		}
-		if p < currentInsatnceCost {
+		// p == 0 means the pricing API returned no usable USD amount, not a free
+		// instance. Without this it sorts to the front as the "cheapest"
+		// alternative and callers report the entire current bill as savings.
+		if p > 0 && p < currentInsatnceCost {
 			recommendedInstances = append(recommendedInstances, instance)
 		}
 	}
@@ -96,12 +115,20 @@ func alternateInstancesBasedOnPricing(instances []map[string]interface{}, curren
 	return recommendedInstances, nil
 }
 
-func getAvailableInstancesFromPricing(cfg aws.Config, serviceName string, filtersMap map[string]string) ([]map[string]interface{}, error) {
-
-	svc := pricing.NewFromConfig(cfg)
-	filters := []types.Filter{}
-	for key, value := range filtersMap {
-		// Skip filters with empty values (allows services to explicitly exclude filters)
+// pricingFilters turns a caller's filter map into Pricing API TERM_MATCH filters,
+// sending exactly what it is given and nothing implicit. Empty values are dropped
+// so a caller can name a key it deliberately does not want to filter on.
+//
+// The helper used to add operatingSystem=Linux whenever the caller left it out.
+// Only EC2 instance products carry that attribute, so the default made every
+// RDS, Redshift, load-balancer and IP-address lookup match nothing and their
+// recommendations price at $0. Callers that need an OS filter pass it themselves.
+func pricingFilters(filtersMap map[string]string) []types.Filter {
+	keys := maps.Keys(filtersMap)
+	sort.Strings(keys)
+	filters := make([]types.Filter, 0, len(keys))
+	for _, key := range keys {
+		value := filtersMap[key]
 		if value == "" {
 			continue
 		}
@@ -111,15 +138,13 @@ func getAvailableInstancesFromPricing(cfg aws.Config, serviceName string, filter
 			Value: aws.String(value),
 		})
 	}
-	// Add a default filter for Linux OS if not provided, as it's common for many services.
-	// Services can explicitly exclude this by setting "operatingSystem": ""
-	if _, ok := filtersMap["operatingSystem"]; !ok {
-		filters = append(filters, types.Filter{
-			Field: aws.String("operatingSystem"),
-			Type:  types.FilterTypeTermMatch,
-			Value: aws.String("Linux"),
-		})
-	}
+	return filters
+}
+
+func getAvailableInstancesFromPricing(cfg aws.Config, serviceName string, filtersMap map[string]string) ([]map[string]interface{}, error) {
+
+	svc := pricing.NewFromConfig(cfg)
+	filters := pricingFilters(filtersMap)
 
 	priceList := []map[string]interface{}{}
 	paginator := pricing.NewGetProductsPaginator(svc, &pricing.GetProductsInput{

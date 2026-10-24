@@ -33,6 +33,7 @@ import { Link } from '@ui/Link';
 import { ds } from 'src/utils/colors';
 import { toast as snackbar } from '@ui/Toast';
 import { parseHttpResponseBodyMessage } from 'src/utils/common';
+import { podDisplayStatus } from 'src/utils/podStatus';
 import { TerminalIcon, DeleteIconRed as DeleteIcon } from '@assets';
 import apiKubernetes1 from '@api1/kubernetes1';
 
@@ -311,6 +312,7 @@ const KubernetesPodsTable = ({ accountId, defaultQuery = {}, enableFilters = tru
                     hideIcon={true}
                     nameMaxLength={70}
                     namespaceFont={ds.text.small}
+                    showTooltip={true}
                   />
                 </Box>
               ),
@@ -329,7 +331,7 @@ const KubernetesPodsTable = ({ accountId, defaultQuery = {}, enableFilters = tru
             { text: '-' },
             { text: '-' },
             { text: '-' },
-            { component: <Text value={item.status + '/' + (item.is_active ? 'Ready' : 'Deleted')} showAutoEllipsis /> },
+            { component: <Text value={podDisplayStatus(item) + '/' + (item.is_active ? 'Ready' : 'Deleted')} showAutoEllipsis /> },
             { component: <Text value={restartCount} /> },
             { component: <Datetime value={item.timestamp} /> },
             { component: <Text value={'-'} /> },
@@ -337,7 +339,7 @@ const KubernetesPodsTable = ({ accountId, defaultQuery = {}, enableFilters = tru
             {
               component: hasWriteAccess(accountId) ? (
                 <Box display={'flex'} justifyContent={'flex-end'} alignItems={'center'}>
-                  <ThreeDotsMenu sx={{ ...action.primary }} menuItems={MENU_ITEMS} data={item} onMenuClick={onMenuClick} />
+                  <ThreeDotsMenu sx={{ ...action.primary }} menuItems={MENU_ITEMS} data={item} onMenuClick={onMenuClick} disablePortal={false} />
                 </Box>
               ) : (
                 <></>
@@ -451,6 +453,7 @@ const KubernetesPodsTable = ({ accountId, defaultQuery = {}, enableFilters = tru
         podFqdn: podFqdn,
         startDate: new Date(selectedDateRange.startDate),
         endDate: new Date(selectedDateRange.endDate),
+        columns: ['cost', 'avg_cpu_used', 'avg_memory_used', 'avg_cpu_request', 'avg_memory_request'],
       })
       .then((res) => {
         for (const itemData of data) {

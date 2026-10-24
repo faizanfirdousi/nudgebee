@@ -118,6 +118,15 @@ func TestCloudProviderToObservabilityFallback(t *testing.T) {
 	}
 }
 
+func TestIsCloudObservabilityProvider(t *testing.T) {
+	for _, provider := range []string{"aws", " AWS ", "gcp", "azure"} {
+		assert.True(t, isCloudObservabilityProvider(provider), provider)
+	}
+	for _, provider := range []string{"", "prometheus", "datadog"} {
+		assert.False(t, isCloudObservabilityProvider(provider), provider)
+	}
+}
+
 // TestGetLogProvider_ServesCachedEntry asserts the cache-hit path short-circuits
 // before the services-server round-trip. A single fetch_logs call resolves the
 // log provider three times (LogAgent construction, FetchLogsAgent construction,
@@ -127,6 +136,20 @@ func TestCloudProviderToObservabilityFallback(t *testing.T) {
 // The seeded provider is deliberately NOT "k8s": on a cache miss the uncached
 // resolver returns the "k8s" default for a non-UUID account, so getting "loki"
 // back is unambiguous proof the cached value was served.
+func TestEffectiveLogProvider(t *testing.T) {
+	resolved := services_server.ObservabilityProvider{Provider: "loki", DefaultIndex: "logs-*"}
+
+	if got := EffectiveLogProvider(resolved, "  "); got.Provider != resolved.Provider || got.DefaultIndex != resolved.DefaultIndex {
+		t.Fatalf("empty override changed resolved provider: %#v", got)
+	}
+	if got := EffectiveLogProvider(resolved, "LOKI"); got.Provider != resolved.Provider || got.DefaultIndex != resolved.DefaultIndex {
+		t.Fatalf("equivalent override discarded resolved config: %#v", got)
+	}
+	if got := EffectiveLogProvider(resolved, " datadog "); got.Provider != "datadog" || got.DefaultIndex != "" {
+		t.Fatalf("override was not isolated to provider name: %#v", got)
+	}
+}
+
 func TestGetLogProvider_ServesCachedEntry(t *testing.T) {
 	acct := "cached-provider-" + t.Name()
 	seeded := services_server.ObservabilityProvider{
@@ -180,4 +203,43 @@ func TestGetLogProvider_IgnoresExpiredEntry(t *testing.T) {
 	got, err := GetLogProvider(acct)
 	require.NoError(t, err)
 	assert.NotEqual(t, "loki", got.Provider, "an expired entry must not be served")
+}
+
+func TestHasConnectedK8sAgent_InvalidUUID(t *testing.T) {
+	assert.False(t, hasConnectedK8sAgent(""), "empty account ID must return false")
+	assert.False(t, hasConnectedK8sAgent("not-a-uuid"), "non-UUID account ID must return false")
+}
+
+func TestHasConnectedK8sAgent_IgnoresCloudCollectorAgent(t *testing.T) {
+	dbms, err := common.GetDatabaseManager(common.Metastore)
+	if err != nil || dbms == nil || dbms.Db == nil {
+		t.Skip("metastore DB not available in this test environment")
+	}
+
+	// Verify against an active AWS cloud account that has a CONNECTED AWS agent row in agent table.
+	// It must NOT be treated as having a connected K8s agent.
+	var awsAccountID string
+	err = dbms.Db.Get(&awsAccountID, `
+		SELECT cloud_account_id::text
+		FROM agent
+		WHERE status = 'CONNECTED' AND type = 'AWS'
+		LIMIT 1
+	`)
+	if err == nil && awsAccountID != "" {
+		assert.False(t, hasConnectedK8sAgent(awsAccountID),
+			"an account with only a cloud-collector agent (type=AWS) must not report hasConnectedK8sAgent=true")
+	}
+
+	// Verify that an account with a real connected K8s agent DOES report true.
+	var k8sAccountID string
+	err = dbms.Db.Get(&k8sAccountID, `
+		SELECT cloud_account_id::text
+		FROM agent
+		WHERE status = 'CONNECTED' AND lower(type) = 'k8s'
+		LIMIT 1
+	`)
+	if err == nil && k8sAccountID != "" {
+		assert.True(t, hasConnectedK8sAgent(k8sAccountID),
+			"an account with a connected K8s agent (type=k8s) must report hasConnectedK8sAgent=true")
+	}
 }
