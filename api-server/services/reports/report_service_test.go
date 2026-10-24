@@ -1,6 +1,7 @@
 package reports
 
 import (
+	"math"
 	"strings"
 	"testing"
 
@@ -372,8 +373,7 @@ func TestIsPayloadEmpty_NonEmptySliceIsNotEmpty(t *testing.T) {
 
 // The savings figure in the email subject and body is the sum of
 // sum_estimated_savings across all recommendation rows. This verifies that
-// big.Float is summed correctly across multiple rows and converted back to
-// float64.
+// multiple rows are added correctly.
 func TestCalculateTotalPotentialSavings_SumsAllRows(t *testing.T) {
 	data := map[string]interface{}{
 		"rows": queryRows(
@@ -396,6 +396,8 @@ func TestCalculateTotalPotentialSavings_EmptyRowsIsZero(t *testing.T) {
 
 // Garbage savings values must be skipped; numeric strings and []uint8 (the
 // shapes sqlx.MapScan / lib/pq yield for numeric columns) must still be summed.
+// Non-finite values must be skipped too: Postgres numeric accepts 'NaN', and
+// float8 can carry ±Inf.
 func TestCalculateTotalPotentialSavings_CoercesDriverNumericTypes(t *testing.T) {
 	data := map[string]interface{}{
 		"rows": queryRows(
@@ -403,6 +405,9 @@ func TestCalculateTotalPotentialSavings_CoercesDriverNumericTypes(t *testing.T) 
 			query.QueryRow{"sum_estimated_savings": float64(100)},
 			query.QueryRow{"sum_estimated_savings": "50.5"},
 			query.QueryRow{"sum_estimated_savings": []uint8("25.25")},
+			query.QueryRow{"sum_estimated_savings": "NaN"},
+			query.QueryRow{"sum_estimated_savings": "+Inf"},
+			query.QueryRow{"sum_estimated_savings": math.NaN()},
 		),
 	}
 	assert.InDelta(t, 175.75, calculateTotalPotentialSavings(data), 0.001)
